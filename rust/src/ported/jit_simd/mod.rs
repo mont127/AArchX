@@ -762,115 +762,115 @@ unsafe fn emit_sse_fparith(
     let mut dbl: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     let mut packed: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     let mut kind: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
-    match (*insn).op as ::core::ffi::c_int {
-        206 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_ADDSS => {
             kind = 0 as ::core::ffi::c_int;
         }
-        207 => {
+        OCERZ_OP_ADDSD => {
             kind = 0 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        204 => {
+        OCERZ_OP_ADDPS => {
             kind = 0 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        205 => {
+        OCERZ_OP_ADDPD => {
             kind = 0 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        210 => {
+        OCERZ_OP_SUBSS => {
             kind = 1 as ::core::ffi::c_int;
         }
-        211 => {
+        OCERZ_OP_SUBSD => {
             kind = 1 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        208 => {
+        OCERZ_OP_SUBPS => {
             kind = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        209 => {
+        OCERZ_OP_SUBPD => {
             kind = 1 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        214 => {
+        OCERZ_OP_MULSS => {
             kind = 2 as ::core::ffi::c_int;
         }
-        215 => {
+        OCERZ_OP_MULSD => {
             kind = 2 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        212 => {
+        OCERZ_OP_MULPS => {
             kind = 2 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        213 => {
+        OCERZ_OP_MULPD => {
             kind = 2 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        218 => {
+        OCERZ_OP_DIVSS => {
             kind = 3 as ::core::ffi::c_int;
         }
-        219 => {
+        OCERZ_OP_DIVSD => {
             kind = 3 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        216 => {
+        OCERZ_OP_DIVPS => {
             kind = 3 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        217 => {
+        OCERZ_OP_DIVPD => {
             kind = 3 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        226 => {
+        OCERZ_OP_MAXSS => {
             kind = 4 as ::core::ffi::c_int;
         }
-        227 => {
+        OCERZ_OP_MAXSD => {
             kind = 4 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        224 => {
+        OCERZ_OP_MAXPS => {
             kind = 4 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        225 => {
+        OCERZ_OP_MAXPD => {
             kind = 4 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        222 => {
+        OCERZ_OP_MINSS => {
             kind = 5 as ::core::ffi::c_int;
         }
-        223 => {
+        OCERZ_OP_MINSD => {
             kind = 5 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        220 => {
+        OCERZ_OP_MINPS => {
             kind = 5 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        221 => {
+        OCERZ_OP_MINPD => {
             kind = 5 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        230 => {
+        OCERZ_OP_SQRTSS => {
             kind = 6 as ::core::ffi::c_int;
         }
-        231 => {
+        OCERZ_OP_SQRTSD => {
             kind = 6 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        228 => {
+        OCERZ_OP_SQRTPS => {
             kind = 6 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        229 => {
+        OCERZ_OP_SQRTPD => {
             kind = 6 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
@@ -1184,189 +1184,189 @@ unsafe fn sse_int_kind(
     mut esz: *mut ::core::ffi::c_int,
 ) -> ::core::ffi::c_int {
     *esz = 0 as ::core::ffi::c_int;
-    match op {
-        249 | 245 => return SIK_XOR as ::core::ffi::c_int,
-        246 | 242 => return SIK_AND as ::core::ffi::c_int,
-        248 | 244 => return SIK_OR as ::core::ffi::c_int,
-        247 | 243 => return SIK_ANDN as ::core::ffi::c_int,
-        282 => return SIK_ADD as ::core::ffi::c_int,
-        283 => {
+    match op as OcerzOp {
+        OCERZ_OP_PXOR | OCERZ_OP_XORPS => return SIK_XOR as ::core::ffi::c_int,
+        OCERZ_OP_PAND | OCERZ_OP_ANDPS => return SIK_AND as ::core::ffi::c_int,
+        OCERZ_OP_POR | OCERZ_OP_ORPS => return SIK_OR as ::core::ffi::c_int,
+        OCERZ_OP_PANDN | OCERZ_OP_ANDNPS => return SIK_ANDN as ::core::ffi::c_int,
+        OCERZ_OP_PADDB => return SIK_ADD as ::core::ffi::c_int,
+        OCERZ_OP_PADDW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_ADD as ::core::ffi::c_int;
         }
-        284 => {
+        OCERZ_OP_PADDD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_ADD as ::core::ffi::c_int;
         }
-        285 => {
+        OCERZ_OP_PADDQ => {
             *esz = 3 as ::core::ffi::c_int;
             return SIK_ADD as ::core::ffi::c_int;
         }
-        286 => return SIK_SUB as ::core::ffi::c_int,
-        287 => {
+        OCERZ_OP_PSUBB => return SIK_SUB as ::core::ffi::c_int,
+        OCERZ_OP_PSUBW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_SUB as ::core::ffi::c_int;
         }
-        288 => {
+        OCERZ_OP_PSUBD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_SUB as ::core::ffi::c_int;
         }
-        289 => {
+        OCERZ_OP_PSUBQ => {
             *esz = 3 as ::core::ffi::c_int;
             return SIK_SUB as ::core::ffi::c_int;
         }
-        258 => return SIK_CMPEQ as ::core::ffi::c_int,
-        259 => {
+        OCERZ_OP_PCMPEQB => return SIK_CMPEQ as ::core::ffi::c_int,
+        OCERZ_OP_PCMPEQW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_CMPEQ as ::core::ffi::c_int;
         }
-        260 => {
+        OCERZ_OP_PCMPEQD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_CMPEQ as ::core::ffi::c_int;
         }
-        261 => {
+        OCERZ_OP_PCMPEQQ => {
             *esz = 3 as ::core::ffi::c_int;
             return SIK_CMPEQ as ::core::ffi::c_int;
         }
-        262 => return SIK_CMPGT as ::core::ffi::c_int,
-        263 => {
+        OCERZ_OP_PCMPGTB => return SIK_CMPGT as ::core::ffi::c_int,
+        OCERZ_OP_PCMPGTW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_CMPGT as ::core::ffi::c_int;
         }
-        264 => {
+        OCERZ_OP_PCMPGTD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_CMPGT as ::core::ffi::c_int;
         }
-        265 => {
+        OCERZ_OP_PCMPGTQ => {
             *esz = 3 as ::core::ffi::c_int;
             return SIK_CMPGT as ::core::ffi::c_int;
         }
-        308 => return SIK_UMIN as ::core::ffi::c_int,
-        316 => {
+        OCERZ_OP_PMINUB => return SIK_UMIN as ::core::ffi::c_int,
+        OCERZ_OP_PMINUW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_UMIN as ::core::ffi::c_int;
         }
-        317 => {
+        OCERZ_OP_PMINUD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_UMIN as ::core::ffi::c_int;
         }
-        306 => return SIK_UMAX as ::core::ffi::c_int,
-        312 => {
+        OCERZ_OP_PMAXUB => return SIK_UMAX as ::core::ffi::c_int,
+        OCERZ_OP_PMAXUW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_UMAX as ::core::ffi::c_int;
         }
-        313 => {
+        OCERZ_OP_PMAXUD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_UMAX as ::core::ffi::c_int;
         }
-        314 => return SIK_SMIN as ::core::ffi::c_int,
-        309 => {
+        OCERZ_OP_PMINSB => return SIK_SMIN as ::core::ffi::c_int,
+        OCERZ_OP_PMINSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_SMIN as ::core::ffi::c_int;
         }
-        315 => {
+        OCERZ_OP_PMINSD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_SMIN as ::core::ffi::c_int;
         }
-        310 => return SIK_SMAX as ::core::ffi::c_int,
-        307 => {
+        OCERZ_OP_PMAXSB => return SIK_SMAX as ::core::ffi::c_int,
+        OCERZ_OP_PMAXSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_SMAX as ::core::ffi::c_int;
         }
-        311 => {
+        OCERZ_OP_PMAXSD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_SMAX as ::core::ffi::c_int;
         }
-        298 => {
+        OCERZ_OP_PMULLW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_MUL as ::core::ffi::c_int;
         }
-        299 => {
+        OCERZ_OP_PMULLD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_MUL as ::core::ffi::c_int;
         }
-        292 => return SIK_UQADD as ::core::ffi::c_int,
-        293 => {
+        OCERZ_OP_PADDUSB => return SIK_UQADD as ::core::ffi::c_int,
+        OCERZ_OP_PADDUSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_UQADD as ::core::ffi::c_int;
         }
-        296 => return SIK_UQSUB as ::core::ffi::c_int,
-        297 => {
+        OCERZ_OP_PSUBUSB => return SIK_UQSUB as ::core::ffi::c_int,
+        OCERZ_OP_PSUBUSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_UQSUB as ::core::ffi::c_int;
         }
-        290 => return SIK_SQADD as ::core::ffi::c_int,
-        291 => {
+        OCERZ_OP_PADDSB => return SIK_SQADD as ::core::ffi::c_int,
+        OCERZ_OP_PADDSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_SQADD as ::core::ffi::c_int;
         }
-        294 => return SIK_SQSUB as ::core::ffi::c_int,
-        295 => {
+        OCERZ_OP_PSUBSB => return SIK_SQSUB as ::core::ffi::c_int,
+        OCERZ_OP_PSUBSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_SQSUB as ::core::ffi::c_int;
         }
-        304 => return SIK_AVG as ::core::ffi::c_int,
-        305 => {
+        OCERZ_OP_PAVGB => return SIK_AVG as ::core::ffi::c_int,
+        OCERZ_OP_PAVGW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_AVG as ::core::ffi::c_int;
         }
-        303 => return SIK_MADDWD as ::core::ffi::c_int,
-        348 => return SIK_MULHRSW as ::core::ffi::c_int,
-        323 => return SIK_PACKSSDW as ::core::ffi::c_int,
-        324 => return SIK_PACKUSWB as ::core::ffi::c_int,
-        302 => return SIK_MULUDQ as ::core::ffi::c_int,
-        300 => {
+        OCERZ_OP_PMADDWD => return SIK_MADDWD as ::core::ffi::c_int,
+        OCERZ_OP_PMULHRSW => return SIK_MULHRSW as ::core::ffi::c_int,
+        OCERZ_OP_PACKSSDW => return SIK_PACKSSDW as ::core::ffi::c_int,
+        OCERZ_OP_PACKUSWB => return SIK_PACKUSWB as ::core::ffi::c_int,
+        OCERZ_OP_PMULUDQ => return SIK_MULUDQ as ::core::ffi::c_int,
+        OCERZ_OP_PMULHW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_MULHW as ::core::ffi::c_int;
         }
-        301 => {
+        OCERZ_OP_PMULHUW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_MULHUW as ::core::ffi::c_int;
         }
-        322 => return SIK_PACKSSWB as ::core::ffi::c_int,
-        325 => return SIK_PACKUSDW as ::core::ffi::c_int,
-        421 => return SIK_MULDQ as ::core::ffi::c_int,
-        318 => return SIK_SADBW as ::core::ffi::c_int,
-        347 => return SIK_MADDUBSW as ::core::ffi::c_int,
-        319 => return SIK_ABS as ::core::ffi::c_int,
-        320 => {
+        OCERZ_OP_PACKSSWB => return SIK_PACKSSWB as ::core::ffi::c_int,
+        OCERZ_OP_PACKUSDW => return SIK_PACKUSDW as ::core::ffi::c_int,
+        OCERZ_OP_PMULDQ => return SIK_MULDQ as ::core::ffi::c_int,
+        OCERZ_OP_PSADBW => return SIK_SADBW as ::core::ffi::c_int,
+        OCERZ_OP_PMADDUBSW => return SIK_MADDUBSW as ::core::ffi::c_int,
+        OCERZ_OP_PABSB => return SIK_ABS as ::core::ffi::c_int,
+        OCERZ_OP_PABSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_ABS as ::core::ffi::c_int;
         }
-        321 => {
+        OCERZ_OP_PABSD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_ABS as ::core::ffi::c_int;
         }
-        344 => return SIK_SIGN as ::core::ffi::c_int,
-        345 => {
+        OCERZ_OP_PSIGNB => return SIK_SIGN as ::core::ffi::c_int,
+        OCERZ_OP_PSIGNW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_SIGN as ::core::ffi::c_int;
         }
-        346 => {
+        OCERZ_OP_PSIGND => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_SIGN as ::core::ffi::c_int;
         }
-        338 => {
+        OCERZ_OP_PHADDW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_HADD as ::core::ffi::c_int;
         }
-        339 => {
+        OCERZ_OP_PHADDD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_HADD as ::core::ffi::c_int;
         }
-        341 => {
+        OCERZ_OP_PHSUBW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_HSUB as ::core::ffi::c_int;
         }
-        342 => {
+        OCERZ_OP_PHSUBD => {
             *esz = 2 as ::core::ffi::c_int;
             return SIK_HSUB as ::core::ffi::c_int;
         }
-        340 => {
+        OCERZ_OP_PHADDSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_HADDS as ::core::ffi::c_int;
         }
-        343 => {
+        OCERZ_OP_PHSUBSW => {
             *esz = 1 as ::core::ffi::c_int;
             return SIK_HSUBS as ::core::ffi::c_int;
         }
@@ -1389,59 +1389,59 @@ unsafe fn emit_sse_int_op(
     mut va: ::core::ffi::c_int,
     mut vb: ::core::ffi::c_int,
 ) {
-    match kind {
-        1 => {
+    match kind as ::core::ffi::c_uint {
+        SIK_XOR => {
             a64_v_eor(b, vd, va, vb);
         }
-        2 => {
+        SIK_AND => {
             a64_v_and(b, vd, va, vb);
         }
-        3 => {
+        SIK_OR => {
             a64_v_orr(b, vd, va, vb);
         }
-        4 => {
+        SIK_ANDN => {
             a64_v_bic(b, vd, vb, va);
         }
-        5 => {
+        SIK_ADD => {
             a64_v_add(b, esz, vd, va, vb);
         }
-        6 => {
+        SIK_SUB => {
             a64_v_sub(b, esz, vd, va, vb);
         }
-        7 => {
+        SIK_CMPEQ => {
             a64_v_cmeq(b, esz, vd, va, vb);
         }
-        8 => {
+        SIK_CMPGT => {
             a64_v_cmgt(b, esz, vd, va, vb);
         }
-        9 => {
+        SIK_UMIN => {
             a64_v_umin(b, esz, vd, va, vb);
         }
-        10 => {
+        SIK_UMAX => {
             a64_v_umax(b, esz, vd, va, vb);
         }
-        11 => {
+        SIK_SMIN => {
             a64_v_smin(b, esz, vd, va, vb);
         }
-        12 => {
+        SIK_SMAX => {
             a64_v_smax(b, esz, vd, va, vb);
         }
-        13 => {
+        SIK_MUL => {
             a64_v_mul(b, esz, vd, va, vb);
         }
-        14 => {
+        SIK_UQADD => {
             a64_v_uqadd(b, esz, vd, va, vb);
         }
-        15 => {
+        SIK_UQSUB => {
             a64_v_uqsub(b, esz, vd, va, vb);
         }
-        16 => {
+        SIK_SQADD => {
             a64_v_sqadd(b, esz, vd, va, vb);
         }
-        17 => {
+        SIK_SQSUB => {
             a64_v_sqsub(b, esz, vd, va, vb);
         }
-        19 => {
+        SIK_MADDWD => {
             a64_v_smull_h(
                 b,
                 0 as ::core::ffi::c_int,
@@ -1458,7 +1458,7 @@ unsafe fn emit_sse_int_op(
             );
             a64_v_addp_4s(b, vd, VX2 as ::core::ffi::c_int, VX3 as ::core::ffi::c_int);
         }
-        20 => {
+        SIK_MULHRSW => {
             a64_v_smull_h(
                 b,
                 0 as ::core::ffi::c_int,
@@ -1476,22 +1476,22 @@ unsafe fn emit_sse_int_op(
             a64_v_rshrn_s15(b, 0 as ::core::ffi::c_int, vd, VX2 as ::core::ffi::c_int);
             a64_v_rshrn_s15(b, 1 as ::core::ffi::c_int, vd, VX3 as ::core::ffi::c_int);
         }
-        21 => {
+        SIK_PACKSSDW => {
             a64_v_sqxtn_s(b, 0 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, va);
             a64_v_sqxtn_s(b, 1 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, vb);
             a64_v_mov(b, vd, VX2 as ::core::ffi::c_int);
         }
-        22 => {
+        SIK_PACKUSWB => {
             a64_v_sqxtun_h(b, 0 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, va);
             a64_v_sqxtun_h(b, 1 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, vb);
             a64_v_mov(b, vd, VX2 as ::core::ffi::c_int);
         }
-        23 => {
+        SIK_MULUDQ => {
             a64_v_xtn(b, 2 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, va);
             a64_v_xtn(b, 2 as ::core::ffi::c_int, VX3 as ::core::ffi::c_int, vb);
             a64_v_umull_s(b, vd, VX2 as ::core::ffi::c_int, VX3 as ::core::ffi::c_int);
         }
-        24 | 25 => {
+        SIK_MULHW | SIK_MULHUW => {
             if kind == SIK_MULHW as ::core::ffi::c_int {
                 a64_v_smull_h(
                     b,
@@ -1532,22 +1532,22 @@ unsafe fn emit_sse_int_op(
                 VX3 as ::core::ffi::c_int,
             );
         }
-        26 => {
+        SIK_PACKSSWB => {
             a64_v_sqxtn_h(b, 0 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, va);
             a64_v_sqxtn_h(b, 1 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, vb);
             a64_v_mov(b, vd, VX2 as ::core::ffi::c_int);
         }
-        27 => {
+        SIK_PACKUSDW => {
             a64_v_sqxtun_s(b, 0 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, va);
             a64_v_sqxtun_s(b, 1 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, vb);
             a64_v_mov(b, vd, VX2 as ::core::ffi::c_int);
         }
-        28 => {
+        SIK_MULDQ => {
             a64_v_xtn(b, 2 as ::core::ffi::c_int, VX2 as ::core::ffi::c_int, va);
             a64_v_xtn(b, 2 as ::core::ffi::c_int, VX3 as ::core::ffi::c_int, vb);
             a64_v_smull_s(b, vd, VX2 as ::core::ffi::c_int, VX3 as ::core::ffi::c_int);
         }
-        29 => {
+        SIK_SADBW => {
             a64_v_uabd(
                 b,
                 0 as ::core::ffi::c_int,
@@ -1569,7 +1569,7 @@ unsafe fn emit_sse_int_op(
             );
             a64_v_uaddlp(b, 2 as ::core::ffi::c_int, vd, VX2 as ::core::ffi::c_int);
         }
-        30 => {
+        SIK_MADDUBSW => {
             a64_v_xtl(
                 b,
                 0 as ::core::ffi::c_int,
@@ -1630,10 +1630,10 @@ unsafe fn emit_sse_int_op(
                 VX3 as ::core::ffi::c_int,
             );
         }
-        31 => {
+        SIK_ABS => {
             a64_v_abs(b, esz, vd, vb);
         }
-        32 => {
+        SIK_SIGN => {
             a64_v_sshr_imm(
                 b,
                 esz,
@@ -1646,10 +1646,10 @@ unsafe fn emit_sse_int_op(
             a64_v_cmeq0(b, esz, VX3 as ::core::ffi::c_int, vb);
             a64_v_bic(b, vd, VX2 as ::core::ffi::c_int, VX3 as ::core::ffi::c_int);
         }
-        33 => {
+        SIK_HADD => {
             a64_v_addp(b, esz, vd, va, vb);
         }
-        34 | 35 | 36 => {
+        SIK_HSUB | SIK_HADDS | SIK_HSUBS => {
             a64_v_uzp(
                 b,
                 esz,
@@ -2449,8 +2449,8 @@ unsafe fn emit_sse_aes(
             (*d).reg as ::core::ffi::c_uint,
         );
     }
-    match op {
-        399 | 400 => {
+    match op as OcerzOp {
+        OCERZ_OP_AESENC | OCERZ_OP_AESENCLAST => {
             a64_v_zero(b, VX3 as ::core::ffi::c_int);
             a64_aese(b, VX3 as ::core::ffi::c_int, vd);
             if op == OCERZ_OP_AESENC as ::core::ffi::c_int as ::core::ffi::c_uint {
@@ -2458,7 +2458,7 @@ unsafe fn emit_sse_aes(
             }
             a64_v_eor(b, vd, VX3 as ::core::ffi::c_int, vb);
         }
-        401 | 402 => {
+        OCERZ_OP_AESDEC | OCERZ_OP_AESDECLAST => {
             a64_v_zero(b, VX3 as ::core::ffi::c_int);
             a64_aesd(b, VX3 as ::core::ffi::c_int, vd);
             if op == OCERZ_OP_AESDEC as ::core::ffi::c_int as ::core::ffi::c_uint {
@@ -2466,7 +2466,7 @@ unsafe fn emit_sse_aes(
             }
             a64_v_eor(b, vd, VX3 as ::core::ffi::c_int, vb);
         }
-        403 => {
+        OCERZ_OP_AESIMC => {
             a64_aesimc(b, vd, vb);
         }
         _ => {
@@ -2823,8 +2823,8 @@ unsafe fn emit_sse_cvt(
     let mut s: *const X86Operand = (&raw const (*insn).ops as *const X86Operand)
         .offset(1 as ::core::ffi::c_int as isize)
         as *const X86Operand;
-    match (*insn).op as ::core::ffi::c_int {
-        271 | 270 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_CVTTSD2SI | OCERZ_OP_CVTTSS2SI => {
             if (*d).kind as ::core::ffi::c_int != OCERZ_OPK_REG as ::core::ffi::c_int
                 || (*d).high8 as ::core::ffi::c_int != 0
                 || (*d).size as ::core::ffi::c_int != 4 as ::core::ffi::c_int
@@ -3006,7 +3006,7 @@ unsafe fn emit_sse_cvt(
             }
             return 1 as ::core::ffi::c_int;
         }
-        267 | 266 => {
+        OCERZ_OP_CVTSI2SD | OCERZ_OP_CVTSI2SS => {
             if (*d).kind as ::core::ffi::c_int != OCERZ_OPK_XMM as ::core::ffi::c_int {
                 return 0 as ::core::ffi::c_int;
             }
@@ -3081,7 +3081,7 @@ unsafe fn emit_sse_cvt(
             );
             return 1 as ::core::ffi::c_int;
         }
-        273 => {
+        OCERZ_OP_CVTSD2SS => {
             if (*d).kind as ::core::ffi::c_int != OCERZ_OPK_XMM as ::core::ffi::c_int {
                 return 0 as ::core::ffi::c_int;
             }
@@ -3106,7 +3106,7 @@ unsafe fn emit_sse_cvt(
             );
             return 1 as ::core::ffi::c_int;
         }
-        272 => {
+        OCERZ_OP_CVTSS2SD => {
             if (*d).kind as ::core::ffi::c_int != OCERZ_OPK_XMM as ::core::ffi::c_int {
                 return 0 as ::core::ffi::c_int;
             }
@@ -3131,7 +3131,7 @@ unsafe fn emit_sse_cvt(
             );
             return 1 as ::core::ffi::c_int;
         }
-        276 => {
+        OCERZ_OP_CVTDQ2PS => {
             if (*d).kind as ::core::ffi::c_int != OCERZ_OPK_XMM as ::core::ffi::c_int {
                 return 0 as ::core::ffi::c_int;
             }
@@ -3686,29 +3686,29 @@ unsafe fn emit_sse_punpck(
     l0_flush_reg(b, (*d).reg as ::core::ffi::c_uint);
     l0_inval((*d).reg as ::core::ffi::c_uint);
     let mut vd: ::core::ffi::c_int = xmm_vreg((*d).reg as ::core::ffi::c_uint);
-    match (*insn).op as ::core::ffi::c_int {
-        326 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_PUNPCKLBW => {
             a64_v_zip1(b, 0 as ::core::ffi::c_int, vd, vd, vb);
         }
-        327 => {
+        OCERZ_OP_PUNPCKLWD => {
             a64_v_zip1(b, 1 as ::core::ffi::c_int, vd, vd, vb);
         }
-        328 => {
+        OCERZ_OP_PUNPCKLDQ => {
             a64_v_zip1(b, 2 as ::core::ffi::c_int, vd, vd, vb);
         }
-        329 => {
+        OCERZ_OP_PUNPCKLQDQ => {
             a64_v_zip1(b, 3 as ::core::ffi::c_int, vd, vd, vb);
         }
-        330 => {
+        OCERZ_OP_PUNPCKHBW => {
             a64_v_zip2(b, 0 as ::core::ffi::c_int, vd, vd, vb);
         }
-        331 => {
+        OCERZ_OP_PUNPCKHWD => {
             a64_v_zip2(b, 1 as ::core::ffi::c_int, vd, vd, vb);
         }
-        332 => {
+        OCERZ_OP_PUNPCKHDQ => {
             a64_v_zip2(b, 2 as ::core::ffi::c_int, vd, vd, vb);
         }
-        333 => {
+        OCERZ_OP_PUNPCKHQDQ => {
             a64_v_zip2(b, 3 as ::core::ffi::c_int, vd, vd, vb);
         }
         _ => return 0 as ::core::ffi::c_int,
@@ -3756,23 +3756,23 @@ unsafe fn emit_sse_unpck(
     }
     let mut vd: ::core::ffi::c_int =
         xmm_dst_reg((*d).reg as ::core::ffi::c_uint, VX2 as ::core::ffi::c_int);
-    match (*insn).op as ::core::ffi::c_int {
-        354 | 195 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_UNPCKLPD | OCERZ_OP_MOVLHPS => {
             a64_v_zip1(b, 3 as ::core::ffi::c_int, vd, va, vb);
         }
-        355 => {
+        OCERZ_OP_UNPCKHPD => {
             a64_v_zip2(b, 3 as ::core::ffi::c_int, vd, va, vb);
         }
-        196 => {
+        OCERZ_OP_MOVHLPS => {
             if vd != va {
                 a64_v_mov(b, vd, va);
             }
             a64_ins_d_d(b, vd, 0 as ::core::ffi::c_int, vb, 1 as ::core::ffi::c_int);
         }
-        352 => {
+        OCERZ_OP_UNPCKLPS => {
             a64_v_zip1(b, 2 as ::core::ffi::c_int, vd, va, vb);
         }
-        353 => {
+        OCERZ_OP_UNPCKHPS => {
             a64_v_zip2(b, 2 as ::core::ffi::c_int, vd, va, vb);
         }
         _ => return 0 as ::core::ffi::c_int,
@@ -4067,14 +4067,14 @@ unsafe fn emit_sse_blendv(
     if vm == VX2 as ::core::ffi::c_int {
         emit_xmm_ld(b, VX2 as ::core::ffi::c_int, 0 as ::core::ffi::c_uint);
     }
-    match (*insn).op as ::core::ffi::c_int {
-        397 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_BLENDVPD => {
             a64_v_sshr_2d(b, VX2 as ::core::ffi::c_int, vm, 63 as ::core::ffi::c_int);
         }
-        396 => {
+        OCERZ_OP_BLENDVPS => {
             a64_v_sshr_4s(b, VX2 as ::core::ffi::c_int, vm, 31 as ::core::ffi::c_int);
         }
-        398 => {
+        OCERZ_OP_PBLENDVB => {
             a64_v_zero(b, VX3 as ::core::ffi::c_int);
             a64_v_cmgt(
                 b,
@@ -4130,36 +4130,36 @@ unsafe fn emit_simd_shift_imm(
 unsafe fn emit_sse_shift_imm(mut b: *mut A64Buf, mut insn: *const X86Insn) -> ::core::ffi::c_int {
     let mut kind: ::core::ffi::c_int = 0;
     let mut esz: ::core::ffi::c_int = 0;
-    match (*insn).op as ::core::ffi::c_int {
-        356 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_PSLLW => {
             kind = 0 as ::core::ffi::c_int;
             esz = 1 as ::core::ffi::c_int;
         }
-        357 => {
+        OCERZ_OP_PSLLD => {
             kind = 0 as ::core::ffi::c_int;
             esz = 2 as ::core::ffi::c_int;
         }
-        358 => {
+        OCERZ_OP_PSLLQ => {
             kind = 0 as ::core::ffi::c_int;
             esz = 3 as ::core::ffi::c_int;
         }
-        359 => {
+        OCERZ_OP_PSRLW => {
             kind = 1 as ::core::ffi::c_int;
             esz = 1 as ::core::ffi::c_int;
         }
-        360 => {
+        OCERZ_OP_PSRLD => {
             kind = 1 as ::core::ffi::c_int;
             esz = 2 as ::core::ffi::c_int;
         }
-        361 => {
+        OCERZ_OP_PSRLQ => {
             kind = 1 as ::core::ffi::c_int;
             esz = 3 as ::core::ffi::c_int;
         }
-        362 => {
+        OCERZ_OP_PSRAW => {
             kind = 2 as ::core::ffi::c_int;
             esz = 1 as ::core::ffi::c_int;
         }
-        363 => {
+        OCERZ_OP_PSRAD => {
             kind = 2 as ::core::ffi::c_int;
             esz = 2 as ::core::ffi::c_int;
         }
@@ -4985,36 +4985,36 @@ pub unsafe extern "C" fn emit_mmx(
     if shift_imm != 0 {
         let mut esz: ::core::ffi::c_int = 0;
         let mut kind: ::core::ffi::c_int = 0;
-        match op {
-            356 => {
+        match op as OcerzOp {
+            OCERZ_OP_PSLLW => {
                 esz = 1 as ::core::ffi::c_int;
                 kind = 0 as ::core::ffi::c_int;
             }
-            357 => {
+            OCERZ_OP_PSLLD => {
                 esz = 2 as ::core::ffi::c_int;
                 kind = 0 as ::core::ffi::c_int;
             }
-            358 => {
+            OCERZ_OP_PSLLQ => {
                 esz = 3 as ::core::ffi::c_int;
                 kind = 0 as ::core::ffi::c_int;
             }
-            359 => {
+            OCERZ_OP_PSRLW => {
                 esz = 1 as ::core::ffi::c_int;
                 kind = 1 as ::core::ffi::c_int;
             }
-            360 => {
+            OCERZ_OP_PSRLD => {
                 esz = 2 as ::core::ffi::c_int;
                 kind = 1 as ::core::ffi::c_int;
             }
-            361 => {
+            OCERZ_OP_PSRLQ => {
                 esz = 3 as ::core::ffi::c_int;
                 kind = 1 as ::core::ffi::c_int;
             }
-            362 => {
+            OCERZ_OP_PSRAW => {
                 esz = 1 as ::core::ffi::c_int;
                 kind = 2 as ::core::ffi::c_int;
             }
-            363 => {
+            OCERZ_OP_PSRAD => {
                 esz = 2 as ::core::ffi::c_int;
                 kind = 2 as ::core::ffi::c_int;
             }
@@ -5071,11 +5071,18 @@ pub unsafe extern "C" fn emit_mmx(
         mmx_enter(b);
         return 1 as ::core::ffi::c_int;
     }
-    match op {
-        282 | 283 | 284 | 285 | 286 | 287 | 288 | 289 | 290 | 291 | 292 | 293 | 294 | 295 | 296
-        | 297 | 298 | 300 | 301 | 246 | 248 | 249 | 247 | 258 | 259 | 260 | 262 | 263 | 264
-        | 326 | 327 | 328 | 330 | 331 | 332 | 324 | 322 | 323 | 318 | 304 | 305 | 308 | 306
-        | 309 | 307 => {}
+    match op as OcerzOp {
+        OCERZ_OP_PADDB | OCERZ_OP_PADDW | OCERZ_OP_PADDD | OCERZ_OP_PADDQ | OCERZ_OP_PSUBB
+        | OCERZ_OP_PSUBW | OCERZ_OP_PSUBD | OCERZ_OP_PSUBQ | OCERZ_OP_PADDSB | OCERZ_OP_PADDSW
+        | OCERZ_OP_PADDUSB | OCERZ_OP_PADDUSW | OCERZ_OP_PSUBSB | OCERZ_OP_PSUBSW
+        | OCERZ_OP_PSUBUSB | OCERZ_OP_PSUBUSW | OCERZ_OP_PMULLW | OCERZ_OP_PMULHW
+        | OCERZ_OP_PMULHUW | OCERZ_OP_PAND | OCERZ_OP_POR | OCERZ_OP_PXOR | OCERZ_OP_PANDN
+        | OCERZ_OP_PCMPEQB | OCERZ_OP_PCMPEQW | OCERZ_OP_PCMPEQD | OCERZ_OP_PCMPGTB
+        | OCERZ_OP_PCMPGTW | OCERZ_OP_PCMPGTD | OCERZ_OP_PUNPCKLBW | OCERZ_OP_PUNPCKLWD
+        | OCERZ_OP_PUNPCKLDQ | OCERZ_OP_PUNPCKHBW | OCERZ_OP_PUNPCKHWD | OCERZ_OP_PUNPCKHDQ
+        | OCERZ_OP_PACKUSWB | OCERZ_OP_PACKSSWB | OCERZ_OP_PACKSSDW | OCERZ_OP_PSADBW
+        | OCERZ_OP_PAVGB | OCERZ_OP_PAVGW | OCERZ_OP_PMINUB | OCERZ_OP_PMAXUB | OCERZ_OP_PMINSW
+        | OCERZ_OP_PMAXSW => {}
         _ => return 0 as ::core::ffi::c_int,
     }
     if op == OCERZ_OP_PXOR as ::core::ffi::c_int
@@ -5113,8 +5120,8 @@ pub unsafe extern "C" fn emit_mmx(
     {
         return 0 as ::core::ffi::c_int;
     }
-    match op {
-        282 => {
+    match op as OcerzOp {
+        OCERZ_OP_PADDB => {
             a64_v_add(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5123,7 +5130,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        283 => {
+        OCERZ_OP_PADDW => {
             a64_v_add(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5132,7 +5139,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        284 => {
+        OCERZ_OP_PADDD => {
             a64_v_add(
                 b,
                 2 as ::core::ffi::c_int,
@@ -5141,7 +5148,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        285 => {
+        OCERZ_OP_PADDQ => {
             a64_v_add(
                 b,
                 3 as ::core::ffi::c_int,
@@ -5150,7 +5157,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        286 => {
+        OCERZ_OP_PSUBB => {
             a64_v_sub(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5159,7 +5166,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        287 => {
+        OCERZ_OP_PSUBW => {
             a64_v_sub(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5168,7 +5175,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        288 => {
+        OCERZ_OP_PSUBD => {
             a64_v_sub(
                 b,
                 2 as ::core::ffi::c_int,
@@ -5177,7 +5184,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        289 => {
+        OCERZ_OP_PSUBQ => {
             a64_v_sub(
                 b,
                 3 as ::core::ffi::c_int,
@@ -5186,7 +5193,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        290 => {
+        OCERZ_OP_PADDSB => {
             a64_v_sqadd(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5195,7 +5202,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        291 => {
+        OCERZ_OP_PADDSW => {
             a64_v_sqadd(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5204,7 +5211,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        292 => {
+        OCERZ_OP_PADDUSB => {
             a64_v_uqadd(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5213,7 +5220,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        293 => {
+        OCERZ_OP_PADDUSW => {
             a64_v_uqadd(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5222,7 +5229,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        294 => {
+        OCERZ_OP_PSUBSB => {
             a64_v_sqsub(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5231,7 +5238,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        295 => {
+        OCERZ_OP_PSUBSW => {
             a64_v_sqsub(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5240,7 +5247,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        296 => {
+        OCERZ_OP_PSUBUSB => {
             a64_v_uqsub(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5249,7 +5256,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        297 => {
+        OCERZ_OP_PSUBUSW => {
             a64_v_uqsub(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5258,7 +5265,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        298 => {
+        OCERZ_OP_PMULLW => {
             a64_v_mul(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5267,7 +5274,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        300 => {
+        OCERZ_OP_PMULHW => {
             a64_v_smull_h(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5284,7 +5291,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX0 as ::core::ffi::c_int,
             );
         }
-        301 => {
+        OCERZ_OP_PMULHUW => {
             a64_v_umull_h(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5301,7 +5308,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX0 as ::core::ffi::c_int,
             );
         }
-        246 => {
+        OCERZ_OP_PAND => {
             a64_v_and(
                 b,
                 VX0 as ::core::ffi::c_int,
@@ -5309,7 +5316,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        248 => {
+        OCERZ_OP_POR => {
             a64_v_orr(
                 b,
                 VX0 as ::core::ffi::c_int,
@@ -5317,7 +5324,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        249 => {
+        OCERZ_OP_PXOR => {
             a64_v_eor(
                 b,
                 VX0 as ::core::ffi::c_int,
@@ -5325,7 +5332,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        247 => {
+        OCERZ_OP_PANDN => {
             a64_v_bic(
                 b,
                 VX0 as ::core::ffi::c_int,
@@ -5333,7 +5340,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX0 as ::core::ffi::c_int,
             );
         }
-        258 => {
+        OCERZ_OP_PCMPEQB => {
             a64_v_cmeq(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5342,7 +5349,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        259 => {
+        OCERZ_OP_PCMPEQW => {
             a64_v_cmeq(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5351,7 +5358,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        260 => {
+        OCERZ_OP_PCMPEQD => {
             a64_v_cmeq(
                 b,
                 2 as ::core::ffi::c_int,
@@ -5360,7 +5367,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        262 => {
+        OCERZ_OP_PCMPGTB => {
             a64_v_cmgt(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5369,7 +5376,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        263 => {
+        OCERZ_OP_PCMPGTW => {
             a64_v_cmgt(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5378,7 +5385,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        264 => {
+        OCERZ_OP_PCMPGTD => {
             a64_v_cmgt(
                 b,
                 2 as ::core::ffi::c_int,
@@ -5387,7 +5394,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        326 => {
+        OCERZ_OP_PUNPCKLBW => {
             a64_v_zip1(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5396,7 +5403,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        327 => {
+        OCERZ_OP_PUNPCKLWD => {
             a64_v_zip1(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5405,7 +5412,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        328 => {
+        OCERZ_OP_PUNPCKLDQ => {
             a64_v_zip1(
                 b,
                 2 as ::core::ffi::c_int,
@@ -5414,7 +5421,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        330 => {
+        OCERZ_OP_PUNPCKHBW => {
             a64_v_zip1(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5429,7 +5436,7 @@ pub unsafe extern "C" fn emit_mmx(
                 1 as ::core::ffi::c_int,
             );
         }
-        331 => {
+        OCERZ_OP_PUNPCKHWD => {
             a64_v_zip1(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5444,7 +5451,7 @@ pub unsafe extern "C" fn emit_mmx(
                 1 as ::core::ffi::c_int,
             );
         }
-        332 => {
+        OCERZ_OP_PUNPCKHDQ => {
             a64_v_zip1(
                 b,
                 2 as ::core::ffi::c_int,
@@ -5459,7 +5466,7 @@ pub unsafe extern "C" fn emit_mmx(
                 1 as ::core::ffi::c_int,
             );
         }
-        324 => {
+        OCERZ_OP_PACKUSWB => {
             a64_v_zip1(
                 b,
                 3 as ::core::ffi::c_int,
@@ -5474,7 +5481,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX0 as ::core::ffi::c_int,
             );
         }
-        322 => {
+        OCERZ_OP_PACKSSWB => {
             a64_v_zip1(
                 b,
                 3 as ::core::ffi::c_int,
@@ -5489,7 +5496,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX0 as ::core::ffi::c_int,
             );
         }
-        323 => {
+        OCERZ_OP_PACKSSDW => {
             a64_v_zip1(
                 b,
                 3 as ::core::ffi::c_int,
@@ -5504,7 +5511,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX0 as ::core::ffi::c_int,
             );
         }
-        318 => {
+        OCERZ_OP_PSADBW => {
             a64_v_uabd(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5531,7 +5538,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX0 as ::core::ffi::c_int,
             );
         }
-        304 => {
+        OCERZ_OP_PAVGB => {
             a64_v_urhadd(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5540,7 +5547,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        305 => {
+        OCERZ_OP_PAVGW => {
             a64_v_urhadd(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5549,7 +5556,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        308 => {
+        OCERZ_OP_PMINUB => {
             a64_v_umin(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5558,7 +5565,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        306 => {
+        OCERZ_OP_PMAXUB => {
             a64_v_umax(
                 b,
                 0 as ::core::ffi::c_int,
@@ -5567,7 +5574,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        309 => {
+        OCERZ_OP_PMINSW => {
             a64_v_smin(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5576,7 +5583,7 @@ pub unsafe extern "C" fn emit_mmx(
                 VX1 as ::core::ffi::c_int,
             );
         }
-        307 => {
+        OCERZ_OP_PMAXSW => {
             a64_v_smax(
                 b,
                 1 as ::core::ffi::c_int,
@@ -5631,76 +5638,120 @@ pub unsafe extern "C" fn emit_sse(
     if (*insn).seg as ::core::ffi::c_int != OCERZ_SEG_NONE as ::core::ffi::c_int {
         return 0 as ::core::ffi::c_int;
     }
-    match (*insn).op as ::core::ffi::c_int {
-        185 | 186 | 187 | 188 => return emit_sse_mov128(b, insn, exit_sites, n_exits),
-        189 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_MOVUPS | OCERZ_OP_MOVAPS | OCERZ_OP_MOVDQA | OCERZ_OP_MOVDQU => {
+            return emit_sse_mov128(b, insn, exit_sites, n_exits);
+        }
+        OCERZ_OP_MOVSS => {
             return emit_sse_movs(b, insn, 4 as ::core::ffi::c_int, exit_sites, n_exits);
         }
-        190 => {
+        OCERZ_OP_MOVSDX => {
             return emit_sse_movs(b, insn, 8 as ::core::ffi::c_int, exit_sites, n_exits);
         }
-        193 | 194 => return emit_sse_movlh(b, insn, exit_sites, n_exits),
-        206 | 207 | 204 | 205 | 210 | 211 | 208 | 209 | 214 | 215 | 212 | 213 | 218 | 219 | 216
-        | 217 | 226 | 227 | 222 | 223 | 224 | 225 | 220 | 221 | 230 | 231 | 228 | 229 => {
+        OCERZ_OP_MOVLPS | OCERZ_OP_MOVHPS => return emit_sse_movlh(b, insn, exit_sites, n_exits),
+        OCERZ_OP_ADDSS | OCERZ_OP_ADDSD | OCERZ_OP_ADDPS | OCERZ_OP_ADDPD | OCERZ_OP_SUBSS
+        | OCERZ_OP_SUBSD | OCERZ_OP_SUBPS | OCERZ_OP_SUBPD | OCERZ_OP_MULSS | OCERZ_OP_MULSD
+        | OCERZ_OP_MULPS | OCERZ_OP_MULPD | OCERZ_OP_DIVSS | OCERZ_OP_DIVSD | OCERZ_OP_DIVPS
+        | OCERZ_OP_DIVPD | OCERZ_OP_MAXSS | OCERZ_OP_MAXSD | OCERZ_OP_MINSS | OCERZ_OP_MINSD
+        | OCERZ_OP_MAXPS | OCERZ_OP_MAXPD | OCERZ_OP_MINPS | OCERZ_OP_MINPD | OCERZ_OP_SQRTSS
+        | OCERZ_OP_SQRTSD | OCERZ_OP_SQRTPS | OCERZ_OP_SQRTPD => {
             return emit_sse_fparith(b, insn, exit_sites, n_exits);
         }
-        249 | 245 | 246 | 242 | 248 | 244 | 247 | 243 | 282 | 283 | 284 | 285 | 286 | 287 | 288
-        | 289 | 258 | 259 | 260 | 261 | 262 | 263 | 264 | 265 | 308 | 316 | 317 | 306 | 312
-        | 313 | 314 | 309 | 315 | 310 | 307 | 311 | 298 | 299 | 304 | 305 | 292 | 293 | 296
-        | 297 | 290 | 291 | 294 | 295 | 303 | 348 | 323 | 324 | 302 | 300 | 301 | 322 | 325
-        | 421 | 318 | 347 | 319 | 320 | 321 | 344 | 345 | 346 | 338 | 339 | 341 | 342 | 340
-        | 343 => {
+        OCERZ_OP_PXOR | OCERZ_OP_XORPS | OCERZ_OP_PAND | OCERZ_OP_ANDPS | OCERZ_OP_POR
+        | OCERZ_OP_ORPS | OCERZ_OP_PANDN | OCERZ_OP_ANDNPS | OCERZ_OP_PADDB | OCERZ_OP_PADDW
+        | OCERZ_OP_PADDD | OCERZ_OP_PADDQ | OCERZ_OP_PSUBB | OCERZ_OP_PSUBW | OCERZ_OP_PSUBD
+        | OCERZ_OP_PSUBQ | OCERZ_OP_PCMPEQB | OCERZ_OP_PCMPEQW | OCERZ_OP_PCMPEQD
+        | OCERZ_OP_PCMPEQQ | OCERZ_OP_PCMPGTB | OCERZ_OP_PCMPGTW | OCERZ_OP_PCMPGTD
+        | OCERZ_OP_PCMPGTQ | OCERZ_OP_PMINUB | OCERZ_OP_PMINUW | OCERZ_OP_PMINUD
+        | OCERZ_OP_PMAXUB | OCERZ_OP_PMAXUW | OCERZ_OP_PMAXUD | OCERZ_OP_PMINSB
+        | OCERZ_OP_PMINSW | OCERZ_OP_PMINSD | OCERZ_OP_PMAXSB | OCERZ_OP_PMAXSW
+        | OCERZ_OP_PMAXSD | OCERZ_OP_PMULLW | OCERZ_OP_PMULLD | OCERZ_OP_PAVGB | OCERZ_OP_PAVGW
+        | OCERZ_OP_PADDUSB | OCERZ_OP_PADDUSW | OCERZ_OP_PSUBUSB | OCERZ_OP_PSUBUSW
+        | OCERZ_OP_PADDSB | OCERZ_OP_PADDSW | OCERZ_OP_PSUBSB | OCERZ_OP_PSUBSW
+        | OCERZ_OP_PMADDWD | OCERZ_OP_PMULHRSW | OCERZ_OP_PACKSSDW | OCERZ_OP_PACKUSWB
+        | OCERZ_OP_PMULUDQ | OCERZ_OP_PMULHW | OCERZ_OP_PMULHUW | OCERZ_OP_PACKSSWB
+        | OCERZ_OP_PACKUSDW | OCERZ_OP_PMULDQ | OCERZ_OP_PSADBW | OCERZ_OP_PMADDUBSW
+        | OCERZ_OP_PABSB | OCERZ_OP_PABSW | OCERZ_OP_PABSD | OCERZ_OP_PSIGNB | OCERZ_OP_PSIGNW
+        | OCERZ_OP_PSIGND | OCERZ_OP_PHADDW | OCERZ_OP_PHADDD | OCERZ_OP_PHSUBW
+        | OCERZ_OP_PHSUBD | OCERZ_OP_PHADDSW | OCERZ_OP_PHSUBSW => {
             return emit_sse_bitwise(b, insn, exit_sites, n_exits);
         }
-        393 | 349 => return emit_sse_pblendw_palignr(b, insn, exit_sites, n_exits),
-        335 | 336 => return emit_sse_pshuflhw(b, insn, exit_sites, n_exits),
-        364 | 365 => return emit_sse_bytesh(b, insn),
-        394 | 395 => return emit_sse_blendp(b, insn, exit_sites, n_exits),
-        200 | 201 => return emit_sse_movsdup(b, insn, exit_sites, n_exits),
-        197 | 198 => return emit_sse_movmskp(b, insn),
-        250 | 251 => return emit_sse_cmpp(b, insn, exit_sites, n_exits),
-        278 | 277 | 279 | 274 | 275 => return emit_sse_cvtp(b, insn, exit_sites, n_exits),
-        399 | 400 | 401 | 402 | 403 | 404 => {
+        OCERZ_OP_PBLENDW | OCERZ_OP_PALIGNR => {
+            return emit_sse_pblendw_palignr(b, insn, exit_sites, n_exits);
+        }
+        OCERZ_OP_PSHUFLW | OCERZ_OP_PSHUFHW => {
+            return emit_sse_pshuflhw(b, insn, exit_sites, n_exits);
+        }
+        OCERZ_OP_PSLLDQ | OCERZ_OP_PSRLDQ => return emit_sse_bytesh(b, insn),
+        OCERZ_OP_BLENDPS | OCERZ_OP_BLENDPD => {
+            return emit_sse_blendp(b, insn, exit_sites, n_exits);
+        }
+        OCERZ_OP_MOVSHDUP | OCERZ_OP_MOVSLDUP => {
+            return emit_sse_movsdup(b, insn, exit_sites, n_exits);
+        }
+        OCERZ_OP_MOVMSKPS | OCERZ_OP_MOVMSKPD => return emit_sse_movmskp(b, insn),
+        OCERZ_OP_CMPPS | OCERZ_OP_CMPPD => return emit_sse_cmpp(b, insn, exit_sites, n_exits),
+        OCERZ_OP_CVTTPS2DQ | OCERZ_OP_CVTPS2DQ | OCERZ_OP_CVTDQ2PD | OCERZ_OP_CVTPS2PD
+        | OCERZ_OP_CVTPD2PS => return emit_sse_cvtp(b, insn, exit_sites, n_exits),
+        OCERZ_OP_AESENC
+        | OCERZ_OP_AESENCLAST
+        | OCERZ_OP_AESDEC
+        | OCERZ_OP_AESDECLAST
+        | OCERZ_OP_AESIMC
+        | OCERZ_OP_AESKEYGENASSIST => {
             return emit_sse_aes(b, insn, exit_sites, n_exits);
         }
-        405 => return emit_sse_pclmul(b, insn, exit_sites, n_exits),
-        256 | 257 | 254 | 255 => return emit_sse_comis(b, insn, exit_sites, n_exits),
-        271 | 270 | 267 | 266 | 273 | 272 | 276 => {
+        OCERZ_OP_PCLMULQDQ => return emit_sse_pclmul(b, insn, exit_sites, n_exits),
+        OCERZ_OP_UCOMISS | OCERZ_OP_UCOMISD | OCERZ_OP_COMISS | OCERZ_OP_COMISD => {
+            return emit_sse_comis(b, insn, exit_sites, n_exits);
+        }
+        OCERZ_OP_CVTTSD2SI | OCERZ_OP_CVTTSS2SI | OCERZ_OP_CVTSI2SD | OCERZ_OP_CVTSI2SS
+        | OCERZ_OP_CVTSD2SS | OCERZ_OP_CVTSS2SD | OCERZ_OP_CVTDQ2PS => {
             return emit_sse_cvt(b, insn, exit_sites, n_exits);
         }
-        192 => {
+        OCERZ_OP_MOVQX => {
             g_vec_int_move = 1 as ::core::ffi::c_int;
             let mut r: ::core::ffi::c_int = emit_sse_movq(b, insn, exit_sites, n_exits);
             g_vec_int_move = 0 as ::core::ffi::c_int;
             return r;
         }
-        334 => return emit_sse_pshufd(b, insn, exit_sites, n_exits),
-        370 | 371 | 372 | 373 | 366 | 367 | 368 | 369 => {
+        OCERZ_OP_PSHUFD => return emit_sse_pshufd(b, insn, exit_sites, n_exits),
+        OCERZ_OP_PINSRB | OCERZ_OP_PINSRW | OCERZ_OP_PINSRD | OCERZ_OP_PINSRQ | OCERZ_OP_PEXTRB
+        | OCERZ_OP_PEXTRW | OCERZ_OP_PEXTRD | OCERZ_OP_PEXTRQ => {
             return emit_sse_pinsr_pextr(b, insn, exit_sites, n_exits);
         }
-        383 | 384 | 385 | 386 | 387 | 388 | 377 | 378 | 379 | 380 | 381 | 382 => {
+        OCERZ_OP_PMOVSXBW | OCERZ_OP_PMOVSXBD | OCERZ_OP_PMOVSXBQ | OCERZ_OP_PMOVSXWD
+        | OCERZ_OP_PMOVSXWQ | OCERZ_OP_PMOVSXDQ | OCERZ_OP_PMOVZXBW | OCERZ_OP_PMOVZXBD
+        | OCERZ_OP_PMOVZXBQ | OCERZ_OP_PMOVZXWD | OCERZ_OP_PMOVZXWQ | OCERZ_OP_PMOVZXDQ => {
             return emit_sse_pmovx(b, insn, exit_sites, n_exits);
         }
-        391 | 392 | 389 | 390 => return emit_sse_round(b, insn, exit_sites, n_exits),
-        337 => return emit_sse_pshufb(b, insn, exit_sites, n_exits),
-        326 | 327 | 328 | 329 | 330 | 331 | 332 | 333 => {
+        OCERZ_OP_ROUNDSS | OCERZ_OP_ROUNDSD | OCERZ_OP_ROUNDPS | OCERZ_OP_ROUNDPD => {
+            return emit_sse_round(b, insn, exit_sites, n_exits);
+        }
+        OCERZ_OP_PSHUFB => return emit_sse_pshufb(b, insn, exit_sites, n_exits),
+        OCERZ_OP_PUNPCKLBW | OCERZ_OP_PUNPCKLWD | OCERZ_OP_PUNPCKLDQ | OCERZ_OP_PUNPCKLQDQ
+        | OCERZ_OP_PUNPCKHBW | OCERZ_OP_PUNPCKHWD | OCERZ_OP_PUNPCKHDQ | OCERZ_OP_PUNPCKHQDQ => {
             return emit_sse_punpck(b, insn, exit_sites, n_exits);
         }
-        191 => {
+        OCERZ_OP_MOVD => {
             g_vec_int_move = 1 as ::core::ffi::c_int;
             let mut r_0: ::core::ffi::c_int = emit_sse_movd(b, insn, exit_sites, n_exits);
             g_vec_int_move = 0 as ::core::ffi::c_int;
             return r_0;
         }
-        354 | 355 | 195 | 196 | 352 | 353 => {
+        OCERZ_OP_UNPCKLPD | OCERZ_OP_UNPCKHPD | OCERZ_OP_MOVLHPS | OCERZ_OP_MOVHLPS
+        | OCERZ_OP_UNPCKLPS | OCERZ_OP_UNPCKHPS => {
             return emit_sse_unpck(b, insn, exit_sites, n_exits);
         }
-        252 | 253 => return emit_sse_cmps(b, insn, exit_sites, n_exits),
-        397 | 396 | 398 => return emit_sse_blendv(b, insn, exit_sites, n_exits),
-        202 => return emit_sse_movddup(b, insn, exit_sites, n_exits),
-        350 | 351 => return emit_sse_shufp(b, insn, exit_sites, n_exits),
-        375 => return emit_sse_insertps(b, insn, exit_sites, n_exits),
-        356 | 357 | 358 | 359 | 360 | 361 | 362 | 363 => {
+        OCERZ_OP_CMPSS | OCERZ_OP_CMPSDX => return emit_sse_cmps(b, insn, exit_sites, n_exits),
+        OCERZ_OP_BLENDVPD | OCERZ_OP_BLENDVPS | OCERZ_OP_PBLENDVB => {
+            return emit_sse_blendv(b, insn, exit_sites, n_exits);
+        }
+        OCERZ_OP_MOVDDUP => return emit_sse_movddup(b, insn, exit_sites, n_exits),
+        OCERZ_OP_SHUFPS | OCERZ_OP_SHUFPD => return emit_sse_shufp(b, insn, exit_sites, n_exits),
+        OCERZ_OP_INSERTPS => return emit_sse_insertps(b, insn, exit_sites, n_exits),
+        OCERZ_OP_PSLLW | OCERZ_OP_PSLLD | OCERZ_OP_PSLLQ | OCERZ_OP_PSRLW | OCERZ_OP_PSRLD
+        | OCERZ_OP_PSRLQ | OCERZ_OP_PSRAW | OCERZ_OP_PSRAD => {
             return emit_sse_shift_imm(b, insn);
         }
         _ => return 0 as ::core::ffi::c_int,
@@ -5883,33 +5934,33 @@ unsafe fn emit_sse_pmovx(
     let mut from: ::core::ffi::c_int = 0;
     let mut steps: ::core::ffi::c_int = 0;
     let mut srcw: ::core::ffi::c_int = 0;
-    match op {
-        383 | 377 => {
+    match op as OcerzOp {
+        OCERZ_OP_PMOVSXBW | OCERZ_OP_PMOVZXBW => {
             from = 1 as ::core::ffi::c_int;
             steps = 1 as ::core::ffi::c_int;
             srcw = 8 as ::core::ffi::c_int;
         }
-        384 | 378 => {
+        OCERZ_OP_PMOVSXBD | OCERZ_OP_PMOVZXBD => {
             from = 1 as ::core::ffi::c_int;
             steps = 2 as ::core::ffi::c_int;
             srcw = 4 as ::core::ffi::c_int;
         }
-        385 | 379 => {
+        OCERZ_OP_PMOVSXBQ | OCERZ_OP_PMOVZXBQ => {
             from = 1 as ::core::ffi::c_int;
             steps = 3 as ::core::ffi::c_int;
             srcw = 2 as ::core::ffi::c_int;
         }
-        386 | 380 => {
+        OCERZ_OP_PMOVSXWD | OCERZ_OP_PMOVZXWD => {
             from = 2 as ::core::ffi::c_int;
             steps = 1 as ::core::ffi::c_int;
             srcw = 8 as ::core::ffi::c_int;
         }
-        387 | 381 => {
+        OCERZ_OP_PMOVSXWQ | OCERZ_OP_PMOVZXWQ => {
             from = 2 as ::core::ffi::c_int;
             steps = 2 as ::core::ffi::c_int;
             srcw = 4 as ::core::ffi::c_int;
         }
-        388 | 382 => {
+        OCERZ_OP_PMOVSXDQ | OCERZ_OP_PMOVZXDQ => {
             from = 4 as ::core::ffi::c_int;
             steps = 1 as ::core::ffi::c_int;
             srcw = 8 as ::core::ffi::c_int;
@@ -7126,53 +7177,53 @@ unsafe fn emit_vex_fp256(
 ) -> ::core::ffi::c_int {
     let mut kind: ::core::ffi::c_int = 0;
     let mut dbl: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
-    match (*insn).op as ::core::ffi::c_int {
-        204 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_ADDPS => {
             kind = 0 as ::core::ffi::c_int;
         }
-        205 => {
+        OCERZ_OP_ADDPD => {
             kind = 0 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        208 => {
+        OCERZ_OP_SUBPS => {
             kind = 1 as ::core::ffi::c_int;
         }
-        209 => {
+        OCERZ_OP_SUBPD => {
             kind = 1 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        212 => {
+        OCERZ_OP_MULPS => {
             kind = 2 as ::core::ffi::c_int;
         }
-        213 => {
+        OCERZ_OP_MULPD => {
             kind = 2 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        216 => {
+        OCERZ_OP_DIVPS => {
             kind = 3 as ::core::ffi::c_int;
         }
-        217 => {
+        OCERZ_OP_DIVPD => {
             kind = 3 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        224 => {
+        OCERZ_OP_MAXPS => {
             kind = 4 as ::core::ffi::c_int;
         }
-        225 => {
+        OCERZ_OP_MAXPD => {
             kind = 4 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        220 => {
+        OCERZ_OP_MINPS => {
             kind = 5 as ::core::ffi::c_int;
         }
-        221 => {
+        OCERZ_OP_MINPD => {
             kind = 5 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        228 => {
+        OCERZ_OP_SQRTPS => {
             kind = 6 as ::core::ffi::c_int;
         }
-        229 => {
+        OCERZ_OP_SQRTPD => {
             kind = 6 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
@@ -7320,106 +7371,106 @@ unsafe fn emit_vex_fp128_alias(mut b: *mut A64Buf, mut insn: *const X86Insn) -> 
     let mut kind: ::core::ffi::c_int = 0;
     let mut dbl: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
     let mut packed: ::core::ffi::c_int = 0 as ::core::ffi::c_int;
-    match (*insn).op as ::core::ffi::c_int {
-        206 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_ADDSS => {
             kind = 0 as ::core::ffi::c_int;
         }
-        207 => {
+        OCERZ_OP_ADDSD => {
             kind = 0 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        210 => {
+        OCERZ_OP_SUBSS => {
             kind = 1 as ::core::ffi::c_int;
         }
-        211 => {
+        OCERZ_OP_SUBSD => {
             kind = 1 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        214 => {
+        OCERZ_OP_MULSS => {
             kind = 2 as ::core::ffi::c_int;
         }
-        215 => {
+        OCERZ_OP_MULSD => {
             kind = 2 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        218 => {
+        OCERZ_OP_DIVSS => {
             kind = 3 as ::core::ffi::c_int;
         }
-        219 => {
+        OCERZ_OP_DIVSD => {
             kind = 3 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        226 => {
+        OCERZ_OP_MAXSS => {
             kind = 4 as ::core::ffi::c_int;
         }
-        227 => {
+        OCERZ_OP_MAXSD => {
             kind = 4 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        222 => {
+        OCERZ_OP_MINSS => {
             kind = 5 as ::core::ffi::c_int;
         }
-        223 => {
+        OCERZ_OP_MINSD => {
             kind = 5 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        230 => {
+        OCERZ_OP_SQRTSS => {
             kind = 6 as ::core::ffi::c_int;
         }
-        231 => {
+        OCERZ_OP_SQRTSD => {
             kind = 6 as ::core::ffi::c_int;
             dbl = 1 as ::core::ffi::c_int;
         }
-        204 => {
+        OCERZ_OP_ADDPS => {
             kind = 0 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        205 => {
+        OCERZ_OP_ADDPD => {
             kind = 0 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
             dbl = packed;
         }
-        208 => {
+        OCERZ_OP_SUBPS => {
             kind = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        209 => {
+        OCERZ_OP_SUBPD => {
             kind = 1 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
             dbl = packed;
         }
-        212 => {
+        OCERZ_OP_MULPS => {
             kind = 2 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        213 => {
+        OCERZ_OP_MULPD => {
             kind = 2 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
             dbl = packed;
         }
-        216 => {
+        OCERZ_OP_DIVPS => {
             kind = 3 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        217 => {
+        OCERZ_OP_DIVPD => {
             kind = 3 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
             dbl = packed;
         }
-        224 => {
+        OCERZ_OP_MAXPS => {
             kind = 4 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        225 => {
+        OCERZ_OP_MAXPD => {
             kind = 4 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
             dbl = packed;
         }
-        220 => {
+        OCERZ_OP_MINPS => {
             kind = 5 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
         }
-        221 => {
+        OCERZ_OP_MINPD => {
             kind = 5 as ::core::ffi::c_int;
             packed = 1 as ::core::ffi::c_int;
             dbl = packed;
@@ -7907,8 +7958,8 @@ unsafe fn emit_bmi(
     let mut rd: ::core::ffi::c_int = pin_hreg(pin_slot((*d).reg as ::core::ffi::c_uint));
     let mut bits: ::core::ffi::c_uint =
         (size as ::core::ffi::c_uint).wrapping_mul(8 as ::core::ffi::c_uint);
-    match (*insn).op as ::core::ffi::c_int {
-        551 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_RORX => {
             if (*insn).nops as ::core::ffi::c_int != 3 as ::core::ffi::c_int
                 || (*insn).ops[2 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
                     != OCERZ_OPK_IMM as ::core::ffi::c_int
@@ -7936,7 +7987,7 @@ unsafe fn emit_bmi(
             }
             return 1 as ::core::ffi::c_int;
         }
-        553 | 554 | 552 => {
+        OCERZ_OP_SHLX | OCERZ_OP_SHRX | OCERZ_OP_SARX => {
             if (*insn).nops as ::core::ffi::c_int != 3 as ::core::ffi::c_int {
                 return 0 as ::core::ffi::c_int;
             }
@@ -7968,7 +8019,7 @@ unsafe fn emit_bmi(
             }
             return 1 as ::core::ffi::c_int;
         }
-        542 => {
+        OCERZ_OP_ANDN => {
             if (*insn).nops as ::core::ffi::c_int != 3 as ::core::ffi::c_int
                 || need != 0 && g_defer == 0
             {
@@ -8008,7 +8059,7 @@ unsafe fn emit_bmi(
             }
             return 1 as ::core::ffi::c_int;
         }
-        543 | 544 | 545 => {
+        OCERZ_OP_BLSR | OCERZ_OP_BLSMSK | OCERZ_OP_BLSI => {
             if need != 0 {
                 return 0 as ::core::ffi::c_int;
             }
@@ -8049,7 +8100,7 @@ unsafe fn emit_bmi(
             }
             return 1 as ::core::ffi::c_int;
         }
-        546 => {
+        OCERZ_OP_BZHI => {
             if need != 0 || (*insn).nops as ::core::ffi::c_int != 3 as ::core::ffi::c_int {
                 return 0 as ::core::ffi::c_int;
             }
@@ -8112,7 +8163,7 @@ unsafe fn emit_bmi(
             );
             return 1 as ::core::ffi::c_int;
         }
-        550 => {
+        OCERZ_OP_MULX => {
             if (*insn).nops as ::core::ffi::c_int != 3 as ::core::ffi::c_int
                 || pin_slot(OCERZ_RDX as ::core::ffi::c_int as ::core::ffi::c_uint)
                     < 0 as ::core::ffi::c_int
@@ -8692,22 +8743,36 @@ unsafe fn emit_vex_fma(
     return 1 as ::core::ffi::c_int;
 }
 unsafe fn vex_sse128_ok(mut insn: *const X86Insn, mut L: ::core::ffi::c_int) -> ::core::ffi::c_int {
-    match (*insn).op as ::core::ffi::c_int {
-        189 | 190 | 206 | 207 | 210 | 211 | 214 | 215 | 218 | 219 | 226 | 227 | 222 | 223 | 230
-        | 231 | 391 | 392 | 256 | 257 | 254 | 255 | 271 | 270 | 267 | 266 | 273 | 272 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_MOVSS | OCERZ_OP_MOVSDX | OCERZ_OP_ADDSS | OCERZ_OP_ADDSD | OCERZ_OP_SUBSS
+        | OCERZ_OP_SUBSD | OCERZ_OP_MULSS | OCERZ_OP_MULSD | OCERZ_OP_DIVSS | OCERZ_OP_DIVSD
+        | OCERZ_OP_MAXSS | OCERZ_OP_MAXSD | OCERZ_OP_MINSS | OCERZ_OP_MINSD | OCERZ_OP_SQRTSS
+        | OCERZ_OP_SQRTSD | OCERZ_OP_ROUNDSS | OCERZ_OP_ROUNDSD | OCERZ_OP_UCOMISS
+        | OCERZ_OP_UCOMISD | OCERZ_OP_COMISS | OCERZ_OP_COMISD | OCERZ_OP_CVTTSD2SI
+        | OCERZ_OP_CVTTSS2SI | OCERZ_OP_CVTSI2SD | OCERZ_OP_CVTSI2SS | OCERZ_OP_CVTSD2SS
+        | OCERZ_OP_CVTSS2SD => {
             return 1 as ::core::ffi::c_int;
         }
-        252 | 253 => {
+        OCERZ_OP_CMPSS | OCERZ_OP_CMPSDX => {
             return ((*insn).nops as ::core::ffi::c_int >= 3 as ::core::ffi::c_int
                 && (*insn).ops[2 as ::core::ffi::c_int as usize].kind as ::core::ffi::c_int
                     == OCERZ_OPK_IMM as ::core::ffi::c_int
                 && ((*insn).ops[2 as ::core::ffi::c_int as usize].imm & 0x1f as u64) < 8 as u64)
                 as ::core::ffi::c_int;
         }
-        193 | 194 | 204 | 205 | 208 | 209 | 212 | 213 | 216 | 217 | 224 | 225 | 220 | 221 | 228
-        | 229 | 276 | 191 | 192 | 334 | 337 | 202 | 370 | 371 | 372 | 373 | 366 | 367 | 368
-        | 369 | 384 | 385 | 387 | 378 | 379 | 381 | 389 | 390 | 326 | 327 | 328 | 329 | 330
-        | 331 | 332 | 333 | 354 | 355 | 352 | 353 | 195 | 196 => {
+        OCERZ_OP_MOVLPS | OCERZ_OP_MOVHPS | OCERZ_OP_ADDPS | OCERZ_OP_ADDPD | OCERZ_OP_SUBPS
+        | OCERZ_OP_SUBPD | OCERZ_OP_MULPS | OCERZ_OP_MULPD | OCERZ_OP_DIVPS | OCERZ_OP_DIVPD
+        | OCERZ_OP_MAXPS | OCERZ_OP_MAXPD | OCERZ_OP_MINPS | OCERZ_OP_MINPD | OCERZ_OP_SQRTPS
+        | OCERZ_OP_SQRTPD | OCERZ_OP_CVTDQ2PS | OCERZ_OP_MOVD | OCERZ_OP_MOVQX
+        | OCERZ_OP_PSHUFD | OCERZ_OP_PSHUFB | OCERZ_OP_MOVDDUP | OCERZ_OP_PINSRB
+        | OCERZ_OP_PINSRW | OCERZ_OP_PINSRD | OCERZ_OP_PINSRQ | OCERZ_OP_PEXTRB
+        | OCERZ_OP_PEXTRW | OCERZ_OP_PEXTRD | OCERZ_OP_PEXTRQ | OCERZ_OP_PMOVSXBD
+        | OCERZ_OP_PMOVSXBQ | OCERZ_OP_PMOVSXWQ | OCERZ_OP_PMOVZXBD | OCERZ_OP_PMOVZXBQ
+        | OCERZ_OP_PMOVZXWQ | OCERZ_OP_ROUNDPS | OCERZ_OP_ROUNDPD | OCERZ_OP_PUNPCKLBW
+        | OCERZ_OP_PUNPCKLWD | OCERZ_OP_PUNPCKLDQ | OCERZ_OP_PUNPCKLQDQ | OCERZ_OP_PUNPCKHBW
+        | OCERZ_OP_PUNPCKHWD | OCERZ_OP_PUNPCKHDQ | OCERZ_OP_PUNPCKHQDQ | OCERZ_OP_UNPCKLPD
+        | OCERZ_OP_UNPCKHPD | OCERZ_OP_UNPCKLPS | OCERZ_OP_UNPCKHPS | OCERZ_OP_MOVLHPS
+        | OCERZ_OP_MOVHLPS => {
             return (L == 0) as ::core::ffi::c_int;
         }
         _ => return 0 as ::core::ffi::c_int,
@@ -8840,37 +8905,41 @@ pub unsafe extern "C" fn emit_vex(
     if kind != 0 {
         return emit_vex_int(b, insn, kind, esz, L, exit_sites, n_exits);
     }
-    match (*insn).op as ::core::ffi::c_int {
-        204 | 205 | 208 | 209 | 212 | 213 | 216 | 217 | 224 | 225 | 220 | 221 | 228 | 229 => {
+    match (*insn).op as OcerzOp {
+        OCERZ_OP_ADDPS | OCERZ_OP_ADDPD | OCERZ_OP_SUBPS | OCERZ_OP_SUBPD | OCERZ_OP_MULPS
+        | OCERZ_OP_MULPD | OCERZ_OP_DIVPS | OCERZ_OP_DIVPD | OCERZ_OP_MAXPS | OCERZ_OP_MAXPD
+        | OCERZ_OP_MINPS | OCERZ_OP_MINPD | OCERZ_OP_SQRTPS | OCERZ_OP_SQRTPD => {
             if L != 0 {
                 return emit_vex_fp256(b, insn, exit_sites, n_exits);
             }
             return emit_vex_sse128(b, insn, L, exit_sites, n_exits);
         }
-        185 | 186 | 187 | 188 => return emit_vex_mov(b, insn, L, exit_sites, n_exits),
-        199 => return emit_vex_pmovmskb(b, insn, L),
-        452 => {
+        OCERZ_OP_MOVUPS | OCERZ_OP_MOVAPS | OCERZ_OP_MOVDQA | OCERZ_OP_MOVDQU => {
+            return emit_vex_mov(b, insn, L, exit_sites, n_exits);
+        }
+        OCERZ_OP_PMOVMSKB => return emit_vex_pmovmskb(b, insn, L),
+        OCERZ_OP_VPBROADCASTB => {
             return emit_vex_broadcast(b, insn, 1 as ::core::ffi::c_int, L, exit_sites, n_exits);
         }
-        453 => {
+        OCERZ_OP_VPBROADCASTW => {
             return emit_vex_broadcast(b, insn, 2 as ::core::ffi::c_int, L, exit_sites, n_exits);
         }
-        454 | 432 => {
+        OCERZ_OP_VPBROADCASTD | OCERZ_OP_VBROADCASTSS => {
             return emit_vex_broadcast(b, insn, 4 as ::core::ffi::c_int, L, exit_sites, n_exits);
         }
-        455 | 433 => {
+        OCERZ_OP_VPBROADCASTQ | OCERZ_OP_VBROADCASTSD => {
             return emit_vex_broadcast(b, insn, 8 as ::core::ffi::c_int, L, exit_sites, n_exits);
         }
-        456 | 434 => {
+        OCERZ_OP_VBROADCASTI128 | OCERZ_OP_VBROADCASTF128 => {
             return emit_vex_broadcast(b, insn, 16 as ::core::ffi::c_int, L, exit_sites, n_exits);
         }
-        276 => {
+        OCERZ_OP_CVTDQ2PS => {
             if L != 0 {
                 return emit_vex_cvtdq2ps256(b, insn, exit_sites, n_exits);
             }
             return emit_vex_sse128(b, insn, L, exit_sites, n_exits);
         }
-        444 => {
+        OCERZ_OP_VZEROUPPER => {
             static mut noflag: ::core::ffi::c_int = -(1 as ::core::ffi::c_int);
             if noflag < 0 as ::core::ffi::c_int {
                 noflag = if !libc::getenv(c"OCERZ_NO_YMMH_FLAG".as_ptr()).is_null() {
@@ -8941,7 +9010,7 @@ pub unsafe extern "C" fn emit_vex(
             g_ymmh_zero = 0xffff as u16;
             return 1 as ::core::ffi::c_int;
         }
-        383 => {
+        OCERZ_OP_PMOVSXBW => {
             return emit_vex_pmovx(
                 b,
                 insn,
@@ -8952,7 +9021,7 @@ pub unsafe extern "C" fn emit_vex(
                 n_exits,
             );
         }
-        386 => {
+        OCERZ_OP_PMOVSXWD => {
             return emit_vex_pmovx(
                 b,
                 insn,
@@ -8963,7 +9032,7 @@ pub unsafe extern "C" fn emit_vex(
                 n_exits,
             );
         }
-        388 => {
+        OCERZ_OP_PMOVSXDQ => {
             return emit_vex_pmovx(
                 b,
                 insn,
@@ -8974,7 +9043,7 @@ pub unsafe extern "C" fn emit_vex(
                 n_exits,
             );
         }
-        377 => {
+        OCERZ_OP_PMOVZXBW => {
             return emit_vex_pmovx(
                 b,
                 insn,
@@ -8985,7 +9054,7 @@ pub unsafe extern "C" fn emit_vex(
                 n_exits,
             );
         }
-        380 => {
+        OCERZ_OP_PMOVZXWD => {
             return emit_vex_pmovx(
                 b,
                 insn,
@@ -8996,7 +9065,7 @@ pub unsafe extern "C" fn emit_vex(
                 n_exits,
             );
         }
-        382 => {
+        OCERZ_OP_PMOVZXDQ => {
             return emit_vex_pmovx(
                 b,
                 insn,
@@ -9007,7 +9076,7 @@ pub unsafe extern "C" fn emit_vex(
                 n_exits,
             );
         }
-        356 => {
+        OCERZ_OP_PSLLW => {
             return emit_vex_shift_imm(
                 b,
                 insn,
@@ -9016,7 +9085,7 @@ pub unsafe extern "C" fn emit_vex(
                 L,
             );
         }
-        357 => {
+        OCERZ_OP_PSLLD => {
             return emit_vex_shift_imm(
                 b,
                 insn,
@@ -9025,7 +9094,7 @@ pub unsafe extern "C" fn emit_vex(
                 L,
             );
         }
-        358 => {
+        OCERZ_OP_PSLLQ => {
             return emit_vex_shift_imm(
                 b,
                 insn,
@@ -9034,7 +9103,7 @@ pub unsafe extern "C" fn emit_vex(
                 L,
             );
         }
-        359 => {
+        OCERZ_OP_PSRLW => {
             return emit_vex_shift_imm(
                 b,
                 insn,
@@ -9043,7 +9112,7 @@ pub unsafe extern "C" fn emit_vex(
                 L,
             );
         }
-        360 => {
+        OCERZ_OP_PSRLD => {
             return emit_vex_shift_imm(
                 b,
                 insn,
@@ -9052,7 +9121,7 @@ pub unsafe extern "C" fn emit_vex(
                 L,
             );
         }
-        361 => {
+        OCERZ_OP_PSRLQ => {
             return emit_vex_shift_imm(
                 b,
                 insn,
@@ -9061,7 +9130,7 @@ pub unsafe extern "C" fn emit_vex(
                 L,
             );
         }
-        362 => {
+        OCERZ_OP_PSRAW => {
             return emit_vex_shift_imm(
                 b,
                 insn,
@@ -9070,7 +9139,7 @@ pub unsafe extern "C" fn emit_vex(
                 L,
             );
         }
-        363 => {
+        OCERZ_OP_PSRAD => {
             return emit_vex_shift_imm(
                 b,
                 insn,
@@ -9079,19 +9148,24 @@ pub unsafe extern "C" fn emit_vex(
                 L,
             );
         }
-        350 | 351 => return emit_vex_shufp(b, insn, L, exit_sites, n_exits),
-        397 | 396 | 398 => return emit_vex_blendv(b, insn, L, exit_sites, n_exits),
-        551 | 553 | 554 | 552 | 542 | 543 | 544 | 545 | 546 | 550 => {
+        OCERZ_OP_SHUFPS | OCERZ_OP_SHUFPD => {
+            return emit_vex_shufp(b, insn, L, exit_sites, n_exits);
+        }
+        OCERZ_OP_BLENDVPD | OCERZ_OP_BLENDVPS | OCERZ_OP_PBLENDVB => {
+            return emit_vex_blendv(b, insn, L, exit_sites, n_exits);
+        }
+        OCERZ_OP_RORX | OCERZ_OP_SHLX | OCERZ_OP_SHRX | OCERZ_OP_SARX | OCERZ_OP_ANDN
+        | OCERZ_OP_BLSR | OCERZ_OP_BLSMSK | OCERZ_OP_BLSI | OCERZ_OP_BZHI | OCERZ_OP_MULX => {
             return emit_bmi(b, insn, g_cur_need);
         }
-        375 => {
+        OCERZ_OP_INSERTPS => {
             return if L != 0 {
                 0 as ::core::ffi::c_int
             } else {
                 emit_vex_insertps(b, insn, exit_sites, n_exits)
             };
         }
-        202 => {
+        OCERZ_OP_MOVDDUP => {
             if L != 0 {
                 return emit_vex_movddup256(b, insn, exit_sites, n_exits);
             }
