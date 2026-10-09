@@ -13,7 +13,8 @@ use crate::ffi::{
 use super::hostmem::ocerz_g2h;
 use super::macho::*;
 use super::{
-    g_cache, g_closure_cap, g_closure_hash, g_closure_hash_mask, g_closure_mh, g_closure_n,
+    cstr_ptr, g_cache, g_closure_cap, g_closure_hash, g_closure_hash_mask, g_closure_mh,
+    g_closure_n,
 };
 
 const DYLDAPI_DISK_MAX: usize = 256;
@@ -338,8 +339,8 @@ unsafe fn dylib_name_matches(install_name: *const c_char, library_name: *const c
         let leaf_len = libc::strlen(leaf);
         let name_len = libc::strlen(library_name);
         if leaf_len < name_len + 9
-            || libc::strncmp(leaf, c"lib".as_ptr(), 3) != 0
-            || libc::strcmp(leaf.add(leaf_len - 6), c".dylib".as_ptr()) != 0
+            || libc::strncmp(leaf, cstr_ptr(c"lib"), 3) != 0
+            || libc::strcmp(leaf.add(leaf_len - 6), cstr_ptr(c".dylib")) != 0
             || libc::strncmp(leaf.add(3), library_name, name_len) != 0
         {
             return false;
@@ -634,7 +635,7 @@ pub(crate) unsafe fn image_nearest_symbol(
                 have_sym = true;
             } else if (*l).cmd == LC_SEGMENT_64 {
                 let s = lc.cast::<SegmentCommand64>();
-                if libc::strcmp((*s).segname.as_ptr(), c"__LINKEDIT".as_ptr()) == 0 {
+                if libc::strcmp((*s).segname.as_ptr(), cstr_ptr(c"__LINKEDIT")) == 0 {
                     le_vmaddr = (*s).vmaddr;
                     le_fileoff = (*s).fileoff;
                     le_filesize = (*s).filesize;
@@ -827,15 +828,15 @@ pub(crate) unsafe fn compute_closure(cache: *mut OcerzCache, main_mh: u64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ocerz_dyldapi_register_image(mh: u64, path: *const c_char) {
     unsafe {
-        if !libc::getenv(c"OCERZ_IMGLOG".as_ptr()).is_null() {
+        if !libc::getenv(cstr_ptr(c"OCERZ_IMGLOG")).is_null() {
             libc::fprintf(
                 crate::log::stderr(),
-                c"ocerz: IMGREG mh=%#llx path=%s\n".as_ptr(),
+                cstr_ptr(c"ocerz: IMGREG mh=%#llx path=%s\n"),
                 mh as libc::c_ulonglong,
                 if !path.is_null() && *path != 0 {
                     path
                 } else {
-                    c"<NULL>".as_ptr()
+                    cstr_ptr(c"<NULL>")
                 },
             );
         }
@@ -895,10 +896,10 @@ pub unsafe extern "C" fn ocerz_dyldapi_register_cache_image(mh: u64) {
             g_closure_hash,
             g_closure_hash_mask,
         );
-        if !libc::getenv(c"OCERZ_IMGLOG".as_ptr()).is_null() {
+        if !libc::getenv(cstr_ptr(c"OCERZ_IMGLOG")).is_null() {
             libc::fprintf(
                 crate::log::stderr(),
-                c"ocerz: IMGREG cache mh=%#llx closure now %d\n".as_ptr(),
+                cstr_ptr(c"ocerz: IMGREG cache mh=%#llx closure now %d\n"),
                 mh as libc::c_ulonglong,
                 g_closure_n,
             );

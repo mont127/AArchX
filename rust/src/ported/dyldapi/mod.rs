@@ -99,10 +99,15 @@
 use crate::ffi::OcerzCache;
 use core::ffi::c_int;
 
+#[inline(always)]
+pub(crate) fn cstr_ptr(s: &'static core::ffi::CStr) -> *const core::ffi::c_char {
+    s.as_ptr()
+}
+
 mod closure;
 mod dispatch;
-mod hostmem;
-mod macho;
+pub(crate) mod hostmem;
+pub(crate) mod macho;
 mod memfn;
 mod objc;
 

@@ -12,6 +12,7 @@ use crate::ffi::{
 };
 
 use super::closure::{cache_find_path, image_slide};
+use super::cstr_ptr;
 use super::g_cache;
 use super::hostmem::{ocerz_g2h, ocerz_ld};
 use super::macho::*;
@@ -187,7 +188,7 @@ unsafe fn memfn_build() {
     unsafe {
         let mh = cache_find_path(
             g_cache,
-            c"/usr/lib/system/libsystem_platform.dylib".as_ptr(),
+            cstr_ptr(c"/usr/lib/system/libsystem_platform.dylib"),
         );
         let h = if mh != 0 {
             ocerz_g2h(mh).cast::<MachHeader64>()
@@ -207,10 +208,10 @@ unsafe fn memfn_build() {
             let l = lc.cast::<LoadCommand>();
             if (*l).cmd == LC_SEGMENT_64 {
                 let sg = lc.cast::<SegmentCommand64>();
-                if libc::strcmp((*sg).segname.as_ptr(), c"__TEXT".as_ptr()) == 0 {
+                if libc::strcmp((*sg).segname.as_ptr(), cstr_ptr(c"__TEXT")) == 0 {
                     g_memfn_text_lo = (*sg).vmaddr.wrapping_add(slide);
                     g_memfn_text_hi = g_memfn_text_lo.wrapping_add((*sg).vmsize);
-                } else if libc::strcmp((*sg).segname.as_ptr(), c"__LINKEDIT".as_ptr()) == 0 {
+                } else if libc::strcmp((*sg).segname.as_ptr(), cstr_ptr(c"__LINKEDIT")) == 0 {
                     le_addr = (*sg).vmaddr.wrapping_add(slide);
                     le_fileoff = (*sg).fileoff;
                 }
@@ -264,7 +265,7 @@ unsafe fn memfn_build() {
         }
         g_memfn_starts = starts;
         g_memfn_nstarts = if starts.is_null() { 0 } else { n };
-        let sys = cache_find_path(g_cache, c"/usr/lib/libSystem.B.dylib".as_ptr());
+        let sys = cache_find_path(g_cache, cstr_ptr(c"/usr/lib/libSystem.B.dylib"));
         for k in 0..MEMFN_NAMES.len() {
             if g_memfn_nstarts == 0 {
                 break;
@@ -360,7 +361,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_memfn(rip: u64) -> c_int {
     unsafe {
         static mut off: c_int = -1;
         if off < 0 {
-            off = (!libc::getenv(c"OCERZ_NO_MEMFN_PLAIN".as_ptr()).is_null()) as c_int;
+            off = (!libc::getenv(cstr_ptr(c"OCERZ_NO_MEMFN_PLAIN")).is_null()) as c_int;
         }
         if off != 0 || g_cache.is_null() {
             return 0;
