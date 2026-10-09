@@ -92,3 +92,10 @@ ns/call. Ran after the gate on an idle VM, two runs each, C = ~/AArchX-c:
 The Rust boundary is 1-3% faster on every path in both runs. Run-to-run spread
 is about 3%, so read this as "not slower" rather than a real speedup. Nothing
 is left in C.
+
+The full gate rerun after the switch-over rebase (tip c7d3a93 + 8b5342a)
+listed one new dynamic failure, `dthread_signal-jit`. The same build of
+tests/dynamic/thread_signal.c was then run under both trees: Rust (8b5342a)
+failed 1/40 serial and 2/60 at six in parallel, pristine C (~/AArchX-c)
+2/40 and 3/60. It is the intermittent baseline already noted in status.md
+for 360ad00, not a syscall regression.
