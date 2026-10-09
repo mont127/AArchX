@@ -362,3 +362,56 @@ None of the six requested modules remain in C: `a64emit.c`, `stack.c`,
 `loader.c`, `cache.c`, `tcache.c`, and `main.c` are ported. `jit_core_shim.c`
 remains as the separate sigsetjmp/decode-loop shim documented in the status
 table; it is outside this six-module port.
+
+## SDK constant audit
+
+`tools/audit/sdk_consts.sh` extracts every Rust `const` declaration under
+`rust/src/ported/**`, probes the active macOS SDK for arm64 and x86_64, and
+evaluates copied Rust declarations in a scratch Cargo project. Arm64 values
+are printed by a native program; x86_64 values are read from emitted assembly
+because Rosetta is unavailable on this VM. The script records type-width and
+signedness differences separately from numeric mismatches.
+
+The audit artifacts are under `~/constaudit/`: `consts.tsv`, `probe.h`,
+`probe_status.tsv`, `sdk_values.tsv`, `rust_eval.tsv`, `audit.tsv`, and
+`unmatched.tsv`. The probe includes the requested Mach, Mach-O, POSIX,
+networking, process, and compression headers, plus the additional headers
+needed by extracted names. The final run found 1,101 declarations across 795
+names; 119 SDK names compiled for both architectures and two additional
+thread-state names compiled only for arm64. Of the evaluated declarations,
+181 match both SDK values. Four pointer-valued expressions are marked MANUAL
+by the integer-only evaluator (`NULL`, `__DARWIN_NULL`, `RTLD_DEFAULT`, and
+`MAP_FAILED`); `ARM_THREAD_STATE64` and `ARM_THREAD_STATE64_COUNT` are also
+MANUAL in the two-architecture table because they are arm64-only. They are
+host thread-state values, not x86-64 guest constants. No arm64/x86_64
+value-divergent constants were found. The 17 SDK-looking names that do not
+compile on either architecture are individually hand-checked in
+`unmatched.tsv`; they are project-local aliases/values, compatibility
+fallbacks, or unused local declarations, not SDK value mismatches.
+
+The audit found and corrected these numeric mismatches:
+
+| Rust declaration | Old → SDK value | C reference site | Guest-visible effect |
+|---|---:|---|---|
+| `dyld/bind.rs:682` `N_WEAK_REF` | 128 → 64 | `src/dyld.c:1953` | The wrong bit misidentifies Mach-O weak imports during binding. |
+| `syscall/bsd.rs:17` `VM_INHERIT_SHARE` | 1 → 0 | `src/syscall.c:5277` | A SysV attachment copied at fork would hide the child's write from its parent. |
+| `syscall/mach.rs:19` `VM_INHERIT_DEFAULT` | 2 → 1 | `src/syscall.c:6759`, `:6927` | Mach alias and MIG-reply remaps receive the wrong inheritance semantics. |
+| `vm/mod.rs:178` `THREAD_BASIC_INFO_COUNT` | 11 → 10 | `src/vm.c:630`, `src/jit.c:1340` | `thread_info` is called with the wrong structure word count. |
+| `vm/mod.rs:185` `MACH_PORT_RECEIVE_STATUS` | 1 → 2 | `src/vm.c:1571`, `:3329` | Port attribute queries use the wrong flavor and return incorrect status. |
+| `vm/mod.rs:188` `MACH_PORT_TYPE_PORT_SET` | 8 → 524288 | `src/vm.c:1558` | `mach_port_names` entries fail the port-set bit test. |
+
+The VM inheritance definitions now live once in `rust/src/inline.rs`, sourced
+from `libc::VM_INHERIT_SHARE` and `libc::VM_INHERIT_COPY`; the BSD syscall,
+Mach syscall, cache-map, and memory-map code all use those shared definitions.
+`N_WEAK_REF` is narrower than the SDK's C `int`, but its value 64 is
+representable and remains the same flag bit passed in the Mach-O `n_desc`.
+
+The fork regression is `tests/dynamic/sysv_shm_fork.c`, registered as
+`dsysv_shm_fork` with the single expected output line in its `.out` file. It
+writes through the inherited `shmat` pointer in the child without reattaching.
+Before the inheritance fix, both Rust JIT and no-JIT runs exited 1 and printed
+`bad`; the C-reference run exited 0 and printed `ok`. The existing
+`tests/unit/test_syscall.c::test_mach_vm_remap_mig_relocation` covers a MIG
+remap in-process, but no existing fixture exercises either Mach default
+inheritance path after a fork; no separate test was added for those paths.
+After the fix, the Rust JIT and no-JIT runs both exited 0 and printed `ok`.
