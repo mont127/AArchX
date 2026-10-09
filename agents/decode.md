@@ -43,7 +43,7 @@ All runs use the same 64 MiB shared-cache window. Hashes/counts matched for
 every retained or trial implementation; unhashed numbers are best-of-five
 `ns/insn`, and hashed numbers come from the separate hash sweep.
 
-1. **Inline hot helpers and use unaligned multi-byte fetches** (`6147f3e`).
+1. **Inline hot helpers and use unaligned multi-byte fetches** (`03c3ba1`).
    `fetch16/32/64` perform one `read_unaligned` and `from_le` after the same
    length check. In the step run, C was x64/i386 `18.9/16.8` unhashed and
    `115.7/112.1` hashed; Rust was `17.2/16.0` and `111.2/115.1`.
@@ -53,12 +53,12 @@ every retained or trial implementation; unhashed numbers are best-of-five
 3. **Conditional RIP-relative fixup** was tried and reverted. Two trial runs
    measured C `17.6/15.9`, Rust `17.3/16.1`, then C `18.3/17.0`, Rust
    `17.5/16.3` (x64/i386, unhashed); the shortcut had no consistent gain.
-4. **Prefix-class table and common no-prefix path** (`a959acc`). The first
+4. **Prefix-class table and common no-prefix path** (`885446b`). The first
    paired run measured C `18.2/16.9` and Rust `15.3/13.1` unhashed; hashed
    times were C `116.3/108.3` and Rust `103.6/98.8` (x64/i386).
    Prefix ordering, REX resets, `last_f23`, and truncation/too-long behavior
    remain unchanged.
-5. **Release codegen/bounds audit** (`c15b45c`). `fixup_riprel` now uses
+5. **Release codegen/bounds audit** (`36355e0`). `fixup_riprel` now uses
    unchecked operand access under the decoder's `nops <= 3` invariant. Two
    paired runs measured C `18.2/16.3`, Rust `16.1/14.7`, then C `16.3/15.0`,
    Rust `14.2/13.2` (x64/i386, unhashed). This is faster in both modes in
