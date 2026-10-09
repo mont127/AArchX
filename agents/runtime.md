@@ -114,16 +114,38 @@ The initially reported mismatches were `cache/map.rs` versus
 `sysbridge/mem.rs` for `mach_vm_remap`, and `mem.rs` versus `vm/mod.rs` for
 `mach_vm_region`; source audit found the additional duplicate declarations
 listed above before the final build. Argument and constant types were updated
-without changing their numeric values. The SDK prototypes for
-`clock_gettime_nsec_np(clockid_t) -> uint64_t` and
-`sys_icache_invalidate(void *, size_t)` were also checked; neither had a
-clashing declaration on this tip and neither needed editing.
+without changing their numeric values.
 
-After alignment, `cargo build --release` reported zero
-`clashing_extern_declarations`. The executable text hash remained
-`a5732e0c7f5fc3d0a0e40ce14b62de9f981b78dd` before and after. The fast gate
-passed (`100` differential passes, `0` failures; `GATE: PASS`). Logs are in
-`~/clash_before.log`, `~/clash_after.log`, and `~/clash_fast_gate.log`.
+The subsequent rebase to `098bb5e` also exposed a `sys_icache_invalidate`
+clash: `jit_control.rs` declared `*const c_void`, while
+`jit.rs`, `jit_cache.rs`, `jit_flags.rs`, and `jit_tcache.rs` declared
+`*mut c_void`. The active SDK's `libkern/OSCacheControl.h` prototype is
+`void sys_icache_invalidate(void *start, size_t len)`, so `jit_control.rs`
+was aligned to `*mut c_void` with `size_t`. No bindgen or libc declaration
+exists for this symbol. `clock_gettime_nsec_np(clockid_t) -> uint64_t` was
+also checked against the SDK; it had no clash and needed no edit.
+
+After these alignments, `cargo build --release` reported zero
+`clashing_extern_declarations`. Before the rebase, the cleanup preserved the
+baseline executable text hash
+`a5732e0c7f5fc3d0a0e40ce14b62de9f981b78dd`. The rebase brought in commit
+`098bb5e`, which ports `jit_control.c` to Rust; therefore its executable
+hash is not directly comparable to that earlier C/JIT-control baseline. A
+clean build at `098bb5e` had hash
+`1686578039c9c58358c255fdde46608fa33d270c`, versus
+`cef5eb8c759db8c72d3147dfdffa8f3c4045c77b` on the aligned branch. Their
+`__TEXT,__text` sizes are both `0x2b464c` and both disassemble to 702,803
+instructions. The complete same-tip `otool -tV` comparison found only
+address-formation relocation differences: 304 `adrp` page immediates and
+4,567 `add` literal-pool offsets, all targeting the same literal labels
+shown in the disassembly; opcodes, registers, and branch displacements are
+otherwise identical. The initial and final build logs are in
+`~/clash_before.log`, `~/clash_after.log`, and `~/clash_final.log`; text
+comparisons are in `~/text_before.s`, `~/text_tip_baseline.s`, and
+`~/text_current_tip.s`.
+
+The fast gate passed after the original cleanup (`100` differential passes,
+`0` failures; `GATE: PASS`).
 
 ## tcache
 
