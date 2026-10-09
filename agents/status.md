@@ -9,7 +9,7 @@
 | bridge.c | 3379 | native2 | ported |
 | cache.c | 1496 | runtime (ee47e957) | in progress |
 | cpu.c | 163 | decode-agent | ported |
-| decode.c | 4435 | decode-agent | in progress |
+| decode.c | 4435 | decode-agent | ported |
 | dyld.c | 5840 | dyld-agent | ported |
 | dyldapi.c | 2636 | dyld-agent | ported |
 | flags.c | 230 | - | ported |
