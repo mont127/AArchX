@@ -11,7 +11,7 @@
 | cpu.c | 163 | decode-agent | ported |
 | decode.c | 4435 | decode-agent | in progress |
 | dyld.c | 5840 | - | C |
-| dyldapi.c | 2636 | dyld-agent | in progress |
+| dyldapi.c | 2636 | dyld-agent | ported |
 | flags.c | 230 | - | ported |
 | flags_live.c | 283 | - | C |
 | globals.c | 16 | - | ported |
@@ -42,3 +42,7 @@
 | abicall.s | 237 | native1 | in progress |
 | leaf.s | 598 | native1 | in progress |
 | objcguard.s | 60 | native2 | ported |
+
+## Tip breakages
+
+- At detached tip commit `ff3e398`, `datomic_counter-no-jit` timed out (exit 124; expected `OK`) in the full gate. The current dynamic failure list is identical.
