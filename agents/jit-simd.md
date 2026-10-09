@@ -53,7 +53,7 @@ zeroing rules, plus the SSE memory-operand front end `emit_sse_mem_addr`.
 - Unit bins test_a64emit, test_jit32, test_jit_exit, test_jit_order_transition,
   test_jit_psc_invalidate, test_chain_concurrency, test_sse, test_interp: pass.
 - `tools/rust_gate.sh --fast`: PASS.
-- `tools/rust_gate.sh` (full) at `cd41ce454c4ae39f8fc008d5a74471c22761d716`:
+- `tools/rust_gate.sh` (full) with all three jit_simd code commits applied:
   PASS, no new failures vs `agents/baseline.md` (3 expected unit records,
   7 expected dynamic failures, 1 expected native failure).
 - `tools/rust_gate.sh` (full) at f9753d8: only new failure was
