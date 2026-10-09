@@ -3,6 +3,7 @@
 
 use super::util::*;
 use super::*;
+use crate::inline::VM_INHERIT_DEFAULT;
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::ptr;
@@ -16,7 +17,6 @@ const VM_PROT_WRITE: c_int = 2;
 const VM_PROT_EXECUTE: c_int = 4;
 const VM_FLAGS_ANYWHERE: u32 = 1;
 const VM_FLAGS_OVERWRITE: u32 = 0x4000;
-const VM_INHERIT_DEFAULT: libc::vm_inherit_t = 2;
 const VM_MEMORY_IOKIT: u32 = 21;
 const CLOCK_UPTIME_RAW: libc::clockid_t = 8;
 const OCERZ_SC_UNIVERSE_MAX: usize = 16;
