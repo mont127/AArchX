@@ -552,6 +552,19 @@ static int op_div(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     return OCERZ_STEP_OK;
 }
 
+/*
+ * A 32-bit shift or rotate whose count masks to 0 changes no flag, but it
+ * still writes its register, and a 32-bit write clears the upper half; x86
+ * hardware and Rosetta both do.  Code goes on to use the whole register: a
+ * bit buffer shifted by a count that happens to be 0 kept its stale upper
+ * half here.
+ */
+static void zero_count_write(OcerzCPU *cpu, const X86Insn *insn, uint64_t val)
+{
+    if (insn->ops[0].size == 4 && insn->ops[0].kind == OCERZ_OPK_REG && !insn->mode32)
+        ocerz_write_op(cpu, insn, &insn->ops[0], ocerz_trunc(val, 4));
+}
+
 static int op_shift(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 {
     int size = insn->ops[0].size;
@@ -561,8 +574,10 @@ static int op_shift(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     unsigned cnt = (unsigned)(ocerz_read_op(cpu, insn, &insn->ops[1]) & mask);
     uint64_t res;
     (void)vm;
-    if (cnt == 0)
+    if (cnt == 0) {
+        zero_count_write(cpu, insn, val);
         return OCERZ_STEP_OK;
+    }
     switch (insn->op) {
     case OCERZ_OP_SHL:
         res = ocerz_trunc(val << cnt, size);
@@ -596,8 +611,10 @@ static int op_rotate(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 
     if (insn->op == OCERZ_OP_ROL || insn->op == OCERZ_OP_ROR) {
         unsigned rc = masked % (unsigned)bits;
-        if (masked == 0)
+        if (masked == 0) {
+            zero_count_write(cpu, insn, val);
             return OCERZ_STEP_OK;
+        }
         uint64_t res;
         if (rc == 0)
             res = val;
@@ -622,8 +639,10 @@ static int op_rotate(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         return OCERZ_STEP_OK;
     }
 
-    if (masked == 0)
+    if (masked == 0) {
+        zero_count_write(cpu, insn, val);
         return OCERZ_STEP_OK;
+    }
     uint64_t res = val;
     int carry = cin;
     for (unsigned i = 0; i < masked; i++) {
