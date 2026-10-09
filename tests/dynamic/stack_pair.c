@@ -1,6 +1,6 @@
 /*
- * Runs of 64-bit pushes and pops, which src/jit.c emits two at a time (stp and
- * ldp, emit_stack_pair) where the stack delta is in use: odd and even runs, a
+ * Runs of 64-bit pushes and pops, which src/jit.c emits with one rsp update
+ * per run (emit_stack_run), in both layouts: odd and even runs, a
  * register pushed twice, two pops into one register, pops in another order
  * than the pushes, and a frame of the shape compilers emit around a call.
  * Prints the registers after each, against Rosetta.

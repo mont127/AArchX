@@ -18249,15 +18249,25 @@ static int32_t  g_promo_push_of[JIT_MAX_BLOCK_INSNS];
 static unsigned long long g_promo_seq[JIT_MAX_BLOCK_INSNS];
 
 /*
- * Two pushes, or two pops, of 64-bit registers in a row, where the stack
- * delta is in use: one address, one stp or ldp, and rsp moved once afterwards.
- * rsp moves only after the access, so a fault restarts the pair at its first
- * instruction with nothing yet done; a pop pair never loads one register twice
- * (an ldp with equal destinations is unpredictable).  Prologues and epilogues
- * are these runs: fib's four pushes went from 12 instructions to 6.  The
- * call-frame forms and the push/pop renames own their instructions and are
- * left alone.  OCERZ_NO_STACK_PAIR=1 turns it off.
+ * A run of pushes, or of pops, of 64-bit registers: every access is relative
+ * to rsp as it was before the run, as stp, ldp and single stores or loads at
+ * offsets, and rsp moves once, after them.  Each push or pop on its own moves
+ * rsp with a pre- or post-indexed access, and each of those waits for the
+ * last one's write-back, so fib's four pushes and four pops a call made a
+ * chain of eight; grouped, its calls take a third less time.
+ * - rsp moves only after the accesses, so a fault restarts the run at its first
+ *   instruction with nothing but loaded registers changed, and loading those
+ *   again gives the same values;
+ * - a pop run stops before a register it already loads, since an ldp with
+ *   equal destinations is unpredictable and the later pop has to win;
+ * - a push run is at most 16 deep, so its stores stay inside the 128-byte red
+ *   zone below rsp until rsp covers them;
+ * - the call-frame forms and the push/pop renames keep their instructions.
+ * In the Wine layout the accesses go through rsp plus the stack delta.
+ * OCERZ_NO_STACK_RUN=1 goes back to pairs in the Wine layout only, and
+ * OCERZ_NO_STACK_PAIR=1 turns both off.
  */
+#define STACK_RUN_MAX 16
 static int stack_pair_reg(const X86Insn *in, int op)
 {
     const X86Operand *o = &in->ops[0];
@@ -18266,27 +18276,57 @@ static int stack_pair_reg(const X86Insn *in, int op)
     int s = pin_slot(o->reg);
     return s < 0 ? -1 : pin_hreg(s);
 }
-static int emit_stack_pair(A64Buf *b, const X86Insn *a, const X86Insn *c, int i)
+static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
 {
-    if (!g_lowstack || !stack_plain_access_ok() || ENV_ON("OCERZ_NO_STACK_PAIR")) return 0;
-    if (g_ic_kind[i] || g_ic_kind[i + 1] || g_promo_reg[i] || g_promo_reg[i + 1]) return 0;
-    int hs = pin_hreg(pin_slot(OCERZ_RSP));
-    int ra, rc;
-    if ((ra = stack_pair_reg(a, OCERZ_OP_PUSH)) >= 0 && (rc = stack_pair_reg(c, OCERZ_OP_PUSH)) >= 0) {
-        if (!mem_native_store_ok()) return 0;
-        a64_add_reg(b, 1, JTA, hs, JGB, 0);
-        a64_stp_off(b, rc, ra, JTA, -16);
-        a64_sub_imm(b, 1, hs, hs, 16);
-    } else if ((ra = stack_pair_reg(a, OCERZ_OP_POP)) >= 0 && (rc = stack_pair_reg(c, OCERZ_OP_POP)) >= 0) {
-        if (ra == rc) return 0;
-        a64_add_reg(b, 1, JTA, hs, JGB, 0);
-        a64_ldp_off(b, ra, rc, JTA, 0);
-        a64_add_imm(b, 1, hs, hs, 16);
-    } else {
-        return 0;
+    static int runs = -1;
+    if (runs < 0) runs = getenv("OCERZ_NO_STACK_RUN") ? 0 : 1;
+    if (!stack_plain_access_ok() || ENV_ON("OCERZ_NO_STACK_PAIR")) return 0;
+    int op = insns[i].op;
+    if (op != OCERZ_OP_PUSH && op != OCERZ_OP_POP) return 0;
+    int direct = 0;
+    if (!g_lowstack) {
+        if (!runs || g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || !jgb_usable() || stack_guard_needed())
+            return 0;
+        direct = stack_identity() || rsp_is_ptr();
     }
-    g_mov_skip[i + 1] = 1;
-    return 1;
+    if (op == OCERZ_OP_PUSH && !mem_native_store_ok()) return 0;
+    int max = runs ? STACK_RUN_MAX : 2;
+    int regs[STACK_RUN_MAX];
+    int k = 0;
+    for (int j = i; j < n && k < max; j++) {
+        if (j > i && g_mov_skip[j]) break;
+        if (g_ic_kind[j] || g_promo_reg[j]) break;
+        int r = stack_pair_reg(&insns[j], op);
+        if (r < 0) break;
+        int dup = 0;
+        for (int m = 0; m < k && op == OCERZ_OP_POP; m++) dup |= regs[m] == r;
+        if (dup) break;
+        regs[k++] = r;
+    }
+    if (k < 2) return 0;
+    int hs = pin_hreg(pin_slot(OCERZ_RSP));
+    int base = hs;
+    if (!direct) {
+        a64_add_reg(b, 1, JTA, hs, JGB, 0);
+        base = JTA;
+    }
+    int j = 0;
+    if (op == OCERZ_OP_PUSH) {
+        for (; j + 1 < k; j += 2)
+            a64_stp_off(b, regs[j + 1], regs[j], base, -8 * (j + 2));
+        if (j < k)
+            a64_stur(b, 8, regs[j], base, -8 * (j + 1));
+        a64_sub_imm(b, 1, hs, hs, 8 * k);
+    } else {
+        for (; j + 1 < k; j += 2)
+            a64_ldp_off(b, regs[j], regs[j + 1], base, 8 * j);
+        if (j < k)
+            a64_ldr(b, 8, regs[j], base, (uint32_t)(8 * j));
+        a64_add_imm(b, 1, hs, hs, 8 * k);
+    }
+    for (int m = i + 1; m < i + k; m++)
+        g_mov_skip[m] = 1;
+    return k;
 }
 static int low_splice_ok(const X86Insn *insn)
 {
@@ -20800,7 +20840,7 @@ promo_push_fallthrough:
             blk->n_inlined++;
             continue;
         }
-        if (i + 1 < n && !g_mov_skip[i + 1] && emit_stack_pair(&b, insn, &blk->insns[i + 1], i)) {
+        if (i + 1 < n && !g_mov_skip[i + 1] && emit_stack_run(&b, blk->insns, i, n)) {
             blk->n_inlined++;
             continue;
         }
