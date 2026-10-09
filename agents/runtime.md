@@ -163,6 +163,22 @@ the C compiler; no Rust implementation change was needed in this isolation
 pass. Find-hit timings in this run were highly order-sensitive and should not
 be treated as a stable comparison.
 
+I reran five paired find-hit samples with the driver order alternating
+C→Rust, Rust→C, C→Rust, Rust→C, C→Rust. The per-run ns/call values were:
+
+| Pair | First | C | Rust |
+|---|---|---:|---:|
+| 1 | C | 182.65 | 180.84 |
+| 2 | Rust | 197.70 | 164.45 |
+| 3 | C | 123.40 | 114.53 |
+| 4 | Rust | 189.43 | 111.49 |
+| 5 | C | 120.48 | 128.60 |
+
+The follow-up medians were 182.65 ns/call C and 128.60 ns/call Rust. Together
+with the earlier 91.91 / 94.49 ns medians, these order-sensitive samples do
+not support a stable 2× Rust find-hit slowdown, so no further find-path change
+was made.
+
 With `OCERZ_TCACHE_TRACE=1`, cold dynamic `xbench_dyn depchain 1` runs on both
 trees saved 3,167 records; warm runs logged 3,142 hits/loads and identical
 stdout. Verify mode reported `verify_ok=3150`, `verify_variant=10`,
@@ -176,3 +192,63 @@ passed with no new failures. The full-gate diff32 log recorded 40,044 passed /
 0 failed and 107,410 translated blocks; no i386 phase log was produced.
 The native framework phase passed. Dynamic tests reported 280 passed and
 7 expected failures; `dyn.new` was empty.
+
+## main
+
+`src/main.c` is implemented in `rust/src/ported/main.rs`; the generated
+ported-module list excludes `src/main.o`. The Rust entry point preserves the
+two-argument C ABI and is weakly linked so strong `main` definitions in C unit
+and benchmark drivers continue to win. The `linkage` crate feature is enabled
+in its own build-only change. The module carries the C startup rationale and
+preserves option parsing, environment handling, dyld re-exec, bundle and Wine
+resolution, mock-keychain arguments, command-line summary, and dynamic versus
+static guest startup.
+
+| Static or global | C declaration / initializer | Rust declaration / initializer |
+|---|---|---|
+| mock keychain argv | `static char *out[514]` (zeroed) | `static mut [*mut c_char; 514]` (null pointers) |
+| bundle executable | function-local `static char bundle_exe[PATH_MAX]` (zeroed) | `static mut [c_char; PATH_MAX]` (zeroed) |
+| plist buffer | function-local `static char buf[1 << 20]` (zeroed) | `static mut [c_char; 1 << 20]` (zeroed) |
+| VM | function-local `static OcerzVM vm` (zeroed) | `static mut OcerzVM` initialized with `zeroed()` |
+| command summary | extern `char[256]`, defined in `globals.c` | shared `globals.rs` `c_char[256]` definition |
+| environment vector | extern `char **environ` | matching extern `char **` declaration |
+
+`objc_images` remains a NUL-terminated C string literal at its use site; the
+Rust version and project strings match `version.h` (`AArchX 0.6`). The parity
+driver is `bash tools/bench/main_parity.sh`; it compares stdout, stderr,
+normalized binary paths, exit codes, and redirected stderr, then times twenty
+`/bin/echo hi` starts per tree.
+
+The parity run had exact matches for 17 cases: no args, version, unknown
+option, missing/non-Mach-O/truncated files, verbose/trace/no-JIT static guests,
+cache-mode echo, invalid `OCERZ_MODE`, `--`, redirected stderr, `OCERZ_EXE_ENV`,
+`OCERZ_NOJIT_EXE`, `OCERZ_STRACE_EXE`, and a constructed bundle. The
+`-native /bin/echo hi` case was run on both trees but is a known cross-tree
+divergence: the C reference's older dyld exits 71 after reporting ten
+unresolved libSystem bridges, while the Rust tree runs echo successfully
+(exit 0, `hi`). This is outside `main.c`; the parity script reports it
+explicitly instead of treating it as a match.
+
+Twenty `/bin/echo hi` starts averaged 24.136 ms C / 24.022 ms Rust with
+`OCERZ_TCACHE=off`.
+
+After removing `src/main.o` and `src/main.d`, `make -j12 ocerz` succeeded;
+both files remained absent, and `nm -gU ocerz` showed the Rust entry point as
+`T _main`. The fast and full gates both reported
+`GATE: PASS (no new failures vs baseline)`. The fast gate had 134/0 guests in
+each mode and 100/0 differential tests. Full-gate diff32 covered 40,044
+sequences and 1,060,272 guest steps per side, translating 107,410 blocks.
+The full dynamic phase had 280 passes and seven expected failures; `dyn.new`
+was empty (two failures listed in the expected baseline did not reproduce).
+The native framework phase passed, and no i386 phase log was produced. All
+unit bins linked and ran with the three existing unit failures unchanged.
+The a64emit, cache, and tcache cross-tree bench drivers also linked and ran:
+their hashes matched (`a92b607b1b78480d`, `ddcfe80c6be96dc3`, and
+`8a8582ad476c0930`, respectively).
+
+## Remaining C
+
+None of the six requested modules remain in C: `a64emit.c`, `stack.c`,
+`loader.c`, `cache.c`, `tcache.c`, and `main.c` are ported. `jit_core_shim.c`
+remains as the separate sigsetjmp/decode-loop shim documented in the status
+table; it is outside this six-module port.
