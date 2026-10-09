@@ -42,46 +42,52 @@ emission audit against `~/AArchX-jitc` returned:
 MATCH: 215295 blocks, 145523525 arm64 words (offset + low, seed=1; relocation payloads masked)
 ```
 
-All eight requested unit binaries passed with `OCERZ_NO_ARM_EXEC=1`. The fast
-gate passed with no new failures: 3 known unit failures, 134/134 guest tests in
-both modes, 100/100 differential cases, and 107,410 translated diff32 blocks.
+All eight requested unit binaries passed with `OCERZ_NO_ARM_EXEC=1` on the
+rebased tree. The fast gate passed with no new failures: 3 known unit failures,
+134/134 guest tests in both modes, 100/100 differential cases, and 107,410
+translated diff32 blocks.
 
-The latest full gate returned `GATE: FAIL (new failures vs baseline)` because
-`dthread_signal-jit` failed once (`out='FAIL'`, exit 1). The task owner
-identified this as a known flaky case; it had previously passed isolated
-reruns on both the Rust candidate and C reference. It is not currently in the
-gate's expected failure list, so the raw gate result remains a failure. The
-dynamic phase had 279 passes and 8 failures total (7 baseline failures plus
-this case). Native tests had 86 passes and the known `sys_proc`
-host-compatibility failure.
-Guest-library, native framework, and native format tests passed; native C++
-and Swift tests were skipped because their guest fixtures were not built.
-The earlier `datomic_counter-no-jit` timeout (exit 124) at `9595b42` was also
-accepted as a known tip flake; it did not recur in this full gate.
+The post-rebase full gate passed with no new failures. Dynamic tests reported
+280 passes and 7 known failures; native tests reported 86 passes and 1 known
+`sys_proc` host-compatibility failure. Guest-library, native framework, and
+native format tests passed; native C++ and Swift tests were skipped because
+their guest fixtures were not built. The rebase added the
+`dtest_jcc_gap_low-{jit,no-jit}` cases to the expected dynamic failures.
 
-Full-gate phase logs are preserved at
-`/Users/devin/notes/gate-full/full-final-mut-access/`; fast-gate phase logs are
-at `/Users/devin/notes/gate-full/fast-final-mut-access/`.
+A pre-rebase full-gate run briefly reported `dthread_signal-jit` as a new
+failure. It had previously passed isolated reruns on both the Rust candidate
+and C reference, and did not recur in the post-rebase full gate. The earlier
+`datomic_counter-no-jit` timeout (exit 124) at `9595b42` was also accepted as a
+known tip flake and did not recur.
+
+Final full-gate phase logs are preserved at
+`/Users/devin/notes/gate-full/full-post-rebase-final/`; final fast-gate phase
+logs are at `/Users/devin/notes/gate-full/fast-post-rebase-final/`.
 
 ## Performance
 
 Paired alternating runs used `~/AArchX-jitc` at `16a7c2d` as the C reference
-and the latest unchecked-index candidate. The i386 harness uses the default
-offset corpus and `--jit-required`; the translation counter was enabled by a
-temporary constructor, without changing either production tree. There were
-five alternating pairs. Each dynamic result is the median per-process time
-from six alternating pairs of 30 fresh processes per tree and fixture, with
-`OCERZ_TCACHE=off`.
+and the final post-rebase unchecked-index candidate. The i386 harness uses the
+default offset corpus and `--jit-required`; the translation counter was enabled
+by a temporary constructor, without changing either production tree. There
+were five alternating pairs. Each dynamic result is the median per-process
+time from six alternating pairs of 30 fresh processes per tree and fixture,
+with `OCERZ_TCACHE=off`.
 
 | Measurement | C reference | Rust candidate | Change |
 | --- | ---: | ---: | ---: |
-| i386 `--jit-required` harness wall | 22.642 s | 23.564 s | +4.1% |
-| Time inside `translate` | 857.519 ms | 882.472 ms | +2.9% |
-| `tcache_work` | 38.712 ms | 38.558 ms | -0.4% |
-| `avx_fp` | 38.486 ms | 38.221 ms | -0.7% |
-| `low_hoist` | 38.182 ms | 37.419 ms | -2.0% |
+| i386 `--jit-required` harness wall | 23.649 s | 24.109 s | +1.9% |
+| Time inside `translate` | 902.235 ms | 954.333 ms | +5.8% |
+| `tcache_work` | 40.018 ms | 40.087 ms | +0.2% |
+| `avx_fp` | 38.295 ms | 37.173 ms | -2.9% |
+| `low_hoist` | 38.165 ms | 37.639 ms | -1.4% |
+
+These timings compare the rebased tree against the C reference; the rebase also
+landed other Rust ports, including the decoder and JIT flags. The +5.8%
+translation-time difference is an end-to-end result and is not isolated to
+`jit_control.c`.
 
 Temporary probe, runner, and raw samples are in
 `~/notes/jit-control-bench/`; the final raw samples are in
-`results.json` and the previous samples were snapshotted as
-`results-before-final-mut-access.json`. None are part of the repository.
+`results.json` and the pre-rebase samples were snapshotted as
+`results-before-post-rebase.json`. None are part of the repository.
