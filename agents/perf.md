@@ -84,3 +84,40 @@ x64 `24538590` instructions / `3577018` errors /
 The final optimized runs were faster than their paired C measurements, but
 did not consistently reach the 15% target: the measured improvement was
 11.5–12.9% for x64 and 9.8–12.0% for i386.
+
+## Final comparison, all modules ported (tip 3467959 vs pure C 97a9247)
+
+Idle VM, nothing else running. Both trees run the same guest binaries
+(`tests/guest/benchbin`). For xbench the tree order alternates every rep.
+The other rows come from the `tools/bench/*.sh` scripts, which already
+alternate trees and check that the outputs match (hash or byte equality).
+Script and raw data: `~/perf/final.sh` and `raw.tsv` on the lead VM.
+
+| Benchmark | C | Rust | Change |
+|---|---:|---:|---:|
+| xbench `-no-jit`, median of 5 (s) | 18.74 | 15.82 | -15.6% |
+| xbench_dyn `-no-jit`, median of 5 (s) | 18.24 | 15.92 | -12.7% |
+| xbench JIT, median of 9 (s) | 0.398 | 0.394 | -1.0% |
+| xbench_dyn JIT, median of 9 (s) | 0.427 | 0.424 | -0.5% |
+| decoder x64, unhashed (ns/insn) | 16.0 | 14.0 | -12.5% |
+| decoder i386, unhashed (ns/insn) | 14.7 | 13.1 | -10.9% |
+| syscall getpid (ns/call) | 207.7 | 199.4 | -4.0% |
+| syscall badwrite (ns/call) | 230.3 | 224.7 | -2.4% |
+| syscall gtod / machself (ns/call) | 211.0 / 210.4 | 211.3 / 212.3 | level |
+| a64emit mov_imm64 / try_imm / mix (ns) | 6.37 / 3.59 / 7.94 | 6.68 / 3.46 / 7.88 | level |
+| shared-cache startup, 20 runs (ms) | 28.1 | 26.3 | -6.3% |
+| shared-cache cold / warm resolve (ns/symbol) | 64.3k-70.2k / 10.6k-11.3k | 65.7k-71.2k / 10.9k-12.3k | level (noisy) |
+| tcache put total, 3 runs (ns/record) | 519-523 | 511-536 | level |
+| tcache find hit (ns) | 163-176 | 172-181 | level (noisy) |
+| dyld startup, cache and native modes (ms) | see `dyld_startup.sh` | same | within ±5%, mixed |
+
+Every bench reported HASH MATCH: decoder, a64emit, cache, and tcache in
+both cross-read directions (byte-identical index and data files).
+The JIT emission audit on `--corpus all` matches C exactly, so steady-state
+JIT code is identical and JIT-mode runtime is level. JIT translation time
+is 0.4-6% lower per piece (see the jit-*.md notes).
+
+In short: the interpreter is 13-16% faster, the decoder 11-13% faster,
+and translation is somewhat faster. JIT steady state, the syscall
+boundary, the native bridges, dyld and tcache are level, with nothing
+measurably slower.
