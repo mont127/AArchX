@@ -6,6 +6,9 @@ pub mod ffi {
 }
 
 pub mod inline;
+pub mod jit_internal;
+#[allow(dead_code)]
+pub mod jit_internal_test;
 pub mod log;
 
 pub mod ported {
