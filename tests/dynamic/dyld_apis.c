@@ -4,10 +4,13 @@
  * used to fall through to an unimplemented vtable slot and answer 0 - the
  * program SDK version above all, where OpenGL read 0 as a pre-10.5 SDK and
  * dropped its software renderer, which is why Photos could not get a pixel
- * format.
+ * format.  dyld_program_sdk_at_least and dyld_program_minos_at_least, which
+ * CoreFoundation asks in nearly every call, are answered by x86 code ocerz puts
+ * in their slots (dyldapi_fast_slots), and checked the same way.
  */
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +20,9 @@ extern uint32_t dyld_get_program_min_os_version(void);
 extern uint32_t dyld_get_sdk_version(const struct mach_header *mh);
 extern uint32_t dyld_get_min_os_version(const struct mach_header *mh);
 extern uint64_t dyld_get_program_sdk_version_token(void);
+typedef struct { uint32_t platform; uint32_t version; } dyld_build_version_t;
+extern bool dyld_program_sdk_at_least(dyld_build_version_t version);
+extern bool dyld_program_minos_at_least(dyld_build_version_t version);
 extern uint64_t dyld_get_program_minos_version_token(void);
 extern uint32_t dyld_get_base_platform(uint32_t platform);
 extern int _dyld_get_image_uuid(const struct mach_header *mh, unsigned char uuid[16]);
@@ -59,6 +65,18 @@ int main(void)
         printf("BAD version tokens sdk=%#llx minos=%#llx\n", (unsigned long long)sdk_token,
                (unsigned long long)minos_token);
         return 7;
+    }
+    dyld_build_version_t at_sdk = { bv->platform, bv->sdk }, past_sdk = { bv->platform, bv->sdk + 0x100 };
+    dyld_build_version_t at_min = { bv->platform, bv->minos }, past_min = { bv->platform, bv->minos + 0x100 };
+    dyld_build_version_t other = { bv->platform + 1, 0 };
+    if (!dyld_program_sdk_at_least(at_sdk) || dyld_program_sdk_at_least(past_sdk) ||
+        !dyld_program_minos_at_least(at_min) || dyld_program_minos_at_least(past_min) ||
+        dyld_program_sdk_at_least(other) || dyld_program_minos_at_least(other)) {
+        printf("BAD at_least sdk %d/%d minos %d/%d other %d/%d\n", dyld_program_sdk_at_least(at_sdk),
+               dyld_program_sdk_at_least(past_sdk), dyld_program_minos_at_least(at_min),
+               dyld_program_minos_at_least(past_min), dyld_program_sdk_at_least(other),
+               dyld_program_minos_at_least(other));
+        return 8;
     }
     if (dyld_get_base_platform(PLATFORM_MACOS) != PLATFORM_MACOS ||
         dyld_get_base_platform(PLATFORM_IOSSIMULATOR) != PLATFORM_IOS) {
