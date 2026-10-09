@@ -61,6 +61,8 @@ directory for each build of ocerz and set of `OCERZ_` variables; a Steam session
 fills about 2 GB. A store that reaches its limit is emptied and started again by
 the next process that finds no other process using it. Directories of other
 builds are removed after a day, or sooner while they add up to more than 2 GB.
+Each directory also keeps a 1 MB filter of the names the shared cache defines
+weakly, which a process binding a C++ library would otherwise build for itself.
 
 | Variable | Effect |
 | --- | --- |
@@ -77,11 +79,15 @@ builds are removed after a day, or sooner while they add up to more than 2 GB.
 x86 has a stronger memory model than arm64. A program that never creates a
 thread, forks, or maps shared memory cannot observe the difference, so AArchX
 runs it with plain loads and stores; the first time it does any of those,
-ordered forms are used from then on.
+ordered forms are used from then on. A mapping the kernel hands the program
+counts as shared memory only when another process can see it: a private one,
+like the buffers the system's logging library maps into nearly every program,
+leaves memory plain.
 
 | Variable | Effect |
 | --- | --- |
 | `OCERZ_NO_PLAIN_MEM=1` | use ordered forms from the start |
+| `OCERZ_NO_REMAP_PLAIN=1` | use ordered forms once any mapping the kernel hands the program has to be moved into guest memory, private or not, as before 2026-10-09 |
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
 | `OCERZ_TSO_VECTOR=1` | order SSE loads and stores too, which costs a great deal |
 | `OCERZ_TSO_NARROW=1` | order `movd` and `movq` loads and stores; `=2` orders every SSE access of 8 bytes or fewer |
@@ -137,6 +143,7 @@ bug is in what that switch controls.
 | `OCERZ_FPS=1` | in cache mode, print frames per second, counted at `CGLFlushDrawable`, once a second |
 | `OCERZ_GUESTPROF=<usec>` | sample every running guest thread at about that interval, and every `OCERZ_GUESTPROF_PERIOD` seconds (10 by default) and at exit print the hottest guest code, host symbols and interpreted instruction forms |
 | `OCERZ_GUESTPROF_HOT=1` | with `OCERZ_GUESTPROF`, sample in each period only the thread that used the most CPU in the period before |
+| `OCERZ_ORDERLOG=1` | print what first made the process use ordered memory forms, with a backtrace |
 | `OCERZ_TRIPSTAT=1` | count exits from translated code to the dispatcher, and print their commonest destinations every ten seconds |
 | `OCERZ_BLACKLOG=1` | print the pages most often refused translation because they kept changing |
 | `OCERZ_INVSRC=1` | attribute each of those refusals to the code that invalidated the page |
@@ -153,6 +160,8 @@ bug is in what that switch controls.
 | `OCERZ_NO_FILEMAP=1` | read every private file mapping into anonymous memory instead of mapping it from the file |
 | `OCERZ_PRELOAD_OBJC=<paths>` | put matching shared-cache Objective-C images into the startup batch; `@cat` does it for every image that defines categories |
 | `OCERZ_NO_UPWARD_INIT=1` | do not initialize a library reached only through an upward dependency, as before 2026-09-22 |
+| `OCERZ_NO_DELAY_INIT=1` | load and initialize at launch the libraries reached only through delayed-init dependencies, which dyld leaves until the program asks for them, as before 2026-10-09 |
+| `OCERZ_NO_WEAK_MAIN_FIRST=1` | look a weak definition up in the shared cache before the main executable, as before 2026-10-09 |
 | `OCERZ_NO_LOADMAP=1` | do not map a shared-cache image's Objective-C classes before its `+load` runs |
 | `OCERZ_NO_LATE_CATLIST=1` | do not report category lists for shared-cache images loaded after startup |
 | `OCERZ_NO_THREADACT=1` | hand `thread_suspend`, `thread_resume` and `thread_get_state` on guest threads to the kernel instead of emulating them |
