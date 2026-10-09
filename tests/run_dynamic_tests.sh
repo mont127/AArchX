@@ -853,6 +853,7 @@ run_golden_case dincdec_flags tests/dynamic/incdec_flags.c tests/dynamic/incdec_
 run_golden_case dinline_misc tests/dynamic/inline_misc.c tests/dynamic/inline_misc.out
 run_golden_case dblock_cap tests/dynamic/block_cap.c tests/dynamic/block_cap.out
 run_golden_case dptest_flags tests/dynamic/ptest_flags.c tests/dynamic/ptest_flags.out
+run_golden_case dshift_cl_flags tests/dynamic/shift_cl_flags.c tests/dynamic/shift_cl_flags.out
 run_golden_case dshufps_self tests/dynamic/shufps_self.c tests/dynamic/shufps_self.out
 run_golden_case dcmp_mem_setcc tests/dynamic/cmp_mem_setcc.c tests/dynamic/cmp_mem_setcc.out
 run_golden_case dlowstack_disp tests/dynamic/lowstack_disp.c tests/dynamic/lowstack_disp.out
@@ -1091,6 +1092,7 @@ run_low_golden_case dincdec_flags_low tests/dynamic/incdec_flags.c tests/dynamic
 run_low_golden_case dinline_misc_low tests/dynamic/inline_misc.c tests/dynamic/inline_misc.out
 run_low_golden_case dblock_cap_low tests/dynamic/block_cap.c tests/dynamic/block_cap.out
 run_low_golden_case dptest_flags_low tests/dynamic/ptest_flags.c tests/dynamic/ptest_flags.out
+run_low_golden_case dshift_cl_flags_low tests/dynamic/shift_cl_flags.c tests/dynamic/shift_cl_flags.out
 run_low_golden_case dshufps_self_low tests/dynamic/shufps_self.c tests/dynamic/shufps_self.out
 run_low_golden_case dcmp_mem_setcc_low tests/dynamic/cmp_mem_setcc.c tests/dynamic/cmp_mem_setcc.out
 run_low_golden_case dlowstack_disp_low tests/dynamic/lowstack_disp.c tests/dynamic/lowstack_disp.out

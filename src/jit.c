@@ -3735,6 +3735,24 @@ static int emit_add_inc_pair(A64Buf *b, const X86Insn *add,
     return 1;
 }
 
+/*
+ * A 32-bit shift or rotate by a count that masks to 0 still writes its
+ * register, clearing the upper half (interp.c, zero_count_write).
+ */
+static void emit_zero_count_write(A64Buf *b, const X86Insn *insn)
+{
+    const X86Operand *d = &insn->ops[0];
+    if (d->kind != OCERZ_OPK_REG || d->size != 4 || insn->mode32)
+        return;
+    int ds = pin_slot(d->reg);
+    if (ds >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
+        a64_mov_reg(b, 0, pin_hreg(ds), pin_hreg(ds));
+        return;
+    }
+    emit_gpr_rd(b, 0, JT0, d->reg);
+    emit_gpr_wr(b, JT0, d->reg);
+}
+
 static int emit_shift_eager(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0];
@@ -3746,8 +3764,13 @@ static int emit_shift_eager(A64Buf *b, const X86Insn *insn, uint64_t need)
     int sf = d->size == 8;
     int bits = d->size * 8;
     unsigned cnt = (unsigned)(s->imm & (sf ? 63u : 31u));
-    if (cnt == 0)
+    if (cnt == 0) {
+        if (!sf && !insn->mode32) {
+            a64_ldr(b, 4, JT0, 20, GPR_OFF(d->reg));
+            a64_str(b, 8, JT0, 20, GPR_OFF(d->reg));
+        }
         return 1;
+    }
 
     unsigned op = insn->op;
     a64_ldr(b, sf ? 8 : 4, JT0, 20, GPR_OFF(d->reg));
@@ -3855,8 +3878,10 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
     int sf = d->size == 8;
     int bits = d->size * 8;
     unsigned cnt = (unsigned)(s->imm & (sf ? 63u : 31u));
-    if (cnt == 0)
+    if (cnt == 0) {
+        emit_zero_count_write(b, insn);
         return 1;
+    }
 
     unsigned op = insn->op;
     if (need == 0) {
@@ -7367,8 +7392,10 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (!emit_shift_count(b, insn, sf, JT1, &cnt))
         return 0;
     int variable = cnt == 0xffffffffu;
-    if (!variable && cnt == 0)
+    if (!variable && cnt == 0) {
+        emit_zero_count_write(b, insn);
         return 1;
+    }
     if (need && variable)
         return 0;
     int ds = pin_slot(d->reg);
