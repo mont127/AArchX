@@ -81,6 +81,29 @@ const MAND_66: c_int = 1;
 const MAND_F3: c_int = 2;
 const MAND_F2: c_int = 3;
 
+const fn prefix_classes() -> [u8; 256] {
+    let mut pfx = [0; 256];
+    let mut b = 0x40;
+    while b < 0x50 {
+        pfx[b] = 1;
+        b += 1;
+    }
+    pfx[0x66] = 2;
+    pfx[0x67] = 3;
+    pfx[0xf0] = 4;
+    pfx[0xf2] = 5;
+    pfx[0xf3] = 6;
+    pfx[0x2e] = 7;
+    pfx[0x36] = 7;
+    pfx[0x3e] = 7;
+    pfx[0x26] = 7;
+    pfx[0x64] = 8;
+    pfx[0x65] = 9;
+    pfx
+}
+
+static PFX: [u8; 256] = prefix_classes();
+
 struct DecState {
     base: *const u8,
     p: *const u8,
@@ -907,55 +930,77 @@ pub unsafe extern "C" fn ocerz_decode_mode(
         (*out).ops[i].index = OCERZ_REG_NONE as u8;
     }
     let mut last_f23 = 0;
-    loop {
-        if s.p >= s.end {
-            return if avail >= 16 {
-                OCERZ_ETOOLONG as c_int
-            } else {
-                OCERZ_ETRUNC as c_int
-            };
-        }
-        let b = *s.p;
-        if s.mode32 == 0 && (0x40..=0x4f).contains(&b) {
-            s.rex_present = 1;
-            s.rex = b as c_int;
-            s.rex_w = ((b >> 3) & 1) as c_int;
-            s.rex_r = ((b >> 2) & 1) as c_int;
-            s.rex_x = ((b >> 1) & 1) as c_int;
-            s.rex_b = (b & 1) as c_int;
-            s.p = s.p.add(1);
-            continue;
-        }
-        match b {
-            0x66 => {
-                s.has_66 = 1;
-                if last_f23 == 0 {
-                    s.mand = MAND_66;
-                }
-            }
-            0x67 => s.has_67 = 1,
-            0xf0 => s.has_f0 = 1,
-            0xf2 => {
-                s.rep = OCERZ_REP_REPNE as c_int;
-                s.mand = MAND_F2;
-                last_f23 = 1;
-            }
-            0xf3 => {
-                s.rep = OCERZ_REP_REP as c_int;
-                s.mand = MAND_F3;
-                last_f23 = 1;
-            }
-            0x2e | 0x36 | 0x3e | 0x26 => s.seg = OCERZ_SEG_NONE as c_int,
-            0x64 => s.seg = OCERZ_SEG_FS as c_int,
-            0x65 => s.seg = OCERZ_SEG_GS as c_int,
-            _ => break,
-        }
-        s.rex_present = 0;
-        s.rex_w = 0;
-        s.rex_r = 0;
-        s.rex_x = 0;
-        s.rex_b = 0;
+    if s.p >= s.end {
+        return if avail >= 16 {
+            OCERZ_ETOOLONG as c_int
+        } else {
+            OCERZ_ETRUNC as c_int
+        };
+    }
+    let first = *s.p;
+    let first_class = *PFX.get_unchecked(first as usize);
+    let mut op = 0u8;
+    let e;
+    if first_class == 0 || (first_class == 1 && s.mode32 != 0) {
+        op = first;
         s.p = s.p.add(1);
+        e = OCERZ_OK as c_int;
+    } else {
+        loop {
+            if s.p >= s.end {
+                return if avail >= 16 {
+                    OCERZ_ETOOLONG as c_int
+                } else {
+                    OCERZ_ETRUNC as c_int
+                };
+            }
+            let b = *s.p;
+            let class = *PFX.get_unchecked(b as usize);
+            if class == 0 || (class == 1 && s.mode32 != 0) {
+                break;
+            }
+            if class == 1 {
+                s.rex_present = 1;
+                s.rex = b as c_int;
+                s.rex_w = ((b >> 3) & 1) as c_int;
+                s.rex_r = ((b >> 2) & 1) as c_int;
+                s.rex_x = ((b >> 1) & 1) as c_int;
+                s.rex_b = (b & 1) as c_int;
+                s.p = s.p.add(1);
+                continue;
+            }
+            match class {
+                2 => {
+                    s.has_66 = 1;
+                    if last_f23 == 0 {
+                        s.mand = MAND_66;
+                    }
+                }
+                3 => s.has_67 = 1,
+                4 => s.has_f0 = 1,
+                5 => {
+                    s.rep = OCERZ_REP_REPNE as c_int;
+                    s.mand = MAND_F2;
+                    last_f23 = 1;
+                }
+                6 => {
+                    s.rep = OCERZ_REP_REP as c_int;
+                    s.mand = MAND_F3;
+                    last_f23 = 1;
+                }
+                7 => s.seg = OCERZ_SEG_NONE as c_int,
+                8 => s.seg = OCERZ_SEG_FS as c_int,
+                9 => s.seg = OCERZ_SEG_GS as c_int,
+                _ => break,
+            }
+            s.rex_present = 0;
+            s.rex_w = 0;
+            s.rex_r = 0;
+            s.rex_x = 0;
+            s.rex_b = 0;
+            s.p = s.p.add(1);
+        }
+        e = fetch8(&mut s, &mut op);
     }
     (*out).addrsize = if s.mode32 != 0 {
         if s.has_67 != 0 { 2 } else { 4 }
@@ -968,8 +1013,6 @@ pub unsafe extern "C" fn ocerz_decode_mode(
     (*out).seg = s.seg as u8;
     (*out).lock = (s.has_f0 != 0) as u8;
     (*out).rep = OCERZ_REP_NONE as u8;
-    let mut op = 0u8;
-    let e = fetch8(&mut s, &mut op);
     let r = if e != 0 {
         e
     } else if s.mode32 == 0 && (op == 0xc4 || op == 0xc5) {
