@@ -8,8 +8,8 @@
 | blocks.c | 914 | - | C |
 | bridge.c | 3379 | - | C |
 | cache.c | 1496 | - | C |
-| cpu.c | 163 | - | C |
-| decode.c | 4435 | - | C |
+| cpu.c | 163 | decode-agent | in progress |
+| decode.c | 4435 | decode-agent | in progress |
 | dyld.c | 5840 | - | C |
 | dyldapi.c | 2636 | - | C |
 | flags.c | 230 | - | ported |
