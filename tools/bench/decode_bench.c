@@ -2,9 +2,9 @@
  * Decoder throughput and equivalence bench.  Linear-sweeps a window of the
  * x86_64 dyld shared cache with ocerz_decode (64-bit) and again with
  * ocerz_decode_mode(..., 1) (i386), advancing by the decoded length on success
- * and one byte on error.  Reports best-of-N ns/byte and ns/insn and an FNV-1a
- * hash folded over every decoded instruction's fields and every return code,
- * so two builds can be compared bit-for-bit.
+ * and one byte on error.  Reports best-of-N unhashed ns/byte and ns/insn,
+ * hashed ns/insn, and an FNV-1a hash folded over every decoded instruction's
+ * fields and every return code, so two builds can be compared bit-for-bit.
  */
 #include <fcntl.h>
 #include <stdint.h>
@@ -129,22 +129,25 @@ int main(int argc, char **argv)
 
     for (mode = 0; mode < 2; mode++) {
         double best = 0;
+        double hashed;
+        unsigned long long timed_insn = 0, timed_err = 0;
         unsigned long long ninsn = 0, nerr = 0;
-        uint64_t hbest = 0;
+        uint64_t hash;
         int r;
         for (r = 0; r < NRUNS; r++) {
             double dt;
-            h = 1469598103934665603ULL;
-            dt = sweep(base, len, mode, &ninsn, &nerr, 1);
-            if (r == 0 || dt < best) {
+            dt = sweep(base, len, mode, &timed_insn, &timed_err, 0);
+            if (r == 0 || dt < best)
                 best = dt;
-                hbest = h;
-            }
         }
-        printf("mode=%s bytes=%zu insns=%llu errors=%llu hash=%016llx ns_per_byte=%.3f ns_per_insn=%.1f\n",
+        h = 1469598103934665603ULL;
+        hashed = sweep(base, len, mode, &ninsn, &nerr, 1);
+        hash = h;
+        printf("mode=%s bytes=%zu insns=%llu errors=%llu hash=%016llx ns_per_byte=%.3f ns_per_insn=%.1f ns_per_insn_hashed=%.1f\n",
                mode ? "i386" : "x64", len, ninsn, nerr,
-               (unsigned long long)hbest, best / (double)len,
-               best / (double)(ninsn ? ninsn : 1));
+               (unsigned long long)hash, best / (double)len,
+               best / (double)(timed_insn ? timed_insn : 1),
+               hashed / (double)(ninsn ? ninsn : 1));
     }
     return 0;
 }
