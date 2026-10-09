@@ -37,7 +37,7 @@
 | syscall.c | 8906 | devin-9aa5caef | in progress |
 | tcache.c | 863 | runtime (ee47e957) | in progress |
 | vdylib.c | 1424 | native1 | ported |
-| vm.c | 4376 | memvm | in progress |
+| vm.c | 4376 | memvm | ported |
 | x87.c | 1277 | interp-agent | ported |
 | abicall.s | 237 | native1 | ported |
 | leaf.s | 598 | native1 | ported |
