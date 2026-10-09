@@ -1,0 +1,22 @@
+[package]
+name = "ocerz-rs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ocerz_rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.72"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+overflow-checks = false

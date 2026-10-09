@@ -37,15 +37,27 @@ LDLIBS := -lcompression
 
 SRCS := $(wildcard src/*.c)
 ASRCS := $(wildcard src/*.s)
+PORTED := $(basename $(notdir $(wildcard rust/src/ported/*.rs))) \
+	$(notdir $(patsubst %/mod.rs,%,$(wildcard rust/src/ported/*/mod.rs)))
+SRCS := $(filter-out $(addprefix src/,$(addsuffix .c,$(PORTED))),$(SRCS))
+ASRCS := $(filter-out $(addprefix src/,$(addsuffix .s,$(PORTED))),$(ASRCS))
 OBJS := $(SRCS:.c=.o) $(ASRCS:.s=.o)
+RUSTLIB := rust/target/release/libocerz_rs.a
+RUST_SYSLIBS := -lc -lm
 DEPS := $(SRCS:.c=.d)
 CORE_OBJS := $(filter-out src/main.o,$(OBJS))
 
 UNIT_SRCS := $(wildcard tests/unit/*.c)
 UNIT_BINS := $(UNIT_SRCS:tests/unit/%.c=tests/unit/bin/%)
 
-ocerz: $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+rustlib:
+	cd rust && cargo build --release
+
+$(RUSTLIB): rustlib
+	@true
+
+ocerz: Makefile $(OBJS) $(RUSTLIB)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(RUSTLIB) $(LDLIBS) $(RUST_SYSLIBS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -53,9 +65,9 @@ src/%.o: src/%.c
 src/%.o: src/%.s
 	$(CC) $(ARCHFLAGS) -g -c -o $@ $<
 
-tests/unit/bin/%: tests/unit/%.c $(CORE_OBJS)
+tests/unit/bin/%: tests/unit/%.c $(CORE_OBJS) $(RUSTLIB)
 	@mkdir -p tests/unit/bin
-	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(RUSTLIB) $(LDLIBS) $(RUST_SYSLIBS)
 
 unit: $(UNIT_BINS)
 	@for t in $(UNIT_BINS); do echo "== $$t"; OCERZ_NO_ARM_EXEC=1 $$t || exit 1; done
@@ -117,7 +129,10 @@ i386diff:
 clean:
 	rm -f $(OBJS) $(DEPS) ocerz
 	rm -rf tests/unit/bin
+	cd rust && cargo clean || true
 	$(MAKE) -C tests/guest clean
+
+.PHONY: rustlib
 
 -include $(DEPS)
 
