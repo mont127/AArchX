@@ -1025,6 +1025,30 @@ run_weak_bloom_case() {
 }
 
 run_weak_bloom_case dweak_bloom
+# remap_order.c in its three modes with OCERZ_ORDERLOG=1: a private mapping
+# moved into the guest must leave the process on plain memory, a shared or a
+# writable copy-on-write one must move it to ordered.
+run_remap_order_case() {
+    local name="$1" dir="$TMP/$1" mode want got
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -O1 -o "$dir/$name" tests/dynamic/remap_order.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    for mode in private shared cow; do
+        want=ordered
+        [ $mode = private ] && want=plain
+        OCERZ_ORDERLOG=1 run_bounded "$dir/$mode.out" "$dir/$mode.err" "$OCERZ" "$dir/$name" $mode
+        got=plain
+        grep -q 'ORDERED memory required' "$dir/$mode.err" && got=ordered
+        if [ "$(cat "$dir/$mode.out")" = OK ] && [ $got = $want ]; then
+            echo "PASS $name-$mode ($got)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (out='$(cat "$dir/$mode.out")', memory $got, want $want)"; fail=$((fail+1))
+        fi
+    done
+}
+
+run_remap_order_case dremap_order
 run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
