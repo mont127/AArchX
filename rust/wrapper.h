@@ -18,6 +18,7 @@
 #include "ocerz/interp_common.h"
 #include "ocerz/jit.h"
 #include "ocerz/jit_internal.h"
+#include "ocerz/jit_internal.h"
 #include "ocerz/leaf.h"
 #include "ocerz/loader.h"
 #include "ocerz/mem.h"
