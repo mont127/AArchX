@@ -507,15 +507,19 @@ static int br_bzero(struct OcerzVM *vm, OcerzCPU *cpu)
 static int br_abort(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     fprintf(stderr, "ocerz: bridge: the guest called abort\n");
-    ocerz_vm_request_exit(vm, 134);
-    return OCERZ_STEP_EXIT;
+    /* abort ends the process at once.  A request for the VM to exit waits for
+       the other threads, and a thread that aborted inside Boehm's
+       stop-the-world (Mono's crash handler) left them suspended: the game
+       froze with its audio thread looping. */
+    fflush(stderr);
+    _exit(134);
 }
 
 static int br_stack_chk_fail(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     fprintf(stderr, "ocerz: bridge: the guest overran a stack guard (__stack_chk_fail)\n");
-    ocerz_vm_request_exit(vm, 134);
-    return OCERZ_STEP_EXIT;
+    fflush(stderr);
+    _exit(134);   /* as br_abort does */
 }
 
 static int br_tlv_bootstrap(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -1627,6 +1631,19 @@ void ocerz_bridge_set_process_args(int argc, char **argv)
 
 static int g_br_cf_identified;
 
+/*
+ * A program that embeds ocerz may decide which library answers for a macOS
+ * install name: MacShack, which runs these games on iOS, maps each to its own
+ * shim or to the iOS framework of the same name.  NULL from the hook falls
+ * back to dlopen of the name itself, and with no hook nothing changes.
+ */
+static void *(*g_br_host_open)(const char *install_name);
+
+void ocerz_bridge_set_host_open(void *(*open)(const char *install_name))
+{
+    g_br_host_open = open;
+}
+
 static void br_identify_corefoundation(void)
 {
     const char *path = ocerz_dyld_main_path();
@@ -1648,6 +1665,36 @@ static void br_identify_corefoundation(void)
         OCERZ_LOG("bridge: CoreFoundation initialized with the process path %s\n", path);
     else
         OCERZ_LOG("bridge: CoreFoundation will not open to take the guest's identity: %s\n", dlerror());
+}
+
+/*
+ * AppKit keys its behavior to the SDK the process was linked with, and
+ * in native mode that process is ocerz, linked with a current SDK.  So AppKit
+ * layer-backs every view, as it never did for the older SDKs Intel games were
+ * built with, and traps on "nil return from -makeBackingLayer" when a view that
+ * never expected to be layer-backed returns nil (Unity's PlayerWindowView under
+ * OpenGL).  NSViewFixupNilFromMakeBackingLayer is AppKit's own switch for that
+ * case: it gives such a view a default layer instead.  Registered once, as a
+ * registration-domain default, when AppKit first opens.
+ */
+static void br_appkit_compat(void)
+{
+    /* objc_msgSend takes its arguments in registers: exact prototypes, never variadic */
+    typedef void *(*Send0)(void *, void *);
+    typedef void *(*Send1)(void *, void *, const void *);
+    typedef void *(*Send2)(void *, void *, const void *, const void *);
+    void *(*getClass)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    void *(*selName)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
+    void *send = dlsym(RTLD_DEFAULT, "objc_msgSend");
+    const void *(*cfstr)(const void *, const char *, uint32_t) = dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+    const void **yes = dlsym(RTLD_DEFAULT, "kCFBooleanTrue");
+    if (!getClass || !selName || !send || !cfstr || !yes)
+        return;
+    void *defaults = ((Send0)send)(getClass("NSUserDefaults"), selName("standardUserDefaults"));
+    const void *key = cfstr(NULL, "NSViewFixupNilFromMakeBackingLayer", 0x08000100 /* UTF-8 */);
+    void *dict = ((Send2)send)(getClass("NSDictionary"), selName("dictionaryWithObject:forKey:"), *yes, key);
+    if (defaults && dict)
+        ((Send1)send)(defaults, selName("registerDefaults:"), dict);
 }
 
 static uint64_t br_stack_below(const OcerzCPU *cpu)
@@ -1854,6 +1901,23 @@ static int br_thread_get_state(struct OcerzVM *vm, OcerzCPU *cpu)
     uint64_t countp = cpu->gpr[OCERZ_RCX];
     if (br_debug_state_count(flavor))
         return br_debug_state_get(vm, cpu, flavor, state, countp);
+    /* x86_FLOAT_STATE64: Mono asks for it beside the registers when it
+       suspends a thread for its GC, which scans only the integer registers.
+       A suspended thread's xmm live in pinned host registers with no accessor
+       here, so the answer is the default x87 and SSE state: control 0x37f,
+       MXCSR 0x1f80, the rest zero.  A caller that restored a thread's FP state
+       from it would lose its xmm; none has been seen. */
+    if (flavor == 5) {
+        if (!state || !countp || (uint32_t)ocerz_ld(countp, 4) < 131)
+            return br_answer(vm, cpu, KERN_INVALID_ARGUMENT);
+        for (uint64_t k = 0; k < 524; k += 4)
+            ocerz_st(state + k, 4, 0);
+        ocerz_st(state + 8, 2, 0x37f);
+        ocerz_st(state + 32, 4, 0x1f80);
+        ocerz_st(state + 36, 4, 0xffbf);
+        ocerz_st(countp, 4, 131);
+        return br_answer(vm, cpu, 0);
+    }
     if (flavor != 4) {
         fprintf(stderr, "ocerz: bridge: _thread_get_state takes flavor %u, which has no x86 register mapping here\n",
                 flavor);
@@ -2326,9 +2390,11 @@ static int br_ssl_get_negotiated_cipher(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_answer(vm, cpu, (uint64_t)(int64_t)st);
 }
 
-typedef const void *(*BrCFUUIDFn)(const void *, unsigned, unsigned, unsigned, unsigned, unsigned,
-                                  unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
-                                  unsigned, unsigned, unsigned, unsigned, unsigned);
+/* UInt8, as CFUUID.h declares them: Apple's arm64 ABI packs stack arguments at their own size, so bytes 7-15
+   (on the stack) came out wrong when passed as unsigned. */
+typedef const void *(*BrCFUUIDFn)(const void *, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t,
+                                  uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t,
+                                  uint8_t, uint8_t, uint8_t, uint8_t, uint8_t);
 
 static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -2343,19 +2409,19 @@ static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
         cached = fn;
     }
     OcerzAbiSig named;
-    if (ocerz_abi_parse("p", &named) != OCERZ_OK)
+    if (ocerz_abi_parse("p(p)", &named) != OCERZ_OK)   /* "p" alone has no argument list and never parsed */
         return br_answer(vm, cpu, 0);
     OcerzAbiVaList va;
     if (ocerz_abi_va_start(&named, cpu, &va) != OCERZ_OK)
         return br_answer(vm, cpu, 0);
     uint64_t raw = cpu->gpr[OCERZ_RDI];
     const void *alloc = raw ? ocerz_g2h(raw) : NULL;
-    unsigned b[16];
+    uint8_t b[16];
     for (int k = 0; k < 16; k++) {
         uint64_t v = 0;
         if (ocerz_abi_va_arg(&va, cpu, 'u', &v) != OCERZ_OK)
             return br_answer(vm, cpu, 0);
-        b[k] = (unsigned)(v & 0xffu);
+        b[k] = (uint8_t)v;
     }
     const void *r = ((BrCFUUIDFn)fn)(alloc, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                                      b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
@@ -2493,6 +2559,63 @@ static int br_dyld_image_containing(struct OcerzVM *vm, OcerzCPU *cpu)
 static int br_dyld_prog_image_header(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     return br_answer(vm, cpu, ocerz_main_mh);
+}
+
+/*
+ * getsegbyname and getsectbyname answer from the main executable's own load commands (Feral's launcher reads
+ * its __TEXT and __DATA segments); the result is a guest pointer into them, as dyld returns.
+ */
+static uint64_t br_main_segment_or_section(const char *seg, const char *sect)
+{
+    if (!ocerz_main_mh)
+        return 0;
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(ocerz_main_mh);
+    uint32_t ncmds;
+    memcpy(&ncmds, h + 16, 4);
+    const uint8_t *lc = h + 32;   /* sizeof(struct mach_header_64) */
+    for (uint32_t i = 0; i < ncmds; i++) {
+        uint32_t cmd, size;
+        memcpy(&cmd, lc, 4);
+        memcpy(&size, lc + 4, 4);
+        if (cmd == 0x19 && !strncmp((const char *)lc + 8, seg, 16)) {   /* LC_SEGMENT_64 */
+            if (!sect)
+                return ocerz_main_mh + (uint64_t)(lc - h);
+            uint32_t nsects;
+            memcpy(&nsects, lc + 64, 4);
+            const uint8_t *sc = lc + 72;
+            for (uint32_t j = 0; j < nsects; j++, sc += 80)
+                if (!strncmp((const char *)sc, sect, 16))
+                    return ocerz_main_mh + (uint64_t)(sc - h);
+        }
+        if (size < 8)
+            break;
+        lc += size;
+    }
+    return 0;
+}
+
+static int br_getsegbyname(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const char *seg = (const char *)ocerz_g2h(cpu->gpr[OCERZ_RDI]);
+    return br_answer(vm, cpu, seg ? br_main_segment_or_section(seg, NULL) : 0);
+}
+
+/* The service's IOCFPlugInInterface is a table of arm64 functions, so it is
+   refused as for a service with no plug-in: kIOReturnUnsupported, and NULL in
+   *theInterface. */
+static int br_io_create_plugin_interface(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t out = cpu->gpr[OCERZ_RCX];
+    if (out)
+        ocerz_st(out, 8, 0);
+    return br_answer(vm, cpu, 0xe00002c7u);
+}
+
+static int br_getsectbyname(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const char *seg = (const char *)ocerz_g2h(cpu->gpr[OCERZ_RDI]);
+    const char *sect = (const char *)ocerz_g2h(cpu->gpr[OCERZ_RSI]);
+    return br_answer(vm, cpu, seg && sect ? br_main_segment_or_section(seg, sect) : 0);
 }
 
 static int br_dyld_build_field(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t mh, int field)
@@ -2683,6 +2806,9 @@ static const BrHandler g_br_handlers[] = {
     { "dyld_image_header_containing", br_dyld_image_header_containing },
     { "dyld_image_path_containing",  br_dyld_image_path_containing },
     { "dyld_image_containing",       br_dyld_image_containing },
+    { "getsegbyname",              br_getsegbyname },
+    { "getsectbyname",             br_getsectbyname },
+    { "io_create_plugin_interface", br_io_create_plugin_interface },
     { "dyld_prog_image_header",      br_dyld_prog_image_header },
     { "dyld_program_sdk_version",    br_dyld_program_sdk_version },
     { "dyld_program_min_os_version", br_dyld_program_min_os_version },
@@ -2704,6 +2830,10 @@ static const BrHandler g_br_handlers[] = {
     { "objc_msgSendSuper2_stret",  ocerz_objc_msgSendSuper2_stret },
     { "objc_msgSend_fpret",        ocerz_objc_msgSend_fpret },
     { "objc_msgSend_fp2ret",       ocerz_objc_msgSend_fp2ret },
+    { "objc_msgSend_fixup", ocerz_objc_msgSend_fixup },
+    { "objc_msgSend_stret_fixup", ocerz_objc_msgSend_stret_fixup },
+    { "objc_msgSendSuper2_fixup", ocerz_objc_msgSendSuper2_fixup },
+    { "objc_msgSendSuper2_stret_fixup", ocerz_objc_msgSendSuper2_stret_fixup },
     { "objc_setUncaughtExceptionHandler", ocerz_objc_setUncaughtExceptionHandler },
     { "objc_allocateClassPair",     ocerz_objc_allocateClassPair },
     { "class_addMethod",            ocerz_objc_class_addMethod },
@@ -2945,12 +3075,16 @@ void *ocerz_bridge_host_library(const char *install_name)
                 sigaction(sig, NULL, &before[sig]);
             if (strstr(install_name, ".framework/"))
                 br_identify_corefoundation();
-            h = dlopen(install_name, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
+            h = g_br_host_open ? g_br_host_open(install_name) : NULL;
+            if (!h)
+                h = dlopen(install_name, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
             if (!h)
                 h = dlopen(install_name, RTLD_LAZY | RTLD_LOCAL);
             if (h)
                 br_note_stolen_signals(before, install_name);
-            else
+            if (h && strstr(install_name, "/AppKit.framework/"))
+                br_appkit_compat();
+            if (!h)
                 OCERZ_LOG("bridge: host library %s will not open: %s\n", install_name, dlerror());
         }
         if (h)
@@ -2960,10 +3094,25 @@ void *ocerz_bridge_host_library(const char *install_name)
     return h;
 }
 
+/*
+ * A program that embeds ocerz may answer a symbol itself, ahead of the
+ * library.  Rebinding the embedder's own imports changes nothing here, since a
+ * bridged call reaches the host only through this lookup.
+ */
+static void *(*g_br_host_sym)(const char *host_sym);
+
+void ocerz_bridge_set_host_symbol(void *(*sym)(const char *host_sym))
+{
+    g_br_host_sym = sym;
+}
+
 void *ocerz_bridge_host_symbol(const char *install_name, const char *host_sym)
 {
     if (!host_sym)
         return NULL;
+    void *own = g_br_host_sym ? g_br_host_sym(host_sym) : NULL;
+    if (own)
+        return own;
     void *h = ocerz_bridge_host_library(install_name);
     return h ? dlsym(h, host_sym) : NULL;
 }
@@ -3299,6 +3448,57 @@ static int br_cross_structs(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
     return rc;
 }
 
+/* An argument as text when it points at a printable C string (a path, a
+   name), else "", read with vm_read_overwrite so a non-pointer cannot fault. */
+static const char *br_trace_str(uint64_t a, char out[320])
+{
+    char raw[300];
+    vm_size_t got = 0;
+    out[0] = 0;
+    if (a < 0x10000 || vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)ocerz_g2h(a), sizeof raw,
+                                         (vm_address_t)(uintptr_t)raw, &got) != KERN_SUCCESS)
+        return out;
+    size_t n = 0;
+    while (n < got && raw[n] >= 0x20 && raw[n] < 0x7f) n++;
+    if (n >= 2 && n < got && raw[n] == 0)
+        snprintf(out, 320, " \"%.*s\"", (int)n, raw);
+    return out;
+}
+
+/* OCERZ_BRIDGELOG_MATCH="CFBundle|stat" traces only the calls whose name
+   contains one of the words, with the first three arguments (the first two
+   also as text when they point at a C string), the result and the caller: a
+   trace of a few APIs without slowing a game to a crawl.  OCERZ_TRACE_CHAIN
+   adds the guest frame-pointer chain.  The words are split once. */
+#define BR_TRACE_WORDS 16
+static int br_trace_wanted(const char *sym)
+{
+    static int ready;
+    static int nwords;
+    static char buf[256];
+    static const char *words[BR_TRACE_WORDS];
+    if (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) {
+        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&lock);
+        if (!ready) {
+            const char *m = getenv("OCERZ_BRIDGELOG_MATCH");
+            if (m) {
+                strlcpy(buf, m, sizeof buf);
+                char *save = NULL;
+                for (char *w = strtok_r(buf, "|", &save); w && nwords < BR_TRACE_WORDS; w = strtok_r(NULL, "|", &save))
+                    words[nwords++] = w;
+            }
+            __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&lock);
+    }
+    for (int k = 0; sym && k < nwords; k++)
+        if (strstr(sym, words[k]))
+            return 1;
+    return 0;
+}
+#define ENV_TRACE_CHAIN() ({ static int on_ = -1; if (on_ < 0) on_ = getenv("OCERZ_TRACE_CHAIN") != NULL; on_; })
+
 static int br_cross(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
 {
     if (fn->nstructs || fn->ninplace)
@@ -3329,12 +3529,34 @@ int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBri
                 fn->lib, fn->sym, fn->sig ? fn->sig : "(nothing)",
                 (unsigned long long)ocerz_ld(cpu->gpr[OCERZ_RSP], 8), (unsigned long long)cpu->gpr[OCERZ_RDI]);
 
+    int traced = br_trace_wanted(fn->sym);
+    uint64_t a0 = cpu->gpr[OCERZ_RDI], a1 = cpu->gpr[OCERZ_RSI], a2 = cpu->gpr[OCERZ_RDX];
+    uint64_t caller = traced ? ocerz_ld(cpu->gpr[OCERZ_RSP], 8) : 0, fp = cpu->gpr[OCERZ_RBP];
+    char ts0[320], ts1[320];
+    if (traced) {
+        br_trace_str(a0, ts0);
+        br_trace_str(a1, ts1);
+    }
+
     int rc = fn->special ? fn->special(vm, cpu) : br_cross(fn, cpu);
     if (rc == OCERZ_STEP_OK && !fn->special)
         rc = br_settle(vm, cpu);
     if (br_logging() == 2)
         fprintf(stderr, "ocerz: BRIDGERET[%d] %s rax=%#llx rdx=%#llx rc=%d\n", (int)getpid(), fn->sym,
                 (unsigned long long)cpu->gpr[OCERZ_RAX], (unsigned long long)cpu->gpr[OCERZ_RDX], rc);
+    if (traced) {
+        fprintf(stderr, "ocerz: TRACE %s(%#llx%s, %#llx%s, %#llx) -> %#llx from %#llx\n", fn->sym,
+                (unsigned long long)a0, ts0, (unsigned long long)a1, ts1, (unsigned long long)a2,
+                (unsigned long long)cpu->gpr[OCERZ_RAX], (unsigned long long)caller);
+        if (ENV_TRACE_CHAIN()) {
+            fprintf(stderr, "ocerz:   chain:");
+            for (int d = 0; d < 12 && fp >= ocerz_arena_lo && fp < ocerz_arena_hi; d++) {
+                fprintf(stderr, " %#llx", (unsigned long long)ocerz_ld(fp + 8, 8));
+                fp = ocerz_ld(fp, 8);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     return rc;
 }
 

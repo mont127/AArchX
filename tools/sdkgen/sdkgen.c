@@ -1812,7 +1812,10 @@ static void collect_doc(ExportSet *e, const TbdFile *main, const TbdDoc *doc, Ma
     if (map_get(seen, doc->install_name) >= 0)
         return;
     map_set(seen, doc->install_name, 1);
-    if (!top && doc->parent_umbrella.n == 0 && public_location(doc->install_name))
+    /* libcharset is public, but x86 binaries built against older SDKs import
+       locale_charset by libiconv's ordinal, so it is folded in all the same. */
+    if (!top && doc->parent_umbrella.n == 0 && public_location(doc->install_name) &&
+        strcmp(doc->install_name, "/usr/lib/libcharset.1.dylib") != 0)
         return;
     collect_section(e, &doc->exports);
     collect_section(e, &doc->reexports);

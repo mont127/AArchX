@@ -259,6 +259,7 @@
  */
 #include "ocerz/dyld.h"
 #include "ocerz/abi.h"
+#include "ocerz/mode.h"
 #include "ocerz/blocks.h"
 #include "ocerz/bridge.h"
 #include "ocerz/mem.h"
@@ -1516,6 +1517,12 @@ int ocerz_abi_is_guest_code(uint64_t gptr)
 
     if (ocerz_host_in_guest_reservation(host))
         return 1;
+    /* Native mode maps everything the guest runs inside the arena, synthesized
+       system libraries included.  Anonymous memory outside it is native code
+       dyld never registered (libobjc's imp_implementationWithBlock trampolines,
+       a host's own JIT), and taking that for x86 ran arm64 bytes as guest code. */
+    if (ocerz_mode == OCERZ_MODE_NATIVE)
+        return 0;
 
     size_t cache_len = 0;
     const void *cache = _dyld_get_shared_cache_range(&cache_len);

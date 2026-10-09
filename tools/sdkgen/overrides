@@ -515,6 +515,18 @@
 
 library /usr/lib/libSystem.B.dylib
 
+# POSIX AIO takes the guest's aiocb as it is, since it has one layout on
+# x86_64 and arm64; Feral's streaming reads use it.  A sigevent asking for a
+# thread callback would hand the kernel an x86 function, so a guest's must be
+# SIGEV_NONE.
+fn _aio_read aio_read i(p)
+fn _aio_write aio_write i(p)
+fn _aio_error aio_error i(p)
+fn _aio_return aio_return l(p)
+fn _aio_suspend aio_suspend i(pip)
+fn _aio_suspend$NOCANCEL aio_suspend i(pip)
+fn _aio_cancel aio_cancel i(ip)
+
 special _exit exit
 special ___error error
 special __exit exit_now
@@ -646,6 +658,30 @@ fn ___memccpy_chk __memccpy_chk p(ppiLL)
 fn ___memcpy_chk __memcpy_chk p(ppLL)
 fn ___memmove_chk __memmove_chk p(ppLL)
 fn ___memset_chk __memset_chk p(piLL)
+# keymgr has no SDK header; the signatures are keymgr.h's.  Old GCC-built C++
+# runtimes (Shovel Knight's) register their exception frames through it.
+fn __keymgr_get_and_lock_processwide_ptr _keymgr_get_and_lock_processwide_ptr p(u)
+fn __keymgr_get_and_lock_processwide_ptr_2 _keymgr_get_and_lock_processwide_ptr_2 i(up)
+fn __keymgr_set_and_unlock_processwide_ptr _keymgr_set_and_unlock_processwide_ptr i(up)
+fn __keymgr_unlock_processwide_ptr _keymgr_unlock_processwide_ptr i(u)
+fn __keymgr_set_lockmode_processwide_ptr _keymgr_set_lockmode_processwide_ptr i(uu)
+fn __keymgr_get_lockmode_processwide_ptr _keymgr_get_lockmode_processwide_ptr u(u)
+fn __keymgr_get_lock_count_processwide_ptr _keymgr_get_lock_count_processwide_ptr i(u)
+# Old SDKs compiled isfinite(), isnan() and the rest into calls to these, and
+# no current header declares them.  The long double forms stay stubs, since an
+# x87 long double does not cross.
+fn ___isfinitef __isfinitef i(f)
+fn ___isfinited __isfinited i(d)
+fn ___isinff __isinff i(f)
+fn ___isinfd __isinfd i(d)
+fn ___isnanf __isnanf i(f)
+fn ___isnand __isnand i(d)
+fn ___isnormalf __isnormalf i(f)
+fn ___isnormald __isnormald i(d)
+fn ___signbitf __signbitf i(f)
+fn ___signbitd __signbitd i(d)
+fn ___fpclassifyf __fpclassifyf i(f)
+fn ___fpclassifyd __fpclassifyd i(d)
 fn ___stpcpy_chk __stpcpy_chk p(ppL)
 fn ___stpncpy_chk __stpncpy_chk p(ppLL)
 fn ___strcat_chk __strcat_chk p(ppL)
@@ -704,6 +740,7 @@ special _dlsym dlsym
 special _dladdr dladdr
 special __dyld_find_unwind_sections dyld_unwind_sections
 fn ___cxa_atexit __cxa_atexit i(c{v(p)}pp)
+fn ___cxa_finalize __cxa_finalize v(p)
 special _dlclose dlclose
 special _dlerror dlerror
 special __dyld_image_count dyld_image_count
@@ -759,8 +796,8 @@ stub _NSVersionOfLinkTimeLibrary override
 stub _NSVersionOfRunTimeLibrary override
 stub _getsectdata override
 stub _getsectdatafromFramework override
-stub _getsectbyname override
-stub _getsegbyname override
+special _getsectbyname getsectbyname
+special _getsegbyname getsegbyname
 stub _get_end override
 stub _get_etext override
 stub _get_edata override
@@ -1057,16 +1094,16 @@ stub _objc_msgLookupSuper2_stret override
 stub _objc_msgLookup_fp2ret override
 stub _objc_msgLookup_fpret override
 stub _objc_msgLookup_stret override
-stub _objc_msgSendSuper2_fixup override
+special _objc_msgSendSuper2_fixup objc_msgSendSuper2_fixup
 stub _objc_msgSendSuper2_stret_debug override
-stub _objc_msgSendSuper2_stret_fixup override
-stub _objc_msgSend_fixup override
+special _objc_msgSendSuper2_stret_fixup objc_msgSendSuper2_stret_fixup
+special _objc_msgSend_fixup objc_msgSend_fixup
 stub _objc_msgSend_fp2ret_debug override
 stub _objc_msgSend_fp2ret_fixup override
 stub _objc_msgSend_fpret_debug override
 stub _objc_msgSend_fpret_fixup override
 stub _objc_msgSend_stret_debug override
-stub _objc_msgSend_stret_fixup override
+special _objc_msgSend_stret_fixup objc_msgSend_stret_fixup
 
 special _objc_exception_throw objc_exception_throw
 special _objc_exception_rethrow objc_exception_rethrow
@@ -1301,6 +1338,10 @@ struct _FSEventStreamCreateRelativeToDevice 2 FSEventStreamContext
 library /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
 
 fn _IODisplayCreateInfoDictionary IODisplayCreateInfoDictionary p(uu)
+# IOCreatePlugInInterfaceForService hands back a table of arm64 functions x86
+# code would call directly, so its handler refuses every service, and Feral's
+# HID pad scan skips the pad where a stub would end the process (src/bridge.c).
+special _IOCreatePlugInInterfaceForService io_create_plugin_interface
 
 shape SCDynamicStoreContext 0 5 - - p(p) v(p) p(p)
 
@@ -1566,3 +1607,27 @@ special _AudioUnitSetProperty audio_unit_set_property
 library /System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit
 
 special _AudioUnitSetProperty audio_unit_set_property
+
+# compiler-rt's complex arithmetic and powi builtins, which no SDK header
+# declares (Unity 2019's libmonobdwgc imports __divdc3).  A _Complex double
+# comes back in xmm0/xmm1 on x86_64 and d0/d1 on arm64, as a {dd} structure
+# does, and a _Complex float in xmm0's low half and s0/s1, as {ff} does.  The
+# arm64 libSystem exports the multiplications but not the divisions, so ocerz
+# defines those itself (src/complexdiv.c) and the libSystem lookup finds them.
+
+library /usr/lib/libSystem.B.dylib
+
+fn ___divdc3 __divdc3 {dd}(dddd)
+fn ___muldc3 __muldc3 {dd}(dddd)
+fn ___divsc3 __divsc3 {ff}(ffff)
+fn ___mulsc3 __mulsc3 {ff}(ffff)
+fn ___powidf2 __powidf2 d(di)
+fn ___powisf2 __powisf2 f(fi)
+
+# locale_charset is libcharset's, which sdkgen folds into libiconv, since
+# binaries built against older SDKs import it by libiconv's ordinal.
+# localcharset.h is not in the libiconv pass.
+
+library /usr/lib/libiconv.2.dylib
+
+fn _locale_charset locale_charset p()

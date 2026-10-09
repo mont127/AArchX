@@ -414,11 +414,14 @@
  * A repeat fault still takes the range invalidation, which feeds the churn
  * accounting, and OCERZ_FAULT_INV_RANGE=1 restores it for the first fault too.
  *
- * OCERZ_FPS=1 counts frames in cache mode: the block that begins at the Intel
- * cache's CGLFlushDrawable gets four instructions at its head that increment a
- * counter, and a thread prints the rate to stderr once a second.  The guest
- * sees nothing of it.  It is how a game's frame rate under ocerz is measured
- * when Steam's overlay counter, which relies on dyld interposing, is not there.
+ * OCERZ_FPS=1 counts frames: the block that begins at the Intel cache's
+ * CGLFlushDrawable, or in native mode at its virtual stub, gets four
+ * instructions at its head that increment a counter, and a thread prints the
+ * rate to stderr once a second.  Native mode also counts -[NSOpenGLContext
+ * flushBuffer], whose swap never reaches the stub (src/objcbridge.c).  The
+ * guest sees nothing of it.  It is how a game's frame rate under ocerz is
+ * measured when Steam's overlay counter, which relies on dyld interposing, is
+ * not there.
  *
  * OCERZ_TRIPSTAT=1 counts the times translated code leaves to the dispatcher,
  * which ocerz_jit_step sees once each, and samples one in 64 of their guest
@@ -15622,7 +15625,7 @@ void ocerz_ras_push(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t retaddr)
 
 static void **ras_slot_alloc(void);
 static void pending_add_ras(uint64_t target_key, void **ras_slot);
-static uint64_t g_fps_frames;
+uint64_t g_fps_frames;   /* objcbridge.c counts -flushBuffer into it in native mode */
 static uint64_t g_fps_start;
 
 static void *fps_report(void *arg)
@@ -15650,7 +15653,7 @@ static int fps_watch(uint64_t rip)
     static uint64_t target;
     if (state < 0) {
         state = 0;
-        if (getenv("OCERZ_FPS") && ocerz_mode == OCERZ_MODE_CACHE) {
+        if (getenv("OCERZ_FPS")) {   /* in native mode the name resolves to its virtual stub */
             target = ocerz_dyld_resolve_guest_sym("_CGLFlushDrawable");
             pthread_t t;
             if (target && pthread_create(&t, NULL, fps_report, NULL) == 0) {
