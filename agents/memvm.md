@@ -55,3 +55,66 @@ No semantic deviations intended.
 Bench program: ~/memvm-bench/membench.c (binaries membench-c / membench-rust,
 linked like the unit tests: CORE_OBJS + libocerz_rs.a for the rust tree,
 CORE_OBJS incl. src/mem.o for the C tree).
+
+## vm.c (4376 lines) -> rust/src/ported/vm/{mod,run,sig,prof}.rs
+
+Split: `mod.rs` holds the file-scope state, the private Mach/ucontext
+declarations, the small helpers (str_into/hex_into, g2h/h2g/ld/st, leaf_site),
+the cpu registry, suspend/resume, the riphist/recov rings, the reporting
+functions (bt/exc/arg/sel/ctx traps), watch/peek/dump accessors,
+mirror_host_signal and the atfork hooks. `run.rs` holds the setjmp trampoline,
+vm_init/install_handlers/peek_dump, the guest-call core (CallCtx +
+vm_call_body), run_cpu (RunCtx + run_cpu_body + run_fatal), thread
+attach/detach/guest_stack, the unstick watchdog, request_exit, vm_fatal_where
+and vm_run. `sig.rs` holds ripdump/threaddump/portdump handlers, the async
+signal handler, the kick handler and the ~1200-line crash_handler.
+`prof.rs` holds the guest profiler tables, sampling thread and final report.
+
+- `sigsetjmp` (two sites) is called through a module-private `global_asm!`
+  trampoline `_ocerz_vm_setjmp_run` (15 instructions, same shape as the lead
+  design note): pre-setjmp state lives in a `#[repr(C)]` ctx struct on the
+  outer frame (`CallCtx`/`RunCtx`), the code after setjmp is an
+  `unsafe extern "C" fn` body that the trampoline calls with the setjmp rc.
+  Teardown ordering matches C. NOTE: the asm block must carry
+  `.section __TEXT,__text` — without it the symbol linked into
+  `__DATA_CONST,__const` and every setjmp site SIGBUS'd (found via
+  test_callback, bisected with a standalone driver).
+- `ocerz_jit_decode_recover` is `__thread` in jit_flags.c — it must be
+  declared `#[thread_local]` in the module extern block, not a plain
+  `static mut`. Declared plainly it reads a different address and the
+  crash handler siglongjmps into garbage: every fault/signal/jit guest test
+  died with host SIGILL (rc=132). `ocerz_jit_exec_state` (jit_control.c) is
+  also `#[thread_local]` extern. Do not trust the bindgen `static mut` decls
+  for these two.
+- ucontext/mcontext: private `repr(C)` types in mod.rs, layout const-asserted
+  against SDK-measured values (ucontext_t 56B mcsize@40 mcontext@48;
+  mcontext64 816B es@0 ss@16 ns@288; thread_state 272B sp@248 pc@256
+  cpsr@264; esr@8; fpsr@512; sigjmp_buf 196B; siginfo_t 104B via libc).
+- All C `__thread`s are `#[thread_local] static mut` (g_cur_cpu,
+  g_pending_async_mask [volatile => AtomicU32 SeqCst/Relaxed], g_sig_recover,
+  t_jit_escape_r, g_recov_ring, g_riphist/_n, g_attached, fn-local
+  depth/last_alias_page/retry_addr/retry_n, CRASH_DEPTH).
+- `ocerz_leaf_site` (leaf.h static inline) and the mem.h helpers are private
+  `#[inline(always)]` copies; leaf_near_lo/hi read via Acquire atomics.
+- Handlers keep the exact C sigaction flags and async-signal-safe bodies
+  (write(2)+str_into/hex_into, no alloc).
+- Mach calls used by vm.c (thread_get/set_state, mach_vm_read_overwrite,
+  mach_vm_region, mach_port_names/get_attributes/get_set_status/peek,
+  dladdr, malloc_zone_malloc, _dyld_get_image_header/slide, sysctlbyname,
+  clock_gettime_nsec_np — the last two not bound by libc 0.2.190) are
+  declared in the module extern block with repr(C) info structs
+  (vm_region_basic_info_data_64, mach_port_status, mach_port_info_entry
+  trailer, thread_state_64/basic_info) and const size asserts.
+- Every C-bound string is a `c"..."` literal (fprintf formats, getenv names,
+  str_into/arg strings); no `"...".as_ptr()` anywhere.
+- `mrs tpidrro_el0` -> `core::arch::asm!("mrs {0}, tpidrro_el0")`.
+- `__typeof__` swaps -> `ptr::swap`; `__builtin_expect` -> plain branch.
+- `ocerz_jit_time_xlat`/`xlat_ns`/`retire_ns` are plain externs (not TLS).
+
+Verification: all 47 `nm -g ~/AArchX-c/src/vm.o` globals resolve in `ocerz`;
+direct units test_attach/test_callback(132015)/test_syscall/test_mem/
+test_shared_map/test_interp{,32}/test_jit{,32}/test_jit_exit/
+test_jit_order_transition/test_jit_psc_invalidate/test_wow64/test_loader/
+test_bridge/test_objcbridge/test_chain_concurrency/test_blocks all pass.
+Known non-regression still observed: dtest_jcc_gap_low -jit/-no-jit prints
+`faults 59` vs golden 60, identical on the pristine C tree (5/5 runs).
