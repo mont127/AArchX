@@ -51,7 +51,7 @@ unsafe extern "C" {
         address: *mut libc::mach_vm_address_t,
         size: *mut libc::mach_vm_size_t,
         flavor: vm_region_flavor_t,
-        info: *mut c_void,
+        info: *mut c_int,
         info_count: *mut c_uint,
         object_name: *mut libc::mach_port_t,
     ) -> libc::kern_return_t;
@@ -184,7 +184,7 @@ unsafe fn sb_vm_region(vm: *mut OcerzVM, cpu: *mut OcerzCPU, export: *const core
             sb_ptr(addrp) as *mut libc::mach_vm_address_t,
             sb_ptr(sizep) as *mut libc::mach_vm_size_t,
             flavor,
-            sb_ptr(info),
+            sb_ptr(info).cast::<c_int>(),
             sb_ptr(sb_arg(cpu, 5)) as *mut c_uint,
             sb_ptr(sb_arg(cpu, 6)) as *mut libc::mach_port_t,
         );

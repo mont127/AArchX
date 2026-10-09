@@ -16,7 +16,7 @@ const VM_PROT_WRITE: c_int = 2;
 const VM_PROT_EXECUTE: c_int = 4;
 const VM_FLAGS_ANYWHERE: u32 = 1;
 const VM_FLAGS_OVERWRITE: u32 = 0x4000;
-const VM_INHERIT_DEFAULT: c_int = 2;
+const VM_INHERIT_DEFAULT: libc::vm_inherit_t = 2;
 const VM_MEMORY_IOKIT: u32 = 21;
 const CLOCK_UPTIME_RAW: libc::clockid_t = 8;
 const OCERZ_SC_UNIVERSE_MAX: usize = 16;
@@ -135,7 +135,7 @@ unsafe extern "C" {
         address: *mut MachVmAddress,
         size: *mut MachVmSize,
         flavor: c_int,
-        info: *mut c_void,
+        info: *mut c_int,
         info_cnt: *mut MachMsgTypeNumber,
         object_name: *mut MachPort,
     ) -> KernReturn;
@@ -159,7 +159,7 @@ unsafe extern "C" {
         copy: c_int,
         cur_protection: *mut c_int,
         max_protection: *mut c_int,
-        inheritance: c_int,
+        inheritance: libc::vm_inherit_t,
     ) -> KernReturn;
     fn mach_vm_deallocate(task: MachPort, address: MachVmAddress, size: MachVmSize) -> KernReturn;
     fn mach_vm_allocate(
