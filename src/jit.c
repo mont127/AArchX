@@ -1531,9 +1531,12 @@ static void al_mark(uint64_t key)
     g_al_all = 1;
 }
 static inline int stack_plain_access_ok(void) { return g_plain_mem || stack_plain_ok(); }
+/* The source of the load being emitted when dep_plain_mark let it be plain. */
+static const X86Operand *g_dep_plain_op;
 static inline int mem_plain_access_ok(const X86Operand *m)
 {
     if (g_plain_mem) return 1;
+    if (m && m == g_dep_plain_op) return 1;
     return stack_plain_ok() && m->base == OCERZ_RSP && !m->riprel;
 }
 static inline int jgb_usable(void);
@@ -18249,6 +18252,73 @@ static int32_t  g_promo_push_of[JIT_MAX_BLOCK_INSNS];
 static unsigned long long g_promo_seq[JIT_MAX_BLOCK_INSNS];
 
 /*
+ * In ordered memory, every scalar load is an acquire (ldapr), so that no later
+ * access passes it, as x86 requires; and ldapr takes no index register, so an
+ * indexed one costs an add as well.  But arm64 already orders a load before
+ * any later load whose address it supplies.  So a load whose next memory
+ * access is a load addressed through the register it loaded, with nothing but
+ * register arithmetic between that leaves the register alone, can be a plain
+ * ldr: that next load cannot pass it, and is itself an acquire, or plain by the
+ * same rule, so nothing later passes either.  The last load of every chain
+ * stays an acquire.  p = next[p], obj->a->b and a vtable's function pointer
+ * are such chains.  OCERZ_NO_DEP_PLAIN=1 turns it off, and OCERZ_DEP_PLAIN_LOG=1
+ * names each load made plain as it is translated.
+ */
+static uint8_t g_dep_plain[JIT_MAX_BLOCK_INSNS];
+static int dep_load_dest(const X86Insn *in)
+{
+    if (in->op != OCERZ_OP_MOV && in->op != OCERZ_OP_MOVZX && in->op != OCERZ_OP_MOVSX && in->op != OCERZ_OP_MOVSXD)
+        return -1;
+    if (in->nops != 2 || in->mode32 || in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || in->lock) return -1;
+    const X86Operand *d = &in->ops[0], *m = &in->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return -1;
+    if (m->kind != OCERZ_OPK_MEM || (d->reg & 15) == OCERZ_RSP) return -1;
+    return d->reg & 15;
+}
+static int dep_reg_only(const X86Insn *in, int reg)
+{
+    switch (in->op) {
+    case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD: case OCERZ_OP_LEA:
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+    case OCERZ_OP_CMP: case OCERZ_OP_TEST: case OCERZ_OP_INC: case OCERZ_OP_DEC: case OCERZ_OP_NEG:
+    case OCERZ_OP_NOT: case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR: case OCERZ_OP_IMUL:
+        break;
+    default:
+        return 0;
+    }
+    if (in->op == OCERZ_OP_IMUL && in->nops < 2) return 0;
+    if (in->nops < 1 || in->ops[0].kind != OCERZ_OPK_REG || in->lock || in->rep) return 0;
+    for (int k = 0; k < in->nops; k++)
+        if (in->ops[k].kind == OCERZ_OPK_MEM && in->op != OCERZ_OP_LEA) return 0;
+    int writes = in->op != OCERZ_OP_CMP && in->op != OCERZ_OP_TEST;
+    return !(writes && (in->ops[0].reg & 15) == reg);
+}
+static void dep_plain_mark(const X86Insn *insns, int n)
+{
+    static int off = -1, log = -1;
+    if (off < 0) off = getenv("OCERZ_NO_DEP_PLAIN") ? 1 : 0;
+    if (log < 0) log = getenv("OCERZ_DEP_PLAIN_LOG") ? 1 : 0;
+    for (int i = 0; i < n; i++) g_dep_plain[i] = 0;
+    if (off || g_plain_mem) return;
+    for (int i = 0; i + 1 < n; i++) {
+        int r = dep_load_dest(&insns[i]);
+        if (r < 0) continue;
+        for (int j = i + 1; j < n && j <= i + 8; j++) {
+            const X86Insn *m = &insns[j];
+            if (dep_load_dest(m) >= 0) {
+                const X86Operand *a = &m->ops[1];
+                g_dep_plain[i] = !a->riprel && a->base != OCERZ_REG_NONE && (a->base & 15) != OCERZ_RSP &&
+                                 ((a->base & 15) == r || (a->index != OCERZ_REG_NONE && (a->index & 15) == r));
+                if (g_dep_plain[i] && log)
+                    fprintf(stderr, "ocerz: DEP_PLAIN %#llx\n", (unsigned long long)insns[i].rip);
+                break;
+            }
+            if (!dep_reg_only(m, r)) break;
+        }
+    }
+}
+
+/*
  * A run of pushes, or of pops, of 64-bit registers: every access is relative
  * to rsp as it was before the run, as stp, ldp and single stores or loads at
  * offsets, and rsp moves once, after them.  Each push or pop on its own moves
@@ -20408,8 +20478,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 leaf_entry = NULL;
         }
     }
+    dep_plain_mark(blk->insns, n);
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
+        g_dep_plain_op = g_dep_plain[i] ? &insn->ops[1] : NULL;
         g_cur_insn_idx = i;
         g_cur_insn_start = b.p;
         g_align_guard = g_align_blk || (g_align_any && al_marked(jit_key(insn->rip, mode32)));
@@ -20881,6 +20953,7 @@ promo_push_fallthrough:
         g_undo_want_slot = -1; g_undo_saved = 0;
     }
 
+    g_dep_plain_op = NULL;
     if (fpb_open >= 0) {
         fpb_emit_check(&b, &g_fpb[fpb_open]);
         for (int r = 0; r < 16; r++) { g_fpb[fpb_open].l0[r] = g_l0[r]; g_fpb[fpb_open].l0_dbl[r] = g_l0_dbl[r]; }

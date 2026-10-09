@@ -875,6 +875,18 @@ run_file_case dsignal_wait tests/dynamic/signal_wait.c 'OK'
 run_file_case dpreadv tests/dynamic/preadv.c 'OK'
 run_file_case dsysv_sem tests/dynamic/sysv_sem.c 'OK'
 run_file_case drel_acq_order tests/dynamic/rel_acq_order.c 'OK'
+run_file_case ddep_order tests/dynamic/dep_order.c 'OK'
+# dep_order names its three loads; in ordered mode only the first, whose result the second is
+# addressed through, may be made plain, and the last of the chain must stay an acquire.
+if run_bounded "$TMP/ddep_order.log.out" "$TMP/ddep_order.log.err" env OCERZ_DEP_PLAIN_LOG=1 "$OCERZ" "$TMP/ddep_order" &&
+   read -r _ dep_l1 dep_l2 dep_l3 < <(grep '^loads ' "$TMP/ddep_order.log.err") &&
+   grep -q "DEP_PLAIN $dep_l1\$" "$TMP/ddep_order.log.err" &&
+   ! grep -q -e "DEP_PLAIN $dep_l2\$" -e "DEP_PLAIN $dep_l3\$" "$TMP/ddep_order.log.err"; then
+    echo "PASS ddep_order_plain (only the load the next one depends on is plain)"; pass=$((pass+1))
+else
+    echo "FAIL ddep_order_plain (loads ${dep_l1:-?} ${dep_l2:-?} ${dep_l3:-?}; $(grep -c DEP_PLAIN "$TMP/ddep_order.log.err") plain)"
+    fail=$((fail+1))
+fi
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 export OCERZ_TSO_NARROW=1
