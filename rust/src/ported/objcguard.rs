@@ -5,7 +5,7 @@
 //! the dispatcher and the thread's entry, none of which catches anything, so
 //! without this the runtime found no handler and terminated, even when the
 //! guest had wrapped the send in @try.  ocerz_objc_guarded calls body(ctx) in a
-//! frame whose personality is ocerz_objc_guard_personality (src/objcbridge.c).
+//! frame whose personality is ocerz_objc_guard_personality (rust/src/ported/objcbridge/eh.rs).
 //! The unwinder's search finds a handler here; its cleanup phase runs every
 //! native frame's cleanups on the way, as it would for any catch, and then
 //! resumes at the landing pad, whose address ocerz_objc_guard_pad holds, since
