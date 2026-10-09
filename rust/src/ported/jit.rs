@@ -1482,6 +1482,8 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
             (*jit).code_cur = pp.add(pad) as *mut u32;
         }
     }
+    #[cfg(ocerz_jit_emit_audit)]
+    let audit_x64 = ocerz_jit_emit_audit_begin(jit);
     let mut b: A64Buf = core::mem::zeroed();
     b.start = (*jit).code_cur;
     b.p = (*jit).code_cur;
@@ -1491,6 +1493,8 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
     g_push_entry = entry;
     g_tc_entry = entry;
     g_tc_on = if g_tc_rec != 0 || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP as c_int { tc_usable(jit) } else { 0 };
+    #[cfg(ocerz_jit_emit_audit)]
+    if audit_x64 != 0 { g_tc_on = 1; }
 
     a64_stp_pre(bp, 29, 30, 31, -16);
     a64_stp_pre(bp, 19, 20, 31, -16);

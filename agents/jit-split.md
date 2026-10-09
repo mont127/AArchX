@@ -133,8 +133,11 @@ guarded call sites in a Rust core; the sink alone cannot capture native relocs.
 
 C uses `#ifdef OCERZ_JIT_EMIT_AUDIT`; the runner defines it only for its
 temporary core object. Older reference cores are instrumented in a temporary
-source copy at unique markers; reference sources are never edited. A Rust core
-with the original sink but without the begin hook is similarly instrumented
+source copy at unique markers; reference sources are never edited. The Rust core in
+rust/src/ported/jit.rs carries both guarded calls itself (behind
+`#[cfg(ocerz_jit_emit_audit)]`), so the runner builds it in place with only
+that cfg. An older Rust core
+with the original sink but without the begin hook is still instrumented
 in an isolated crate copy, with repository-relative build inputs symlinked
 read-only in use; normal sources and archives remain untouched.
 When `jit` itself is ported, preserve both calls behind
@@ -189,9 +192,11 @@ ports) reports **256/427,713**, of which x64 has 212,418 variants. Its complete
 normalized mismatch inventory is identical to `92b63de`; i386 and all native
 cases still match. Only sampled system-cache coverage changed.
 
-The runner recognizes the landed Rust core's original sink-only contract and
-adds the x64 begin/relocation guards in its temporary crate copy; this does not
-modify `rust/src/ported/jit.rs` or any other porter's tracked sources.
+The Rust core now carries the x64 begin/relocation guards in
+`rust/src/ported/jit.rs` itself, behind `#[cfg(ocerz_jit_emit_audit)]` (normal
+builds have an identical `otool -t` text), so the runner no longer copies or
+patches the crate for it; the temporary-copy instrumentation only applies to
+older Rust cores that have the sink alone.
 
 The following is the historical pre-Rust-core inventory:
 
