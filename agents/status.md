@@ -3,7 +3,7 @@
 | file | lines | owner | status |
 |---|---|---|---|
 | a64emit.c | 947 | runtime (ee47e957) | ported |
-| abi.c | 1877 | native1 | in progress |
+| abi.c | 1877 | native1 | ported |
 | apidb.c | 1108 | native1 | ported |
 | blocks.c | 914 | native1 | ported |
 | bridge.c | 3379 | native2 | ported |
