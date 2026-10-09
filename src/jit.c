@@ -3506,6 +3506,11 @@ static int emit_incdec_eager(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
+/* Every flag live after the instruction being emitted, not only those it
+   defines: inc and dec leave CF alone, and rebuild the old one only if a later
+   instruction reads it. */
+static uint64_t g_cur_live_after = OCERZ_FL_ALL;
+static inline int incdec_cf_live(void) { return (g_cur_live_after & OCERZ_CF) != 0; }
 static void emit_cc_predicate(A64Buf *b, unsigned cc);
 static inline int xmm_vreg(unsigned xr);
 static inline int xmm_is_pinned(unsigned xr);
@@ -3519,8 +3524,12 @@ static int emit_incdec_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     int is_inc = insn->op == OCERZ_OP_INC;
     need &= JIT_ARITH_FLAGS & ~(uint64_t)OCERZ_CF;
     if (need) {
-        emit_cc_predicate(b, OCERZ_CC_B);
-        a64_cset(b, JTU, A64_NE);
+        if (incdec_cf_live()) {
+            emit_cc_predicate(b, OCERZ_CC_B);
+            a64_cset(b, JTU, A64_NE);
+        } else {
+            a64_mov_imm64(b, JTU, 0);
+        }
     }
     if (d->size == 1) a64_uxtb(b, JT0, rd); else a64_uxth(b, JT0, rd);
     if (is_inc) a64_add_imm(b, 0, JT2, JT0, 1); else a64_sub_imm(b, 0, JT2, JT0, 1);
@@ -3568,8 +3577,12 @@ static int emit_incdec(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need == 0)
         return 1;
 
-    emit_cc_predicate(b, OCERZ_CC_B);
-    a64_cset(b, JT0, A64_NE);
+    if (incdec_cf_live()) {
+        emit_cc_predicate(b, OCERZ_CC_B);
+        a64_cset(b, JT0, A64_NE);
+    } else {
+        a64_mov_imm64(b, JT0, 0);
+    }
     emit_gpr_rd(b, 1, JT1, d->reg);
     emit_defer_flags(b, ocerz_cc_pack(is_inc ? OCERZ_CC_INC : OCERZ_CC_DEC,
                                       d->size, 0), JT0, JT1);
@@ -6265,6 +6278,9 @@ static unsigned producer_record_kind(const X86Insn *p, int *size)
     case OCERZ_OP_TEST: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
         *size = p->ops[0].size; return OCERZ_CC_LOGIC;
     case OCERZ_OP_ADD: *size = p->ops[0].size; return OCERZ_CC_ADD;
+    case OCERZ_OP_INC: case OCERZ_OP_DEC:
+        *size = p->ops[0].size;
+        return p->op == OCERZ_OP_INC ? OCERZ_CC_INC : OCERZ_CC_DEC;
     case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
         if (p->ops[1].kind == OCERZ_OPK_IMM && p->ops[0].kind == OCERZ_OPK_REG &&
             (p->ops[0].size == 4 || p->ops[0].size == 8)) {
@@ -6675,6 +6691,32 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         a64_patch_b(ready, a64_label(b));
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
+    }
+    /*
+     * After inc or dec, ZF, SF and OF are those of the result's own add or sub of
+     * 1, so the record's result is turned back into the operand and that is redone:
+     * every condition but the carry and parity ones, with no call-out.  CF is the
+     * one before the inc or dec, kept in the record, and stays with the generic path.
+     */
+    if (g_defer && (pkind == OCERZ_CC_INC || pkind == OCERZ_CC_DEC) && (psize == 4 || psize == 8) &&
+        cc != OCERZ_CC_P && cc != OCERZ_CC_NP && cc != OCERZ_CC_B && cc != OCERZ_CC_AE &&
+        cc != OCERZ_CC_BE && cc != OCERZ_CC_A) {
+        int dc = pkind == OCERZ_CC_DEC ? c_sub : c_add;
+        if (dc >= 0 && dc != A64_AL && dc != A64_NV) {
+            int sf = psize == 8;
+            a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
+            uint32_t *to_rf = a64_label(b); a64_cbz(b, 0, JT0, 0);
+            a64_ldr(b, 8, JTA, 20, CC_DST_OFF);
+            if (pkind == OCERZ_CC_DEC) { a64_add_imm(b, sf, JTA, JTA, 1); a64_subs_imm(b, sf, A64_ZR, JTA, 1); }
+            else                       { a64_sub_imm(b, sf, JTA, JTA, 1); a64_adds_imm(b, sf, A64_ZR, JTA, 1); }
+            a64_cset(b, JTF, dc);
+            uint32_t *ready = a64_label(b); a64_b(b, 0);
+            a64_patch_cbz(to_rf, a64_label(b));
+            emit_cc_predicate_rflags(b, cc);
+            a64_patch_b(ready, a64_label(b));
+            a64_subs_imm(b, 1, A64_ZR, JTF, 0);
+            return;
+        }
     }
     if (g_defer && pkind == OCERZ_CC_ADD && c_add >= 0 && (psize == 4 || psize == 8)) {
         a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
@@ -7271,20 +7313,18 @@ static int emit_rot(A64Buf *b, const X86Insn *insn, uint64_t need)
         a64_ubfx(b, 1, JT1, rd, 0, 1);
     else
         a64_ubfx(b, 1, JT1, rd, bits - 1, 1);
-    a64_mov_imm64(b, JTU, ~(uint64_t)OCERZ_CF & (cnt == 1 ? ~(uint64_t)OCERZ_OF : ~0ull));
+    a64_mov_imm64(b, JTU, ~(uint64_t)OCERZ_CF & ~(uint64_t)OCERZ_OF);
     a64_and_reg(b, 1, JTT, JTT, JTU, 0);
     a64_orr_reg(b, 1, JTT, JTT, JT1, 0);
-    if (cnt == 1) {
-        if (is_rol) {
-            a64_ubfx(b, 1, JTU, rd, bits - 1, 1);
-            a64_eor_reg(b, 1, JTU, JTU, JT1, 0);
-        } else {
-            a64_ubfx(b, 1, JTU, rd, bits - 2, 1);
-            a64_eor_reg(b, 1, JTU, JTU, JT1, 0);
-        }
-        a64_lsl_imm(b, 1, JTU, JTU, 11);
-        a64_orr_reg(b, 1, JTT, JTT, JTU, 0);
+    if (is_rol) {
+        a64_ubfx(b, 1, JTU, rd, bits - 1, 1);
+        a64_eor_reg(b, 1, JTU, JTU, JT1, 0);
+    } else {
+        a64_ubfx(b, 1, JTU, rd, bits - 2, 1);
+        a64_eor_reg(b, 1, JTU, JTU, JT1, 0);
     }
+    a64_lsl_imm(b, 1, JTU, JTU, 11);
+    a64_orr_reg(b, 1, JTT, JTT, JTU, 0);
     a64_str(b, 8, JTT, 20, RF_OFF);
     return 1;
 }
@@ -12401,7 +12441,7 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     int sf = size == 8;
     int ordered = !g_plain_mem;
 
-    int incdec_cf = (op == OCERZ_OP_INC || op == OCERZ_OP_DEC) && need;
+    int incdec_cf = (op == OCERZ_OP_INC || op == OCERZ_OP_DEC) && need && incdec_cf_live();
     if (incdec_cf) {
         emit_cc_predicate(b, OCERZ_CC_B);
         a64_cset(b, JT1, A64_NE);
@@ -12505,7 +12545,8 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
             emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2);
             break;
         case OCERZ_OP_INC: case OCERZ_OP_DEC:
-            a64_ldr(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
+            if (incdec_cf) a64_ldr(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
+            else a64_mov_imm64(b, JT1, 0);
             emit_defer_flags(b, ocerz_cc_pack(op == OCERZ_OP_INC ? OCERZ_CC_INC : OCERZ_CC_DEC, size, 0), JT1, JT2);
             break;
         case OCERZ_OP_NEG:
@@ -20243,6 +20284,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     }
 
     uint64_t fl_need[JIT_MAX_BLOCK_INSNS];
+    uint64_t fl_live[JIT_MAX_BLOCK_INSNS];
     uint64_t jcc_fall_live[JIT_MAX_BLOCK_INSNS];
     uint64_t entry_all;
     {
@@ -20277,11 +20319,14 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if (side_fused)
                 use = 0;
             fl_need[i] = def & live_seam;
+            fl_live[i] = live_seam;
             live_seam = (live_seam & ~def) | use;
             live_all = (live_all & ~def) | use;
 
-            if (g_no_lazyflags)
+            if (g_no_lazyflags) {
                 fl_need[i] = def;
+                fl_live[i] = OCERZ_FL_ALL;
+            }
         }
         static int pub_all = -1;
         if (pub_all < 0) pub_all = getenv("OCERZ_XLIVE_ALL") ? 1 : 0;
@@ -20513,6 +20558,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 emit_stack_delta_check(&b);
         }
         g_cur_need = fl_need[i];
+        g_cur_live_after = fl_live[i];
         g_cur_insns = blk->insns; g_cur_insns_n = n;
         {
             int mmx = 0;
@@ -20954,6 +21000,7 @@ promo_push_fallthrough:
     }
 
     g_dep_plain_op = NULL;
+    g_cur_live_after = OCERZ_FL_ALL;
     if (fpb_open >= 0) {
         fpb_emit_check(&b, &g_fpb[fpb_open]);
         for (int r = 0; r < 16; r++) { g_fpb[fpb_open].l0[r] = g_l0[r]; g_fpb[fpb_open].l0_dbl[r] = g_l0_dbl[r]; }

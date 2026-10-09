@@ -605,20 +605,19 @@ static int op_rotate(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
             res = ocerz_trunc((val << rc) | (val >> (bits - rc)), size);
         else
             res = ocerz_trunc((val >> rc) | (val << (bits - rc)), size);
-        int cf, of = 0;
+        /* OF is architecturally undefined past a count of 1; x86 hardware and Rosetta
+           give the count-1 formula for every count, so that is what is set. */
+        int cf, of;
         if (insn->op == OCERZ_OP_ROL)
             cf = (int)(res & 1);
         else
             cf = ocerz_msb(res, size);
-        if (masked == 1) {
-            if (insn->op == OCERZ_OP_ROL)
-                of = cf ^ ocerz_msb(res, size);
-            else
-                of = ocerz_msb(res, size) ^ (int)((res >> (bits - 2)) & 1);
-        }
+        if (insn->op == OCERZ_OP_ROL)
+            of = cf ^ ocerz_msb(res, size);
+        else
+            of = ocerz_msb(res, size) ^ (int)((res >> (bits - 2)) & 1);
         ocerz_flag_assign(cpu, OCERZ_CF, cf);
-        if (masked == 1)
-            ocerz_flag_assign(cpu, OCERZ_OF, of);
+        ocerz_flag_assign(cpu, OCERZ_OF, of);
         ocerz_write_op(cpu, insn, &insn->ops[0], res);
         return OCERZ_STEP_OK;
     }
