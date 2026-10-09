@@ -9,7 +9,6 @@
 //! `threads` the pthread keys and thread entry points, and `misc` the rest.
 
 mod common;
-pub(crate) use common::{ocerz_g2h, ocerz_st};
 mod fenv;
 mod fcntl;
 mod files;
