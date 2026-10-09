@@ -156,6 +156,7 @@ static void closure_add(uint64_t mh);
 static int hinfo_ro_index(uint64_t mh);
 static uint64_t objc_index_loaded(uint32_t idx);
 static void api_return(OcerzCPU *cpu, uint64_t result);
+static void dyldapi_fast_slots(uint64_t vtable);
 
 static void methdump_diag(const char *tag)
 {
@@ -979,6 +980,7 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
     }
 
     parse_build_version(ocerz_main_mh, &g_main_bv_platform, &g_main_bv_minos, &g_main_bv_sdk);
+    dyldapi_fast_slots(vtable);
 
     g_block_scratch = ocerz_map_anywhere(0x40, PROT_READ | PROT_WRITE);
 
@@ -1000,6 +1002,66 @@ static void api_return(OcerzCPU *cpu, uint64_t result)
     cpu->rip = ocerz_ld(rsp, 8);
     cpu->gpr[OCERZ_RSP] = rsp + 8;
     cpu->gpr[OCERZ_RAX] = result;
+}
+
+/*
+ * Slots whose answer is fixed for the process get real x86 code, which the JIT
+ * translates and chains into like any guest function.  Through the trap window
+ * every call left translated code for ocerz_dyldapi_dispatch and came back
+ * through a lookup of its return address, and CoreFoundation asks +0x238
+ * (dyld_program_sdk_at_least) and +0x210 in nearly every call: 1.2 million times
+ * while building a 200,000-entry dictionary, a tenth of the time it took.  The
+ * code answers as the switch in ocerz_dyldapi_dispatch and build_version_at_least
+ * do.  OCERZ_NO_DYLDAPI_FAST=1, or OCERZ_DYLDAPI_TRACE, keeps every slot trapping.
+ */
+static size_t fast_const(uint8_t *p, uint32_t v)
+{
+    p[0] = 0xb8;                               /* mov eax, v */
+    memcpy(p + 1, &v, 4);
+    p[5] = 0xc3;                               /* ret */
+    return 6;
+}
+
+static size_t fast_at_least(uint8_t *p, uint32_t plat, uint32_t have)
+{
+    static const uint8_t code[] = {
+        0xb8, 0x01, 0x00, 0x00, 0x00,          /* mov eax, 1 */
+        0x83, 0xfe, 0xff,                      /* cmp esi, -1: any platform */
+        0x74, 0x1a,                            /* je ret */
+        0x31, 0xc0,                            /* xor eax, eax */
+        0x81, 0xfe, 0, 0, 0, 0,                /* cmp esi, plat */
+        0x75, 0x10,                            /* jne ret */
+        0x48, 0x89, 0xf1,                      /* mov rcx, rsi */
+        0x48, 0xc1, 0xe9, 0x20,                /* shr rcx, 32: the version asked for */
+        0x81, 0xf9, 0, 0, 0, 0,                /* cmp ecx, have */
+        0x0f, 0x96, 0xc0,                      /* setbe al */
+        0xc3,                                  /* ret */
+    };
+    memcpy(p, code, sizeof code);
+    memcpy(p + 14, &plat, 4);
+    memcpy(p + 29, &have, 4);
+    return sizeof code;
+}
+
+static void dyldapi_fast_slots(uint64_t vtable)
+{
+    if (getenv("OCERZ_NO_DYLDAPI_FAST") || getenv("OCERZ_DYLDAPI_TRACE"))
+        return;
+    uint64_t code = ocerz_map_anywhere(0x1000, PROT_READ | PROT_WRITE);
+    if (!code)
+        return;
+    uint8_t *p = (uint8_t *)ocerz_g2h(code);
+    size_t n = 0;
+    ocerz_st(vtable + 0x210, 8, code + n);
+    n += fast_const(p + n, 1);
+    ocerz_st(vtable + 0x188, 8, code + n);
+    n += fast_const(p + n, g_main_bv_sdk);
+    ocerz_st(vtable + 0x190, 8, code + n);
+    n += fast_const(p + n, g_main_bv_minos);
+    ocerz_st(vtable + 0x238, 8, code + n);
+    n += fast_at_least(p + n, g_main_bv_platform, g_main_bv_sdk);
+    ocerz_st(vtable + 0x240, 8, code + n);
+    n += fast_at_least(p + n, g_main_bv_platform, g_main_bv_minos);
 }
 
 #define BULK_CB_MAX 16
