@@ -1,0 +1,7 @@
+FAIL ddlopen_cryptex-jit (got out='OK (this machine has no cryptex-only library to open)' exit=0; want out='OK' exit=0)
+FAIL ddlopen_cryptex-no-jit (got out='OK (this machine has no cryptex-only library to open)' exit=0; want out='OK' exit=0)
+FAIL ddlopen_image_list-jit (got out='dlopen_image_list bad: libxml2 was already listed
+FAIL ddlopen_image_list-no-jit (got out='dlopen_image_list bad: libxml2 was already listed
+FAIL dmetal_nocopy_low-jit (got out='extra 0: 16384 of 16384 wrong
+FAIL dmetal_nocopy_low-no-jit (got out='extra 0: 16384 of 16384 wrong
+FAIL dyldslots (slot 0x450 is answered but nothing witnesses it)
