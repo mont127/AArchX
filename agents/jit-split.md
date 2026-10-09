@@ -169,6 +169,47 @@ unique block variants / 53,776,852 arm64 words**. Reintroducing the known
 produced **27 differing/missing block variants**. The native coverage catches
 this bug even with ordered memory forced; the ordinary C control exits 0.
 
+### Rust-tip audit, 2026-10-09
+
+Against `16a7c2d`, the Rust engine at `360ad00` plus the audit hooks reports
+**MISMATCH: 76/427,594 blocks** with default `--corpus all`. I386 matches all
+215,295 translations; x64 compares 212,299 unique variants over 186 cases and
+has 76 mismatches. Every native case matches. The exact mismatching block
+identities and raw streams are emitted in the per-fixture artifacts above.
+
+All 76 differences are attributed to **the FP shared helper port**, specifically
+`rust/src/jit_internal.rs::emit_pk_consts_load` (used through
+`emit_slowcall_keep_lanes` by ported emitters). The C helper in
+`include/ocerz/jit_internal.h` immediately returns; Rust omits that unconditional
+return and emits twelve NaN-constant setup instructions whenever
+`g_pk_consts_needed` is set. Thus a fixture named for memory/control/SIMD can
+expose this FP-helper discrepancy without indicating a bug in its named piece.
+
+Attribution was checked experimentally without editing either checkout: a
+disposable C header removed only that early return, and only the five already
+ported JIT pieces were recompiled against it. Comparing its captures with the
+unchanged Rust engine left **zero mismatches across all affected fixtures**.
+No remaining discrepancy is attributed to flags, integer, memory or tcache in
+this captured corpus. This is an emission/performance discrepancy; the audit
+does not establish a guest-visible semantic failure. The owning porter should
+restore C behavior separately; this tooling change does not edit Rust modules.
+
+| Affected fixture(s) | Differing variants per case | Guest RIP(s) |
+| --- | ---: | --- |
+| `avx_basic` | 1 | `0x100000a60` |
+| `fault_lane` | 3 | `0x100000ae9`, `0x100000d19`, `0x100000f49` |
+| `fpb_loop_nan` (default/NaN/replay) | 2 each | `0x100001860`, `0x100001880` |
+| `fpb_undo_nan` (default/NaN/replay) | 2 each | `0x100001300`, `0x100001322` |
+| `jit_sse2` (default/NaN/replay) | 1 each | `0x1000009c0` |
+| `side_exit_l0` | 2 | `0x100000a68`, `0x100000a94` |
+| `simd_misc_jit` (default/NaN/replay) | 7 each | `0x100001930`, `0x100001a10` (2), `0x100001a30`, `0x100001ac2` (2), `0x100001b70` |
+| `avx_fp_jit` (NaN/replay) | 10 each | `0x100002d40`, `0x100002d80`, `0x100002dc0`, `0x100002e00`, `0x100002ec0`, `0x100002f00`, `0x100002f40`, `0x100002f80`, `0x100002fc0`, `0x100003080` |
+| `sw_vers`, `plutil` | 4 each | `0x7ff809fdce77`, `0x7ff809fdceac`, `0x7ff809fdcedb`, `0x7ff809fdcef3` |
+| `dtc_policy_low` | 2 | `0x2000005c1` (2 variants) |
+| `dlow_hoist` | 1 | `0x200000a70` |
+| `dhoist_forms_low` | 1 | `0x200000830` |
+| `dflip_phase_low` | 2 | `0x200000840` (2 variants) |
+
 ## Ownership map
 
 Line counts include opening prose and declarations. The exact exported symbols
