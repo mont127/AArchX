@@ -1,6 +1,7 @@
 odd 33 22 11 55 44 33 22 11
 long 1 f e d c b a 9 8 7 6 5 e 1 2
 repeat c3 b2 d4
+movpush fffffffffffffff8 88 77 fffffffffffffff8
 prologue 10851025925711000934
 faults 1
-fault 606 505 404 303 202 101 0
+fault 606 505 404 303 202 101 0 fffffffffffffff8

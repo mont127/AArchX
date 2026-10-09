@@ -2,8 +2,9 @@
  * Runs of 64-bit pushes and pops, which src/jit.c emits with one rsp update
  * per run (emit_stack_run): odd runs, a run of sixteen and one of seventeen,
  * which goes past the longest run and splits, a pop run that loads one
- * register twice, the push rbp / mov rbp, rsp / push prologue, and a push run
- * that walks into a protected page.  Its handler unprotects the page and
+ * register twice, the push rbp / mov rbp, rsp / push prologue, a run that
+ * pushes the register its mov of rsp wrote, and a push run with a mov of rsp
+ * in it that walks into a protected page.  Its handler unprotects the page and
  * returns, so the run restarts and has to end exactly as on x86.  Prints the
  * registers after each.  The first four lines are Rosetta's.  The fault lines
  * are x86's own result, one fault and every value in place: Rosetta on macOS
@@ -84,6 +85,19 @@ static void repeated_pop(void)
         : : "r"(r) : "rax", "rbx", "rcx", "rdx", "memory");
 }
 
+/* push rax; mov rbx, rsp; push rcx; push rbx: the second push stores the new rbx, rsp after one push. */
+static void mov_then_push(void)
+{
+    __asm__ volatile(
+        "mov %%rsp, %%rdx\n\t"
+        "mov $0x77, %%rax\n\t" "mov $0x88, %%rcx\n\t" "mov $0x99, %%rbx\n\t"
+        "push %%rax\n\t" "mov %%rsp, %%rbx\n\t" "push %%rcx\n\t" "push %%rbx\n\t"
+        "pop %%rsi\n\t" "pop %%rcx\n\t" "pop %%rax\n\t"
+        "sub %%rdx, %%rsi\n\t" "sub %%rdx, %%rbx\n\t"
+        "mov %%rsi, 0(%0)\n\t" "mov %%rcx, 8(%0)\n\t" "mov %%rax, 16(%0)\n\t" "mov %%rbx, 24(%0)\n\t"
+        : : "r"(r) : "rax", "rbx", "rcx", "rdx", "rsi", "memory");
+}
+
 __attribute__((noinline)) static uint64_t prologue(uint64_t a, uint64_t b)
 {
     uint64_t out;
@@ -117,14 +131,16 @@ static void fault_run(char *top)
         "mov %2, %%rsp\n\t"
         "mov $0x101, %%rax\n\t" "mov $0x202, %%rbx\n\t" "mov $0x303, %%rcx\n\t" "mov $0x404, %%rdx\n\t"
         "mov $0x505, %%rsi\n\t" "mov $0x606, %%rdi\n\t"
-        "push %%rax\n\t" "push %%rbx\n\t" "push %%rcx\n\t" "push %%rdx\n\t" "push %%rsi\n\t" "push %%rdi\n\t"
+        "push %%rax\n\t" "mov %%rsp, %%r12\n\t" "push %%rbx\n\t" "push %%rcx\n\t" "push %%rdx\n\t"
+        "push %%rsi\n\t" "push %%rdi\n\t"
         "pop %%r8\n\t" "pop %%r9\n\t" "pop %%r10\n\t" "pop %%r11\n\t" "pop %%rax\n\t" "pop %%rbx\n\t"
         "mov %%rsp, %%rcx\n\t"
         "mov (%1), %%rsp\n\t"
         "mov %%r8, 0(%0)\n\t" "mov %%r9, 8(%0)\n\t" "mov %%r10, 16(%0)\n\t" "mov %%r11, 24(%0)\n\t"
         "mov %%rax, 32(%0)\n\t" "mov %%rbx, 40(%0)\n\t" "sub %2, %%rcx\n\t" "mov %%rcx, 48(%0)\n\t"
+        "sub %2, %%r12\n\t" "mov %%r12, 56(%0)\n\t"
         : : "r"(r), "r"(&saved_rsp), "r"(top)
-        : "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory");
+        : "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "memory");
 }
 
 int main(void)
@@ -135,6 +151,8 @@ int main(void)
     print_regs("long", 15);
     repeated_pop();
     print_regs("repeat", 3);
+    mov_then_push();
+    print_regs("movpush", 4);
 
     uint64_t acc = 0;
     for (uint64_t i = 0; i < 100000; i++) acc += prologue(i, i ^ 5);
@@ -157,6 +175,6 @@ int main(void)
     mprotect(g_lower, g_page, PROT_NONE);
     fault_run(g_lower + g_page + 16);
     printf("faults %d\n", g_faults);
-    print_regs("fault", 7);
+    print_regs("fault", 8);
     return 0;
 }
