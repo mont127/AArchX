@@ -3,9 +3,9 @@
 | file | lines | owner | status |
 |---|---|---|---|
 | a64emit.c | 947 | - | C |
-| abi.c | 1877 | - | C |
-| apidb.c | 1108 | - | C |
-| blocks.c | 914 | - | C |
+| abi.c | 1877 | native1 | in progress |
+| apidb.c | 1108 | native1 | in progress |
+| blocks.c | 914 | native1 | in progress |
 | bridge.c | 3379 | - | C |
 | cache.c | 1496 | - | C |
 | cpu.c | 163 | decode-agent | in progress |
@@ -28,9 +28,9 @@
 | sysbridge.c | 2077 | - | C |
 | syscall.c | 8906 | devin-9aa5caef | in progress |
 | tcache.c | 863 | - | C |
-| vdylib.c | 1424 | - | C |
+| vdylib.c | 1424 | native1 | in progress |
 | vm.c | 4376 | - | C |
 | x87.c | 1277 | - | C |
-| abicall.s | 237 | - | C |
-| leaf.s | 598 | - | C |
+| abicall.s | 237 | native1 | in progress |
+| leaf.s | 598 | native1 | in progress |
 | objcguard.s | 60 | - | C |
