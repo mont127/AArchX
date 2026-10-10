@@ -4646,9 +4646,10 @@ static int insn_const_addr(const X86Insn *insn, uint64_t *ga)
 
 static void emit_guard_full(A64Buf *b, int addr_reg);
 #define GUARD_ARMS_MAX 512
-/* kind 0: the top strip's three-range guard; 1 and 2: wine_guard's sides (WG_LOW, WG_HIGH) */
-static struct { uint32_t *site, *back; int reg, idx, kind; } g_garm[GUARD_ARMS_MAX];
+/* kind 0: the top strip's three-range guard; 1 and 2: wine_guard's sides (WG_LOW, WG_HIGH); 3 and 4: wine_base_ea's (WB_HIGH, WB_LOW), off src */
+static struct { uint32_t *site, *back; int reg, idx, kind, src; } g_garm[GUARD_ARMS_MAX];
 static int g_n_garm;
+static int wine_base_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int size, int unscaled_ok, int32_t *disp_out);
 
 _Static_assert(OCERZ_TOP_LO == (1ull << 47) - (1ull << 25), "the fast low guard tests the top strip with shifts by 25 and 22");
 
@@ -5597,6 +5598,13 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         else     { if (store) emit_gpr_st_at(b, size, reg, sbase, (int32_t)m->disp, plain); else emit_gpr_ld_at(b, size, reg, sbase, (int32_t)m->disp, plain); }
         return 1;
     }
+    int32_t wd;
+    if (wine_base_ea(b, insn, m, size, 1, &wd)) {
+        int plain = mem_plain_access_ok(m);
+        if (vec) { if (store) emit_v_st_at(b, size, reg, JTA, wd, plain); else emit_v_ld_at(b, size, reg, JTA, wd, plain); }
+        else     { if (store) emit_gpr_st_at(b, size, reg, JTA, wd, plain); else emit_gpr_ld_at(b, size, reg, JTA, wd, plain); }
+        return 1;
+    }
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || m->riprel) return 0;
     if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
@@ -5699,7 +5707,9 @@ static struct {
 static int g_cur_fpb = -1;
 static int g_fcmp_self_vreg = -1;
 static int g_fcmp_self_idx = -1;
-static void ea_cache_reset(void) { g_ea_cache.valid = 0; }
+/* wine_base_ea's settled base: JTA holds base's host address, from after until JTA or base is written */
+static struct { int valid, idx; unsigned base; int32_t min; unsigned long long seq; const uint32_t *start, *after; } g_wb;
+static void ea_cache_reset(void) { g_ea_cache.valid = 0; g_wb.valid = 0; }
 static int a64_word_may_write_reg(uint32_t w, unsigned r)
 {
     if ((w & 0x1f) == r) return 1;
@@ -5738,11 +5748,137 @@ static void ea_cache_set_full(const A64Buf *b, unsigned base, unsigned index, in
 static void ea_cache_set(const A64Buf *b, const X86Operand *op) { ea_cache_set_full(b, op->base, op->index, op->scale & 3); }
 static void ea_cache_step(const X86Insn *in, const X86Insn *prev)
 {
+    if (g_wb.valid && (insn_may_write_gpr(in, g_wb.base) || (prev && insn_may_write_gpr(prev, g_wb.base))))
+        g_wb.valid = 0;
     if (!g_ea_cache.valid) return;
     if (g_ea_cache.base != OCERZ_REG_NONE &&
         (insn_may_write_gpr(in, g_ea_cache.base) || (prev && insn_may_write_gpr(prev, g_ea_cache.base)))) { g_ea_cache.valid = 0; return; }
     if (g_ea_cache.index != OCERZ_REG_NONE &&
         (insn_may_write_gpr(in, g_ea_cache.index) || (prev && insn_may_write_gpr(prev, g_ea_cache.index)))) { g_ea_cache.valid = 0; return; }
+}
+
+/*
+ * The Wine layout's guard settled on a base register instead of on each
+ * address (wine_base_ea).  An operand base+disp, no index, is guarded by the
+ * side of 12 GB its base is on: the base's host address goes to JTA (the base
+ * itself above 12 GB, the base plus low_base below it) and the access carries
+ * the displacement.  A later operand on the same base, while the block has
+ * written neither the base nor JTA and called nothing out, is that access
+ * alone: a third of the guards in Lua's blocks repeat one on a base guarded
+ * earlier in the block, and each was an add or mov, a compare, a branch and
+ * an orr.  The compare is with x29 (12 GB, wlim_on).  A base the block has not
+ * written yet has the side it was on at translation laid out inline and the
+ * other in an arm (WB_HIGH, WB_LOW); one it has written, whose side is not
+ * known, is an orr, the compare and a csel, since an arm taken each time costs
+ * two taken branches.
+ * The side is that of the base plus the least displacement the block takes
+ * off it (wine_base_min_disp), which a one-past-the-end pointer walked
+ * backwards from 12 GB needs; a base below 12 GB whose displacement reaches
+ * above it is an access past the end of the low window.  The displacement is
+ * kept to what one load or store encodes (-256..255 ordered, a scaled 12-bit
+ * offset plain).  Top-strip blocks, alignment-
+ * checked ones and rsp's operands keep their own paths.  OCERZ_NO_WINE_BASE=1
+ * turns it off.
+ */
+#define WB_HIGH 3
+#define WB_LOW 4
+/*
+ * The least negative displacement (down to -256, the most an operand settled
+ * here takes) off greg from instruction `from` until the block writes greg, or
+ * 0.  The side is decided by the base plus that: a one-past-the-end pointer
+ * of an array ending at 12 GB, walked backwards, is above 12 GB while every
+ * element it reaches is below.
+ */
+static int32_t wine_base_min_disp(unsigned greg, int from)
+{
+    int32_t mn = 0;
+    for (int k = from; k >= 0 && k < g_cur_insns_n; k++) {
+        const X86Insn *in = &g_cur_insns[k];
+        for (int o = 0; o < in->nops && o < 3; o++) {
+            const X86Operand *m = &in->ops[o];
+            if (m->kind == OCERZ_OPK_MEM && !m->riprel && m->base == greg && m->index == OCERZ_REG_NONE &&
+                m->disp < mn && m->disp >= -256)
+                mn = (int32_t)m->disp;
+        }
+        if (insn_may_write_gpr(in, greg)) break;
+    }
+    return mn;
+}
+/* 1 or 0 for the side greg was on at translation, -1 when the block has written it since */
+static int wine_base_expects_high(unsigned greg)
+{
+    if (!g_xlat_cpu || !g_cur_insns || g_cur_insn_idx < 0 || greg > 15) return -1;
+    for (int i = 0; i < g_cur_insn_idx; i++)
+        if (insn_may_write_gpr(&g_cur_insns[i], greg)) return -1;
+    return g_xlat_cpu->gpr[greg] >= OCERZ_LOW_LIMIT;
+}
+static int wine_base_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int size, int unscaled_ok, int32_t *disp_out)
+{
+    static int dis = -1;
+    if (dis < 0) dis = getenv("OCERZ_NO_WINE_BASE") ? 1 : 0;
+    if (dis || !wlim_on() || g_low_top || g_align_guard || g_pin_class != 3 || !g_cur_insns || !insn) return 0;
+    if (op->kind != OCERZ_OPK_MEM || op->riprel || insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
+    if (op->base == OCERZ_REG_NONE || op->base > 15 || op->index != OCERZ_REG_NONE || op->base == OCERZ_RSP) return 0;
+    if (val_slot(op->base) < 0) return 0;
+    int64_t d = op->disp;
+    int simm9 = d >= -256 && d <= 255;
+    int scaled = d >= 0 && size > 0 && (d % size) == 0 && d / size <= 4095;
+    int plain = mem_plain_access_ok(op);
+    /* A caller that takes only a scaled offset (unscaled_ok 0) gets one; otherwise one access must encode it. */
+    if (!unscaled_ok ? !scaled : plain ? !(scaled || simm9) : !simm9) return 0;
+    int hb = pin_hreg(val_slot(op->base));
+    /*
+     * Reused only for the instruction being translated, in the same buffer,
+     * with nothing since that writes JTA or calls (bl, blr), and no
+     * instruction from the settling one on that writes the base: fused
+     * instructions are translated together, so this does not rely on
+     * ea_cache_step seeing each one.
+     */
+    int cur = &g_cur_insns[g_cur_insn_idx] == insn;
+    int reuse = cur && g_wb.valid && g_wb.base == op->base && g_wb.seq == g_callout_seq && g_wb.start == b->start &&
+                g_wb.after && g_wb.after <= b->p && g_wb.idx <= g_cur_insn_idx && d >= g_wb.min;
+    for (const uint32_t *w = reuse ? g_wb.after : b->p; reuse && w < b->p; w++)
+        if (a64_word_may_write_x15(*w) || (*w & 0xfc000000u) == 0x94000000u || (*w & 0xfffffc1fu) == 0xd63f0000u)
+            reuse = 0;
+    for (int k = g_wb.idx; reuse && k < g_cur_insn_idx; k++)
+        if (insn_may_write_gpr(&g_cur_insns[k], op->base)) reuse = 0;
+    if (!reuse) {
+        if (ENV_ON("OCERZ_WLIM_CHECK")) {
+            a64_mov_imm64(b, JTT, OCERZ_LOW_LIMIT);
+            a64_subs_reg(b, 1, A64_ZR, JTT, WLIM, 0);
+            uint32_t *ok = a64_label(b); a64_bcond(b, A64_EQ, 0);
+            a64_emit32(b, 0xd4200000u | (0x77u << 5));
+            a64_patch_bcond(ok, a64_label(b));
+        }
+        int high = wine_base_expects_high(op->base);
+        int32_t mn = cur ? wine_base_min_disp(op->base, g_cur_insn_idx) : 0;
+        if (d < mn) mn = (int32_t)d;
+        int side = hb;
+        if (mn < 0) { a64_sub_imm(b, 1, JTT, hb, (uint32_t)-mn); side = JTT; }
+        if (high >= 0 && g_xlat_cpu && g_xlat_cpu->gpr[op->base] + (uint64_t)(int64_t)mn < OCERZ_LOW_LIMIT) high = 0;
+        if (high >= 0 && g_n_garm < GUARD_ARMS_MAX) {
+            if (high) a64_mov_reg(b, 1, JTA, hb);
+            else      (void)a64_try_orr_imm(b, 1, JTA, hb, ocerz_low_base);
+            a64_subs_reg(b, 1, A64_ZR, side, WLIM, 0);
+            g_garm[g_n_garm].site = a64_label(b);
+            a64_bcond(b, high ? A64_CC : A64_CS, 0);
+            g_garm[g_n_garm].back = a64_label(b);
+            g_garm[g_n_garm].reg = JTA;
+            g_garm[g_n_garm].src = hb;
+            g_garm[g_n_garm].idx = g_cur_insn_idx;
+            g_garm[g_n_garm].kind = high ? WB_HIGH : WB_LOW;
+            g_n_garm++;
+        } else {
+            (void)a64_try_orr_imm(b, 1, JTA, hb, ocerz_low_base);
+            a64_subs_reg(b, 1, A64_ZR, side, WLIM, 0);
+            a64_csel(b, 1, JTA, hb, JTA, A64_CS);
+        }
+        g_ea_cache.valid = 0;
+        g_wb.valid = cur; g_wb.base = op->base; g_wb.seq = g_callout_seq; g_wb.start = b->start; g_wb.after = b->p;
+        g_wb.idx = g_cur_insn_idx; g_wb.min = mn;
+    }
+    *disp_out = (int32_t)d;
+    return 1;
 }
 
 static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand *op,
@@ -5773,6 +5909,10 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
             *ra_out = JTA; *disp_out = (uint32_t)d;
             return 1;
         }
+    }
+    {
+        int32_t wd;
+        if (wine_base_ea(b, insn, op, size, unscaled_ok, &wd)) { *ra_out = JTA; *disp_out = (uint32_t)wd; return 1; }
     }
     if (!mem_fast_forms_ok()) return 0;
     if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
@@ -6583,8 +6723,15 @@ static int emit_arith_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     int writes = (op == OCERZ_OP_ADD || op == OCERZ_OP_SUB ||
                   op == OCERZ_OP_AND || op == OCERZ_OP_OR || op == OCERZ_OP_XOR);
 
+    /*
+     * The source goes to JT1 through the guard where it needs one, and the
+     * operation is done on the pinned register; in the Wine layout it went
+     * through JT0 and JT2 with a mov each way.  OCERZ_NO_ARITH_MEM_ANY=1
+     * keeps the fast path to identity forms.
+     */
     if (pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP) &&
-        emit_mem_load_plain(b, insn, s, sf ? 8 : 4, JT1)) {
+        (ENV_ON("OCERZ_NO_ARITH_MEM_ANY") ? emit_mem_load_plain(b, insn, s, sf ? 8 : 4, JT1)
+                                          : emit_mem_load_any(b, insn, s, sf ? 8 : 4, JT1))) {
         int rd = pin_hreg(pin_slot(d->reg));
         if (g_nzcv_want) {
             if (is_add || is_sub) {
@@ -15275,10 +15422,12 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             uint32_t tmpw[128];
             A64Buf tb = { tmpw, tmpw, tmpw + 128, 0, 0 };
             __typeof__(g_ea_cache) saved = g_ea_cache;
+            __typeof__(g_wb) saved_wb = g_wb;
             int saved_lits = g_n_raslit;
             ea_cache_reset();
             int ok = emit_flag_neutral(&tb, gap) && !tb.overflow;
             g_ea_cache = saved;
+            g_wb = saved_wb;
             g_n_raslit = saved_lits;
             if (!ok) return 0;
         }
@@ -19588,6 +19737,11 @@ static void emit_guard_arms(A64Buf *b, const uint32_t *entry)
             /* Expected at or above 12 GB, found below it: low_base. */
             a64_patch_bcond(g_garm[k].site, lo);
             (void)a64_try_orr_imm(b, 1, r, r, ocerz_low_base);
+        } else if (g_garm[k].kind == WB_HIGH || g_garm[k].kind == WB_LOW) {
+            /* wine_base_ea's base found on the other side: plus low_base below 12 GB, itself above. */
+            a64_patch_bcond(g_garm[k].site, lo);
+            if (g_garm[k].kind == WB_HIGH) (void)a64_try_orr_imm(b, 1, r, g_garm[k].src, ocerz_low_base);
+            else                           a64_mov_reg(b, 1, r, g_garm[k].src);
         } else {
             a64_patch_cbz(g_garm[k].site, lo);
             emit_guard_full(b, r);

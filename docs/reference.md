@@ -107,6 +107,7 @@ bug is in what that switch controls.
 | `OCERZ_WLIM_CHECK=1` | in a Wine process, trap before every guard whose x29 is not 12 GB (a debugging aid) |
 | `OCERZ_NO_LOW_STACK_PTR=1` | in a Wine process, keep rsp's own value in its register and add the stack's offset on every stack access, instead of keeping the host address rsp points at and converting only when rsp is read or written as a value |
 | `OCERZ_LOWSTACK_CHECK=1` | in a Wine process, trap before any instruction where the stack offset kept for rsp no longer matches rsp (a debugging aid) |
+| `OCERZ_NO_WINE_BASE=1` | in a Wine process, guard every memory operand's whole address, instead of guarding its base register once for the operands after it in the block and putting the displacement in each access |
 | `OCERZ_LOW_TOP_GUARD=1` | in a Wine process, test every access for the top strip instead of learning which blocks reach it from their first fault there |
 | `OCERZ_ALIGN_TEST_ALL=1` | test every ordered access for a 16-byte crossing instead of patching the sites that fault |
 | `OCERZ_NO_LEAF_INPLACE=1` | call `strlen`, `memcpy` and the nine other string and memory routines the ordinary way instead of through AArchX's own arm64 versions |
