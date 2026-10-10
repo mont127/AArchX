@@ -1,0 +1,10 @@
+len 8
+back hello cf
+handle 1
+const len 8 eq 1
+count 2 same 1
+find 6 2
+cmp exact -1 nocase 0
+keys 1
+bytes 1 mutable 1
+exit 0

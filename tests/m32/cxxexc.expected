@@ -1,0 +1,12 @@
+unwound 0
+unwound 1
+unwound 2
+unwound 3
+caught 42 live 0
+inner text
+rethrown text
+int 7
+kept 2 4 6 24 caught 212
+kept 2 4 6 24 caught 412
+any
+exit 0

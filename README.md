@@ -86,6 +86,7 @@ make apis
 | Ollama | command line and server work, and the menu-bar app runs |
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
 | Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window |
+| Batman: Arkham Asylum, a 32-bit Mac game | gameplay renders through m32, at about 31 fps (October 2026) |
 | Counter-Strike 2, under Wine with D3DMetal | reaches its window, then stops on an error Rosetta does not hit |
 | Photoshop | stops during startup |
 
@@ -180,6 +181,7 @@ The full list is in [Compatibility](docs/compatibility.md#known-limitations) and
 | [Getting started](docs/getting-started.md) | requirements, building, running a first program |
 | [Modes](docs/modes.md) | cache mode and native mode, and which to pick |
 | [Native mode in depth](docs/native-mode.md) | how native mode crosses into the Mac's frameworks, and its limits |
+| [32-bit Mac programs](docs/m32.md) | m32: i386 Mach-O programs, such as Feral's Batman: Arkham Asylum |
 | [Reference](docs/reference.md) | every command-line option, environment variable and exit code |
 | [Architecture](docs/architecture.md) | how a program is loaded, translated and run |
 | [Performance](docs/performance.md) | results against Rosetta and how to reproduce them |

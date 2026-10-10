@@ -1,0 +1,10 @@
+bump 12
+desc <c1 12>
+host-sees <c1 12>
+kind 1 1 0
+responds 1 0
+category 6
+class Counter
+array 3 3 TWO
+dict 42 2.50
+exit 0

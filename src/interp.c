@@ -804,7 +804,7 @@ static int op_stack(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
     case OCERZ_OP_POPF: {
         uint64_t v = ocerz_pop_mode(cpu, insn->opsize ? insn->opsize : 8, insn->mode32);
         uint64_t writable = OCERZ_CF | OCERZ_PF | OCERZ_AF | OCERZ_ZF | OCERZ_SF |
-                            OCERZ_TF | OCERZ_DF | OCERZ_OF;
+                            OCERZ_TF | OCERZ_DF | OCERZ_OF | ((uint64_t)1 << 18) | ((uint64_t)1 << 21);
         cpu->rflags = (v & writable) | OCERZ_FLAG_FIXED1 | OCERZ_IF;
         return OCERZ_STEP_OK;
     }

@@ -1,0 +1,4 @@
+area 42 live 1
+demangle Rect::area() 0
+array 5
+exit 0

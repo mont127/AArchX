@@ -1,0 +1,1 @@
+obj/crt_start.o -Wl,-e,start -mmacosx-version-min=10.7

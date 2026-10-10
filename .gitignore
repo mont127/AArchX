@@ -14,3 +14,7 @@ tools/cxx/build/
 tools/swift/build/
 runtime/guest/
 runtime/apis/
+tests/m32/obj/
+tests/m32/sdk/
+runtime/apis32/
+runtime/guest32

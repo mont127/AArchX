@@ -51,6 +51,11 @@ elif [ "${1:-}" = "--no-baseline" ]; then
     nobase=1
     shift
 fi
+guest=()
+if [ "${1:-}" = "--guest" ]; then   # --guest i386 writes m32's database
+    guest=(--guest "$2")
+    shift 2
+fi
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
     echo "usage: tools/sdkgen.sh [--update-baseline | --no-baseline] <library> [output-root]" >&2
     exit 2
@@ -74,7 +79,7 @@ clang -std=c11 -O2 -Wall -Wextra -Werror -o "$build/sdkgen" $tool/sdkgen.c $tool
     "$libclang" -Wl,-rpath,"$(dirname "$libclang")"
 
 "$build/sdkgen" --sdk "$sdk" --version "$ver" --tooldir "$PWD/$tool" --library "$lib" \
-    --out "$root" --build "$build"
+    --out "$root" --build "$build" ${guest[@]+"${guest[@]}"}
 
 new=$build/$leaf.coverage
 base=$tool/baseline/$leaf.coverage
@@ -120,7 +125,7 @@ fi
 
 out=$root/macos/$ver/$leaf.api
 installed=runtime/apis/macos/$ver/$leaf.api
-if [ -f "$installed" ] && [ "$(cd "$(dirname "$out")" && pwd -P)/$leaf.api" != "$(cd "$(dirname "$installed")" && pwd -P)/$leaf.api" ]; then
+if [ ${#guest[@]} = 0 ] && [ -f "$installed" ] && [ "$(cd "$(dirname "$out")" && pwd -P)/$leaf.api" != "$(cd "$(dirname "$installed")" && pwd -P)/$leaf.api" ]; then
     awk '
         NR == FNR { if ($1 ~ /^(fn|data|var|special|stub)$/) rec[$2] = $0; next }
         $1 == "fn" && rec[$2] != $0 {

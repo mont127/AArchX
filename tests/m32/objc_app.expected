@@ -1,0 +1,8 @@
+app 1
+launched 1
+frame 320 200
+input context 1
+draw 320
+ticks 3
+ran
+exit 0
