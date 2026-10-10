@@ -18145,9 +18145,10 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
     }
     /*
      * What a base must carry to pay.  Settled before a loop, a base costs the
-     * loop nothing, so one operand will do if the block has two; settled each
-     * time round, the narrow check is the price of an operand and a half.  The
-     * wide form's costs four times as much.
+     * loop nothing, so one operand will do if the block has two, or if the
+     * base is one the short check takes.  Settled each time round, that check
+     * is the price of one operand and the long one of two.  The wide form's
+     * costs twice that again.
      */
     int total = 0, slot_of[16], quick[16];
     for (int r = 0; r < 16; r++) {
@@ -18162,7 +18163,7 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
             int best = -1;
             for (int r = 0; r < 16; r++) {
                 int pre = loops && firstw[r] == n;
-                int least = g_llh_wide ? (pre ? 2 : 6) : pre ? (total >= 2 ? 1 : 2) : quick[r] ? 2 : 3;
+                int least = g_llh_wide ? (pre ? 2 : 6) : pre ? (total >= 2 || quick[r] ? 1 : 2) : quick[r] ? 2 : 3;
                 if (slot_of[r] < 0 && cnt[r] >= least && (best < 0 || cnt[r] > cnt[best])) best = r;
             }
             if (best < 0) break;
