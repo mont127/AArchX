@@ -165,6 +165,7 @@ typedef struct OcerzCPU {
     uint64_t slow_op;
     struct { uint64_t t, a0, a1, a2, ret, peek, peek2, peek3, peek4; int32_t num; } sysring[24];
     uint32_t sysring_n;
+    uint64_t low_stack_delta;   /* the Wine layout's stack delta, kept with x0 while rsp's register holds a host pointer */
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256
