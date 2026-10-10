@@ -1,0 +1,7 @@
+rect 1 2 30 40
+str {{1, 2}, {30, 40}}
+guest-stret 40
+host-calls-guest 1200
+fp 1.250 3.500
+point 5 6
+exit 0

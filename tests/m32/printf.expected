@@ -1,0 +1,10 @@
+-42 42 ff FF 10 Z str|   ab|cd   |
+-9000000000 18000000000 deadbeef 77 0x1234
+1.500000 3.142 1.234568e+04 0.0001    -2.50
+[k=9] 3
+[truncat] 9
+003.2|+4
+to stdout 1
+sscanf 4 17 2.5 word -5
+(null)
+exit 0

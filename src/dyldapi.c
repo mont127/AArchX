@@ -98,6 +98,7 @@
  * protection at all, __PAGEZERO, is left out of it.
  */
 #include "ocerz/dyldapi.h"
+#include "ocerz/m32.h"
 #include "ocerz/leaf.h"
 #include "ocerz/vdylib.h"
 #include "ocerz/vm.h"
@@ -2313,6 +2314,8 @@ int ocerz_dyldapi_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t off = cpu->rip - OCERZ_DYLDAPI_LO;
 
+    if (m32_active && cpu->mode32)
+        return m32_trap(vm, cpu);
     if (off == OCERZ_BRIDGE_OFF)
         return ocerz_vdylib_dispatch(vm, cpu);
     static int trace = -1;

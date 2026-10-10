@@ -1502,7 +1502,7 @@ const OcerzAbiSig *ocerz_abi_callback_sig(const void *slot_address, uint64_t *gu
     if (a < lo || (a - lo) % OCERZ_ABI_CALLBACK_STRIDE != 0)
         return NULL;
     uintptr_t slot = (a - lo) / OCERZ_ABI_CALLBACK_STRIDE;
-    if (slot >= abi_callback_capacity() || !g_abi_cb[slot].used)
+    if (slot >= abi_callback_capacity() || g_abi_cb[slot].used != 1)
         return NULL;
     if (guest_fn)
         *guest_fn = g_abi_cb[slot].guest_fn;
@@ -1874,9 +1874,34 @@ out:
         ocerz_block_release(owned[--nowned]);
 }
 
+static OcerzAbiForeignDispatch g_abi_foreign;
+
+void *ocerz_abi_callback_reserve(OcerzAbiForeignDispatch dispatch, unsigned *slot_out)
+{
+    pthread_mutex_lock(&g_abi_cb_lock);
+    unsigned cap = abi_callback_capacity();
+    if (g_abi_cb_n >= cap) {
+        pthread_mutex_unlock(&g_abi_cb_lock);
+        fprintf(stderr, "ocerz: abi: the callback bank is exhausted (%u slots)\n", cap);
+        return NULL;
+    }
+    unsigned slot = g_abi_cb_n++;
+    g_abi_cb[slot].guest_fn = 0;
+    g_abi_cb[slot].shape = NULL;
+    g_abi_cb[slot].used = 2;
+    g_abi_foreign = dispatch;
+    pthread_mutex_unlock(&g_abi_cb_lock);
+    *slot_out = slot;
+    return abi_callback_address(slot);
+}
+
 void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_t *v,
                                  const uint8_t *stack, void *x8, uint64_t *out_x, uint64_t *out_v)
 {
+    if (slot < OCERZ_ABI_CALLBACK_SLOTS && g_abi_cb[slot].used == 2) {
+        g_abi_foreign(slot, x, v, stack, x8, out_x, out_v);
+        return;
+    }
     int entered = errno;
     uint64_t gs = 0;
     abi_callback_dispatch(slot, x, v, stack, x8, out_x, out_v, entered, &gs);

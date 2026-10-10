@@ -1,0 +1,5 @@
+guest-throw Deep
+host-raise HostRaised n=3
+range NSRangeException
+finally 1 str
+exit 0

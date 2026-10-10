@@ -1,0 +1,2 @@
+zone mallocs 400 frees 600 memaligns 201 aligned 200 inzone 200 sum 0 enomem 1 untouched 1 einval 50
+exit 0

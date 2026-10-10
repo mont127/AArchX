@@ -33,11 +33,12 @@ export OCERZ_TCACHE ?= off
 ARCHFLAGS := -arch arm64
 CFLAGS := $(ARCHFLAGS) -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Iinclude -MMD -MP
 LDFLAGS := $(ARCHFLAGS)
-LDLIBS := -lcompression
+LDLIBS := -lcompression -lobjc
 
 SRCS := $(wildcard src/*.c)
 ASRCS := $(wildcard src/*.s)
-OBJS := $(SRCS:.c=.o) $(ASRCS:.s=.o)
+MSRCS := $(wildcard src/*.m)
+OBJS := $(SRCS:.c=.o) $(ASRCS:.s=.o) $(MSRCS:.m=.o)
 DEPS := $(SRCS:.c=.d)
 CORE_OBJS := $(filter-out src/main.o,$(OBJS))
 
@@ -49,6 +50,9 @@ ocerz: $(OBJS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+src/%.o: src/%.m
+	$(CC) $(CFLAGS) -fobjc-exceptions -c -o $@ $<
 
 src/%.o: src/%.s
 	$(CC) $(ARCHFLAGS) -g -c -o $@ $<
@@ -76,6 +80,23 @@ $(APIS_STAMP): $(APIS_INPUTS)
 		out=$$(tools/sdkgen.sh --no-baseline $$l 2>&1) || { echo "$$out" >&2; echo "sdkgen failed for $$l" >&2; exit 1; }; \
 	done
 	@touch $@
+
+APIS32_LIBS := libSystem CoreFoundation libobjc Foundation CoreGraphics AppKit libz SystemConfiguration Security CFNetwork WebKit \
+	CoreServices CoreMedia CoreVideo libiconv IOKit Carbon AudioToolbox libbz2 CoreAudio ForceFeedback QuartzCore \
+	OpenGL libGL Accelerate ApplicationServices CoreText OpenAL AudioUnit libcurl ImageIO
+APIS32_STAMP := runtime/apis32/.generated-$(APIS_VER)
+
+apis32: $(APIS32_STAMP)
+
+$(APIS32_STAMP): $(APIS_INPUTS)
+	@echo "generating i386 API databases from the macOS $(APIS_VER) SDK"
+	@for l in $(APIS32_LIBS); do \
+		out=$$(tools/sdkgen.sh --no-baseline --guest i386 $$l runtime/apis32 2>&1) || { echo "$$out" >&2; echo "sdkgen --guest i386 failed for $$l" >&2; exit 1; }; \
+	done
+	@touch $@
+
+check-m32: ocerz apis32
+	bash tests/run_m32_tests.sh
 
 check: ocerz unit guest apis
 	bash tests/run_guest_tests.sh --no-jit
@@ -121,4 +142,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: unit guest check apis clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift
+.PHONY: unit guest check apis apis32 check-m32 clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift
