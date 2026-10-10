@@ -1269,6 +1269,31 @@ static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_gu
 static int g_low_top;
 /* The Wine layout's stack delta in x0 (emit_stack_delta), for the block being translated. */
 static int g_lowstack, g_lowstack_from, g_lowstack_check, g_m32low;
+/*
+ * The Wine layout's stack pointer as a host pointer (lowptr_on).  rsp's
+ * register holds the guest rsp plus the stack delta, so a push, a pop, a call,
+ * a ret and an rsp-relative operand address the host's stack directly, as in
+ * the other layouts; x0 keeps the delta, and the cpu keeps a copy
+ * (low_stack_delta) for where x0 has been reused.  A read of rsp's value
+ * subtracts the delta (val_slot sends such reads to emit_gpr_rd); a write of a
+ * value works the delta out from it first.  A step by a constant (push, pop,
+ * call, ret, add or sub of an immediate, lea off rsp, and with -2^k) keeps the
+ * pointer on its side of 12 GB and moves it in place; add or sub of a register
+ * is a write of a value, since it may cross to the other stack.
+ * OCERZ_NO_LOW_STACK_PTR=1 keeps the guest value in the register.
+ */
+static int g_lowptr;
+static int g_lowptr_process;
+#define LOW_DELTA_OFF ((uint32_t)offsetof(OcerzCPU, low_stack_delta))
+struct A64Buf;
+static void emit_delta_of(struct A64Buf *b, int rd, int src);
+static void emit_lowptr_from_guest(struct A64Buf *b);
+static int lowptr_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_LOW_STACK_PTR") == NULL;
+    return on;
+}
 static void emit_stack_delta(A64Buf *b);
 
 static int stack_plain_ok(void)
@@ -1729,6 +1754,8 @@ static void emit_reload_jgb(A64Buf *b)
 {
     if (jgb_usable())
         a64_mov_imm64(b, JGB, ocerz_guest_base);
+    else if (g_lowptr)
+        a64_ldr(b, 8, JGB, 20, LOW_DELTA_OFF);
     else if (g_lowstack)
         emit_stack_delta(b);
     else if (g_m32low)
@@ -1774,6 +1801,19 @@ static inline int rsp_is_ptr(void)
            (g_pin_class == 3 && !g_xlat_mode32_fwd() && rsp_ptr3());
 }
 int g_pin_class_fwd(void) { return g_pin_class; }
+/*
+ * The pinned slot a guest register's 64-bit value can be read from, or -1
+ * when its register holds something else: rsp's holds rsp plus guest_base in
+ * offset mode and plus the stack delta in the Wine layout (g_lowptr), and is
+ * read through emit_gpr_rd, which takes that off.  Its low 32 bits are rsp's
+ * own in the Wine layout (the delta is 0 or low_base).
+ */
+static inline int val_slot(unsigned reg)
+{
+    if (reg == OCERZ_RSP && rsp_is_ptr() && (g_lowptr || (ocerz_low_base == 0 && ocerz_guest_base != 0)))
+        return -1;
+    return pin_slot(reg);
+}
 
 int ocerz_jit_time_xlat;
 uint64_t ocerz_jit_xlat_ns;
@@ -2778,7 +2818,7 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
 static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scratch);
 static void emit_stack_push64(A64Buf *b, const X86Insn *insn, int hs, int rv)
 {
-    if (!stack_guard_needed()) {
+    if (!stack_guard_needed() || (g_lowptr && stack_plain_access_ok() && rv != hs)) {
         emit_push_pinned(b, hs, rv);
         return;
     }
@@ -2798,6 +2838,10 @@ static void emit_stack_push64(A64Buf *b, const X86Insn *insn, int hs, int rv)
 }
 static void emit_stack_pop64(A64Buf *b, const X86Insn *insn, int hs, int rd)
 {
+    if (g_lowptr && stack_plain_access_ok() && rd != hs) {
+        a64_ldr_post64(b, rd, hs, 8);
+        return;
+    }
     if (!stack_guard_needed()) {
         if (stack_identity() || rsp_is_ptr()) {
             a64_ldr_post64(b, rd, hs, 8);
@@ -2953,7 +2997,7 @@ static void emit_gpr_rd(A64Buf *b, int sf, int dst, unsigned greg)
 {
     int s = pin_slot(greg);
     if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
-        if (jgb_usable() && ocerz_guest_base != 0)
+        if ((jgb_usable() && ocerz_guest_base != 0) || g_lowptr)
             a64_sub_reg(b, 1, dst, pin_hreg(s), JGB, 0);
         else if (ocerz_guest_base == 0)
             a64_mov_reg(b, 1, dst, pin_hreg(s));
@@ -2982,7 +3026,11 @@ static void emit_gpr_wr(A64Buf *b, int src, unsigned greg)
 {
     int s = pin_slot(greg);
     if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
-        if (jgb_usable() && ocerz_guest_base != 0)
+        if (g_lowptr) {
+            emit_delta_of(b, JGB, src);
+            a64_str(b, 8, JGB, 20, LOW_DELTA_OFF);
+            a64_add_reg(b, 1, pin_hreg(s), src, JGB, 0);
+        } else if (jgb_usable() && ocerz_guest_base != 0)
             a64_add_reg(b, 1, pin_hreg(s), src, JGB, 0);
         else if (ocerz_guest_base == 0)
             a64_mov_reg(b, 1, pin_hreg(s), src);
@@ -3001,7 +3049,8 @@ static void emit_spill_pinned(A64Buf *b)
 {
     for (int i = 0; i < g_n_pinned; i++) {
         if (rsp_is_ptr() && g_pin_hold[i] == OCERZ_RSP) {
-            a64_mov_imm64(b, JTA, ocerz_guest_base);
+            if (g_lowptr) a64_ldr(b, 8, JTA, 20, LOW_DELTA_OFF);
+            else          a64_mov_imm64(b, JTA, ocerz_guest_base);
             a64_sub_reg(b, 1, JTA, pin_hreg(i), JTA, 0);
             a64_str(b, 8, JTA, 20, GPR_OFF(OCERZ_RSP));
         } else {
@@ -3025,7 +3074,9 @@ static void emit_fill_pinned(A64Buf *b)
 {
     for (int i = 0; i < g_n_pinned; i++)
         a64_ldr(b, 8, pin_hreg(i), 20, GPR_OFF(g_pin_hold[i]));
-    if (rsp_is_ptr()) {
+    if (rsp_is_ptr() && g_lowptr) {
+        emit_lowptr_from_guest(b);
+    } else if (rsp_is_ptr()) {
         int s = pin_slot(OCERZ_RSP);
         assert(s >= 0);
         a64_mov_imm64(b, JTA, ocerz_guest_base);
@@ -3323,9 +3374,20 @@ static int emit_arith(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (writes && need == 0) {
         int rsp_d = rsp_is_ptr() && d->reg == OCERZ_RSP;
         int rsp_s = rsp_is_ptr() && s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP;
+        /*
+         * and rsp, -2^k (k up to 12) aligns rsp's register as it aligns rsp in
+         * the Wine layout, whose stack delta is 0 or low_base: AVX code does it
+         * on entry to every function that spills a ymm register.
+         */
+        if (rsp_d && sf && op == OCERZ_OP_AND && s->kind == OCERZ_OPK_IMM && ocerz_low_base != 0 && g_pin_class == 3 &&
+            s->imm >= 0xfffffffffffff000ull && ((0 - s->imm) & (0 - s->imm - 1)) == 0 &&
+            a64_try_and_imm(b, 1, pin_hreg(pin_slot(OCERZ_RSP)), pin_hreg(pin_slot(OCERZ_RSP)), s->imm))
+            return 1;
         if (rsp_d && (!sf || (op != OCERZ_OP_ADD && op != OCERZ_OP_SUB) || rsp_s))
             return 0;
         int ds = pin_slot(d->reg);
+        /* A register may move rsp to the other side of 12 GB: the guest value is formed and goes in through emit_gpr_wr. */
+        if (rsp_d && g_lowptr && s->kind != OCERZ_OPK_IMM) ds = -1;
         int rd = ds >= 0 ? pin_hreg(ds) : JT2;
         int rn = ds >= 0 ? rd : JT0;
         int rm;
@@ -3774,8 +3836,8 @@ static int emit_mov_logic_pair(A64Buf *b, const X86Insn *mov,
     }
 
     int sf = md->size == 8;
-    int ds = pin_slot(md->reg);
-    int ss = pin_slot(ms->reg);
+    int ds = val_slot(md->reg);
+    int ss = val_slot(ms->reg);
     int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     int rn = ss >= 0 ? pin_hreg(ss) : JT0;
     if (ss < 0)
@@ -3806,7 +3868,7 @@ static int emit_mov_logic_pair(A64Buf *b, const X86Insn *mov,
 
         rm = rn;
     } else {
-        int ls_slot = pin_slot(ls->reg);
+        int ls_slot = val_slot(ls->reg);
         if (ls_slot >= 0)
             rm = pin_hreg(ls_slot);
         else
@@ -3850,6 +3912,8 @@ static int emit_add_inc_pair(A64Buf *b, const X86Insn *add,
     }
 
     if (add_need != OCERZ_CF || inc_need == 0)
+        return 0;
+    if (val_slot(d->reg) != pin_slot(d->reg) || (s->kind == OCERZ_OPK_REG && val_slot(s->reg) != pin_slot(s->reg)))
         return 0;
 
     int sf = d->size == 8;
@@ -4128,7 +4192,7 @@ static int emit_mul_wide(A64Buf *b, const X86Insn *insn, uint64_t need, int is_s
     int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
     int src;
     if (o->kind == OCERZ_OPK_REG) {
-        if (o->high8 || pin_slot(o->reg) < 0) return 0;
+        if (o->high8 || val_slot(o->reg) < 0) return 0;
         src = pin_hreg(pin_slot(o->reg));
     } else if (o->kind == OCERZ_OPK_MEM) {
         if (!emit_mem_load_any(b, insn, o, o->size, JT1)) return 0;
@@ -4488,8 +4552,15 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
         else if (op->disp < 0) a64_sub_imm(b, 1, addr_reg, addr_reg, (uint32_t)-op->disp);
         return 1;
     }
+    /*
+     * Under g_lowptr rsp's register is a host pointer, which with a small
+     * displacement stays one, on the same stack, and the guard takes it as
+     * such; with an index or a segment base added it could be anything (code
+     * reaches p as rsp + (p - rsp)), so the base is rsp's value then.
+     */
+    int base_val = g_lowptr && op->base == OCERZ_RSP && (op->index != OCERZ_REG_NONE || seg != OCERZ_SEG_NONE);
     int index_done = 0;
-    if (op->base != OCERZ_REG_NONE && pin_slot(op->base) >= 0 &&
+    if (op->base != OCERZ_REG_NONE && pin_slot(op->base) >= 0 && !base_val &&
         (int64_t)initial >= -4095 && (int64_t)initial <= 4095) {
         int hb = pin_hreg(pin_slot(op->base));
         int xs = op->index != OCERZ_REG_NONE ? pin_slot(op->index) : -1;
@@ -4502,7 +4573,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     } else {
         a64_mov_imm64(b, addr_reg, initial);
         if (op->base != OCERZ_REG_NONE) {
-            int s = pin_slot(op->base);
+            int s = base_val ? -1 : pin_slot(op->base);
             if (s >= 0)
                 a64_add_reg(b, 1, addr_reg, addr_reg, pin_hreg(s), 0);
             else {
@@ -4621,13 +4692,31 @@ static int lowstack_delta_ok(void)
            !g_xlat_mode32 && pin_slot(OCERZ_RSP) >= 0 && rsp_is_ptr() && low_guard_fast_ok();
 }
 
-static void emit_stack_delta_into(A64Buf *b, int rd)
+/* rd = the stack delta of the guest address in src: low_base below 12 GB, 0 otherwise; flag-free. */
+static void emit_delta_of(A64Buf *b, int rd, int src)
 {
-    int hs = pin_hreg(pin_slot(OCERZ_RSP));
-    a64_lsr_imm(b, 1, rd, hs, 32);
+    a64_lsr_imm(b, 1, rd, src, 32);
     a64_sub_imm(b, 1, rd, rd, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
     a64_asr_imm(b, 1, rd, rd, 63);
     (void)a64_try_and_imm(b, 1, rd, rd, ocerz_low_base);
+}
+static void emit_stack_delta_into(A64Buf *b, int rd)
+{
+    emit_delta_of(b, rd, pin_hreg(pin_slot(OCERZ_RSP)));
+}
+/*
+ * rsp's register holds the guest value (filled from the cpu after a call-out):
+ * the cpu's copy takes its delta, and it becomes the host pointer.  The delta
+ * goes through JTA, not x0, which still holds what the call-out returned (a
+ * slow step's request to leave the block, tested after the fill); x0 is
+ * loaded from the copy afterwards, by emit_reload_jgb.
+ */
+static void emit_lowptr_from_guest(A64Buf *b)
+{
+    int hs = pin_hreg(pin_slot(OCERZ_RSP));
+    emit_delta_of(b, JTA, hs);
+    a64_str(b, 8, JTA, 20, LOW_DELTA_OFF);
+    a64_add_reg(b, 1, hs, hs, JTA, 0);
 }
 
 static void emit_stack_delta(A64Buf *b)
@@ -4635,6 +4724,29 @@ static void emit_stack_delta(A64Buf *b)
     emit_stack_delta_into(b, JGB);
 }
 
+/*
+ * OCERZ_LOWSTACK_CHECK=1 with rsp's register a host pointer: x0, the cpu's copy
+ * and the delta the pointer implies (low_base when it lies in the low window's
+ * host range) must agree before every instruction; a trap otherwise.
+ */
+static void emit_lowptr_check(A64Buf *b)
+{
+    int hs = pin_hreg(pin_slot(OCERZ_RSP));
+    a64_mov_imm64(b, JTU, ocerz_low_base);
+    a64_sub_reg(b, 1, JTT, hs, JTU, 0);
+    a64_lsr_imm(b, 1, JTT, JTT, 32);
+    a64_sub_imm(b, 1, JTT, JTT, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+    a64_asr_imm(b, 1, JTT, JTT, 63);
+    a64_and_reg(b, 1, JTT, JTT, JTU, 0);
+    a64_eor_reg(b, 1, JTT, JTT, JGB, 0);
+    a64_ldr(b, 8, JTU, 20, LOW_DELTA_OFF);
+    a64_eor_reg(b, 1, JTU, JTU, JGB, 0);
+    a64_orr_reg(b, 1, JTT, JTT, JTU, 0);
+    uint32_t *ok = a64_label(b);
+    a64_cbz(b, 1, JTT, 0);
+    a64_emit32(b, 0xd4200000u | (0x5d1u << 5));
+    a64_patch_cbz(ok, a64_label(b));
+}
 static void emit_stack_delta_check(A64Buf *b)
 {
     emit_stack_delta_into(b, JTT);
@@ -4809,7 +4921,8 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         g_ea_is_const = 0;
         return NULL;
     }
-    if (g_lowstack && insn && insn_stack_only(insn)) {
+    /* With rsp's register a host pointer an address may be either, and the ordinary guard is right for both. */
+    if (g_lowstack && !g_lowptr && insn && insn_stack_only(insn)) {
         g_ea_is_const = 0;
         a64_add_reg(b, 1, addr_reg, addr_reg, JGB, 0);
         return NULL;
@@ -5388,11 +5501,17 @@ static int lowstack_disp_ok(const X86Insn *insn, const X86Operand *m, int size, 
     int64_t d = m->disp;
     return (d >= 0 && (d % size) == 0 && d / size <= 4095) || (unscaled_ok && d >= -256 && d <= 255);
 }
-static int lowstack_disp_ea(A64Buf *b, const X86Insn *insn, const X86Operand *m, int size, int unscaled_ok)
+static int lowstack_disp_ea(A64Buf *b, const X86Insn *insn, const X86Operand *m, int size, int unscaled_ok,
+                            int *base)
 {
     if (!lowstack_disp_ok(insn, m, size, unscaled_ok)) return 0;
+    if (g_lowptr) {
+        *base = pin_hreg(pin_slot(OCERZ_RSP));
+        return 1;
+    }
     if (!ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, pin_hreg(pin_slot(OCERZ_RSP)), JGB, 0);
     ea_cache_set_full(b, OCERZ_RSP, OCERZ_REG_NONE, 0);
+    *base = JTA;
     return 1;
 }
 /*
@@ -5471,10 +5590,11 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         return 1;
     }
     if (llh_regoff_access(b, insn, m, size, reg, store, vec)) return 1;
-    if (lowstack_disp_ea(b, insn, m, size, 1)) {
+    int sbase;
+    if (lowstack_disp_ea(b, insn, m, size, 1, &sbase)) {
         int plain = mem_plain_access_ok(m);
-        if (vec) { if (store) emit_v_st_at(b, size, reg, JTA, (int32_t)m->disp, plain); else emit_v_ld_at(b, size, reg, JTA, (int32_t)m->disp, plain); }
-        else     { if (store) emit_gpr_st_at(b, size, reg, JTA, (int32_t)m->disp, plain); else emit_gpr_ld_at(b, size, reg, JTA, (int32_t)m->disp, plain); }
+        if (vec) { if (store) emit_v_st_at(b, size, reg, sbase, (int32_t)m->disp, plain); else emit_v_ld_at(b, size, reg, sbase, (int32_t)m->disp, plain); }
+        else     { if (store) emit_gpr_st_at(b, size, reg, sbase, (int32_t)m->disp, plain); else emit_gpr_ld_at(b, size, reg, sbase, (int32_t)m->disp, plain); }
         return 1;
     }
     if (!mem_fast_forms_ok()) return 0;
@@ -5635,7 +5755,8 @@ static int emit_mem_ea_plain(A64Buf *b, const X86Insn *insn, const X86Operand *o
 static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand *op,
                                 int size, int *ra_out, uint32_t *disp_out, int unscaled_ok)
 {
-    if (lowstack_disp_ea(b, insn, op, size, unscaled_ok)) { *ra_out = JTA; *disp_out = (uint32_t)op->disp; return 1; }
+    int sbase;
+    if (lowstack_disp_ea(b, insn, op, size, unscaled_ok, &sbase)) { *ra_out = sbase; *disp_out = (uint32_t)op->disp; return 1; }
     if (!ENV_ON("OCERZ_NO_HOIST_DISP")) {
         int64_t d = op->disp;
         int dfits = (d >= 0 && (d % size) == 0 && d / size <= 4095) || (unscaled_ok && d >= -256 && d <= 255);
@@ -5848,7 +5969,7 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
             return 0;
         if (!mem_native_store_ok())
             return 0;
-        int ss = pin_slot(s->reg);
+        int ss = val_slot(s->reg);
         int rv = ss >= 0 ? pin_hreg(ss) : JT1;
         if (ss >= 0 && emit_hoisted_mem_access(b, insn, d, s->size, rv, 1))
             return 1;
@@ -5884,6 +6005,8 @@ static int emit_mov_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, i
         if (d->high8 || (d->size != 4 && d->size != 8))
             return 0;
         int ds = pin_slot(d->reg);
+        /* A value loaded into rsp goes in through emit_gpr_wr when its register is not the plain guest value. */
+        if (rsp_is_ptr() && d->reg == OCERZ_RSP && !jgb_zero()) ds = -1;
         int rd = ds >= 0 ? pin_hreg(ds) : JT1;
         if (emit_hoisted_mem_access(b, insn, s, d->size, rd, 0))
             return 1;
@@ -6165,6 +6288,10 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             } else {
                 a64_mov_imm64(b, JT1, o->imm);
             }
+            if (g_lowptr) {
+                a64_str_pre64(b, rv, hs, -8);
+                return 1;
+            }
             a64_sub_imm(b, 1, JTA, hs, 8);
             a64_str_regoff(b, 8, rv, JTA, JGB, 0);
             a64_mov_reg(b, 1, hs, JTA);
@@ -6255,8 +6382,12 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
             int ds = pin_slot(o->reg);
             int rd = ds >= 0 ? pin_hreg(ds) : JT1;
-            a64_ldr_regoff(b, 8, rd, hs, JGB, 0);
-            a64_add_imm(b, 1, hs, hs, 8);
+            if (g_lowptr) {
+                a64_ldr_post64(b, rd, hs, 8);
+            } else {
+                a64_ldr_regoff(b, 8, rd, hs, JGB, 0);
+                a64_add_imm(b, 1, hs, hs, 8);
+            }
             if (ds < 0)
                 emit_gpr_wr(b, JT1, o->reg);
             return 1;
@@ -6556,6 +6687,25 @@ static int emit_lea(A64Buf *b, const X86Insn *insn)
     int ds = pin_slot(d->reg);
     int bs = s->base != OCERZ_REG_NONE ? pin_slot(s->base) : -1;
     int is = s->index != OCERZ_REG_NONE ? pin_slot(s->index) : -1;
+    /*
+     * lea off rsp, its register a host pointer (guest rsp plus guest_base, or
+     * in the Wine layout plus the stack delta, either in x0): into rsp itself
+     * it moves the pointer, which a small step keeps on its side; into another
+     * register it is the guest value, the pointer less x0.
+     */
+    if (rsp_is_ptr() && (g_lowptr || jgb_usable()) && s->base == OCERZ_RSP && s->index == OCERZ_REG_NONE &&
+        !s->riprel && insn->addrsize == 8 && d->size == 8 && ds >= 0 && bs >= 0 && s->disp >= -4095 &&
+        s->disp <= 4095 && insn->seg == OCERZ_SEG_NONE) {
+        int hs = pin_hreg(bs), rd = pin_hreg(ds), from = hs;
+        if (d->reg != OCERZ_RSP) {
+            if (jgb_zero()) from = hs;
+            else { a64_sub_reg(b, 1, rd, hs, JGB, 0); from = rd; }
+        }
+        if (s->disp > 0)       a64_add_imm(b, 1, rd, from, (uint32_t)s->disp);
+        else if (s->disp < 0)  a64_sub_imm(b, 1, rd, from, (uint32_t)-s->disp);
+        else if (rd != from)   a64_mov_reg(b, 1, rd, from);
+        return 1;
+    }
     int host_rsp_operand = rsp_is_ptr() &&
         (d->reg == OCERZ_RSP || s->base == OCERZ_RSP || s->index == OCERZ_RSP);
     if (ds >= 0 && !s->riprel && bs >= 0 && !host_rsp_operand) {
@@ -6889,7 +7039,7 @@ static int nzcv_gap_shape(const X86Insn *in)
         const X86Operand *d = &in->ops[0], *sr = &in->ops[1];
         return d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 4 || d->size == 8) &&
                sr->kind == OCERZ_OPK_REG && !sr->high8 && sr->size == d->size &&
-               pin_slot(d->reg) >= 0 && pin_slot(sr->reg) >= 0 && g_pin_class == 3;
+               val_slot(d->reg) >= 0 && val_slot(sr->reg) >= 0 && g_pin_class == 3;
     }
     if (in->op == OCERZ_OP_SETCC) {
         const X86Operand *d = &in->ops[0];
@@ -7606,7 +7756,7 @@ static int emit_div(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
         patch_guard_skip(skip, a64_label(b));
     } else if (o->kind == OCERZ_OPK_REG) {
         if (o->high8) return 0;
-        if (pin_slot(o->reg) >= 0 && g_pin_class == 3 && pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0)
+        if (val_slot(o->reg) >= 0 && g_pin_class == 3 && pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0)
             hdv = pin_hreg(pin_slot(o->reg));
         else
             emit_gpr_rd(b, sf, JT2, o->reg);
@@ -11838,6 +11988,16 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
     (void)insn; (void)exit_sites; (void)n_exits;
     if (insn->mode32)
         return emit_leave32(b, insn);
+    if (g_lowptr && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && pin_slot(OCERZ_RBP) >= 0 &&
+        stack_plain_access_ok()) {
+        /* rsp takes rbp's value, so its delta first, then the pop off the host pointer. */
+        int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
+        emit_delta_of(b, JGB, hb);
+        a64_str(b, 8, JGB, 20, LOW_DELTA_OFF);
+        a64_add_reg(b, 1, hs, hb, JGB, 0);
+        a64_ldr_post64(b, hb, hs, 8);
+        return 1;
+    }
     if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || pin_slot(OCERZ_RBP) < 0 ||
         !stack_plain_access_ok() || !jgb_usable() || stack_guard_needed())
         return 0;
@@ -13014,7 +13174,7 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     if (rsp_is_ptr() && (m->index == OCERZ_RSP || (r && r->reg == OCERZ_RSP) ||
                          (s && s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
         return 0;
-    if (op == OCERZ_OP_CMPXCHG && (pin_slot(OCERZ_RAX) < 0 || !s || s->kind != OCERZ_OPK_REG || s->high8 || pin_slot(s->reg) < 0)) return 0;
+    if (op == OCERZ_OP_CMPXCHG && (pin_slot(OCERZ_RAX) < 0 || !s || s->kind != OCERZ_OPK_REG || s->high8 || val_slot(s->reg) < 0)) return 0;
     if (!mem_native_store_ok()) return 0;
     int atomic = op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD || op == OCERZ_OP_CMPXCHG || insn->lock;
     int is_cmp = op == OCERZ_OP_CMP || op == OCERZ_OP_TEST;
@@ -13162,7 +13322,7 @@ static int emit_xchg_reg32(A64Buf *b, const X86Insn *insn)
 {
     const X86Operand *x = &insn->ops[0], *y = &insn->ops[1];
     int size = x->size;
-    if (insn->nops != 2 || y->kind != OCERZ_OPK_REG || y->size != size || pin_slot(x->reg) < 0 || pin_slot(y->reg) < 0)
+    if (insn->nops != 2 || y->kind != OCERZ_OPK_REG || y->size != size || val_slot(x->reg) < 0 || val_slot(y->reg) < 0)
         return 0;
     int rx = pin_hreg(pin_slot(x->reg)), ry = pin_hreg(pin_slot(y->reg));
     if (size == 4) {
@@ -14668,7 +14828,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                     return 1;
                 if (rsp_is_ptr() && !sz4 && s->reg == OCERZ_RSP &&
                     d->reg != OCERZ_RSP && ds >= 0 && ss >= 0) {
-                    if (jgb_usable() && ocerz_guest_base != 0)
+                    if ((jgb_usable() && ocerz_guest_base != 0) || g_lowptr)
                         a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), JGB, 0);
                     else if (ocerz_guest_base == 0)
                         a64_mov_reg(b, 1, pin_hreg(ds), pin_hreg(ss));
@@ -15066,8 +15226,9 @@ static int emit_flag_neutral(A64Buf *b, const X86Insn *in)
     case OCERZ_OP_MOV: {
         const X86Operand *d = &in->ops[0], *s = &in->ops[1];
         if (stack_gap_load_ok(in)) {
-            if (!lowstack_disp_ea(b, in, s, d->size, 1)) return 0;
-            emit_gpr_ld_at(b, d->size, pin_hreg(pin_slot(d->reg)), JTA, (int32_t)s->disp, 1);
+            int sbase;
+            if (!lowstack_disp_ea(b, in, s, d->size, 1, &sbase)) return 0;
+            emit_gpr_ld_at(b, d->size, pin_hreg(pin_slot(d->reg)), sbase, (int32_t)s->disp, 1);
             return 1;
         }
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
@@ -15240,14 +15401,14 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
             ccop = ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0);
         }
     } else if (producer->op == OCERZ_OP_CMP) {
-        int ds = d_in_jt0 ? -1 : pin_slot(d->reg);
+        int ds = d_in_jt0 ? -1 : val_slot(d->reg);
         record_src = ds >= 0 ? pin_hreg(ds) : JT0;
         if (ds < 0 && !d_in_jt0)
             emit_gpr_rd(b, sf, JT0, d->reg);
         if (s_in_jt1) {
             record_dst = JT1;
         } else if (s->kind == OCERZ_OPK_REG && !s->high8) {
-            int ss = pin_slot(s->reg);
+            int ss = val_slot(s->reg);
             record_dst = ss >= 0 ? pin_hreg(ss) : JT1;
             if (ss < 0)
                 emit_gpr_rd(b, sf, JT1, s->reg);
@@ -15276,7 +15437,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
         ccop = ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0);
     cmp_done:;
     } else {
-        int ds = d_in_jt0 ? -1 : pin_slot(d->reg);
+        int ds = d_in_jt0 ? -1 : val_slot(d->reg);
         int rn = ds >= 0 ? pin_hreg(ds) : JT0;
         if (ds < 0 && !d_in_jt0)
             emit_gpr_rd(b, sf, JT0, d->reg);
@@ -15303,7 +15464,7 @@ static int emit_cmp_test_jcc(A64Buf *b, const X86Insn *producer,
                 }
             }
         } else if (s->kind == OCERZ_OPK_REG && !s->high8) {
-            int ss = pin_slot(s->reg);
+            int ss = val_slot(s->reg);
             int rm = ss >= 0 ? pin_hreg(ss) : JT1;
             if (ss < 0)
                 emit_gpr_rd(b, sf, JT1, s->reg);
@@ -15589,7 +15750,7 @@ static int emit_incdec_jcc(A64Buf *b, const X86Insn *producer,
         return 0;
     const X86Operand *d = &producer->ops[0];
     int sf = d->size == 8;
-    int ds = pin_slot(d->reg);
+    int ds = val_slot(d->reg);
     int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds >= 0) {
         if (producer->op == OCERZ_OP_INC)
@@ -15666,6 +15827,8 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
         d->high8 || id->high8 ||
         (d->size != 4 && d->size != 8) || id->size != d->size ||
         id->reg == d->reg)
+        return 0;
+    if (rsp_is_ptr() && (d->reg == OCERZ_RSP || id->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
         return 0;
     if (s->kind == OCERZ_OPK_REG) {
         if (s->high8 || s->size != d->size)
@@ -15819,7 +15982,7 @@ static int emit_logic_jmp_incdec_jcc(A64Buf *b, const X86Insn *logic,
     const X86Insn *jcc = &target[1];
     const X86Operand *id = &incdec->ops[0];
     int sf = id->size == 8;
-    int ids = pin_slot(id->reg);
+    int ids = val_slot(id->reg);
     int rd = ids >= 0 ? pin_hreg(ids) : JT2;
     if (ids < 0)
         emit_gpr_rd(b, sf, rd, id->reg);
@@ -16039,10 +16202,10 @@ static int match_ifconv_diamond(const X86Insn *test, const X86Insn *jcc,
             const X86Operand *src = &m->complex[0].ops[1];
             const X86Operand *latch = &m->direct[1].ops[0];
             const X86Operand *nested_test = &m->nested[0].ops[0];
-            if (pin_slot(test->ops[0].reg) < 0 ||
-                pin_slot(nested_test->reg) < 0 ||
-                pin_slot(acc->reg) < 0 || pin_slot(tmp->reg) < 0 ||
-                pin_slot(src->reg) < 0 || pin_slot(latch->reg) < 0)
+            if (val_slot(test->ops[0].reg) < 0 ||
+                val_slot(nested_test->reg) < 0 ||
+                val_slot(acc->reg) < 0 || val_slot(tmp->reg) < 0 ||
+                val_slot(src->reg) < 0 || val_slot(latch->reg) < 0)
                 continue;
 
             m->direct_is_taken = direct_taken;
@@ -17446,7 +17609,7 @@ static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uin
     uint32_t *declined = a64_label(b); a64_cbnz(b, 1, JT0, 0);
     if (low) emit_leaf_low_result(b, low);
     emit_reload_mem_base(b);
-    if (low) {
+    if (low && !g_lowptr) {
         /* The Wine layout's return address is at rsp plus the stack delta in x0, as pop's. */
         a64_ldr_regoff(b, 8, JT1, pin_hreg(pin_slot(OCERZ_RSP)), JGB, 0);
         a64_add_imm(b, 1, pin_hreg(pin_slot(OCERZ_RSP)), pin_hreg(pin_slot(OCERZ_RSP)), 8);
@@ -19593,7 +19756,7 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
     if (!stack_plain_access_ok() || ENV_ON("OCERZ_NO_STACK_PAIR")) return 0;
     int op = insns[i].op;
     if (op != OCERZ_OP_PUSH && op != OCERZ_OP_POP) return 0;
-    int direct = 0;
+    int direct = g_lowptr;
     if (!g_lowstack) {
         if (!runs || g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || !jgb_usable() || stack_guard_needed())
             return 0;
@@ -21019,6 +21182,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_pinned = 0;
     g_pin_class = 0;
     g_lowstack = 0;
+    g_lowptr = 0;
     g_m32low = 0;
 
     g_defer = !g_no_regflags;
@@ -21352,10 +21516,17 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         a64_add_reg(&b, 1, pin_hreg(rs), pin_hreg(rs), JT0, 0);
     }
     g_lowstack = lowstack_delta_ok();
+    g_lowptr = g_lowstack && lowptr_on();
+    if (g_lowptr) g_lowptr_process = 1;
     g_lowstack_from = 0;
     g_lowstack_check = g_lowstack && ENV_ON("OCERZ_LOWSTACK_CHECK");
     if (g_lowstack)
         emit_stack_delta(&b);
+    if (g_lowptr) {
+        int hs = pin_hreg(pin_slot(OCERZ_RSP));
+        a64_str(&b, 8, JGB, 20, LOW_DELTA_OFF);
+        a64_add_reg(&b, 1, hs, hs, JGB, 0);
+    }
     g_m32low = !g_lowstack && m32_lowreg_ok();
     if (g_m32low)
         a64_mov_imm64(&b, JGB, ocerz_low_base);
@@ -21787,7 +21958,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             ea_cache_reset();
         }
         g_ea_is_const = 0;
-        if (g_lowstack) {
+        if (g_lowstack && !g_lowptr) {
             int moved = 0;
             for (int k = g_lowstack_from; k < i; k++)
                 moved |= lowstack_disturbs(&blk->insns[k]);
@@ -21796,6 +21967,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 emit_stack_delta(&b);
             if (g_lowstack_check)
                 emit_stack_delta_check(&b);
+        } else if (g_lowptr && g_lowstack_check) {
+            emit_lowptr_check(&b);
         }
         g_cur_need = fl_need[i];
         g_cur_live_after = fl_live[i];
@@ -22602,6 +22775,7 @@ promo_push_fallthrough:
         blk->body_code = NULL;
         g_pin = NULL; g_pin_hold = NULL; g_n_pinned = 0; g_pin_class = 0;
         g_lowstack = 0;
+        g_lowptr = 0;
         g_m32low = 0;
         cache_insert(jit, blk);
         return blk;
@@ -22624,6 +22798,7 @@ promo_push_fallthrough:
         blk->code = NULL;
         g_pin = NULL; g_pin_hold = NULL; g_n_pinned = 0; g_pin_class = 0;
         g_lowstack = 0;
+        g_lowptr = 0;
         g_m32low = 0;
         cache_insert(jit, blk);
         return blk;
@@ -22890,6 +23065,18 @@ static const JitBlock *fault_block(const OcerzJit *jit, const uint32_t *pc)
 
 static int fault_insn_index(const JitBlock *b, const uint32_t *pc);
 
+/*
+ * Guest rsp from the host register of a block keeping it as a pointer: guest
+ * plus guest_base, or in the Wine layout guest plus the stack delta, which the
+ * pointer itself shows (low_base when it lies in the low window's host range).
+ */
+static uint64_t guest_rsp_from_host(const JitBlock *b, uint64_t value)
+{
+    if (g_lowptr_process && ocerz_low_base && b->pin_class == 3 && !blk_mode32(b))
+        return value - (value - ocerz_low_base < OCERZ_LOW_LIMIT ? ocerz_low_base : 0);
+    return value - ocerz_guest_base;
+}
+
 int ocerz_jit_guest_gprs_at(const struct OcerzVM *vm, const void *host_pc,
                             const uint64_t *host_x, const OcerzCPU *cpu, uint64_t out[16])
 {
@@ -22906,7 +23093,7 @@ int ocerz_jit_guest_gprs_at(const struct OcerzVM *vm, const void *host_pc,
         if ((b->pin_class == 2 ||
              (b->pin_class == 3 && b->n_insns > 0 && !blk_mode32(b) && rsp_ptr3())) &&
             b->host_holds[i] == OCERZ_RSP)
-            value -= ocerz_guest_base;
+            value = guest_rsp_from_host(b, value);
         out[b->host_holds[i]] = value;
     }
     return 1;
@@ -22924,7 +23111,7 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
         if ((b->pin_class == 2 ||
              (b->pin_class == 3 && b->n_insns > 0 && !blk_mode32(b) && rsp_ptr3())) &&
             b->host_holds[i] == OCERZ_RSP)
-            value -= ocerz_guest_base;
+            value = guest_rsp_from_host(b, value);
         cpu->gpr[b->host_holds[i]] = value;
     }
     if (b->n_push_fix && b->code) {
@@ -22944,7 +23131,7 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
                 else if (op2 == OCERZ_OP_POP || op2 == OCERZ_OP_RET) delta += 8;
             }
             uint64_t slot = cpu->gpr[OCERZ_RSP] + (uint64_t)(-delta);
-            *(uint64_t *)(uintptr_t)(slot + ocerz_guest_base) = p->ra;
+            *(uint64_t *)ocerz_g2h(slot) = p->ra;
         }
     }
 }

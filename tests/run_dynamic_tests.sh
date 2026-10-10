@@ -861,6 +861,7 @@ run_golden_case dleaf_low tests/dynamic/leaf_low.c tests/dynamic/leaf_low.out
 run_golden_case dslot_jump tests/dynamic/slot_jump.c tests/dynamic/slot_jump.out
 run_golden_case dwine_guard tests/dynamic/wine_guard.c tests/dynamic/wine_guard.out
 run_golden_case dlowstack_disp tests/dynamic/lowstack_disp.c tests/dynamic/lowstack_disp.out
+run_golden_case dlowstack_ptr tests/dynamic/lowstack_ptr.c tests/dynamic/lowstack_ptr.out
 run_golden_case dtest_jcc_gap tests/dynamic/test_jcc_gap.c tests/dynamic/test_jcc_gap.out
 run_golden_case dsetcc_zx tests/dynamic/setcc_zx.c tests/dynamic/setcc_zx.out
 run_golden_case dhoist_forms tests/dynamic/hoist_forms.c tests/dynamic/hoist_forms.out
@@ -1105,6 +1106,7 @@ run_low_golden_case dleaf_low_low tests/dynamic/leaf_low.c tests/dynamic/leaf_lo
 run_low_golden_case dslot_jump_low tests/dynamic/slot_jump.c tests/dynamic/slot_jump.out
 run_low_golden_case dwine_guard_low tests/dynamic/wine_guard.c tests/dynamic/wine_guard.out
 run_low_golden_case dlowstack_disp_low tests/dynamic/lowstack_disp.c tests/dynamic/lowstack_disp.out
+run_low_golden_case dlowstack_ptr_low tests/dynamic/lowstack_ptr.c tests/dynamic/lowstack_ptr.out
 run_low_golden_case dtest_jcc_gap_low tests/dynamic/test_jcc_gap.c tests/dynamic/test_jcc_gap.out
 run_low_golden_case dsetcc_zx_low tests/dynamic/setcc_zx.c tests/dynamic/setcc_zx.out
 run_low_golden_case dhoist_forms_low tests/dynamic/hoist_forms.c tests/dynamic/hoist_forms.out
