@@ -16,6 +16,8 @@
  *   - a list walked by mov (%rdi), %rdi, its nodes on both sides of 12 GB;
  *   - a table followed by index, i = tab[i], where some entries are indices
  *     that reach from the table into a mapping on the other side;
+ *   - the same walk with stores and narrower accesses under the loaded index,
+ *     with and without a displacement, scaled by the access size or not;
  *   - straight-line code that steps its index, reloads it, and reloads its
  *     base, between operands;
  *   - a cpuid inside the loop, after which the hoisted bases are formed again;
@@ -324,6 +326,53 @@ static uint64_t follow_c(const uint64_t *tab, uint64_t i, uint64_t n)
 }
 
 /*
+ * i = tab[i] again, with the index scaled to each access size: a 4-byte load
+ * and a 2-byte store off tab and out with the scale their size is, an 8-byte
+ * store, a 2-byte load and a 1-byte store with a displacement or a scale of
+ * another size.  Every operand checks its own index, and one that reaches
+ * across 12 GB makes its access in the operand's arm.
+ */
+__attribute__((noinline)) static uint64_t scatter(uint64_t *tab, uint64_t *out, uint64_t i, uint64_t n)
+{
+    uint64_t acc = 0, w, h, j;
+    __asm__ volatile(
+        "1:\n\t"
+        "mov (%[tab],%[i],8), %[i]\n\t"
+        "lea (,%[i],2), %[w]\n\t"
+        "lea (,%[i],4), %[h]\n\t"
+        "lea (,%[i],8), %[j]\n\t"
+        "movl (%[tab],%[w],4), %%eax\n\t"
+        "movzwl 2(%[tab],%[h],2), %%edx\n\t"
+        "add %%rax, %[acc]\n\t"
+        "add %%rdx, %[acc]\n\t"
+        "mov %[acc], (%[out],%[i],8)\n\t"
+        "movb %%dl, 3(%[out],%[j])\n\t"
+        "movw %%ax, (%[out],%[h],2)\n\t"
+        "rol $7, %[acc]\n\t"
+        "dec %[n]\n\t"
+        "jnz 1b"
+        : [acc] "+&r"(acc), [i] "+&r"(i), [n] "+&r"(n), [w] "=&r"(w), [h] "=&r"(h), [j] "=&r"(j)
+        : [tab] "r"(tab), [out] "r"(out) : "rax", "rdx", "memory", "cc");
+    return acc;
+}
+static uint64_t scatter_c(uint64_t *tab, uint64_t *out, uint64_t i, uint64_t n)
+{
+    uint64_t acc = 0;
+    do {
+        i = *(const uint64_t *)((uintptr_t)tab + i * 8);
+        uint32_t a = *(const uint32_t *)((uintptr_t)tab + i * 8);
+        uint16_t d = *(const uint16_t *)((uintptr_t)tab + i * 8 + 2);
+        acc += a;
+        acc += d;
+        *(uint64_t *)((uintptr_t)out + i * 8) = acc;
+        *(uint8_t *)((uintptr_t)out + i * 8 + 3) = (uint8_t)d;
+        *(uint16_t *)((uintptr_t)out + i * 8) = (uint16_t)a;
+        acc = (acc << 7) | (acc >> 57);
+    } while (--n);
+    return acc;
+}
+
+/*
  * Straight-line: operands on p and q under i; i stepped twice between them;
  * then i reloaded from memory and p from memory, with operands after each
  * that must go by the new values.  The new index reaches from p into another
@@ -591,6 +640,34 @@ int main(void)
         }
         uint64_t want = follow_c(ta, (uint64_t)(rep % 64), 5000), got = follow(ta, (uint64_t)(rep % 64), 5000);
         if (got != want) return fail("follow", got, want);
+    }
+
+    /* the same tables, with scatter's stores landing 600 cells on in whichever area the index names */
+    for (int rep = 0; rep < 64; rep++) {
+        uint64_t *ta = srcs[rep & 3], *tb = srcs[(rep >> 2) & 3];
+        if (tb == ta) tb = gc;
+        uint64_t over = (uint64_t)(tb - ta), want = 0;
+        static uint64_t keep_a[N + 2], keep_b[N + 2];
+        for (int pass = 0; pass < 2; pass++) {
+            uint64_t s = 777 + (uint64_t)rep;
+            memset(ta, 0, sizeof ga);
+            memset(tb, 0, sizeof ga);
+            for (int k = 0; k < 66; k++) {
+                s = s * 6364136223846793005ull + 1442695040888963407ull;
+                ta[k] = ((s >> 33) % 64) + ((s >> 20 & 3) == 0 ? over : 0);
+                s = s * 6364136223846793005ull + 1442695040888963407ull;
+                tb[k] = ((s >> 33) % 64) + ((s >> 20 & 3) == 0 ? 0 : over);
+            }
+            if (!pass) {
+                want = scatter_c(ta, ta + 600, (uint64_t)(rep % 64), 3000);
+                memcpy(keep_a, ta, sizeof ga);
+                memcpy(keep_b, tb, sizeof ga);
+                continue;
+            }
+            uint64_t got = scatter(ta, ta + 600, (uint64_t)(rep % 64), 3000);
+            if (got != want) return fail("scatter", got, want);
+            if (memcmp(ta, keep_a, sizeof ga) || memcmp(tb, keep_b, sizeof ga)) return fail("scatter stores", (uint64_t)rep, 0);
+        }
     }
 
     /* straight-line: p, q, the area the reloaded index reaches into and the reloaded base, each from the four areas */

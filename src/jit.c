@@ -1624,7 +1624,13 @@ static uint8_t g_llh_ix[LLH_MAX], g_llh_pre[LLH_MAX], g_llh_quick[LLH_MAX];
 static uint8_t g_llh_cov[JIT_MAX_BLOCK_INSNS];      /* two bits an operand: its slot plus one */
 static uint8_t g_llh_loose[JIT_MAX_BLOCK_INSNS];    /* a bit an operand: it checks its own index */
 #define LLH_ARMS_MAX 64
-static struct { uint32_t *site, *back; int reg, idx; uint8_t base, other, scale; int32_t disp; } g_larm[LLH_ARMS_MAX];
+static struct {
+    uint32_t *site, *back;
+    int reg, idx;
+    uint8_t base, other, scale;
+    int32_t disp;
+    int8_t acc_size, acc_reg, acc_store;     /* an access the arm makes itself (llh_regoff_access), size 0 if none */
+} g_larm[LLH_ARMS_MAX];
 static int g_n_larm;
 static uint32_t *g_llh_bail_tb[3 * LLH_MAX], *g_llh_bail_cb[2 * LLH_MAX + 1];
 static int g_n_llh_bail_tb, g_n_llh_bail_cb;
@@ -4384,6 +4390,7 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
         g_larm[g_n_larm].other = (uint8_t)llh_other(op, ls);
         g_larm[g_n_larm].scale = (uint8_t)sc;
         g_larm[g_n_larm].disp = (int32_t)op->disp;
+        g_larm[g_n_larm].acc_size = 0;
         g_n_larm++;
         g_ea_lowhoisted = 1;
         g_ea_lowhoisted_reg = addr_reg;
@@ -5269,6 +5276,69 @@ static int lowstack_disp_ea(A64Buf *b, const X86Insn *insn, const X86Operand *m,
     ea_cache_set_full(b, OCERZ_RSP, OCERZ_REG_NONE, 0);
     return 1;
 }
+/*
+ * An indexed operand the Wine layout's hoist covers, made as one access off
+ * the hoisted base.  With no displacement and a scale the access size
+ * matches, that is a register-offset load or store, so in i = next[i] each
+ * load waits on the one before and on nothing else, where forming the address
+ * first put an add between them; otherwise the base plus the scaled index goes
+ * in JTA, kept for the next operand on the same pair, and the displacement
+ * rides in the access.  An operand that checks its own index (loose) branches
+ * to its arm when the index is out of range, and the arm forms the address
+ * the long way and makes the access itself before it comes back.
+ * OCERZ_NO_LOW_HOIST_REGOFF=1 turns it off.
+ */
+static int llh_regoff_access(A64Buf *b, const X86Insn *insn, const X86Operand *m, int size, int reg, int store,
+                             int vec)
+{
+    int loose = 0, ls = llh_slot_ex(insn, m, &loose);
+    if (ls < 0 || m->index == OCERZ_REG_NONE || vec || !mem_plain_access_ok(m) ||
+        (loose && g_n_larm >= LLH_ARMS_MAX) || ENV_ON("OCERZ_NO_LOW_HOIST_REGOFF"))
+        return 0;
+    int sc = m->scale & 3, want = size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0;
+    int regoff = m->disp == 0 && (sc == 0 || sc == want);
+    int fits = (m->disp >= 0 && m->disp % size == 0 && m->disp / size <= 4095) || (m->disp >= -256 && m->disp <= 255);
+    if (!regoff && !fits) return 0;
+    if (store && (reg == JTT || reg == JTU || reg == JTA)) return 0;
+    int hx = pin_hreg(pin_slot(llh_other(m, ls))), hb = g_llh_hreg[ls];
+    if (loose) {
+        if (g_llh_wide) {
+            a64_add_reg(b, 1, JTT, JMEMAUX, hx, sc);
+            a64_lsr_imm(b, 1, JTT, JTT, 31);
+        } else {
+            a64_lsr_imm(b, 1, JTT, hx, 31 - sc);
+        }
+        g_larm[g_n_larm].site = a64_label(b);
+        a64_cbnz(b, 1, JTT, 0);
+    }
+    if (regoff) {
+        if (store) emit_gpr_st_regoff(b, size, reg, hb, hx, sc != 0, 1);
+        else       emit_gpr_ld_regoff(b, size, reg, hb, hx, sc != 0, 1);
+    } else {
+        if (loose || !ea_cache_reusable(b, m)) {
+            a64_add_reg(b, 1, JTA, hb, hx, sc);
+            if (!loose) ea_cache_set(b, m);
+        }
+        if (store) emit_gpr_st_at(b, size, reg, JTA, (int32_t)m->disp, 1);
+        else       emit_gpr_ld_at(b, size, reg, JTA, (int32_t)m->disp, 1);
+    }
+    if (loose) {
+        g_larm[g_n_larm].back = a64_label(b);
+        g_larm[g_n_larm].reg = JTA;
+        g_larm[g_n_larm].idx = g_cur_insn_idx;
+        g_larm[g_n_larm].base = (uint8_t)g_llh_greg[ls];
+        g_larm[g_n_larm].other = (uint8_t)llh_other(m, ls);
+        g_larm[g_n_larm].scale = (uint8_t)sc;
+        g_larm[g_n_larm].disp = (int32_t)m->disp;
+        g_larm[g_n_larm].acc_size = (int8_t)size;
+        g_larm[g_n_larm].acc_reg = (int8_t)reg;
+        g_larm[g_n_larm].acc_store = (int8_t)store;
+        g_n_larm++;
+        ea_cache_reset();
+    }
+    return 1;
+}
+
 static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand *m,
                                int size, int reg, int store, int vec)
 {
@@ -5281,6 +5351,7 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         else     { if (store) emit_gpr_st_at(b, size, reg, lhr, (int32_t)m->disp, plain); else emit_gpr_ld_at(b, size, reg, lhr, (int32_t)m->disp, plain); }
         return 1;
     }
+    if (llh_regoff_access(b, insn, m, size, reg, store, vec)) return 1;
     if (lowstack_disp_ea(b, insn, m, size, 1)) {
         int plain = mem_plain_access_ok(m);
         if (vec) { if (store) emit_v_st_at(b, size, reg, JTA, (int32_t)m->disp, plain); else emit_v_ld_at(b, size, reg, JTA, (int32_t)m->disp, plain); }
@@ -19165,6 +19236,10 @@ static void emit_guard_arms(A64Buf *b, const uint32_t *entry)
         if (g_larm[k].disp > 0)      a64_add_imm(b, 1, r, r, (uint32_t)g_larm[k].disp);
         else if (g_larm[k].disp < 0) a64_sub_imm(b, 1, r, r, (uint32_t)-g_larm[k].disp);
         emit_guard_full(b, r);
+        if (g_larm[k].acc_size) {
+            if (g_larm[k].acc_store) emit_gpr_st_at(b, g_larm[k].acc_size, g_larm[k].acc_reg, r, 0, 1);
+            else                     emit_gpr_ld_at(b, g_larm[k].acc_size, g_larm[k].acc_reg, r, 0, 1);
+        }
         uint32_t *here = a64_label(b);
         a64_b(b, (int32_t)(g_larm[k].back - here));
         if (g_n_fpbmap < JIT_MAX_BLOCK_INSNS) {
