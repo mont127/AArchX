@@ -631,6 +631,8 @@
  * video decoder and Feral's IndirectX use it in i386 code.
  * shld and shrd there also take a count in cl or a memory destination
  * (emit_shiftd32), with the flags dead as in emit_shiftd.
+ * In an m32 program an import stub's jump calls its export from inside the
+ * block (emit_bridge_fastcall32), as a 64-bit one does through the bridge.
  *
  * An fs- or gs-relative operand adds the segment base to the wrapped address
  * without wrapping the sum, as ocerz_ea does, and then takes the same guard and
@@ -689,6 +691,7 @@
 #include "ocerz/leaf.h"
 #include "ocerz/tcache.h"
 #include "ocerz/x87.h"
+#include "ocerz/m32.h"
 
 #include <sys/mman.h>
 #include <mach/mach_time.h>
@@ -18189,6 +18192,110 @@ static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
     a64_patch_bcond(to_deep, plain);
 }
 
+/*
+ * The i386 form of emit_bridge_fastcall, for m32 programs.  An m32 import
+ * stub is a lone `jmp dword [slot]` whose slot holds the export's own trap
+ * address (src/m32_dyld.c).  When it does as the block is translated, the jump
+ * becomes a call to m32_fastcall from inside the block, followed by the ret
+ * through the shadow stack that the export's own code would have ended with,
+ * as in 64-bit code; the slot is compared again at run time, and the host
+ * stack's depth too.  Only xmm0-7 are spilled and filled, the registers i386
+ * code can name.  Batman: Arkham Asylum's render thread made about 30,000
+ * such calls a frame (OpenGL, CGL, the clock), each one through the run loop
+ * and the trap lookup before.  OCERZ_NO_M32_FASTCALL=1 turns it off.
+ */
+static void emit_bridge_fastcall32(A64Buf *b, const X86Insn *insns, int i,
+                                   uint32_t **epi_sites, int *n_epi)
+{
+    const X86Insn *insn = &insns[i];
+    if (!bridge_fastcall_enabled() || !g_xlat_mode32 || !m32_active || ENV_ON("OCERZ_NO_M32_FASTCALL"))
+        return;
+    if (insn->op != OCERZ_OP_JMP || insn->nops != 1 || insn->seg != OCERZ_SEG_NONE)
+        return;
+    const X86Operand *o = &insn->ops[0];
+    if (o->kind != OCERZ_OPK_MEM || o->riprel || o->size != 4 || o->base != OCERZ_REG_NONE ||
+        o->index != OCERZ_REG_NONE)
+        return;
+    uint32_t slot = (uint32_t)o->disp;
+    if (!ocerz_addr_readable(slot) || !ocerz_addr_readable(slot + 3))
+        return;
+    uint32_t trap = (uint32_t)ocerz_ld(slot, 4);
+    if (trap < OCERZ_DYLDAPI_LO + M32_ID_FIRST || trap >= OCERZ_DYLDAPI_LO + M32_ID_LIMIT)
+        return;
+    static int no_blret = -1;
+    if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
+    int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
+                jgb_usable() && !stack_guard_needed();
+    if (!fast3 || !ras_body_only() || !host_ras_enabled() || no_blret)
+        return;
+
+    l0_flush_all(b);
+    a64_mov_imm64(b, JT1, (uint64_t)slot + ocerz_guest_base);
+    a64_ldr(b, 4, JT1, JT1, 0);
+    a64_mov_imm64(b, JT2, trap);
+    a64_subs_reg(b, 0, A64_ZR, JT1, JT2, 0);
+    uint32_t *to_plain = a64_label(b); a64_bcond(b, A64_NE, 0);
+    a64_ldr(b, 8, JT0, 20, JIT_FP_OFF);
+    a64_add_imm(b, 1, JTT, 31, 0);
+    a64_sub_reg(b, 1, JT0, JT0, JTT, 0);
+    a64_subs_imm_sh12(b, 1, A64_ZR, JT0, BRIDGE_FAST_DEPTH_MAX_K);
+    uint32_t *to_deep = a64_label(b); a64_bcond(b, A64_HI, 0);
+
+    g_ymmh_zero = 0;
+    for (unsigned r = 0; r < 8; r++)
+        if (xmm_is_pinned(r))
+            a64_str_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
+    emit_spill_pinned(b);
+    a64_mov_reg(b, 1, 0, 19);
+    a64_mov_reg(b, 1, 1, 20);
+    a64_mov_imm64(b, 2, trap);
+    g_tc_bad = 1;
+    a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)&m32_fastcall);
+    a64_blr(b, 16);
+    g_callout_seq++;
+    a64_mov_reg(b, 0, JT0, 0);
+    emit_fill_pinned(b);
+    uint32_t *to_leave = a64_label(b); a64_cbnz(b, 0, JT0, 0);
+    for (unsigned r = 0; r < 8; r++)
+        if (xmm_is_pinned(r))
+            a64_ldr_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
+    emit_pk_consts_load(b);
+    yc_reload_all(b);
+    emit_reload_jgb(b);
+    emit_reload_mem_base(b);
+
+    a64_ldr(b, 8, JT1, 20, RIP_OFF);
+    (void)a64_try_orr_imm(b, 1, JT1, JT1, JIT_KEY_M32);
+    a64_ldp_post(b, JTF, 30, 31, 16);
+    a64_subs_reg(b, 1, A64_ZR, JTF, JT1, 0);
+    uint32_t *miss_ne = a64_label(b); a64_bcond(b, A64_NE, 0);
+    uint32_t *miss_z = a64_label(b); a64_cbz(b, 1, 30, 0);
+    if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+    a64_ret(b);
+
+    uint32_t *miss = a64_label(b);
+    a64_patch_bcond(miss_ne, miss);
+    a64_patch_cbz(miss_z, miss);
+    a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+    epi_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+
+    a64_patch_cbz(to_leave, a64_label(b));
+    emit_xmm_pin_load_all(b);
+    yc_reload_all(b);
+    emit_reload_jgb(b);
+    emit_reload_mem_base(b);
+    a64_sub_imm(b, 0, 0, JT0, 1);
+    epi_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+
+    uint32_t *plain = a64_label(b);
+    a64_patch_bcond(to_plain, plain);
+    a64_patch_bcond(to_deep, plain);
+}
+
 static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                               int *n_exits, uint32_t **epi_sites, int *n_epi)
 {
@@ -22499,6 +22606,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 
         if (i == n - 1 && insn->op == OCERZ_OP_JMP) {
             emit_bridge_fastcall(&b, blk->insns, i, epi_sites, &n_epi);
+            emit_bridge_fastcall32(&b, blk->insns, i, epi_sites, &n_epi);
             if (emit_jmp(&b, insn, epi_sites, &n_epi) ||
                 emit_indirect_jmp(&b, insn, exit_sites, &n_exits, epi_sites, &n_epi)) {
                 blk->n_inlined++;

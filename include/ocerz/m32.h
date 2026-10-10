@@ -43,6 +43,7 @@ int m32_is_i386(const char *path);
 int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp);
 extern int m32_active;   /* set by m32_run: the process is an i386 Mach-O program, not Wine's WoW64 */
 int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu);
+int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap);   /* a trap made from inside a block */
 
 static inline void *m32_h(uint32_t g) { return (void *)(uintptr_t)(ocerz_guest_base + g); }
 static inline uint32_t m32_rd(uint32_t g) { uint32_t v; memcpy(&v, m32_h(g), 4); return v; }
