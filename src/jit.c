@@ -1697,6 +1697,8 @@ static const X86Operand *mem_hoist_view(const X86Operand *m, X86Operand *tmp)
 }
 #define JGB 0
 static inline int jgb_usable(void) { return ocerz_low_base == 0; }
+/* JGB is usable and holds zero (identity mode): adding or subtracting it is a mov at most. */
+static inline int jgb_zero(void) { return jgb_usable() && ocerz_guest_base == 0; }
 static inline int stack_identity(void)
 {
     static int dis = -1;
@@ -2894,7 +2896,7 @@ static void emit_gpr_rd(A64Buf *b, int sf, int dst, unsigned greg)
 {
     int s = pin_slot(greg);
     if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
-        if (jgb_usable())
+        if (jgb_usable() && ocerz_guest_base != 0)
             a64_sub_reg(b, 1, dst, pin_hreg(s), JGB, 0);
         else if (ocerz_guest_base == 0)
             a64_mov_reg(b, 1, dst, pin_hreg(s));
@@ -2923,7 +2925,7 @@ static void emit_gpr_wr(A64Buf *b, int src, unsigned greg)
 {
     int s = pin_slot(greg);
     if (s >= 0 && rsp_is_ptr() && greg == OCERZ_RSP) {
-        if (jgb_usable())
+        if (jgb_usable() && ocerz_guest_base != 0)
             a64_add_reg(b, 1, pin_hreg(s), src, JGB, 0);
         else if (ocerz_guest_base == 0)
             a64_mov_reg(b, 1, pin_hreg(s), src);
@@ -11639,7 +11641,8 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
         return 0;
     int hs = pin_hreg(pin_slot(OCERZ_RSP)), hb = pin_hreg(pin_slot(OCERZ_RBP));
     if (rsp_is_ptr()) {
-        a64_add_reg(b, 1, hs, hb, JGB, 0);
+        if (jgb_zero()) a64_mov_reg(b, 1, hs, hb);
+        else            a64_add_reg(b, 1, hs, hb, JGB, 0);
         a64_ldr_post64(b, hb, hs, 8);
         return 1;
     }
@@ -14463,7 +14466,7 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                     return 1;
                 if (rsp_is_ptr() && !sz4 && s->reg == OCERZ_RSP &&
                     d->reg != OCERZ_RSP && ds >= 0 && ss >= 0) {
-                    if (jgb_usable())
+                    if (jgb_usable() && ocerz_guest_base != 0)
                         a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), JGB, 0);
                     else if (ocerz_guest_base == 0)
                         a64_mov_reg(b, 1, pin_hreg(ds), pin_hreg(ss));
@@ -19388,7 +19391,7 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
             a64_stur(b, 8, regs[j], base, -8 * (j + 1));
         if (mov_at >= 0) {
             a64_sub_imm(b, 1, mov_hd, hs, 8 * mov_at);
-            if (direct)
+            if (direct && !jgb_zero())
                 a64_sub_reg(b, 1, mov_hd, mov_hd, JGB, 0);
         }
         a64_sub_imm(b, 1, hs, hs, 8 * k);
