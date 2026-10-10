@@ -21147,6 +21147,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
     }
     pthread_jit_write_protect_np(0);
+    ocerz_jit_wx_open = 1;
     if (!ENV_ON("OCERZ_NO_DISPATCH_STUB")) {
         if (mode32) { if (!jit->dispatch_stub32) emit_dispatch_stub(jit, 1); }
         else        { if (!jit->dispatch_stub)   emit_dispatch_stub(jit, 0); }
@@ -22407,6 +22408,7 @@ promo_push_fallthrough:
         }
     }
 
+    ocerz_jit_wx_open = 0;
     pthread_jit_write_protect_np(1);
 
     if (side_patch_oor) {
@@ -23309,6 +23311,7 @@ void ocerz_jit_prof_stats(const struct OcerzVM *vm, uint64_t *translated, uint64
 
 
 __thread sigjmp_buf *ocerz_jit_decode_recover;
+__thread int ocerz_jit_wx_open;
 
 static void stopcheck(const JitBlock *b, const uint32_t *site, uint32_t insn, const char *what)
 {

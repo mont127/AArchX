@@ -1913,8 +1913,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (!align_fault && ocerz_cache_lazy_fault((uintptr_t)si->si_addr))
             return;
     }
-    if (ocerz_jit_decode_recover)
+    if (ocerz_jit_decode_recover) {
+        if (ocerz_jit_wx_open)
+            pthread_jit_write_protect_np(0);
         siglongjmp(*ocerz_jit_decode_recover, 1);
+    }
     if ((sig == SIGSEGV || sig == SIGBUS) && ctx && ocerz_mode == OCERZ_MODE_NATIVE) {
         ucontext_t *suc = (ucontext_t *)ctx;
         uint64_t spc = suc->uc_mcontext->__ss.__pc;
