@@ -12121,7 +12121,9 @@ static int emit_push_pop_mem(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
 {
     if (insn->mode32)
         return emit_push_pop_mem32(b, insn, exit_sites, n_exits);
-    if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || !stack_plain_access_ok() || !jgb_usable() || stack_guard_needed()) return 0;
+    /* With rsp's register a host pointer (g_lowptr) the stack side needs no guard in the Wine layout either. */
+    if (g_pin_class != 3 || pin_slot(OCERZ_RSP) < 0 || !stack_plain_access_ok() ||
+        !(g_lowptr || (jgb_usable() && !stack_guard_needed()))) return 0;
     if (insn->nops != 1 || insn->ops[0].kind != OCERZ_OPK_MEM || insn->ops[0].size != 8) return 0;
     if (insn->addrsize != 8 || (insn->seg != OCERZ_SEG_NONE && insn->seg != OCERZ_SEG_GS && insn->seg != OCERZ_SEG_FS)) return 0;
     const X86Operand *m = &insn->ops[0];
@@ -22448,7 +22450,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 goto promo_push_fallthrough;
             } else {
                 int f3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
-                         stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
+                         stack_plain_access_ok() && ((jgb_usable() && !stack_guard_needed()) || g_lowptr);
                 a64_mov_reg(&b, 1, gr, pr);
                 if (rsp_run_member(blk->insns, i + 1, n, f3)) {
                     g_rsp_lag += 8;
@@ -22462,8 +22464,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
 promo_push_fallthrough:
         if (g_ic_kind[i] != 0) {
+            /* rsp's register is a host pointer in the Wine layout too (g_lowptr): a spliced call's push and ret are its own. */
             int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
-                        stack_plain_access_ok() && jgb_usable() && !stack_guard_needed();
+                        stack_plain_access_ok() && ((jgb_usable() && !stack_guard_needed()) || g_lowptr);
             if (!fast3 && low_splice_ok(insn)) {
                 int hs = pin_hreg(pin_slot(OCERZ_RSP));
                 if (g_ic_kind[i] == 1 && g_ic_pushelide[i] && g_n_pe_real < PE_MAX &&
