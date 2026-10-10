@@ -629,6 +629,8 @@
  * the interpreter does in 32-bit code (64-bit code writes the register back).
  * MMX is translated in 32-bit blocks as in 64-bit ones (emit_mmx): Bink's
  * video decoder and Feral's IndirectX use it in i386 code.
+ * shld and shrd there also take a count in cl or a memory destination
+ * (emit_shiftd32), with the flags dead as in emit_shiftd.
  *
  * An fs- or gs-relative operand adds the segment base to the wrapped address
  * without wrapping the sum, as ocerz_ea does, and then takes the same guard and
@@ -12202,10 +12204,68 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
     return 1;
 }
 
+/*
+ * In 32-bit code shld and shrd also take a count in cl or a memory
+ * destination: Feral's IndirectX hashes 64-bit draw keys with them, and they
+ * were the commonest instruction Batman's render thread still interpreted.
+ * The pair is one 64-bit value shifted by the masked count; a count of 0
+ * leaves the destination alone, as the interpreter does in 32-bit code.
+ * Flags dead only, as emit_shiftd.
+ */
+static int emit_shiftd32(A64Buf *b, const X86Insn *insn)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1], *c = &insn->ops[2];
+    int dmem = d->kind == OCERZ_OPK_MEM;
+    if (s->kind != OCERZ_OPK_REG || s->high8 || s->size != 4 || d->size != 4) return 0;
+    if (!dmem && (d->kind != OCERZ_OPK_REG || d->high8)) return 0;
+    if (dmem && (insn->seg != OCERZ_SEG_NONE || !mem_native_store_ok() ||
+                 (rsp_is_ptr() && (d->base == OCERZ_RSP || d->index == OCERZ_RSP)))) return 0;
+    if (rsp_is_ptr() && (s->reg == OCERZ_RSP || (!dmem && d->reg == OCERZ_RSP))) return 0;
+    int cl = c->kind == OCERZ_OPK_REG;
+    if (cl && (c->reg != OCERZ_RCX || c->high8 || c->size != 1)) return 0;
+    if (!cl && c->kind != OCERZ_OPK_IMM) return 0;
+    unsigned icnt = cl ? 0 : (unsigned)c->imm & 31u;
+    if (!cl && icnt == 0) return 1;
+    uint32_t *zero = NULL;
+    if (cl) {
+        emit_gpr_rd(b, 0, JT2, OCERZ_RCX);
+        a64_try_and_imm(b, 0, JT2, JT2, 31);
+        zero = a64_label(b);
+        a64_cbz(b, 0, JT2, 0);
+    }
+    if (dmem) {
+        if (!emit_mem_ea(b, insn, d, JTA)) return 0;
+        (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_load_ordered(b, 4, JT0, JTA, JTU);
+    } else {
+        emit_gpr_rd(b, 0, JT0, d->reg);
+    }
+    emit_gpr_rd(b, 0, JT1, s->reg);
+    if (insn->op == OCERZ_OP_SHLD) {
+        a64_orr_reg(b, 1, JT0, JT1, JT0, 32);
+        if (cl) a64_lslv(b, 1, JT0, JT0, JT2); else a64_lsl_imm(b, 1, JT0, JT0, (int)icnt);
+        a64_lsr_imm(b, 1, JT0, JT0, 32);
+    } else {
+        a64_orr_reg(b, 1, JT0, JT0, JT1, 32);
+        if (cl) a64_lsrv(b, 1, JT0, JT0, JT2); else a64_lsr_imm(b, 1, JT0, JT0, (int)icnt);
+    }
+    if (dmem) {
+        emit_guest_store_ordered(b, 4, JT0, JTA, JTU);
+    } else {
+        a64_mov_reg(b, 0, JT0, JT0);
+        emit_gpr_wr(b, JT0, d->reg);
+    }
+    if (zero) a64_patch_cbz(zero, a64_label(b));
+    return 1;
+}
+
 static int emit_shiftd(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (need != 0 || !g_defer || insn->nops != 3) return 0;
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1], *c = &insn->ops[2];
+    if (insn->mode32 && d->size == 4)
+        return emit_shiftd32(b, insn);
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
     if (s->kind != OCERZ_OPK_REG || s->high8 || s->size != d->size || c->kind != OCERZ_OPK_IMM) return 0;
     if (pin_slot(d->reg) < 0 || pin_slot(s->reg) < 0) return 0;
