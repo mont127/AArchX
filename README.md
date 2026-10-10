@@ -86,7 +86,7 @@ make apis
 | Ollama | command line and server work, and the menu-bar app runs |
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
 | Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window |
-| Batman: Arkham Asylum, a 32-bit Mac game | gameplay renders through m32, at about 31 fps (October 2026) |
+| Batman: Arkham Asylum, a 32-bit Mac game | gameplay runs through m32 at about 61 fps (October 2026) |
 | Counter-Strike 2, under Wine with D3DMetal | reaches its window, then stops on an error Rosetta does not hit |
 | Photoshop | stops during startup |
 
