@@ -7218,6 +7218,17 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         a64_subs_reg(b, 1, A64_ZR, JT1, JTA, 0);
         done[nd++] = a64_label(b); a64_b(b, 0);
         a64_patch_bcond(not_sub, a64_label(b));
+        /* After inc or dec, CF is the one before it, which the record keeps in its source. */
+        uint32_t *incdec_pred = NULL;
+        if (cc == OCERZ_CC_B || cc == OCERZ_CC_AE) {
+            a64_sub_imm(b, 0, JTF, JTU, OCERZ_CC_INC);
+            a64_subs_imm(b, 0, A64_ZR, JTF, OCERZ_CC_DEC - OCERZ_CC_INC);
+            uint32_t *not_incdec = a64_label(b); a64_bcond(b, A64_HI, 0);
+            (void)a64_try_and_imm(b, 0, JTF, JT1, 1);
+            if (cc == OCERZ_CC_AE) (void)a64_try_eor_imm(b, 0, JTF, JTF, 1);
+            incdec_pred = a64_label(b); a64_b(b, 0);
+            a64_patch_bcond(not_incdec, a64_label(b));
+        }
         a64_subs_imm(b, 0, A64_ZR, JTU, OCERZ_CC_LOGIC);
         to_generic[ng++] = a64_label(b); a64_bcond(b, A64_NE, 0);
         a64_subs_imm(b, 0, A64_ZR, JTT, 8);
@@ -7250,6 +7261,7 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         emit_cc_predicate_rflags(b, cc);
         a64_patch_b(lg_pred, a64_label(b));
         a64_patch_b(sub_pred, a64_label(b));
+        if (incdec_pred) a64_patch_b(incdec_pred, a64_label(b));
         a64_subs_imm(b, 1, A64_ZR, JTF, 0);
         return;
     }
