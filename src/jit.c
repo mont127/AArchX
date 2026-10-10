@@ -18392,6 +18392,84 @@ static void emit_bridge_fastcall32(A64Buf *b, const X86Insn *insns, int i,
     a64_mov_imm64(b, JT2, trap);
     a64_subs_reg(b, 0, A64_ZR, JT1, JT2, 0);
     uint32_t *to_plain = a64_label(b); a64_bcond(b, A64_NE, 0);
+
+    /*
+     * A leaf (src/m32_leaf.c) is called straight from here: its cdecl
+     * arguments off the guest stack into x0-x7 (x0, the guest base until the
+     * call, takes argument 0 last), the result into eax (edx:eax), the return
+     * address popped, and the ret through the shadow stack.  The guest's
+     * registers are pinned in x21-x28, which the call keeps; x1-x8 hold r8-r15,
+     * which i386 code cannot name.  OCERZ_NO_M32_LEAF=1 turns it off.
+     */
+    const M32Leaf *leaf = ENV_ON("OCERZ_NO_M32_LEAF") ? NULL : m32_leaf_for(trap);
+    if (leaf && leaf->nargs <= (leaf->tramp ? 7 : 8) && pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDX) >= 0) {
+        int hs = pin_hreg(pin_slot(OCERZ_RSP)), hax = pin_hreg(pin_slot(OCERZ_RAX)),
+            hdx = pin_hreg(pin_slot(OCERZ_RDX));
+        static const int arg[8] = { JT0, 1, 2, 3, 4, 5, 6, 7 };
+        static const int targ[7] = { 1, 2, 3, 4, 5, 6, 7 };
+        for (int k = 0; k < leaf->nargs; k++) {
+            int r = leaf->tramp ? targ[k] : arg[k];
+            a64_add_imm(b, 0, JTA, hs, 4 + 4 * (uint32_t)k);
+            a64_ldr_regoff_uxtw(b, 4, r, JGB, JTA);
+            if (!leaf->tramp && (leaf->ptrs >> k & 1))
+                a64_add_reg(b, 1, r, JGB, r, 0);
+        }
+        if (!leaf->fn) {
+            a64_dmb_ish(b);
+        } else {
+            if (leaf->simd)
+                for (unsigned r = 0; r < 8; r++)
+                    if (xmm_is_pinned(r))
+                        a64_str_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
+            if (leaf->tramp)
+                a64_mov_imm64(b, 0, (uint64_t)(uintptr_t)leaf);
+            else if (leaf->nargs)
+                a64_mov_reg(b, 1, 0, JT0);
+            g_tc_bad = 1;
+            a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)(leaf->tramp ? (void *)m32_leaf_tramp : leaf->fn));
+            a64_blr(b, 16);
+            g_callout_seq++;
+            a64_mov_reg(b, 1, JT0, 0);
+            if (leaf->simd) {
+                for (unsigned r = 0; r < 8; r++)
+                    if (xmm_is_pinned(r))
+                        a64_ldr_v(b, 16, xmm_vreg(r), 20, XMM_BASE_OFF + r * 16);
+                emit_pk_consts_load(b);
+            }
+            emit_reload_jgb(b);
+            emit_reload_mem_base(b);
+            yc_reload_all(b);
+            if (leaf->ret == M32_LEAF_I32) {
+                a64_mov_reg(b, 0, hax, JT0);
+            } else if (leaf->ret == M32_LEAF_I64) {
+                a64_mov_reg(b, 0, hax, JT0);
+                a64_lsr_imm(b, 1, hdx, JT0, 32);
+            } else if (leaf->ret == M32_LEAF_ARG0) {
+                a64_add_imm(b, 0, JTA, hs, 4);
+                a64_ldr_regoff_uxtw(b, 4, hax, JGB, JTA);
+            }
+        }
+        a64_ldr_regoff_uxtw(b, 4, JT1, JGB, hs);
+        a64_add_imm(b, 0, hs, hs, 4);
+        a64_mov_reg(b, 1, JT2, JT1);
+        (void)a64_try_orr_imm(b, 1, JT2, JT2, JIT_KEY_M32);
+        a64_ldp_post(b, JTF, 30, 31, 16);
+        a64_subs_reg(b, 1, A64_ZR, JTF, JT2, 0);
+        uint32_t *lmiss_ne = a64_label(b); a64_bcond(b, A64_NE, 0);
+        uint32_t *lmiss_z = a64_label(b); a64_cbz(b, 1, 30, 0);
+        if (!xmm_global_enabled()) emit_xmm_pin_spill_all(b);
+        a64_ret(b);
+        uint32_t *lmiss = a64_label(b);
+        a64_patch_bcond(lmiss_ne, lmiss);
+        a64_patch_cbz(lmiss_z, lmiss);
+        a64_str(b, 8, JT1, 20, RIP_OFF);
+        a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+        epi_sites[*n_epi] = a64_label(b);
+        a64_b(b, 0);
+        (*n_epi)++;
+        a64_patch_bcond(to_plain, a64_label(b));
+        return;
+    }
     a64_ldr(b, 8, JT0, 20, JIT_FP_OFF);
     a64_add_imm(b, 1, JTT, 31, 0);
     a64_sub_reg(b, 1, JT0, JT0, JTT, 0);
