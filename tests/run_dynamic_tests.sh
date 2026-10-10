@@ -861,6 +861,7 @@ run_golden_case dlowstack_disp tests/dynamic/lowstack_disp.c tests/dynamic/lowst
 run_golden_case dtest_jcc_gap tests/dynamic/test_jcc_gap.c tests/dynamic/test_jcc_gap.out
 run_golden_case dsetcc_zx tests/dynamic/setcc_zx.c tests/dynamic/setcc_zx.out
 run_golden_case dhoist_forms tests/dynamic/hoist_forms.c tests/dynamic/hoist_forms.out
+run_golden_case dlow_loop_hoist tests/dynamic/low_loop_hoist.c tests/dynamic/low_loop_hoist.out
 run_golden_case dfist_rc tests/dynamic/fist_rc.c tests/dynamic/fist_rc.out
 run_golden_case dflip_phase tests/dynamic/flip_phase.c tests/dynamic/flip_phase.out
 run_file_case dunaligned_atomics tests/dynamic/unaligned_atomics.c 'OK'
@@ -1101,6 +1102,19 @@ run_low_golden_case dlowstack_disp_low tests/dynamic/lowstack_disp.c tests/dynam
 run_low_golden_case dtest_jcc_gap_low tests/dynamic/test_jcc_gap.c tests/dynamic/test_jcc_gap.out
 run_low_golden_case dsetcc_zx_low tests/dynamic/setcc_zx.c tests/dynamic/setcc_zx.out
 run_low_golden_case dhoist_forms_low tests/dynamic/hoist_forms.c tests/dynamic/hoist_forms.out
+run_low_golden_case dlow_loop_hoist_low tests/dynamic/low_loop_hoist.c tests/dynamic/low_loop_hoist.out
+# The hoist's decisions themselves: the three-array loop keeps three bases, loops that meet a base
+# above 12 GB or a negative index move to the wide form, and the loops built to defeat that too (an
+# index striding 3 GB, a base just below 12 GB, an index hopping across 12 GB) give the hoist up.
+if run_bounded "$TMP/dlow_loop_hoist.log.out" "$TMP/dlow_loop_hoist.log.err" env OCERZ_LOW_HOIST_LOG=1 "$OCERZ" "$TMP/dlow_loop_hoist_low/dlow_loop_hoist_low" &&
+   grep -q 'LOWHOIST take 0x2[0-9a-f]* bases=3' "$TMP/dlow_loop_hoist.log.err" &&
+   [ "$(grep -c 'LOWHOIST widen 0x2[0-9a-f]*$' "$TMP/dlow_loop_hoist.log.err")" -ge 3 ] &&
+   [ "$(grep -c 'LOWHOIST bail 0x2[0-9a-f]*$' "$TMP/dlow_loop_hoist.log.err")" -ge 3 ]; then
+    echo "PASS dlow_loop_hoist_decisions (three bases kept; the wide form taken, and given up, where it must be)"; pass=$((pass+1))
+else
+    echo "FAIL dlow_loop_hoist_decisions ($(grep -c 'LOWHOIST take 0x2' "$TMP/dlow_loop_hoist.log.err") taken, $(grep -c 'LOWHOIST widen 0x2' "$TMP/dlow_loop_hoist.log.err") widened, $(grep -c 'LOWHOIST bail 0x2' "$TMP/dlow_loop_hoist.log.err") given up)"
+    fail=$((fail+1))
+fi
 run_low_golden_case dfist_rc_low tests/dynamic/fist_rc.c tests/dynamic/fist_rc.out
 run_low_golden_case dflip_phase_low tests/dynamic/flip_phase.c tests/dynamic/flip_phase.out
 run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
