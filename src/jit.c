@@ -685,6 +685,8 @@
 #include <sys/mman.h>
 #include <mach/mach_time.h>
 #include <mach/thread_act.h>
+#include <mach/mach_init.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
@@ -2355,6 +2357,33 @@ static void fpb_site_emit(A64Buf *b, int end, int va, int vb, int dbl);
 static int unsafe_nocheckbr(void);
 static int fpb_det_here(int idx);
 extern uint64_t ocerz_jit_retire_count;
+/*
+ * What a rip-relative 8-byte slot holds while the block is translated, or
+ * false when the slot or what it points to cannot be read, or it holds no
+ * canonical address.  The kernel copies both, so an unreadable one is an
+ * error rather than a fault: the translator is inside the arena's writable
+ * window here, and a fault taken and longjmp'd out of would leave this
+ * thread's JIT pages read-only.  Not in native mode, whose slots may hold the
+ * host's own functions.
+ */
+static int slot_value_now(const X86Operand *o, uint64_t *out)
+{
+    if (o->kind != OCERZ_OPK_MEM || !o->riprel || o->size != 8 || ocerz_mode == OCERZ_MODE_NATIVE ||
+        ENV_ON("OCERZ_NO_SLOT_CHAIN"))
+        return 0;
+    uint64_t v = 0;
+    uint8_t probe;
+    mach_vm_size_t got = 0, got1 = 0;
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)ocerz_g2h((uint64_t)o->disp),
+                               sizeof v, (mach_vm_address_t)(uintptr_t)&v, &got) != KERN_SUCCESS ||
+        got != sizeof v || v == 0 || v >> 47 ||
+        mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)ocerz_g2h(v), 1,
+                               (mach_vm_address_t)(uintptr_t)&probe, &got1) != KERN_SUCCESS)
+        return 0;
+    *out = v;
+    return 1;
+}
+
 #define XLIVE_MEMO_SLOTS 8192
 #define XLIVE_MEMO_DEPS 6
 #define XLIVE_NO_DEPS 0xff
@@ -2527,8 +2556,11 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     uint64_t live = OCERZ_FL_ALL;
     if (depth < maxd && is_terminator(insns[n - 1].op)) {
         const X86Insn *t = &insns[n - 1];
+        uint64_t slot_to;
         if ((t->op == OCERZ_OP_JMP || t->op == OCERZ_OP_CALL) && t->ops[0].kind == OCERZ_OPK_IMM)
             live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1);
+        else if (t->op == OCERZ_OP_JMP && !t->mode32 && slot_value_now(&t->ops[0], &slot_to))
+            live = xlive_succ_live_d(g_xlat_jit, slot_to, depth + 1);
         else if (t->op == OCERZ_OP_JCC && t->ops[0].kind == OCERZ_OPK_IMM)
             live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1) |
                    xlive_succ_live_d(g_xlat_jit, t->rip + t->len, depth + 1);
@@ -17214,6 +17246,15 @@ static int emit_indirect32(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     return 1;
 }
 
+/*
+ * A jump through a rip-relative slot - a Mach-O stub's jmp *GOT, an import
+ * thunk - goes where the slot pointed when the block was translated nearly
+ * every time, since such a slot is bound once.  The target it loads is
+ * compared with that value, and when they agree the block chains straight to
+ * it; only a slot that has changed since goes through the per-site cache and
+ * hash probe, as every such jump did before.  The comparison leaves the flags
+ * alone.  OCERZ_NO_SLOT_CHAIN=1 turns it off.
+ */
 static int emit_indirect_jmp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                              int *n_exits, uint32_t **epi_sites, int *n_epi)
 {
@@ -17228,6 +17269,22 @@ static int emit_indirect_jmp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sit
     if (ENV_ON("OCERZ_EXP_MAT_IND")) emit_materialize(b);
     if (!emit_branch_target(b, insn, &insn->ops[0], exit_sites, n_exits))
         return 0;
+    uint64_t slot_to;
+    if (!g_no_chain && g_ind_treg == JT1 && slot_value_now(&insn->ops[0], &slot_to)) {
+        emit_const_lit(b, JT2, slot_to);
+        a64_eor_reg(b, 1, JT2, JT2, JT1, 0);
+        uint32_t *moved = a64_label(b); a64_cbnz(b, 1, JT2, 0);
+        int edge_class = body_edge_pin_class();
+        int body_edge = edge_class >= 0;
+        uint32_t *pb = emit_static_chain_tail(b, slot_to, slot_to <= g_self_rip, body_edge, epi_sites, n_epi);
+        g_jcc_edge[0].target_rip = slot_to;
+        g_jcc_edge[0].patch_b = pb;
+        g_jcc_edge[0].cond_site = NULL;
+        g_jcc_edge[0].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
+        g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
+        g_n_jcc_edges = 1;
+        a64_patch_cbz(moved, a64_label(b));
+    }
     emit_indirect_tail(b, epi_sites, n_epi);
     return 1;
 }
@@ -21306,11 +21363,14 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     if (!g_no_xlive && is_terminator(blk->insns[n - 1].op)) {
         const X86Insn *term = &blk->insns[n - 1];
         switch (term->op) {
-        case OCERZ_OP_JMP:
-
+        case OCERZ_OP_JMP: {
+            uint64_t slot_to;
             if (term->ops[0].kind == OCERZ_OPK_IMM)
                 seam_seed = xlive_succ_live(jit, term->ops[0].imm);
+            else if (!mode32 && slot_value_now(&term->ops[0], &slot_to))
+                seam_seed = xlive_succ_live(jit, slot_to);
             break;
+        }
         case OCERZ_OP_JCC: {
 
             uint64_t taken = xlive_succ_live(jit, term->ops[0].imm);
