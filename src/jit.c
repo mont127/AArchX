@@ -9918,11 +9918,11 @@ static int emit_mov128_pair(A64Buf *b, const X86Insn *a, const X86Insn *c, int i
     if (kind == 1) {
         l0_inval(ar); l0_inval(cr);
         if (pair) a64_ldp_q_off(b, va, vc, ra, d);
-        else { a64_ldr_v(b, 16, va, ra, disp); a64_ldr_v(b, 16, vc, ra, disp + 16); }
+        else { emit_v_ld_at_(b, 16, va, ra, d, 1); emit_v_ld_at_(b, 16, vc, ra, d + 16, 1); }
         if (a->vex) { emit_ymmh_clear(b, ar); emit_ymmh_clear(b, cr); }
     } else {
         if (pair) a64_stp_q_off(b, va, vc, ra, d);
-        else { a64_str_v(b, 16, va, ra, disp); a64_str_v(b, 16, vc, ra, disp + 16); }
+        else { emit_v_st_at(b, 16, va, ra, d, 1); emit_v_st_at(b, 16, vc, ra, d + 16, 1); }
     }
     g_mov_skip[i + 1] = 1;
     return 1;
@@ -13196,8 +13196,10 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
         emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
         ra = JTA; disp = 0;
     } else if ((!plainacc || (ordered && atomic)) && disp != 0) {
-        if (disp <= 4095) a64_add_imm(b, 1, JTA, ra, disp);
-        else { a64_mov_imm64(b, JTU, disp); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
+        int32_t sd = (int32_t)disp;
+        if (sd > 0 && sd <= 4095)       a64_add_imm(b, 1, JTA, ra, (uint32_t)sd);
+        else if (sd < 0 && -sd <= 4095) a64_sub_imm(b, 1, JTA, ra, (uint32_t)-sd);
+        else { a64_mov_imm64(b, JTU, (uint64_t)(int64_t)sd); a64_add_reg(b, 1, JTA, ra, JTU, 0); }
         ra = JTA; disp = 0;
     }
     int rs = -1;
