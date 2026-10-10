@@ -14,6 +14,8 @@
  *   - records walked by an offset stepped inside the loop, the array's address
  *     in the index register;
  *   - a list walked by mov (%rdi), %rdi, its nodes on both sides of 12 GB;
+ *   - a table followed by index, i = tab[i], where some entries are indices
+ *     that reach from the table into a mapping on the other side;
  *   - straight-line code that steps its index, reloads it, and reloads its
  *     base, between operands;
  *   - a cpuid inside the loop, after which the hoisted bases are formed again;
@@ -292,6 +294,35 @@ static uint64_t chase_c(struct node *p)
     return acc;
 }
 
+/* i = tab[i], twice a round: every operand's index is whatever the last load brought. */
+__attribute__((noinline)) static uint64_t follow(uint64_t *tab, uint64_t i, uint64_t n)
+{
+    uint64_t acc = 0;
+    __asm__ volatile(
+        "1:\n\t"
+        "mov (%[tab],%[i],8), %[i]\n\t"
+        "add %[i], %[acc]\n\t"
+        "rol $9, %[acc]\n\t"
+        "mov 8(%[tab],%[i],8), %[i]\n\t"
+        "xor %[i], %[acc]\n\t"
+        "dec %[n]\n\t"
+        "jnz 1b"
+        : [acc] "+&r"(acc), [i] "+&r"(i), [n] "+&r"(n) : [tab] "r"(tab) : "memory", "cc");
+    return acc;
+}
+static uint64_t follow_c(const uint64_t *tab, uint64_t i, uint64_t n)
+{
+    uint64_t acc = 0;
+    do {
+        i = *(const uint64_t *)((uintptr_t)tab + i * 8);
+        acc += i;
+        acc = (acc << 9) | (acc >> 55);
+        i = *(const uint64_t *)((uintptr_t)tab + i * 8 + 8);
+        acc ^= i;
+    } while (--n);
+    return acc;
+}
+
 /*
  * Straight-line: operands on p and q under i; i stepped twice between them;
  * then i reloaded from memory and p from memory, with operands after each
@@ -542,6 +573,26 @@ int main(void)
         for (int k = 0; k < 64; k++) if (at[k]->w != nodes_ref[k].w) return fail("chase stores", at[k]->w, nodes_ref[k].w);
     }
 
+    /*
+     * Tables of indices: 64 cells in one area and 64 in another, each cell
+     * naming a cell of either, as an index from the first.  Every pairing of
+     * the four areas, so the reach crosses 12 GB both ways in the Wine layout
+     * build.
+     */
+    for (int rep = 0; rep < 64; rep++) {
+        uint64_t *ta = srcs[rep & 3], *tb = srcs[(rep >> 2) & 3];
+        if (tb == ta) tb = gc;
+        uint64_t s = 12345 + (uint64_t)rep, over = (uint64_t)(tb - ta);
+        for (int k = 0; k < 66; k++) {
+            s = s * 6364136223846793005ull + 1442695040888963407ull;
+            ta[k] = ((s >> 33) % 64) + ((s >> 20 & 3) == 0 ? over : 0);
+            s = s * 6364136223846793005ull + 1442695040888963407ull;
+            tb[k] = ((s >> 33) % 64) + ((s >> 20 & 3) == 0 ? 0 : over);
+        }
+        uint64_t want = follow_c(ta, (uint64_t)(rep % 64), 5000), got = follow(ta, (uint64_t)(rep % 64), 5000);
+        if (got != want) return fail("follow", got, want);
+    }
+
     /* straight-line: p, q, the area the reloaded index reaches into and the reloaded base, each from the four areas */
     for (int rep = 0; rep < 1024; rep++) {
         uint64_t *pp = srcs[rep & 3], *qq = srcs[(rep >> 2) & 3], *tp = srcs[(rep >> 4) & 3], *np = srcs[(rep >> 6) & 3];
@@ -574,7 +625,7 @@ int main(void)
     sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
-    uint8_t *area = (uint8_t *)map_at(0x140000000ull, 0xc000);
+    uint8_t *area = (uint8_t *)map_at(0x240000000ull, 0xc000);
     if (!area) { printf("map prot\n"); return 1; }
     g_prot = area + 0x4000;
     uint64_t *dst = (uint64_t *)(void *)(area + 0x3000);          /* dst[512] is the protected page's first word */
