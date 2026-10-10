@@ -1579,6 +1579,9 @@ static int g_mem_hoist_aux_index = -1;
 static int g_mem_hoist_aux_scale;
 #define JMEMBASE 17
 #define JMEMAUX 29
+/* In the Wine layout x29 holds OCERZ_LOW_LIMIT instead (wlim_on). */
+#define WLIM 29
+static int wlim_on(void);
 #define JMEMBASE2 16
 #define JMEMBASE3 30
 /*
@@ -2910,6 +2913,22 @@ static inline int pin_slot(unsigned greg)
     return (g_pin && greg < 16) ? g_pin[greg] : -1;
 }
 
+static int fullpin_enabled(void);
+static int low_guard_fast_ok(void);
+/*
+ * x29 holds OCERZ_LOW_LIMIT through all translated code of a Wine-layout
+ * process: every block's prologue sets it, nothing translated writes it
+ * otherwise (JMEMAUX, which shares it, is not used in this layout: the hoist's
+ * wide form leaves indexed operands alone, and LeafLow keeps rsi in x16), and
+ * host code called out to keeps it, x29 being callee-saved.  wine_guard
+ * compares against it.  Fixed for the life of the process.
+ */
+static int wlim_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = ocerz_low_base && low_guard_fast_ok() && fullpin_enabled() && !ENV_ON("OCERZ_NO_WINE_LIM");
+    return on;
+}
 static int fullpin_enabled(void)
 {
     static int on = -1;
@@ -4555,8 +4574,9 @@ static int insn_const_addr(const X86Insn *insn, uint64_t *ga)
 }
 
 static void emit_guard_full(A64Buf *b, int addr_reg);
-#define GUARD_ARMS_MAX 128
-static struct { uint32_t *site, *back; int reg, idx; } g_garm[GUARD_ARMS_MAX];
+#define GUARD_ARMS_MAX 512
+/* kind 0: the top strip's three-range guard; 1 and 2: wine_guard's sides (WG_LOW, WG_HIGH) */
+static struct { uint32_t *site, *back; int reg, idx, kind; } g_garm[GUARD_ARMS_MAX];
 static int g_n_garm;
 
 _Static_assert(OCERZ_TOP_LO == (1ull << 47) - (1ull << 25), "the fast low guard tests the top strip with shifts by 25 and 22");
@@ -4713,6 +4733,68 @@ static int insn_stack_only(const X86Insn *in)
     return implicit || mem;
 }
 
+static const X86Insn *g_cur_insns;
+static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
+/*
+ * The Wine layout's guard on an address in a register.  The question is
+ * which side of 12 GB the address is on: below it the address takes
+ * low_base, at or above it the address is the host's own (the top strip
+ * excepted, which only blocks marked for it look for, g_low_top).  It was a
+ * shift, a compare, a branch over an orr and the orr, the branch taken for
+ * every address above 12 GB.  With 12 GB kept in x29 (wlim_on), the compare
+ * is one instruction, and the side the address is expected on goes straight
+ * through: an address expected below 12 GB is the compare, a branch over the
+ * orr and the orr, as before less the shift; one expected above it is the
+ * compare and a branch to an out-of-line arm that does the orr when it is
+ * wrong.  The side expected is the one the address was on when the block was
+ * translated, while its registers still hold what they held then, and below
+ * 12 GB when that is not known.  OCERZ_NO_WINE_LIM=1 turns it off.
+ */
+#define WG_HIGH 2
+static int wine_guard_expects_high(const X86Insn *insn)
+{
+    if (!insn || !g_xlat_cpu || !g_cur_insns || g_cur_insn_idx < 0 || &g_cur_insns[g_cur_insn_idx] != insn)
+        return 0;
+    const X86Operand *m = NULL;
+    for (int k = 0; k < insn->nops && k < 3; k++)
+        if (insn->ops[k].kind == OCERZ_OPK_MEM) { m = &insn->ops[k]; break; }
+    if (!m || m->riprel || (m->base > 15 && m->base != OCERZ_REG_NONE) || (m->index > 15 && m->index != OCERZ_REG_NONE))
+        return 0;
+    for (int i = 0; i < g_cur_insn_idx; i++) {
+        if (m->base != OCERZ_REG_NONE && insn_may_write_gpr(&g_cur_insns[i], m->base)) return 0;
+        if (m->index != OCERZ_REG_NONE && insn_may_write_gpr(&g_cur_insns[i], m->index)) return 0;
+    }
+    uint64_t v = (uint64_t)m->disp;
+    if (m->base != OCERZ_REG_NONE) v += g_xlat_cpu->gpr[m->base];
+    if (m->index != OCERZ_REG_NONE) v += g_xlat_cpu->gpr[m->index] << (m->scale & 3);
+    return v >= OCERZ_LOW_LIMIT;
+}
+static void wine_guard(A64Buf *b, const X86Insn *insn, int addr_reg)
+{
+    if (ENV_ON("OCERZ_WLIM_CHECK")) {
+        a64_mov_imm64(b, JTT, OCERZ_LOW_LIMIT);
+        a64_subs_reg(b, 1, A64_ZR, JTT, WLIM, 0);
+        uint32_t *ok = a64_label(b); a64_bcond(b, A64_EQ, 0);
+        a64_emit32(b, 0xd4200000u | (0x77u << 5));
+        a64_patch_bcond(ok, a64_label(b));
+    }
+    a64_subs_reg(b, 1, A64_ZR, addr_reg, WLIM, 0);
+    if (wine_guard_expects_high(insn) && g_n_garm < GUARD_ARMS_MAX) {
+        g_garm[g_n_garm].site = a64_label(b);
+        a64_bcond(b, A64_CC, 0);
+        g_garm[g_n_garm].back = a64_label(b);
+        g_garm[g_n_garm].reg = addr_reg;
+        g_garm[g_n_garm].idx = g_cur_insn_idx;
+        g_garm[g_n_garm].kind = WG_HIGH;
+        g_n_garm++;
+        return;
+    }
+    uint32_t *high = a64_label(b);
+    a64_bcond(b, A64_CS, 0);
+    (void)a64_try_orr_imm(b, 1, addr_reg, addr_reg, ocerz_low_base);
+    a64_patch_bcond(high, a64_label(b));
+}
+
 static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
                                      int addr_reg, uint32_t **exit_sites, int *n_exits)
 {
@@ -4784,6 +4866,10 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
         return NULL;
     }
     if (ocerz_low_base && ea_fold() == 0 && low_guard_fast_ok()) {
+        if (!g_low_top && g_pin_class == 3 && wlim_on()) {
+            wine_guard(b, insn, addr_reg);
+            return NULL;
+        }
         a64_lsr_imm(b, 1, JTT, addr_reg, 32);
         a64_subs_imm(b, 1, A64_ZR, JTT, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
         uint32_t *high = a64_label(b);
@@ -4805,6 +4891,7 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
             g_garm[g_n_garm].back = a64_label(b);
             g_garm[g_n_garm].reg = addr_reg;
             g_garm[g_n_garm].idx = g_cur_insn_idx;
+            g_garm[g_n_garm].kind = 0;
             g_n_garm++;
             a64_patch_b(done_low, a64_label(b));
             return NULL;
@@ -17341,14 +17428,15 @@ static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uin
                               ? g_xlat_jit->leaf_near + ((const char *)leaf - ocerz_leaf_lo)
                               : (const char *)leaf;
     int64_t leaf_words = ((const char *)leaf_at - (const char *)b->p) / 4;
+    int call_reg = low ? 30 : 16;       /* the Wine layout's x16 holds the guest's rsi meanwhile */
     if (g_tc_on) {
-        tc_imm64(b, 16, TCR_LEAF, (uint64_t)((const char *)leaf - ocerz_leaf_lo), (uint64_t)(uintptr_t)leaf_at);
-        a64_blr(b, 16);
+        tc_imm64(b, call_reg, TCR_LEAF, (uint64_t)((const char *)leaf - ocerz_leaf_lo), (uint64_t)(uintptr_t)leaf_at);
+        a64_blr(b, call_reg);
     } else if (leaf_words > -(1 << 25) && leaf_words < (1 << 25)) {
         a64_emit32(b, 0x94000000u | ((uint32_t)leaf_words & 0x03ffffffu));
     } else {
-        a64_mov_imm64(b, 16, (uint64_t)(uintptr_t)leaf_at);
-        a64_blr(b, 16);
+        a64_mov_imm64(b, call_reg, (uint64_t)(uintptr_t)leaf_at);
+        a64_blr(b, call_reg);
     }
     g_callout_seq++;
     if (low) {
@@ -17413,9 +17501,10 @@ static int leaf_layout_ok(void)
  * further on below 12 GB, so the block hands a routine its pointers
  * translated.  It first checks that each range the routine may touch lies on
  * one side of 12 GB and, above it, below the top strip; otherwise the routine
- * is not called.  Meanwhile the guest's rdi waits in x17 and its rsi in x29,
+ * is not called.  Meanwhile the guest's rdi waits in x17 and its rsi in x16,
  * which only the hoist uses, and select_low_hoist leaves these blocks alone;
- * both go back before anything else runs, called or not.
+ * both go back before anything else runs, called or not; the routine is
+ * called through x30, which the call overwrites anyway.
  *
  * A range is known only for a routine given a length.  strlen is asked as
  * strnlen up to 12 GB or the top strip, and is declined when it gets there,
@@ -17483,7 +17572,7 @@ static int leaf_low_entry(uint64_t rip)
 }
 
 /*
- * Before the call: rdi and rsi saved, x9 set to declined, and each pointer
+ * Before the call: rdi and rsi saved (x17, x16), x9 set to declined, and each pointer
  * checked and translated.  A check that fails branches to after the call
  * (*fail), where the registers go back and x9 sends the block on to the
  * translation.  x10 holds 12 GB, x11 the top strip, x12 low_base; for each
@@ -17494,7 +17583,7 @@ static void emit_leaf_low_args(A64Buf *b, const LeafLow *s, uint32_t **fail, int
 {
     const int rdi = 28, rsi = 27, rdx = 23;
     a64_mov_reg(b, 1, JMEMBASE, rdi);
-    a64_mov_reg(b, 1, JMEMAUX, rsi);
+    a64_mov_reg(b, 1, JMEMBASE2, rsi);
     a64_movz(b, JT0, 1, 0);
     a64_movz(b, JT1, (uint16_t)(OCERZ_LOW_LIMIT >> 32), 2);
     a64_mov_imm64(b, JT2, OCERZ_TOP_LO);
@@ -17517,8 +17606,8 @@ static void emit_leaf_low_args(A64Buf *b, const LeafLow *s, uint32_t **fail, int
             a64_subs_reg(b, 1, rsi, JTU, hp, 0);
             fail[(*n_fail)++] = a64_label(b); a64_bcond(b, A64_LS, 0);
             if (s->clamp == 2) {
-                a64_subs_reg(b, 1, A64_ZR, rsi, JMEMAUX, 0);
-                a64_csel(b, 1, rsi, rsi, JMEMAUX, A64_CC);
+                a64_subs_reg(b, 1, A64_ZR, rsi, JMEMBASE2, 0);
+                a64_csel(b, 1, rsi, rsi, JMEMBASE2, A64_CC);
             }
         }
         a64_add_reg(b, 1, hp, hp, JTA, 0);
@@ -17537,7 +17626,7 @@ static void emit_leaf_low_restore(A64Buf *b, const LeafLow *s)
         a64_subs_reg(b, 1, A64_ZR, rax, rsi, 0);
         a64_cset(b, JT1, A64_EQ);
         if (s->clamp == 2) {
-            a64_subs_reg(b, 1, A64_ZR, rsi, JMEMAUX, 0);
+            a64_subs_reg(b, 1, A64_ZR, rsi, JMEMBASE2, 0);
             a64_cset(b, JT2, A64_CC);
             a64_and_reg(b, 1, JT1, JT1, JT2, 0);
         }
@@ -17545,7 +17634,7 @@ static void emit_leaf_low_restore(A64Buf *b, const LeafLow *s)
     }
     if (s->result == 2) a64_sub_reg(b, 1, JT1, rdi, JMEMBASE, 0);
     a64_mov_reg(b, 1, rdi, JMEMBASE);
-    a64_mov_reg(b, 1, rsi, JMEMAUX);
+    a64_mov_reg(b, 1, rsi, JMEMBASE2);
 }
 
 /* The answer, once the routine has given one. */
@@ -18466,7 +18555,9 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
     const X86Insn *t = &insns[n - 1];
     int loops = (t->op == OCERZ_OP_JCC || t->op == OCERZ_OP_JMP) && t->nops == 1 &&
                 t->ops[0].kind == OCERZ_OPK_IMM && t->ops[0].imm == rip;
-    int no_ix = ENV_ON("OCERZ_NO_LOW_HOIST_INDEX"), no_loose = ENV_ON("OCERZ_NO_LOW_HOIST_LOOSE");
+    /* With x29 holding 12 GB (wlim_on) the wide form has nowhere to keep its index reach, so leaves indexed operands to the guard. */
+    int no_ix = ENV_ON("OCERZ_NO_LOW_HOIST_INDEX") || (g_llh_wide && wlim_on()), no_loose = ENV_ON("OCERZ_NO_LOW_HOIST_LOOSE");
+restart_wide:;
     /* firstw: the first instruction to write a register; stepend: the first to write it other than by a constant step */
     int firstw[16], stepend[16], cnt[16] = {0}, ixn[16][4] = {{0}};
     int64_t lo[16] = {0}, hi[16] = {0};
@@ -18569,6 +18660,10 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
         }
         if (fits) break;
         g_llh_wide = 1;
+        if (wlim_on() && !no_ix) {
+            no_ix = 1;
+            goto restart_wide;
+        }
     }
     if (!g_llh_n) return;
     /* The wide form's reach below the bases is one value for them all, so they are settled together. */
@@ -19321,8 +19416,15 @@ static void emit_guard_arms(A64Buf *b, const uint32_t *entry)
     g_n_larm = 0;
     for (int k = 0; k < g_n_garm; k++) {
         uint32_t *lo = a64_label(b);
-        a64_patch_cbz(g_garm[k].site, lo);
-        emit_guard_full(b, g_garm[k].reg);
+        int r = g_garm[k].reg;
+        if (g_garm[k].kind == WG_HIGH) {
+            /* Expected at or above 12 GB, found below it: low_base. */
+            a64_patch_bcond(g_garm[k].site, lo);
+            (void)a64_try_orr_imm(b, 1, r, r, ocerz_low_base);
+        } else {
+            a64_patch_cbz(g_garm[k].site, lo);
+            emit_guard_full(b, r);
+        }
         uint32_t *here = a64_label(b);
         a64_b(b, (int32_t)(g_garm[k].back - here));
         if (g_n_fpbmap < JIT_MAX_BLOCK_INSNS) {
@@ -21239,6 +21341,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     a64_mov_reg(&b, 1, 19, 0);
     a64_mov_reg(&b, 1, 20, 1);
     emit_reload_jgb(&b);
+    if (wlim_on()) a64_movz(&b, WLIM, (uint16_t)(OCERZ_LOW_LIMIT >> 32), 2);
 
     emit_pin_prologue(&b);
 

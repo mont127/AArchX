@@ -103,6 +103,8 @@ bug is in what that switch controls.
 | `OCERZ_NO_AFP=1` | check NaN results in translated code even where the processor can produce x86's NaNs itself |
 | `OCERZ_NO_JIT_MMX=1` | run MMX instructions in the interpreter |
 | `OCERZ_NO_FAST_LOW_GUARD=1` | in a Wine process, map every guest address with the general three-range check instead of the short form |
+| `OCERZ_NO_WINE_LIM=1` | in a Wine process, test each address against 12 GB with a shift and a compare again, instead of comparing it with x29 (which then holds 12 GB) and laying out the side it was on when translated |
+| `OCERZ_WLIM_CHECK=1` | in a Wine process, trap before every guard whose x29 is not 12 GB (a debugging aid) |
 | `OCERZ_LOW_TOP_GUARD=1` | in a Wine process, test every access for the top strip instead of learning which blocks reach it from their first fault there |
 | `OCERZ_ALIGN_TEST_ALL=1` | test every ordered access for a 16-byte crossing instead of patching the sites that fault |
 | `OCERZ_NO_LEAF_INPLACE=1` | call `strlen`, `memcpy` and the nine other string and memory routines the ordinary way instead of through AArchX's own arm64 versions |
