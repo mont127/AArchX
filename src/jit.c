@@ -18239,7 +18239,8 @@ static void emit_llh_base(A64Buf *b, int k)
  * base that was below 8 GB when the block was translated is only asked to be
  * there again, which puts every span the hoist takes below 12 GB.
  * The wide form asks instead that the end be on the same side of 12 GB as the
- * start and below the top strip, and leaves in JMEMAUX the least distance
+ * start, and below the top strip in a block marked for it, and leaves in
+ * JMEMAUX the least distance
  * from a span's start down to its side's floor, 1 GB at most: the index may
  * reach that far below.
  */
@@ -18292,11 +18293,14 @@ static void emit_low_hoist_setup(A64Buf *b, int pre)
         a64_eor_reg(b, 1, JT0, JT0, JTU, 0);
         g_llh_bail_tb[g_n_llh_bail_tb++] = a64_label(b);
         a64_tbnz(b, JT0, 63, 0);
-        a64_lsr_imm(b, 1, JT0, JTA, 25);
-        a64_add_imm(b, 1, JT0, JT0, 1);
-        a64_lsr_imm(b, 1, JT0, JT0, 22);
-        g_llh_bail_cb[g_n_llh_bail_cb++] = a64_label(b);
-        a64_cbnz(b, 1, JT0, 0);
+        /* The top strip is told apart only in blocks marked for it, as emit_commpage_guard has it. */
+        if (g_low_top) {
+            a64_lsr_imm(b, 1, JT0, JTA, 25);
+            a64_add_imm(b, 1, JT0, JT0, 1);
+            a64_lsr_imm(b, 1, JT0, JT0, 22);
+            g_llh_bail_cb[g_n_llh_bail_cb++] = a64_label(b);
+            a64_cbnz(b, 1, JT0, 0);
+        }
         if (!g_llh_ix[k]) continue;
         a64_mov_imm64(b, JTA, OCERZ_LOW_LIMIT);
         a64_asr_imm(b, 1, JT0, JTU, 63);
