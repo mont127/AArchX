@@ -7410,9 +7410,13 @@ static int emit_shift_count(A64Buf *b, const X86Insn *insn, int sf, int dst,
         return 1;
     }
     if (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RCX && !s->high8 && s->size == 1) {
-        emit_gpr_rd(b, 1, dst, OCERZ_RCX);
-        a64_mov_imm64(b, JTU, mask);
-        a64_and_reg(b, 1, dst, dst, JTU, 0);
+        if (pin_slot(OCERZ_RCX) >= 0) {
+            (void)a64_try_and_imm(b, 1, dst, pin_hreg(pin_slot(OCERZ_RCX)), mask);
+        } else {
+            emit_gpr_rd(b, 1, dst, OCERZ_RCX);
+            a64_mov_imm64(b, JTU, mask);
+            a64_and_reg(b, 1, dst, dst, JTU, 0);
+        }
         *const_cnt = 0xffffffffu;
         return 1;
     }
@@ -7531,7 +7535,11 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
         return 0;
     int sf = d->size == 8;
     unsigned cnt;
-    if (!emit_shift_count(b, insn, sf, JT1, &cnt))
+    /* With the flags dead the count needs no mask: lslv, lsrv and asrv take it modulo the width, as x86 does. */
+    int rc = JT1;
+    if (!need && pin_slot(OCERZ_RCX) >= 0)
+        rc = pin_hreg(pin_slot(OCERZ_RCX));
+    else if (!emit_shift_count(b, insn, sf, JT1, &cnt))
         return 0;
     int ds = pin_slot(d->reg);
     int rd = ds >= 0 ? pin_hreg(ds) : JT2;
@@ -7542,9 +7550,9 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
     int rn = ds >= 0 ? rd : JT0;
     unsigned kind;
     switch (insn->op) {
-    case OCERZ_OP_SHL: a64_lslv(b, sf, rd, rn, JT1); kind = OCERZ_CC_SHL; break;
-    case OCERZ_OP_SHR: a64_lsrv(b, sf, rd, rn, JT1); kind = OCERZ_CC_SHR; break;
-    case OCERZ_OP_SAR: a64_asrv(b, sf, rd, rn, JT1); kind = OCERZ_CC_SAR; break;
+    case OCERZ_OP_SHL: a64_lslv(b, sf, rd, rn, rc); kind = OCERZ_CC_SHL; break;
+    case OCERZ_OP_SHR: a64_lsrv(b, sf, rd, rn, rc); kind = OCERZ_CC_SHR; break;
+    case OCERZ_OP_SAR: a64_asrv(b, sf, rd, rn, rc); kind = OCERZ_CC_SAR; break;
     default: return 0;
     }
     if (ds < 0)
@@ -14324,6 +14332,8 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                     d->reg != OCERZ_RSP && ds >= 0 && ss >= 0) {
                     if (jgb_usable())
                         a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), JGB, 0);
+                    else if (ocerz_guest_base == 0)
+                        a64_mov_reg(b, 1, pin_hreg(ds), pin_hreg(ss));
                     else {
                         a64_mov_imm64(b, pin_hreg(ds), ocerz_guest_base);
                         a64_sub_reg(b, 1, pin_hreg(ds), pin_hreg(ss), pin_hreg(ds), 0);
