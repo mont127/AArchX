@@ -9,14 +9,14 @@
  * pop, call and rsp-relative loads and stores after each.  Then the pairs and
  * fused forms that read or write rsp's register themselves: mov then and, from
  * rsp and into it, cmp and test of rsp fused with a jump, esp's low half, steps
- * too big for one instruction, rsp stored at rsp, an indexed lea, the other
- * stack reached as rsp plus an index, and add and sub of a register that cross
- * between the stacks.  Last, a load that faults on each stack, whose handler
- * reads rsp from the context: the translator rebuilds it from the host
- * register.  Then fork, from each stack: the translator hands it back to its
- * outer loop from inside a block, which must hear the request.  The checksum
- * takes values and rsp's offsets from the stack tops, never addresses, so it is
- * the same anywhere.  Against Rosetta.
+ * too big for one instruction, push and pop of memory, rsp stored at rsp, an
+ * indexed lea, the other stack reached as rsp plus an index, and add and sub
+ * of a register that cross between the stacks.  Last, a load that faults on
+ * each stack, whose handler reads rsp from the context: the translator
+ * rebuilds it from the host register.  Then fork, from each stack: the
+ * translator hands it back to its outer loop from inside a block, which must
+ * hear the request.  The checksum takes values and rsp's offsets from the
+ * stack tops, never addresses, so it is the same anywhere.  Against Rosetta.
  */
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -125,6 +125,10 @@ __asm__(
     "    sub $0x2000, %rsp\n    movq $0x34, 0x10(%rsp)\n    add 0x10(%rsp), %r13\n    add $0x2000, %rsp\n"
     "    add $-128, %rsp\n    movq $0x56, (%rsp)\n    add (%rsp), %r13\n    sub $-128, %rsp\n"
     "    mov %rsp, %rax\n    sub %r12, %rax\n    imul $7, %r13, %r13\n    add %rax, %r13\n"
+    /* push and pop with a memory operand, rip-relative and off a register */
+    "    movq $0x31, _g_pp(%rip)\n    movq $0x42, _g_pp+8(%rip)\n"
+    "    push _g_pp(%rip)\n    lea _g_pp(%rip), %rcx\n    push 8(%rcx)\n    pop (%rcx)\n    pop 8(%rcx)\n"
+    "    mov (%rcx), %rax\n    imul $3, %r13, %r13\n    add %rax, %r13\n    mov 8(%rcx), %rax\n    add %rax, %r13\n"
     /* rsp stored where it points, and an indexed lea off it */
     "    mov %rsp, 8(%rsp)\n    mov 8(%rsp), %rax\n    sub %rsp, %rax\n    add %rax, %r13\n"
     "    mov $3, %ecx\n    lea 8(%rsp,%rcx,8), %rax\n    sub %rsp, %rax\n    imul $11, %r13, %r13\n    add %rax, %r13\n"
@@ -185,6 +189,7 @@ static int fork_once(void)
 }
 
 uint64_t g_fault_rsp;
+uint64_t g_pp[2];
 static void on_fault(int sig, siginfo_t *si, void *ctx)
 {
     (void)sig; (void)si;
