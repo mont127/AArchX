@@ -624,6 +624,10 @@
  * modes.  The FP batch and lane-0 machinery stays off in 32-bit blocks: the
  * differential has no SSE arithmetic corpus to hold it to.
  *
+ * Shifts by cl are translated in 32-bit blocks too.  A masked count of 0
+ * skips the shift there, leaving the register and the flags as they were, as
+ * the interpreter does in 32-bit code (64-bit code writes the register back).
+ *
  * An fs- or gs-relative operand adds the segment base to the wrapped address
  * without wrapping the sum, as ocerz_ea does, and then takes the same guard and
  * translation as any other operand.  32-bit Windows code reads fs:[0] for every
@@ -8184,16 +8188,24 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
      */
     if (need && (!g_defer || ENV_ON("OCERZ_NO_SHIFT_CL_FLAGS")))
         return 0;
-    if (insn->mode32)
-        return 0;
     int sf = d->size == 8;
     unsigned cnt;
-    /* With the flags dead the count needs no mask: lslv, lsrv and asrv take it modulo the width, as x86 does. */
+    /*
+     * With the flags dead the count needs no mask: lslv, lsrv and asrv take it
+     * modulo the width, as x86 does.  In 32-bit code a count of 0 leaves the
+     * register alone, as the interpreter's op_shift does there, so the masked
+     * count is tested first and a 0 skips the shift.
+     */
     int rc = JT1;
-    if (!need && pin_slot(OCERZ_RCX) >= 0)
+    if (!need && !insn->mode32 && pin_slot(OCERZ_RCX) >= 0)
         rc = pin_hreg(pin_slot(OCERZ_RCX));
     else if (!emit_shift_count(b, insn, sf, JT1, &cnt))
         return 0;
+    uint32_t *zero32 = NULL;
+    if (insn->mode32) {
+        zero32 = a64_label(b);
+        a64_cbz(b, 0, JT1, 0);
+    }
     int ds = pin_slot(d->reg);
     int rd = ds >= 0 ? pin_hreg(ds) : JT2;
     if (ds < 0)
@@ -8216,6 +8228,8 @@ static int emit_shift_cl(A64Buf *b, const X86Insn *insn, uint64_t need)
         emit_defer_flags(b, ocerz_cc_pack(kind, d->size, 0), JT0, JT1);
         a64_patch_cbz(zero, a64_label(b));
     }
+    if (zero32)
+        a64_patch_cbz(zero32, a64_label(b));
     return 1;
 }
 
