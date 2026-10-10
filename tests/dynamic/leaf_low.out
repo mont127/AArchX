@@ -1,0 +1,3 @@
+strlen 11 strnlen 4 11 memchr 5 strchr 8
+memcmp 1 strncmp 0 strcmp -1
+OK

@@ -471,7 +471,10 @@
  * fault inside a routine is not delivered from there: src/vm.c makes the
  * routine decline, and the x86 code takes the same fault with every detail
  * right.  A block with a branch back to its own start is left alone, since
- * its lanes may be live where the call would leave.
+ * its lanes may be live where the call would leave.  In the Wine layout the
+ * block translates the pointers first and puts the guest's back after
+ * (LeafLow), for the routines that are told how far they may read; Wine-layout
+ * memcpy went from 2.26 to 0.76 times Rosetta's time.
  * OCERZ_NO_LEAF_INPLACE=1 turns the routines off in both modes, and so do
  * OCERZ_BRIDGESTAT and OCERZ_BRIDGELOG, whose counts and lines come from the
  * crossing.
@@ -17176,14 +17179,21 @@ static int leaf_inplace_enabled(void)
     return en;
 }
 
+typedef struct LeafLow LeafLow;
+static void emit_leaf_low_args(A64Buf *b, const LeafLow *s, uint32_t **fail, int *n_fail);
+static void emit_leaf_low_restore(A64Buf *b, const LeafLow *s);
+static void emit_leaf_low_result(A64Buf *b, const LeafLow *s);
 static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uint32_t **epi_sites,
-                                    int *n_epi)
+                                    int *n_epi, const LeafLow *low)
 {
     if (writes) {
         tc_imm64(b, JT0, TCR_SYM, TCS_RETIRE_COUNT, (uint64_t)(uintptr_t)&ocerz_jit_retire_count);
         a64_ldr(b, 8, JT0, JT0, 0);
         a64_str(b, 8, JT0, 20, LEAF_EPOCH_OFF);
     }
+    uint32_t *low_fail[4];
+    int n_low_fail = 0;
+    if (low) emit_leaf_low_args(b, low, low_fail, &n_low_fail);
     const char *leaf_at = g_xlat_jit && g_xlat_jit->leaf_near
                               ? g_xlat_jit->leaf_near + ((const char *)leaf - ocerz_leaf_lo)
                               : (const char *)leaf;
@@ -17198,9 +17208,20 @@ static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uin
         a64_blr(b, 16);
     }
     g_callout_seq++;
+    if (low) {
+        for (int k = 0; k < n_low_fail; k++) a64_patch_bcond(low_fail[k], a64_label(b));
+        emit_leaf_low_restore(b, low);
+    }
     uint32_t *declined = a64_label(b); a64_cbnz(b, 1, JT0, 0);
+    if (low) emit_leaf_low_result(b, low);
     emit_reload_mem_base(b);
-    a64_ldr_post64(b, JT1, pin_hreg(pin_slot(OCERZ_RSP)), 8);
+    if (low) {
+        /* The Wine layout's return address is at rsp plus the stack delta in x0, as pop's. */
+        a64_ldr_regoff(b, 8, JT1, pin_hreg(pin_slot(OCERZ_RSP)), JGB, 0);
+        a64_add_imm(b, 1, pin_hreg(pin_slot(OCERZ_RSP)), pin_hreg(pin_slot(OCERZ_RSP)), 8);
+    } else {
+        a64_ldr_post64(b, JT1, pin_hreg(pin_slot(OCERZ_RSP)), 8);
+    }
     uint32_t *retired = NULL;
     if (writes) {
         a64_ldr(b, 8, JT2, 20, LEAF_EPOCH_OFF);
@@ -17227,18 +17248,174 @@ static uint32_t *emit_leaf_call_ret(A64Buf *b, const void *leaf, int writes, uin
     return declined;
 }
 
-static int leaf_layout_ok(void)
+static int leaf_regs_ok(void)
 {
     static int no_blret = -1;
     if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
-    int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
-                jgb_usable() && !stack_guard_needed();
-    return fast3 && ras_body_only() && host_ras_enabled() && !no_blret && !g_xlat_mode32 &&
-           leaf_inplace_enabled() && ocerz_guest_base == 0 &&
-           !(ocerz_low_base && ocerz_mode == OCERZ_MODE_NATIVE) && pin_slot(OCERZ_RAX) >= 0 &&
-           pin_slot(OCERZ_RDI) >= 0 && pin_slot(OCERZ_RSI) >= 0 && pin_slot(OCERZ_RDX) >= 0 &&
-           pin_hreg(pin_slot(OCERZ_RAX)) == 21 && pin_hreg(pin_slot(OCERZ_RDI)) == 28 &&
+    return g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() && ras_body_only() &&
+           host_ras_enabled() && !no_blret && !g_xlat_mode32 && leaf_inplace_enabled() && ocerz_guest_base == 0 &&
+           pin_slot(OCERZ_RAX) >= 0 && pin_slot(OCERZ_RDI) >= 0 && pin_slot(OCERZ_RSI) >= 0 &&
+           pin_slot(OCERZ_RDX) >= 0 && pin_hreg(pin_slot(OCERZ_RAX)) == 21 && pin_hreg(pin_slot(OCERZ_RDI)) == 28 &&
            pin_hreg(pin_slot(OCERZ_RSI)) == 27 && pin_hreg(pin_slot(OCERZ_RDX)) == 23;
+}
+
+static int leaf_layout_ok(void)
+{
+    return jgb_usable() && !stack_guard_needed() && leaf_regs_ok();
+}
+
+/*
+ * The in-place routines in the Wine layout, cache mode only.  A guest pointer
+ * is the host address there from 12 GB up to the top strip, and low_base
+ * further on below 12 GB, so the block hands a routine its pointers
+ * translated.  It first checks that each range the routine may touch lies on
+ * one side of 12 GB and, above it, below the top strip; otherwise the routine
+ * is not called.  Meanwhile the guest's rdi waits in x17 and its rsi in x29,
+ * which only the hoist uses, and select_low_hoist leaves these blocks alone;
+ * both go back before anything else runs, called or not.
+ *
+ * A range is known only for a routine given a length.  strlen is asked as
+ * strnlen up to 12 GB or the top strip, and is declined when it gets there,
+ * as a string running on across would be; strnlen's bound is cut the same
+ * way.  strcmp and strchr scan with no bound at all and keep their
+ * translation.  memchr's answer, a host pointer, is turned back into the
+ * guest's; memmove and memset answer their first argument as the guest gave
+ * it.  The return address is popped through the stack delta in x0, so this
+ * needs that delta (lowstack_delta_ok).  OCERZ_NO_LEAF_LOW=1 turns it off.
+ */
+struct LeafLow {
+    uint8_t ptrs;        /* bit 0: rdi is a pointer, bit 1: rsi */
+    uint8_t len;         /* both ranges run for rdx bytes */
+    uint8_t clamp;       /* 1: strlen asked as strnlen; 2: strnlen with its bound cut */
+    uint8_t result;      /* 0: a number; 1: the first argument; 2: a pointer into it, or zero */
+    const void *call;    /* the routine called */
+};
+
+static int leaf_low_layout_ok(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_LEAF_LOW") ? 1 : 0;
+    return !off && ocerz_low_base && ocerz_mode != OCERZ_MODE_NATIVE && g_lowstack && low_guard_fast_ok() &&
+           leaf_regs_ok();
+}
+
+static int leaf_low_shape(const void *leaf, LeafLow *s)
+{
+    memset(s, 0, sizeof *s);
+    s->call = leaf;
+    if (leaf == (const void *)ocerz_leaf_memmove || leaf == (const void *)ocerz_leaf_memset) {
+        s->ptrs = leaf == (const void *)ocerz_leaf_memmove ? 3 : 1;
+        s->len = 1;
+        s->result = 1;
+    } else if (leaf == (const void *)ocerz_leaf_memcmp || leaf == (const void *)ocerz_leaf_strncmp) {
+        s->ptrs = 3;
+        s->len = 1;
+    } else if (leaf == (const void *)ocerz_leaf_memchr) {
+        s->ptrs = 1;
+        s->len = 1;
+        s->result = 2;
+    } else if (leaf == (const void *)ocerz_leaf_strnlen) {
+        s->ptrs = 1;
+        s->clamp = 2;
+    } else if (leaf == (const void *)ocerz_leaf_strlen) {
+        s->ptrs = 1;
+        s->clamp = 1;
+        s->call = (const void *)ocerz_leaf_strnlen;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* Whether the block at rip starts a routine leaf_low_shape takes, so the hoist must keep off x17 and x29. */
+static int leaf_low_entry(uint64_t rip)
+{
+    int w;
+    LeafLow s;
+    const void *leaf = ocerz_low_base && ocerz_mode != OCERZ_MODE_NATIVE && leaf_inplace_enabled() &&
+                               !ENV_ON("OCERZ_NO_LEAF_LOW")
+                           ? ocerz_dyldapi_leaf_entry(rip, &w)
+                           : NULL;
+    return leaf && leaf_low_shape(leaf, &s);
+}
+
+/*
+ * Before the call: rdi and rsi saved, x9 set to declined, and each pointer
+ * checked and translated.  A check that fails branches to after the call
+ * (*fail), where the registers go back and x9 sends the block on to the
+ * translation.  x10 holds 12 GB, x11 the top strip, x12 low_base; for each
+ * pointer x13 is where its range ends, x14 the end of its side, x15 what it
+ * is moved by.
+ */
+static void emit_leaf_low_args(A64Buf *b, const LeafLow *s, uint32_t **fail, int *n_fail)
+{
+    const int rdi = 28, rsi = 27, rdx = 23;
+    a64_mov_reg(b, 1, JMEMBASE, rdi);
+    a64_mov_reg(b, 1, JMEMAUX, rsi);
+    a64_movz(b, JT0, 1, 0);
+    a64_movz(b, JT1, (uint16_t)(OCERZ_LOW_LIMIT >> 32), 2);
+    a64_mov_imm64(b, JT2, OCERZ_TOP_LO);
+    a64_mov_imm64(b, JTF, ocerz_low_base);
+    for (int k = 0; k < 2; k++) {
+        if (!(s->ptrs >> k & 1)) continue;
+        int hp = k ? rsi : rdi;
+        if (s->len) {
+            a64_adds_reg(b, 1, JTT, hp, rdx, 0);
+            fail[(*n_fail)++] = a64_label(b); a64_bcond(b, A64_CS, 0);
+        }
+        a64_subs_reg(b, 1, A64_ZR, hp, JT1, 0);
+        a64_csel(b, 1, JTU, JT1, JT2, A64_CC);
+        a64_csel(b, 1, JTA, JTF, A64_ZR, A64_CC);
+        if (s->len) {
+            a64_subs_reg(b, 1, A64_ZR, JTT, JTU, 0);
+            fail[(*n_fail)++] = a64_label(b); a64_bcond(b, A64_HI, 0);
+        } else {
+            /* The bound goes in rsi: the distance to the side's end, none at all from the top strip on. */
+            a64_subs_reg(b, 1, rsi, JTU, hp, 0);
+            fail[(*n_fail)++] = a64_label(b); a64_bcond(b, A64_LS, 0);
+            if (s->clamp == 2) {
+                a64_subs_reg(b, 1, A64_ZR, rsi, JMEMAUX, 0);
+                a64_csel(b, 1, rsi, rsi, JMEMAUX, A64_CC);
+            }
+        }
+        a64_add_reg(b, 1, hp, hp, JTA, 0);
+    }
+}
+
+/*
+ * After the call, on either path: a strnlen that stopped at the bound the
+ * block set rather than the guest's declines, then the guest's rdi and rsi
+ * go back, with how far rdi was moved kept in x10 for memchr's answer.
+ */
+static void emit_leaf_low_restore(A64Buf *b, const LeafLow *s)
+{
+    const int rdi = 28, rsi = 27, rax = 21;
+    if (s->clamp) {
+        a64_subs_reg(b, 1, A64_ZR, rax, rsi, 0);
+        a64_cset(b, JT1, A64_EQ);
+        if (s->clamp == 2) {
+            a64_subs_reg(b, 1, A64_ZR, rsi, JMEMAUX, 0);
+            a64_cset(b, JT2, A64_CC);
+            a64_and_reg(b, 1, JT1, JT1, JT2, 0);
+        }
+        a64_orr_reg(b, 1, JT0, JT0, JT1, 0);
+    }
+    if (s->result == 2) a64_sub_reg(b, 1, JT1, rdi, JMEMBASE, 0);
+    a64_mov_reg(b, 1, rdi, JMEMBASE);
+    a64_mov_reg(b, 1, rsi, JMEMAUX);
+}
+
+/* The answer, once the routine has given one. */
+static void emit_leaf_low_result(A64Buf *b, const LeafLow *s)
+{
+    const int rdi = 28, rax = 21;
+    if (s->result == 1) {
+        a64_mov_reg(b, 1, rax, rdi);
+    } else if (s->result == 2) {
+        uint32_t *none = a64_label(b); a64_cbz(b, 1, rax, 0);
+        a64_sub_reg(b, 1, rax, rax, JT1, 0);
+        a64_patch_cbz(none, a64_label(b));
+    }
 }
 
 static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
@@ -17297,7 +17474,7 @@ static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
             leaf_out[n_leaf_out++] = a64_label(b); a64_bcond(b, A64_HI, 0);
         }
         leaf_out_cb[n_leaf_out] = 1;
-        leaf_out[n_leaf_out++] = emit_leaf_call_ret(b, leaf, leaf_limit != 0, epi_sites, n_epi);
+        leaf_out[n_leaf_out++] = emit_leaf_call_ret(b, leaf, leaf_limit != 0, epi_sites, n_epi, NULL);
         for (int k = 0; k < n_leaf_out; k++) {
             if (leaf_out_cb[k]) a64_patch_cbz(leaf_out[k], a64_label(b));
             else a64_patch_bcond(leaf_out[k], a64_label(b));
@@ -18133,6 +18310,9 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
     g_llh_index = -1;
     if (!ocerz_low_base || ocerz_guest_base != 0 || g_xlat_mode32 || g_pin_class != 3 || g_no_chain ||
         !low_guard_fast_ok() || g_mem_hoist_greg >= 0 || n < 2 || n > JIT_MAX_BLOCK_INSNS || ENV_ON("OCERZ_NO_LOW_HOIST"))
+        return;
+    /* A routine answered in place keeps rdi and rsi in the hoist's registers meanwhile. */
+    if (leaf_low_entry(rip))
         return;
     /* A block that gave the hoist up translates without it: a learned variant, as the alignment marks make. */
     if (lowhoist_marked(jit_key(rip, 0))) {
@@ -21313,13 +21493,19 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     ea_cache_reset();
     int leaf_entry_writes = 0;
     const void *leaf_entry = NULL;
-    if (ocerz_mode != OCERZ_MODE_NATIVE && !g_l0_fixed && leaf_layout_ok()) {
+    LeafLow leaf_low;
+    const LeafLow *leaf_lowp = NULL;
+    if (ocerz_mode != OCERZ_MODE_NATIVE && !g_l0_fixed && (leaf_layout_ok() || leaf_low_layout_ok())) {
         leaf_entry = ocerz_dyldapi_leaf_entry(rip, &leaf_entry_writes);
         for (int k = 0; leaf_entry && k < n; k++) {
             const X86Insn *t = &blk->insns[k];
             if (t->op != OCERZ_OP_CALL && t->nops == 1 && t->ops[0].kind == OCERZ_OPK_IMM &&
                 (uint64_t)t->ops[0].imm == rip)
                 leaf_entry = NULL;
+        }
+        if (leaf_entry && ocerz_low_base) {
+            if (g_llh_n || g_mem_hoist_greg >= 0 || !leaf_low_shape(leaf_entry, &leaf_low)) leaf_entry = NULL;
+            else leaf_lowp = &leaf_low;
         }
     }
     dep_plain_mark(blk->insns, n);
@@ -21341,7 +21527,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
         if (i == 0 && leaf_entry) {
             OCERZ_LOG("jit: the routine at %#llx is answered in place\n", (unsigned long long)rip);
-            uint32_t *declined = emit_leaf_call_ret(&b, leaf_entry, leaf_entry_writes, epi_sites, &n_epi);
+            uint32_t *declined = emit_leaf_call_ret(&b, leaf_lowp ? leaf_lowp->call : leaf_entry, leaf_entry_writes,
+                                                    epi_sites, &n_epi, leaf_lowp);
             a64_patch_cbz(declined, a64_label(&b));
             ea_cache_reset();
         }

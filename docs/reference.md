@@ -106,6 +106,7 @@ bug is in what that switch controls.
 | `OCERZ_LOW_TOP_GUARD=1` | in a Wine process, test every access for the top strip instead of learning which blocks reach it from their first fault there |
 | `OCERZ_ALIGN_TEST_ALL=1` | test every ordered access for a 16-byte crossing instead of patching the sites that fault |
 | `OCERZ_NO_LEAF_INPLACE=1` | call `strlen`, `memcpy` and the nine other string and memory routines the ordinary way instead of through AArchX's own arm64 versions |
+| `OCERZ_NO_LEAF_LOW=1` | in the Wine layout, leave those routines to their translated x86 code instead of handing AArchX's versions translated pointers |
 | `OCERZ_NO_MEMFN_PLAIN=1` | translate the system's string and memory routines with ordered accesses when the rest of the process has them |
 | `OCERZ_NO_FPB_DEFER=1` | check every floating-point result immediately instead of once per batch |
 | `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
