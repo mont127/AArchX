@@ -14600,6 +14600,8 @@ static int emit_x87(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **ex
     int ok = g_n_x87_site + 16 <= X87_SITE_MAX && g_n_x87_frag + 4 <= X87_FRAG_MAX &&
              emit_x87_one(b, insn, need, exit_sites, n_exits);
     x87_frag_land(b);
+    /* An out-of-line tail lands here, and the run's exits at its end, past code that may have set the address caches. */
+    ea_cache_reset();
     if (!ok) {
         emit_slowcall(b, insn, exit_sites, n_exits);
         r->last = (int16_t)idx;
@@ -21915,6 +21917,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     int fpb_open = -1;
 
     int last_flag_def = -1;
+    int ea_stepped = -1;
     ea_cache_reset();
     int leaf_entry_writes = 0;
     const void *leaf_entry = NULL;
@@ -21987,7 +21990,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (g_scpend.valid && g_scpend.idx < i - 1) scalar_pend_flush(&b);
         g_fpb_open = fpb_open;
         g_fpb_fast = fpb_open >= 0 && g_fpb_member[i];
+        /* Every instruction since the last step: a fused pair or triple is translated, and stepped past, as one. */
+        for (int k = ea_stepped < 0 ? 0 : ea_stepped; k < i - 1; k++) ea_cache_step(&blk->insns[k], NULL);
         ea_cache_step(insn, i > 0 ? &blk->insns[i - 1] : NULL);
+        ea_stepped = i;
         g_nzcv_want = 0;
         for (int j = i + 1; j < n && j <= i + 1 + NZCV_GAP_MAX; j++)
             if (nzcv_fuse_producer(blk->insns, j) == i) { g_nzcv_want = 1; break; }
@@ -22561,6 +22567,8 @@ promo_push_fallthrough:
         uint32_t *lbl = a64_label(&b);
         a64_patch_bcond(fb->site, lbl);
         if (fb->gain) a64_patch_b(fb->site + fb->gain, lbl);
+        /* The replay calls out; x15 is kept for the address caches the code after the check may be using. */
+        a64_str_pre64(&b, JTA, 31, -16);
         fpb_replay_prelude(&b, fb, fb->l0, fb->l0_dbl);
         yc_flush_from(&b, 0xffff);
         g_yc_dirty = 0;
@@ -22597,6 +22605,7 @@ promo_push_fallthrough:
         }
         if (fb->fcmp_vreg >= 0)
             a64_fcmp(&b, 1, fb->fcmp_vreg, fb->fcmp_vreg);
+        a64_ldr_post64(&b, JTA, 31, 16);
         uint32_t *here = a64_label(&b);
         a64_b(&b, (int32_t)(fb->back - here));
     }
@@ -22604,6 +22613,7 @@ promo_push_fallthrough:
         FpbSite *st = &g_fpb_sites[k];
         FpBatch *fb = &g_fpb[st->batch];
         a64_patch_bcond(st->site, a64_label(&b));
+        a64_str_pre64(&b, JTA, 31, -16);
         if (st->keep_jt) { a64_stp_pre(&b, 9, 10, 31, -32); a64_stp_off(&b, 11, 12, 31, 16); }
         fpb_replay_prelude(&b, fb, st->l0, st->l0_dbl);
         yc_flush_from(&b, 0xffff);
@@ -22642,6 +22652,7 @@ promo_push_fallthrough:
         if (st->fcmp_a >= 0)
             a64_fcmp(&b, st->fcmp_dbl, st->fcmp_a, st->fcmp_b);
         if (st->keep_jt) { a64_ldp_off(&b, 11, 12, 31, 16); a64_ldp_post(&b, 9, 10, 31, 32); }
+        a64_ldr_post64(&b, JTA, 31, 16);
         uint32_t *here = a64_label(&b);
         a64_b(&b, (int32_t)(st->back - here));
     }
