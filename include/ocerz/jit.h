@@ -18,6 +18,9 @@
 struct OcerzVM;
 
 extern __thread sigjmp_buf *ocerz_jit_decode_recover;
+/* Set while translate has this thread's JIT pages writable; a fault recovered
+   through ocerz_jit_decode_recover skips sigreturn, so the handler reopens them. */
+extern __thread int ocerz_jit_wx_open;
 
 typedef struct OcerzJit OcerzJit;
 
