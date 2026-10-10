@@ -6286,8 +6286,13 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
         return 0;
     int sf = (d->size == 8);
     if (s->kind == OCERZ_OPK_REG) {
-        if (s->high8)
-            return 0;
+        if (s->high8) {
+            if (ENV_ON("OCERZ_NO_HIGH8_ARITH")) return 0;
+            emit_gpr_rd(b, 1, JT1, s->reg);
+            if (is_signed) a64_sbfx(b, sf, JT1, JT1, 8, 8); else a64_ubfx(b, sf, JT1, JT1, 8, 8);
+            emit_gpr_wr(b, JT1, d->reg);
+            return 1;
+        }
         if (pin_slot(d->reg) >= 0 && pin_slot(s->reg) >= 0 &&
             !(rsp_is_ptr() && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP))) {
             int rd = pin_hreg(pin_slot(d->reg)), rs = pin_hreg(pin_slot(s->reg));
@@ -8425,21 +8430,36 @@ static int setcc_zx_partner(const X86Insn *insn)
 static int emit_setcc(A64Buf *b, const X86Insn *insn)
 {
     const X86Operand *d = &insn->ops[0];
-    if (d->kind == OCERZ_OPK_MEM && d->size == 1 && insn->addrsize == 8 && g_defer &&
-        (insn->seg == OCERZ_SEG_NONE || insn->seg == OCERZ_SEG_GS || insn->seg == OCERZ_SEG_FS)) {
+    if (d->kind == OCERZ_OPK_MEM && d->size == 1 && (insn->addrsize == 8 || (insn->addrsize == 4 && insn->mode32)) &&
+        g_defer && (insn->seg == OCERZ_SEG_NONE || insn->seg == OCERZ_SEG_GS || insn->seg == OCERZ_SEG_FS)) {
+        if (insn->mode32 && !mem_native_store_ok()) return 0;
         emit_cc_predicate_ex(b, insn->cc, 1);
         a64_cset(b, JT2, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
-        if (mem_native_store_ok() && emit_plain_mem_fast(b, insn, d, 1, JT2, 1, 0)) return 1;
+        if (!insn->mode32 && mem_native_store_ok() && emit_plain_mem_fast(b, insn, d, 1, JT2, 1, 0)) return 1;
         if (!emit_mem_ea(b, insn, d, JTA)) return 0;
         (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
         emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
         emit_guest_store_ordered(b, 1, JT2, JTA, JTU);
         return 1;
     }
-    if (d->kind != OCERZ_OPK_REG || d->high8 || d->size != 1)
+    if (d->kind != OCERZ_OPK_REG || d->size != 1)
         return 0;
     if (rsp_is_ptr() && d->reg == OCERZ_RSP)
         return 0;
+    if (d->high8) {
+        /* bits 8-15 of the register, as the high-byte arithmetic does; OCERZ_NO_HIGH8_ARITH=1 interprets it */
+        if (ENV_ON("OCERZ_NO_HIGH8_ARITH")) return 0;
+        emit_cc_predicate_ex(b, insn->cc, 1);
+        a64_cset(b, JT2, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
+        if (pin_slot(d->reg) >= 0) {
+            a64_bfi(b, 1, pin_hreg(pin_slot(d->reg)), JT2, 8, 8);
+            return 1;
+        }
+        emit_gpr_rd(b, 1, JT0, d->reg);
+        a64_bfi(b, 1, JT0, JT2, 8, 8);
+        emit_gpr_wr(b, JT0, d->reg);
+        return 1;
+    }
     emit_cc_predicate_ex(b, insn->cc, 1);
     int zx = pin_slot(d->reg) >= 0 ? setcc_zx_partner(insn) : -1;
     if (zx >= 0) {
@@ -15179,6 +15199,30 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     if (insn->op == OCERZ_OP_MOV) {
         const X86Operand *d = &insn->ops[0];
         const X86Operand *s = &insn->ops[1];
+        if (d->kind == OCERZ_OPK_REG && d->size == 1 && (d->high8 || (s->kind == OCERZ_OPK_REG && s->high8))) {
+            /* a byte move into or out of ah, ch, dh or bh: bits 8-15 by ubfx and bfi */
+            if (ENV_ON("OCERZ_NO_HIGH8_ARITH") || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
+            if (s->kind == OCERZ_OPK_MEM) {
+                if (insn->seg != OCERZ_SEG_NONE) return 0;
+                if (!emit_mem_load_plain(b, insn, s, 1, JT1)) {
+                    if (!emit_mem_ea(b, insn, s, JTA)) return 0;
+                    (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
+                    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+                    emit_guest_load_ordered(b, 1, JT1, JTA, JTU);
+                }
+            } else if (s->kind == OCERZ_OPK_IMM) {
+                a64_mov_imm64(b, JT1, (uint64_t)s->imm & 0xff);
+            } else if (s->kind == OCERZ_OPK_REG && s->size == 1) {
+                emit_gpr_rd(b, 1, JT1, s->reg);
+                if (s->high8) a64_ubfx(b, 0, JT1, JT1, 8, 8);
+            } else {
+                return 0;
+            }
+            emit_gpr_rd(b, 1, JT0, d->reg);
+            a64_bfi(b, 1, JT0, JT1, d->high8 ? 8 : 0, 8);
+            emit_gpr_wr(b, JT0, d->reg);
+            return 1;
+        }
         if (d->kind == OCERZ_OPK_REG && d->high8)
             return 0;
         if (d->kind == OCERZ_OPK_REG && (d->size == 4 || d->size == 8)) {

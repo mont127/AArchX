@@ -1,6 +1,7 @@
 /* Byte arithmetic, logic, cmp and test with ah or ch on either side (register, immediate and memory operands), the
  * flags read back by pushf (the defined ones: CF, PF, ZF, SF, OF, and AF after add, sub and cmp) and by setcc right
- * after the instruction, on edge values. Builds for i386 and x86_64; high8.expected is the x86_64 build's output under
+ * after the instruction, on edge values; byte moves into and out of them, movzx and movsx from them, and setcc into
+ * them and into memory. Builds for i386 and x86_64; high8.expected is the x86_64 build's output under
  * Rosetta, and the i386 lines are the same ones. The x86_64 build steps past the red zone around pushf, which would
  * overwrite the memory operand there. */
 #include <stdio.h>
@@ -43,6 +44,19 @@ OPS(cmp_b, "b", "cmpb %%ch, %%ah") OPS(cmp_l, "l", "cmpb %%ch, %%ah") OPS(cmp_e,
 OPS(test_z, "z", "testb $0x40, %%ah") OPS(test_s, "s", "testb %%ch, %%ah") OPS(and_z, "z", "andb %%cl, %%ah")
 OPS(add_c, "c", "addb %%ch, %%ah") OPS(sub_o, "o", "subb %%ch, %%ah") OPS(xor_p, "p", "xorb %%ch, %%ah")
 
+#define OPR(name, insn)                                                                                      \
+    static uint64_t name(uint32_t a, uint32_t c)                                                             \
+    {                                                                                                        \
+        volatile uint8_t m = (uint8_t)(c >> 16);                                                             \
+        __asm__ volatile(insn : "+a"(a), "+c"(c), "+m"(m) : : "cc");                                         \
+        return (uint64_t)a << 32 ^ (uint64_t)(uint16_t)c << 16 ^ (uint64_t)m << 8;                           \
+    }
+OPR(mov_hh, "movb %%ch, %%ah") OPR(mov_hl, "movb %%cl, %%ah") OPR(mov_lh, "movb %%ah, %%cl")
+OPR(mov_hi, "movb $0x5a, %%ah") OPR(mov_hm, "movb %2, %%ah") OPR(mov_mh, "movb %%ah, %2")
+OPR(movzx_h, "movzbl %%ah, %%ecx") OPR(movsx_h, "movsbl %%ch, %%eax")
+OPR(set_h, "cmpb %%ch, %%al\n\tsetl %%ah") OPR(set_hb, "cmpb %%cl, %%ah\n\tsetb %%ch")
+OPR(set_m, "cmpb %%ch, %%ah\n\tsetg %2")
+
 typedef uint64_t (*fn)(uint32_t, uint32_t);
 static const struct { const char *name; fn f; } ops[] = {
 #define E(n) { #n, n },
@@ -50,7 +64,8 @@ static const struct { const char *name; fn f; } ops[] = {
     E(sub_mh) E(and_hh) E(and_hl) E(and_lh) E(and_hi) E(and_hm) E(and_mh) E(or_hh) E(or_hl) E(or_lh) E(or_hi)
     E(or_hm) E(or_mh) E(xor_hh) E(xor_hl) E(xor_lh) E(xor_hi) E(xor_hm) E(xor_mh) E(cmp_hh) E(cmp_hi) E(cmp_hm)
     E(cmp_mh) E(cmp_lh) E(test_hh) E(test_hi) E(test_mh) E(cmp_b) E(cmp_l) E(cmp_e) E(test_z) E(test_s) E(and_z)
-    E(add_c) E(sub_o) E(xor_p)
+    E(add_c) E(sub_o) E(xor_p) E(mov_hh) E(mov_hl) E(mov_lh) E(mov_hi) E(mov_hm) E(mov_mh) E(movzx_h)
+    E(movsx_h) E(set_h) E(set_hb) E(set_m)
 #undef E
 };
 
