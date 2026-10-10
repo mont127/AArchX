@@ -1568,18 +1568,7 @@ static uint32_t stop_retarget(uint32_t insn, const uint32_t *site,
     return 0x14000000u | ((uint32_t)off & 0x03ffffffu);
 }
 static int g_mem_hoist_greg = -1;
-/* The Wine layout's base hoist (select_low_hoist): its guest register, the instruction it holds until, and the displacement span. */
-static int g_low_hoist_greg = -1, g_low_hoist_until;
-static int32_t g_low_hoist_lo, g_low_hoist_hi;
-/* An operand the block's low hoist covers: its host address is JMEMBASE plus its displacement. */
-static int low_hoist_covers(const X86Insn *insn, const X86Operand *op)
-{
-    return g_low_hoist_greg >= 0 && insn->seg == OCERZ_SEG_NONE && insn->addrsize == 8 &&
-           op->base == (unsigned)g_low_hoist_greg && op->index == OCERZ_REG_NONE && !op->riprel &&
-           g_cur_insn_idx < g_low_hoist_until && op->disp >= g_low_hoist_lo && op->disp < g_low_hoist_hi;
-}
-static uint32_t *g_low_hoist_bail[3];
-static int g_n_low_hoist_bail, g_ea_lowhoisted, g_ea_lowhoisted_reg;
+static int g_ea_lowhoisted, g_ea_lowhoisted_reg;
 static int g_mem_hoist_aux_disp;
 static int g_mem_hoist_aux_index = -1;
 static int g_mem_hoist_aux_scale;
@@ -1587,6 +1576,75 @@ static int g_mem_hoist_aux_scale;
 #define JMEMAUX 29
 #define JMEMBASE2 16
 #define JMEMBASE3 30
+/*
+ * The Wine layout's hoist (select_low_hoist).  A guest address there needs
+ * low_base added when it is below 12 GB, which costs every memory operand a
+ * shift, a compare, a branch and an orr.  A block instead settles that where
+ * it starts, for up to three of the registers its operands are based on: each
+ * gets its host address in a register (JMEMBASE, JMEMBASE2, JMEMBASE3), and
+ * an operand on it, until the block writes the base, is that register plus
+ * the displacement.  A base the block never writes is settled once, before a
+ * block that loops on itself; any other one each time round.
+ *
+ * Operands indexed by one chosen register and scale are covered as well.  The
+ * base's check then allows 2 GB for the scaled index, and the block checks,
+ * each time round, that the index is inside that.  The index may be stepped
+ * by constants on the way (add, sub, inc, dec): the steps count as
+ * displacement.  With a scale of 1 the two registers swap roles when it is
+ * the index that the block leaves alone.
+ *
+ * A block is first translated for the usual case, every base below 12 GB and
+ * an index that is not negative: three instructions for a base below 8 GB,
+ * eight for one above, and two for the index.  When one of those checks fails
+ * the block is translated again in the
+ * wide form (g_llh_wide), which takes a base on either side of 12 GB and an
+ * index of either sign, with JMEMAUX holding how far below the bases the
+ * index may reach.  When that fails too, it is translated without a hoist.
+ *
+ * Which operands are covered is decided once, in select_low_hoist, and kept
+ * per instruction in g_llh_cov.  Code emitted later asks by the operand's
+ * address (llh_slot), so it cannot disagree with what the checks were sized
+ * for, whichever instruction the emitter thinks it is on.
+ */
+#define LLH_MAX 3
+#define LLH_REACH (1ull << 31)
+static const int g_llh_hreg[LLH_MAX] = { JMEMBASE, JMEMBASE2, JMEMBASE3 };
+static int g_llh_n, g_llh_live, g_llh_wide, g_llh_index = -1, g_llh_scale, g_llh_ninsn;
+static const OcerzCPU *g_xlat_cpu;                  /* the registers translate() was called with, when it was from the dispatcher */
+static const X86Insn *g_llh_insns;
+static int g_llh_greg[LLH_MAX];
+static int64_t g_llh_lo[LLH_MAX], g_llh_hi[LLH_MAX];
+static uint8_t g_llh_ix[LLH_MAX], g_llh_pre[LLH_MAX], g_llh_quick[LLH_MAX];
+static uint8_t g_llh_cov[JIT_MAX_BLOCK_INSNS];      /* two bits an operand: its slot plus one */
+static uint32_t *g_llh_bail_tb[3 * LLH_MAX], *g_llh_bail_cb[2 * LLH_MAX + 1];
+static int g_n_llh_bail_tb, g_n_llh_bail_cb;
+/* The hoist's slot for an operand it covers, or -1. */
+static int llh_slot(const X86Insn *insn, const X86Operand *op)
+{
+    if (!g_llh_n) return -1;
+    uintptr_t i = (uintptr_t)insn - (uintptr_t)g_llh_insns, k = (uintptr_t)op - (uintptr_t)insn->ops;
+    if (i >= (uintptr_t)g_llh_ninsn * sizeof *insn || i % sizeof *insn || k >= sizeof insn->ops || k % sizeof *op)
+        return -1;
+    return (g_llh_cov[i / sizeof *insn] >> (2 * (k / sizeof *op)) & 3) - 1;
+}
+static int llh_uses(int hreg)
+{
+    for (int k = 0; k < g_llh_n; k++) if (g_llh_hreg[k] == hreg) return 1;
+    return 0;
+}
+/* The register an unindexed covered operand is addressed off, or -1. */
+static int low_hoist_reg(const X86Insn *insn, const X86Operand *op)
+{
+    int k = op->index == OCERZ_REG_NONE ? llh_slot(insn, op) : -1;
+    return k >= 0 ? g_llh_hreg[k] : -1;
+}
+/* The other register of an indexed operand in slot k: its index, or its base when the two swapped roles. */
+static unsigned llh_other(const X86Operand *op, int k)
+{
+    return op->base == (unsigned)g_llh_greg[k] ? op->index : op->base;
+}
+static int ea_cache_reusable(const A64Buf *b, const X86Operand *op);
+static void ea_cache_set(const A64Buf *b, const X86Operand *op);
 static int g_mem_hoist_greg2 = -1;
 static int g_mem_hoist_greg3 = -1;
 static inline uint64_t hoist_signature(void)
@@ -4279,10 +4337,19 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     }
     if (insn->addrsize != 8)
         return 0;
-    if (low_hoist_covers(insn, op)) {
-        if (op->disp > 0)      a64_add_imm(b, 1, addr_reg, JMEMBASE, (uint32_t)op->disp);
-        else if (op->disp < 0) a64_sub_imm(b, 1, addr_reg, JMEMBASE, (uint32_t)-op->disp);
-        else                   a64_mov_reg(b, 1, addr_reg, JMEMBASE);
+    int ls = llh_slot(insn, op);
+    if (ls >= 0) {
+        int from = g_llh_hreg[ls];
+        if (op->index != OCERZ_REG_NONE) {
+            if (addr_reg != JTA || !ea_cache_reusable(b, op)) {
+                a64_add_reg(b, 1, addr_reg, from, pin_hreg(pin_slot(llh_other(op, ls))), op->scale & 3);
+                if (addr_reg == JTA) ea_cache_set(b, op);
+            }
+            from = addr_reg;
+        }
+        if (op->disp > 0)        a64_add_imm(b, 1, addr_reg, from, (uint32_t)op->disp);
+        else if (op->disp < 0)   a64_sub_imm(b, 1, addr_reg, from, (uint32_t)-op->disp);
+        else if (from != addr_reg) a64_mov_reg(b, 1, addr_reg, from);
         g_ea_lowhoisted = 1;
         g_ea_lowhoisted_reg = addr_reg;
         return 1;
@@ -4716,10 +4783,10 @@ static inline void patch_guard_skip(uint32_t *skip, uint32_t *target)
         a64_patch_b(skip, target);
 }
 
+static void emit_llh_base(A64Buf *b, int k);
 static void emit_reload_mem_base(A64Buf *b)
 {
-    if (g_low_hoist_greg >= 0)
-        (void)a64_try_orr_imm(b, 1, JMEMBASE, pin_hreg(pin_slot(g_low_hoist_greg)), ocerz_low_base);
+    for (int k = 0; g_llh_live && k < g_llh_n; k++) emit_llh_base(b, k);
     if (g_mem_hoist_greg < 0)
         return;
     int bs = pin_slot(g_mem_hoist_greg);
@@ -5156,10 +5223,11 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
 {
     static int dis = -1; if (dis < 0) dis = getenv("OCERZ_NO_PLAINFAST") ? 1 : 0;
     if (dis) return 0;
-    if (low_hoist_covers(insn, m) && !ENV_ON("OCERZ_NO_HOIST_DISP")) {
+    int lhr = low_hoist_reg(insn, m);
+    if (lhr >= 0 && !ENV_ON("OCERZ_NO_HOIST_DISP")) {
         int plain = mem_plain_access_ok(m);
-        if (vec) { if (store) emit_v_st_at(b, size, reg, JMEMBASE, (int32_t)m->disp, plain); else emit_v_ld_at(b, size, reg, JMEMBASE, (int32_t)m->disp, plain); }
-        else     { if (store) emit_gpr_st_at(b, size, reg, JMEMBASE, (int32_t)m->disp, plain); else emit_gpr_ld_at(b, size, reg, JMEMBASE, (int32_t)m->disp, plain); }
+        if (vec) { if (store) emit_v_st_at(b, size, reg, lhr, (int32_t)m->disp, plain); else emit_v_ld_at(b, size, reg, lhr, (int32_t)m->disp, plain); }
+        else     { if (store) emit_gpr_st_at(b, size, reg, lhr, (int32_t)m->disp, plain); else emit_gpr_ld_at(b, size, reg, lhr, (int32_t)m->disp, plain); }
         return 1;
     }
     if (lowstack_disp_ea(b, insn, m, size, 1)) {
@@ -5327,10 +5395,20 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
                                 int size, int *ra_out, uint32_t *disp_out, int unscaled_ok)
 {
     if (lowstack_disp_ea(b, insn, op, size, unscaled_ok)) { *ra_out = JTA; *disp_out = (uint32_t)op->disp; return 1; }
-    if (low_hoist_covers(insn, op) && !ENV_ON("OCERZ_NO_HOIST_DISP")) {
+    if (!ENV_ON("OCERZ_NO_HOIST_DISP")) {
         int64_t d = op->disp;
-        if ((d >= 0 && (d % size) == 0 && d / size <= 4095) || (unscaled_ok && d >= -256 && d <= 255)) {
-            *ra_out = JMEMBASE; *disp_out = (uint32_t)d;
+        int dfits = (d >= 0 && (d % size) == 0 && d / size <= 4095) || (unscaled_ok && d >= -256 && d <= 255);
+        int lhr = low_hoist_reg(insn, op), ls = lhr < 0 ? llh_slot(insn, op) : -1;
+        if (lhr >= 0 && dfits) {
+            *ra_out = lhr; *disp_out = (uint32_t)d;
+            return 1;
+        }
+        /* An indexed operand of the loop hoist: JTA = base + index << scale, which the next one on the pair takes over. */
+        if (ls >= 0 && dfits) {
+            if (!ea_cache_reusable(b, op))
+                a64_add_reg(b, 1, JTA, g_llh_hreg[ls], pin_hreg(pin_slot(llh_other(op, ls))), op->scale & 3);
+            ea_cache_set(b, op);
+            *ra_out = JTA; *disp_out = (uint32_t)d;
             return 1;
         }
     }
@@ -17952,91 +18030,308 @@ static void mark_add(MarkSet *m, uint64_t key)
     }
     m->full = 1;
 }
-static MarkSet g_lowhoist_marks, g_x87spec_marks;
+static MarkSet g_lowhoist_marks, g_llhwide_marks, g_x87spec_marks;
 static int lowhoist_marked(uint64_t key) { return mark_has(&g_lowhoist_marks, key); }
 static void lowhoist_mark(uint64_t key) { mark_add(&g_lowhoist_marks, key); }
-static int select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
+/* add, sub, inc or dec of the 64-bit register r by a constant: how far it steps. */
+static int llh_step(const X86Insn *in, unsigned r, int64_t *by)
 {
+    const X86Operand *d = &in->ops[0];
+    if (in->nops < 1 || d->kind != OCERZ_OPK_REG || d->reg != r || d->size != 8 || d->high8) return 0;
+    switch (in->op) {
+    case OCERZ_OP_INC: *by = 1; return in->nops == 1;
+    case OCERZ_OP_DEC: *by = -1; return in->nops == 1;
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB:
+        if (in->nops != 2 || in->ops[1].kind != OCERZ_OPK_IMM) return 0;
+        *by = in->op == OCERZ_OP_ADD ? (int64_t)in->ops[1].imm : -(int64_t)in->ops[1].imm;
+        return *by > -(1 << 20) && *by < (1 << 20);
+    default: return 0;
+    }
+}
+/*
+ * The registers a memory operand the hoist may cover is based on (*rb) and
+ * indexed by (*rx, or -1), swapped when the scale is 1 and only the index is
+ * left alone.  An operand reads a register's value from before its own
+ * instruction, so one on a base or index that instruction writes still counts
+ * when the instruction is a plain load: mov rax, [rax+8].
+ */
+static int llh_roles(const X86Insn *insns, int n, int i, const X86Operand *m, const int *firstw, const int *stepend,
+                     int *rb, int *rx)
+{
+    const X86Insn *in = &insns[i];
+    if (m->kind != OCERZ_OPK_MEM || m->riprel || m->base > 15 || (m->index > 15 && m->index != OCERZ_REG_NONE) ||
+        in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || m->size > 64 || m->disp < -4095 || m->disp > 4095 ||
+        in->op == OCERZ_OP_LEA || in->op == OCERZ_OP_NOP || in->op == OCERZ_OP_PREFETCH || in->op == OCERZ_OP_CLFLUSH)
+        return 0;
+    int b = m->base, x = m->index == OCERZ_REG_NONE ? -1 : m->index;
+    if (x >= 0 && (m->scale & 3) == 0 && firstw[b] != n && firstw[x] == n) { int t = b; b = x; x = t; }
+    int load = (in->op == OCERZ_OP_MOV || in->op == OCERZ_OP_MOVZX || in->op == OCERZ_OP_MOVSX ||
+                in->op == OCERZ_OP_MOVSXD) && m == &in->ops[1];
+    if (b == OCERZ_RSP || pin_slot((unsigned)b) < 0 || i > firstw[b] - !load) return 0;
+    if (x >= 0 && (x == OCERZ_RSP || pin_slot((unsigned)x) < 0 || i > stepend[x] - !load)) return 0;
+    *rb = b;
+    *rx = x;
+    return 1;
+}
+/* The block's hoist: its bases, index and covered operands; g_llh_n stays 0 when nothing pays. */
+static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
+{
+    g_llh_n = g_llh_live = g_llh_wide = 0;
+    g_llh_index = -1;
     if (!ocerz_low_base || ocerz_guest_base != 0 || g_xlat_mode32 || g_pin_class != 3 || g_no_chain ||
-        !low_guard_fast_ok() || g_mem_hoist_greg >= 0 || n < 2 || ENV_ON("OCERZ_NO_LOW_HOIST"))
-        return -1;
-    /* A block that bailed translates without the hoist: a learned variant, as the alignment marks make. */
+        !low_guard_fast_ok() || g_mem_hoist_greg >= 0 || n < 2 || n > JIT_MAX_BLOCK_INSNS || ENV_ON("OCERZ_NO_LOW_HOIST"))
+        return;
+    /* A block that gave the hoist up translates without it: a learned variant, as the alignment marks make. */
     if (lowhoist_marked(jit_key(rip, 0))) {
         g_tc_learned = 1;
-        return -1;
+        return;
     }
-    int cnt[16] = {0}, until[16], shut[16] = {0};
-    int32_t lo[16] = {0}, hi[16] = {0};
-    for (int r = 0; r < 16; r++) until[r] = n;
-    for (int i = 0; i < n; i++) {
-        const X86Insn *in = &insns[i];
-        for (int k = 0; k < in->nops; k++) {
-            const X86Operand *m = &in->ops[k];
-            if (m->kind != OCERZ_OPK_MEM || m->riprel || m->base == OCERZ_REG_NONE || m->index != OCERZ_REG_NONE)
-                continue;
-            unsigned r = m->base & 15;
-            if (shut[r] || until[r] < n) continue;
-            int sz = m->size ? m->size : 64;
-            if (in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || m->disp < -4095 || m->disp + sz > 4095 || sz > 64) {
-                cnt[r] = -1000;
-                continue;
-            }
-            cnt[r]++;
-            if (m->disp < lo[r]) lo[r] = (int32_t)m->disp;
-            if (m->disp + sz > hi[r]) hi[r] = (int32_t)(m->disp + sz);
+    g_llh_wide = mark_has(&g_llhwide_marks, jit_key(rip, 0)) || ENV_ON("OCERZ_LOW_HOIST_WIDE");
+    const X86Insn *t = &insns[n - 1];
+    int loops = (t->op == OCERZ_OP_JCC || t->op == OCERZ_OP_JMP) && t->nops == 1 &&
+                t->ops[0].kind == OCERZ_OPK_IMM && t->ops[0].imm == rip;
+    int no_ix = ENV_ON("OCERZ_NO_LOW_HOIST_INDEX");
+    /* firstw: the first instruction to write a register; stepend: the first to write it other than by a constant step */
+    int firstw[16], stepend[16], cnt[16] = {0}, ixn[16][4] = {{0}};
+    int64_t lo[16] = {0}, hi[16] = {0};
+    uint8_t ix[16] = {0}, role[JIT_MAX_BLOCK_INSNS][3];
+    for (unsigned r = 0; r < 16; r++) {
+        firstw[r] = stepend[r] = n;
+        for (int i = n - 1; i >= 0; i--) {
+            int64_t by;
+            if (!insn_may_write_gpr(&insns[i], r)) continue;
+            firstw[r] = i;
+            if (!llh_step(&insns[i], r, &by)) stepend[r] = i;
         }
-        for (unsigned r = 0; r < 16; r++)
-            if (!shut[r] && until[r] == n && insn_may_write_gpr(in, r)) until[r] = i + 1;
     }
-    int best = -1;
+    /* Two passes: the index and scale most operands share, then the spans, with the index's steps so far added in. */
+    int bx = -1, bs = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int64_t stepped = 0;
+        for (int i = 0; i < n; i++) {
+            const X86Insn *in = &insns[i];
+            for (int k = 0; k < in->nops && k < 3; k++) {
+                const X86Operand *m = &in->ops[k];
+                int rb, rx;
+                if (pass) role[i][k] = 0;
+                if (!llh_roles(insns, n, i, m, firstw, stepend, &rb, &rx) || (rx >= 0 && no_ix)) continue;
+                if (!pass) {
+                    if (rx >= 0) ixn[rx][m->scale & 3]++;
+                    continue;
+                }
+                if (rx >= 0 && (rx != bx || (m->scale & 3) != bs)) continue;
+                int64_t at = m->disp + (rx >= 0 ? stepped * (1 << bs) : 0);
+                int sz = m->size ? m->size : 64;
+                if (at < -(1ll << 30) || at > (1ll << 30)) continue;
+                cnt[rb]++;
+                if (rx >= 0) ix[rb] = 1;
+                if (at < lo[rb]) lo[rb] = at;
+                if (at + sz > hi[rb]) hi[rb] = at + sz;
+                role[i][k] = (uint8_t)(rb + 1);
+            }
+            int64_t by;
+            if (pass && bx >= 0 && llh_step(in, (unsigned)bx, &by)) stepped += by;
+        }
+        if (!pass)
+            for (int x = 0; x < 16; x++)
+                for (int sc = 0; sc < 4; sc++)
+                    if (ixn[x][sc] > (bx < 0 ? 0 : ixn[bx][bs])) { bx = x; bs = sc; }
+    }
+    /*
+     * What a base must carry to pay.  Settled before a loop, a base costs the
+     * loop nothing, so one operand will do if the block has two; settled each
+     * time round, the narrow check is the price of an operand and a half.  The
+     * wide form's costs four times as much.
+     */
+    int total = 0, slot_of[16], quick[16];
     for (int r = 0; r < 16; r++) {
-        if (r == OCERZ_RSP || pin_slot((unsigned)r) < 0 || cnt[r] < 3) continue;
-        if (best < 0 || cnt[r] > cnt[best]) best = r;
+        total += cnt[r];
+        quick[r] = g_xlat_cpu && g_xlat_cpu->gpr[r] >> 33 == 0;
     }
-    if (best < 0) return -1;
-    g_low_hoist_until = until[best];
-    g_low_hoist_lo = lo[best];
-    g_low_hoist_hi = hi[best] > 0 ? hi[best] : 1;
-    return best;
+    for (;;) {
+        g_llh_n = 0;
+        g_llh_index = -1;
+        for (int r = 0; r < 16; r++) slot_of[r] = -1;
+        for (; g_llh_n < LLH_MAX; g_llh_n++) {
+            int best = -1;
+            for (int r = 0; r < 16; r++) {
+                int pre = loops && firstw[r] == n;
+                int least = g_llh_wide ? (pre ? 2 : 6) : pre ? (total >= 2 ? 1 : 2) : quick[r] ? 2 : 3;
+                if (slot_of[r] < 0 && cnt[r] >= least && (best < 0 || cnt[r] > cnt[best])) best = r;
+            }
+            if (best < 0) break;
+            slot_of[best] = g_llh_n;
+            g_llh_greg[g_llh_n] = best;
+            g_llh_lo[g_llh_n] = lo[best];
+            g_llh_hi[g_llh_n] = hi[best] > 0 ? hi[best] : 1;
+            g_llh_ix[g_llh_n] = ix[best];
+            g_llh_pre[g_llh_n] = loops && firstw[best] == n;
+            g_llh_quick[g_llh_n] = (uint8_t)quick[best];
+            if (ix[best]) { g_llh_index = bx; g_llh_scale = bs; }
+        }
+        /*
+         * The registers hold what the block is about to be entered with.  If
+         * the narrow form's checks would fail on that, start in the wide one
+         * instead of translating twice to find out.
+         */
+        int fits = 1;
+        for (int k = 0; k < g_llh_n && !g_llh_wide && g_xlat_cpu; k++) {
+            uint64_t v = g_xlat_cpu->gpr[g_llh_greg[k]];
+            uint64_t end = v + (uint64_t)g_llh_hi[k] + (g_llh_ix[k] ? LLH_REACH : 0);
+            if ((int64_t)(v + (uint64_t)g_llh_lo[k]) < 0 || ((v | end) >> 32) >= (OCERZ_LOW_LIMIT >> 32)) fits = 0;
+            if (g_llh_ix[k] && g_xlat_cpu->gpr[g_llh_index] >> (31 - g_llh_scale)) fits = 0;
+        }
+        if (fits) break;
+        g_llh_wide = 1;
+    }
+    if (!g_llh_n) return;
+    /* The wide form's reach below the bases is one value for them all, so they are settled together. */
+    for (int k = 0; g_llh_wide && k < g_llh_n; k++)
+        if (!g_llh_pre[k]) memset(g_llh_pre, 0, sizeof g_llh_pre);
+    g_llh_insns = insns;
+    g_llh_ninsn = n;
+    for (int i = 0; i < n; i++) {
+        g_llh_cov[i] = 0;
+        for (int k = 0; k < insns[i].nops && k < 3; k++)
+            if (role[i][k] && slot_of[role[i][k] - 1] >= 0)
+                g_llh_cov[i] |= (uint8_t)((slot_of[role[i][k] - 1] + 1) << (2 * k));
+    }
+    if (g_llh_wide) g_tc_learned = 1;
+    if (ENV_ON("OCERZ_LOW_HOIST_LOG"))
+        fprintf(stderr, "ocerz: LOWHOIST take %#llx bases=%d index=%d%s%s\n", (unsigned long long)rip, g_llh_n,
+                g_llh_index, loops ? " loop" : "", g_llh_wide ? " wide" : "");
 }
 /*
- * At the loop head: the span below 12 GB, then JMEMBASE = base | low_base; the
- * branches go to the bail stub.  Without touching the flags, which a block may
- * be entered with live in NZCV: (base | (base + hi)) >> 32 must be below 3,
- * which also catches base + hi wrapping, and base + lo must not go below zero.
- * A span that crosses 8 GB fails the or for no reason, which costs that block
- * its hoist and nothing else.
+ * JMEMBASEn from its base, without touching the flags: the base with low_base
+ * set, or in the wide form plus low_base when its span starts below 12 GB.
  */
-static void emit_low_hoist_check(A64Buf *b)
+static void emit_llh_base(A64Buf *b, int k)
 {
-    int hb = pin_hreg(pin_slot(g_low_hoist_greg));
-    g_n_low_hoist_bail = 0;
-    a64_add_imm(b, 1, JTT, hb, (uint32_t)g_low_hoist_hi);
-    a64_orr_reg(b, 1, JTT, JTT, hb, 0);
-    a64_lsr_imm(b, 1, JTT, JTT, 32);
-    a64_sub_imm(b, 1, JTT, JTT, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
-    g_low_hoist_bail[g_n_low_hoist_bail++] = a64_label(b);
-    a64_tbz(b, JTT, 63, 0);
-    if (g_low_hoist_lo < 0) {
-        a64_sub_imm(b, 1, JTT, hb, (uint32_t)-g_low_hoist_lo);
-        g_low_hoist_bail[g_n_low_hoist_bail++] = a64_label(b);
-        a64_tbnz(b, JTT, 63, 0);
+    int hb = pin_hreg(pin_slot((unsigned)g_llh_greg[k])), hr = g_llh_hreg[k];
+    if (!g_llh_wide) {
+        (void)a64_try_orr_imm(b, 1, hr, hb, ocerz_low_base);
+        return;
     }
-    (void)a64_try_orr_imm(b, 1, JMEMBASE, hb, ocerz_low_base);
+    if (g_llh_lo[k] < 0) {
+        a64_mov_imm64(b, hr, (uint64_t)-g_llh_lo[k]);
+        a64_sub_reg(b, 1, hr, hb, hr, 0);
+        a64_lsr_imm(b, 1, hr, hr, 32);
+    } else {
+        a64_lsr_imm(b, 1, hr, hb, 32);
+    }
+    a64_sub_imm(b, 1, hr, hr, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+    a64_asr_imm(b, 1, hr, hr, 63);
+    (void)a64_try_and_imm(b, 1, hr, hr, ocerz_low_base);
+    a64_add_reg(b, 1, hr, hr, hb, 0);
 }
 /*
- * Out of line: leave before the block's first instruction, with side_idx -2 asking C to retire it.  It
- * returns OCERZ_STEP_PROFILE, as a probe's side exit does: STEP_OK goes to the in-arena dispatcher,
- * which would enter the same block again without C ever seeing side_blk.
+ * The checks for the bases settled before the loop (pre) or each time round.
+ * Per base B with span [lo, hi), all without touching the flags, which a
+ * block may be entered with live in NZCV: B + lo must not go below zero, and
+ * the span's end, 2 GB further on when the index reaches there, must be below
+ * 12 GB.  (B | end) >> 32 below 3 says both, and catches the end wrapping.  A
+ * base that was below 8 GB when the block was translated is only asked to be
+ * there again, which puts every span the hoist takes below 12 GB.
+ * The wide form asks instead that the end be on the same side of 12 GB as the
+ * start and below the top strip, and leaves in JMEMAUX the least distance
+ * from a span's start down to its side's floor, 1 GB at most: the index may
+ * reach that far below.
+ */
+static void emit_low_hoist_setup(A64Buf *b, int pre)
+{
+    int zero = g_llh_wide && g_llh_index >= 0;
+    for (int k = 0; k < g_llh_n; k++) {
+        if (g_llh_pre[k] != pre) continue;
+        int hb = pin_hreg(pin_slot((unsigned)g_llh_greg[k])), hr = g_llh_hreg[k], t = hb;
+        uint64_t reach = g_llh_ix[k] ? LLH_REACH : 0;
+        if (zero) { a64_movz(b, JMEMAUX, 0x4000, 1); zero = 0; }
+        if (g_llh_lo[k] < 0) {
+            t = JTT;
+            a64_mov_imm64(b, JTT, (uint64_t)-g_llh_lo[k]);
+            a64_sub_reg(b, 1, JTT, hb, JTT, 0);
+            g_llh_bail_tb[g_n_llh_bail_tb++] = a64_label(b);
+            a64_tbnz(b, JTT, 63, 0);
+        }
+        if (!g_llh_wide && g_llh_quick[k]) {
+            a64_lsr_imm(b, 1, JTU, hb, 33);
+            g_llh_bail_cb[g_n_llh_bail_cb++] = a64_label(b);
+            a64_cbnz(b, 1, JTU, 0);
+            emit_llh_base(b, k);
+            continue;
+        }
+        if (!g_llh_wide) {
+            if (reach || g_llh_hi[k] > 4095) {
+                a64_mov_imm64(b, JTU, (uint64_t)g_llh_hi[k] + reach);
+                a64_add_reg(b, 1, JTU, hb, JTU, 0);
+            } else {
+                a64_add_imm(b, 1, JTU, hb, (uint32_t)g_llh_hi[k]);
+            }
+            a64_orr_reg(b, 1, JTU, JTU, hb, 0);
+            a64_lsr_imm(b, 1, JTU, JTU, 32);
+            a64_sub_imm(b, 1, JTU, JTU, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+            g_llh_bail_tb[g_n_llh_bail_tb++] = a64_label(b);
+            a64_tbz(b, JTU, 63, 0);
+            emit_llh_base(b, k);
+            continue;
+        }
+        a64_lsr_imm(b, 1, JTU, t, 32);
+        a64_sub_imm(b, 1, JTU, JTU, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+        a64_asr_imm(b, 1, hr, JTU, 63);
+        (void)a64_try_and_imm(b, 1, hr, hr, ocerz_low_base);
+        a64_add_reg(b, 1, hr, hr, hb, 0);
+        a64_mov_imm64(b, JTA, (uint64_t)(g_llh_hi[k] - g_llh_lo[k] - 1) + reach);
+        a64_add_reg(b, 1, JTA, t, JTA, 0);
+        a64_lsr_imm(b, 1, JT0, JTA, 32);
+        a64_sub_imm(b, 1, JT0, JT0, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+        a64_eor_reg(b, 1, JT0, JT0, JTU, 0);
+        g_llh_bail_tb[g_n_llh_bail_tb++] = a64_label(b);
+        a64_tbnz(b, JT0, 63, 0);
+        a64_lsr_imm(b, 1, JT0, JTA, 25);
+        a64_add_imm(b, 1, JT0, JT0, 1);
+        a64_lsr_imm(b, 1, JT0, JT0, 22);
+        g_llh_bail_cb[g_n_llh_bail_cb++] = a64_label(b);
+        a64_cbnz(b, 1, JT0, 0);
+        if (!g_llh_ix[k]) continue;
+        a64_mov_imm64(b, JTA, OCERZ_LOW_LIMIT);
+        a64_asr_imm(b, 1, JT0, JTU, 63);
+        a64_bic_reg(b, 1, JTA, JTA, JT0, 0);
+        a64_sub_reg(b, 1, JTA, t, JTA, 0);
+        a64_sub_reg(b, 1, JTA, JTA, JMEMAUX, 0);
+        a64_asr_imm(b, 1, JT0, JTA, 63);
+        a64_and_reg(b, 1, JTA, JTA, JT0, 0);
+        a64_add_reg(b, 1, JMEMAUX, JMEMAUX, JTA, 0);
+    }
+    if (pre) g_llh_live = 1;
+}
+/* Each time round: the index, scaled, is below 2 GB, or in the wide form within [-JMEMAUX, 2 GB - JMEMAUX). */
+static void emit_low_hoist_index_check(A64Buf *b)
+{
+    if (g_llh_index < 0) return;
+    int hx = pin_hreg(pin_slot((unsigned)g_llh_index));
+    if (g_llh_wide) {
+        a64_add_reg(b, 1, JTT, JMEMAUX, hx, g_llh_scale);
+        a64_lsr_imm(b, 1, JTT, JTT, 31);
+    } else {
+        a64_lsr_imm(b, 1, JTT, hx, 31 - g_llh_scale);
+    }
+    g_llh_bail_cb[g_n_llh_bail_cb++] = a64_label(b);
+    a64_cbnz(b, 1, JTT, 0);
+}
+/*
+ * Out of line: leave before the block's first instruction, with side_idx -2 asking C to retire it,
+ * or -4 from the hoist's narrow form, which asks for the wide one.  It returns
+ * OCERZ_STEP_PROFILE, as a probe's side exit does: STEP_OK goes to the in-arena dispatcher, which
+ * would enter the same block again without C ever seeing side_blk.
  */
 static void emit_low_hoist_bail(A64Buf *b, uint64_t rip, uint32_t **epi_sites, int *n_epi)
 {
-    if (!g_n_low_hoist_bail) return;
-    for (int k = 0; k < g_n_low_hoist_bail; k++) a64_patch_tbz(g_low_hoist_bail[k], a64_label(b));
-    g_n_low_hoist_bail = 0;
+    if (!g_n_llh_bail_tb && !g_n_llh_bail_cb) return;
+    for (int k = 0; k < g_n_llh_bail_tb; k++) a64_patch_tbz(g_llh_bail_tb[k], a64_label(b));
+    for (int k = 0; k < g_n_llh_bail_cb; k++) a64_patch_cbz(g_llh_bail_cb[k], a64_label(b));
+    g_n_llh_bail_tb = g_n_llh_bail_cb = 0;
     tc_imm64(b, JT0, TCR_BLK, 0, (uint64_t)(uintptr_t)g_cur_blk);
     a64_str(b, 8, JT0, 20, SIDE_BLK_OFF);
-    a64_movn(b, JT0, 1, 0);
+    a64_movn(b, JT0, g_llh_wide ? 1 : 3, 0);
     a64_str(b, 4, JT0, 20, SIDE_IDX_OFF);
     a64_mov_imm64(b, JT0, rip);
     a64_str(b, 8, JT0, 20, RIP_OFF);
@@ -20307,8 +20602,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_side = 0;
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
-    g_low_hoist_greg = -1;
-    g_n_low_hoist_bail = 0;
+    g_n_llh_bail_tb = g_n_llh_bail_cb = 0;
+    g_llh_n = g_llh_live = g_llh_wide = 0;
+    g_llh_index = -1;
     g_mem_hoist_greg2 = -1;
     g_mem_hoist_greg3 = -1;
     g_mem_hoist_aux_index = -1;
@@ -20475,8 +20771,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     }
 
     g_mem_hoist_greg = select_mem_base_hoist(blk->insns, n, rip);
-    g_low_hoist_greg = select_low_hoist(blk->insns, n, rip);
-    g_n_low_hoist_bail = 0;
+    select_low_hoist(blk->insns, n, rip);
+    g_n_llh_bail_tb = g_n_llh_bail_cb = 0;
 
     g_xmm_pinned = 0;
     if (xmm_pinning_enabled() && sse_enabled() && xmm_global_enabled() && !g_no_regflags) {
@@ -20618,9 +20914,13 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
               sse_enabled() && xmm_global_enabled() && !g_no_regflags)
               yc_setup(&b, blk->insns, n);
         }
+        if (g_llh_n)
+            emit_low_hoist_setup(&b, 1);
         g_loop_entry = a64_label(&b);
-        if (g_low_hoist_greg >= 0)
-            emit_low_hoist_check(&b);
+        if (g_llh_n) {
+            emit_low_hoist_setup(&b, 0);
+            emit_low_hoist_index_check(&b);
+        }
         if (g_mem_hoist_greg >= 0 && g_mem_hoist_aux_index >= 0)
             a64_add_reg(&b, 1, JMEMAUX, JMEMBASE, pin_hreg(pin_slot(g_mem_hoist_aux_index)), g_mem_hoist_aux_scale);
         static int loop_poll = -1;
@@ -20633,7 +20933,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     } else {
         if (!xmm_global_enabled())
             emit_xmm_pin_load_all(&b);
-        g_low_hoist_greg = -1;
+        g_llh_n = 0;
+        g_llh_index = -1;
     }
     if (ocerz_perfstat > 0) {
         g_tc_bad = 1;
@@ -20840,9 +21141,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     if (!no_promo && g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
         (stack_identity() || rsp_is_ptr())) {
         int freer[3]; int nfree = 0;
-        if (g_mem_hoist_greg2 < 0) freer[nfree++] = JMEMBASE2;
-        if (g_mem_hoist_greg  < 0 && g_low_hoist_greg < 0) freer[nfree++] = JMEMBASE;
-        if (g_mem_hoist_greg3 < 0) freer[nfree++] = JMEMBASE3;
+        if (g_mem_hoist_greg2 < 0 && !llh_uses(JMEMBASE2)) freer[nfree++] = JMEMBASE2;
+        if (g_mem_hoist_greg  < 0 && !llh_uses(JMEMBASE)) freer[nfree++] = JMEMBASE;
+        if (g_mem_hoist_greg3 < 0 && !llh_uses(JMEMBASE3)) freer[nfree++] = JMEMBASE3;
         int npairs = 0;
         int sp = 0, dead = 0; int pstk[64]; int8_t rres[64];
         int nend = 0; int32_t endstk[8];
@@ -23666,8 +23967,11 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
     JitBlock *blk = (JitBlock *)cpu->side_blk;
     int k = cpu->side_idx;
     cpu->side_blk = NULL;
-    if (k == -2 && blk) {
-        lowhoist_mark(blk->key);
+    if ((k == -2 || k == -4) && blk) {
+        if (ENV_ON("OCERZ_LOW_HOIST_LOG"))
+            fprintf(stderr, "ocerz: LOWHOIST %s %#llx\n", k == -4 ? "widen" : "bail", (unsigned long long)blk_rip(blk));
+        if (k == -4) mark_add(&g_llhwide_marks, blk->key);
+        else lowhoist_mark(blk->key);
         flip_retire_block(vm, jit, blk);
         return;
     }
@@ -24096,8 +24400,10 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             if (g_jl_log > 0)
                 __atomic_store_n(&g_jl_phase, 2, __ATOMIC_RELAXED);
             g_xlat_ftop = cpu->ftop & 7;
+            g_xlat_cpu = cpu;
             b = translate(jit, cpu->rip, cpu->mode32);
             g_xlat_ftop = -1;
+            g_xlat_cpu = NULL;
             if (b)
                 xlatpage_note(cpu->rip);
             if (g_jl_log > 0 && !b)
