@@ -7149,6 +7149,25 @@ static int mem_plain_ok(const X86Insn *insn, const X86Operand *op)
     if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
     return 1;
 }
+/*
+ * A memory operand of a flag producer whose emitter reaches it inline and sets
+ * NZCV after: identity forms, or in the Wine layout any operand without a
+ * segment, which emit_mem_ea forms and the guard translates in line (the narrow
+ * compare and emit_arith_mem load it, then compare).  Without this a byte
+ * compare with memory and its setcc took 18 instructions there instead of 2.
+ * OCERZ_NO_LOW_NZCV_MEM=1 keeps such producers to the flag record.
+ */
+static int mem_inline_ok(const X86Insn *insn, const X86Operand *op)
+{
+    if (mem_plain_ok(insn, op)) return 1;
+    if (!ocerz_low_base || g_pin_class != 3 || ENV_ON("OCERZ_NO_LOW_NZCV_MEM")) return 0;
+    if (insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8) return 0;
+    if (rsp_is_ptr() && (op->base == OCERZ_RSP || op->index == OCERZ_RSP)) return 0;
+    if (op->riprel) return 1;
+    if (op->base != OCERZ_REG_NONE && pin_slot(op->base) < 0) return 0;
+    if (op->index != OCERZ_REG_NONE && pin_slot(op->index) < 0) return 0;
+    return 1;
+}
 /* A cmp/test whose first operand is memory, as emit_rmw_mem emits it inline with NZCV set. */
 static int rmw_nzcv_ok(const X86Insn *p, const X86Operand *m)
 {
@@ -7288,14 +7307,14 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
         if (d->kind == OCERZ_OPK_REG) {
             if (d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return -1;
         } else if (d->kind == OCERZ_OPK_MEM) {
-            if (p->op != OCERZ_OP_CMP || !mem_plain_ok(p, d) || sr->kind == OCERZ_OPK_MEM) return -1;
+            if (p->op != OCERZ_OP_CMP || !mem_inline_ok(p, d) || sr->kind == OCERZ_OPK_MEM) return -1;
         } else return -1;
         if (p->op == OCERZ_OP_TEST) {
             if (sr->kind != OCERZ_OPK_IMM) return -1;
             if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE) return -1;
         } else if (p->op == OCERZ_OP_CMP) {
             if (sr->kind == OCERZ_OPK_REG) { if (pin_slot(sr->reg) < 0 || (rsp_is_ptr() && sr->reg == OCERZ_RSP)) return -1; }
-            else if (sr->kind == OCERZ_OPK_MEM) { if (!mem_plain_ok(p, sr)) return -1; }
+            else if (sr->kind == OCERZ_OPK_MEM) { if (!mem_inline_ok(p, sr)) return -1; }
             else if (sr->kind != OCERZ_OPK_IMM) return -1;
             if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE && cc != OCERZ_CC_B && cc != OCERZ_CC_AE &&
                 cc != OCERZ_CC_A && cc != OCERZ_CC_BE) return -1;
@@ -7318,7 +7337,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     if (sr->kind == OCERZ_OPK_REG) {
         if (sr->high8 || pin_slot(sr->reg) < 0 || (rsp_is_ptr() && sr->reg == OCERZ_RSP)) return -1;
     } else if (sr->kind == OCERZ_OPK_MEM) {
-        if (!mem_plain_ok(p, sr)) return -1;
+        if (!mem_inline_ok(p, sr)) return -1;
     } else if (sr->kind != OCERZ_OPK_IMM) return -1;
     return k;
 }
