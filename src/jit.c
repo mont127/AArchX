@@ -1586,12 +1586,15 @@ static int g_mem_hoist_aux_scale;
  * the displacement.  A base the block never writes is settled once, before a
  * block that loops on itself; any other one each time round.
  *
- * Operands indexed by one chosen register and scale are covered as well.  The
- * base's check then allows 2 GB for the scaled index, and the block checks,
- * each time round, that the index is inside that.  The index may be stepped
- * by constants on the way (add, sub, inc, dec): the steps count as
- * displacement.  With a scale of 1 the two registers swap roles when it is
- * the index that the block leaves alone.
+ * Indexed operands are covered as well: the base's check then allows 2 GB for
+ * the scaled index, and the index is checked to be inside that.  When three
+ * or more operands share an index register and scale, the block checks it
+ * once, each time round; the index may be stepped by constants on the way
+ * (add, sub, inc, dec), the steps counting as displacement.  Any other
+ * indexed operand checks its own index where it forms its address, and one
+ * that is out of range forms it the long way, out of line (g_larm), which
+ * costs nothing but that operand.  With a scale of 1 the two registers swap
+ * roles when it is the index that the block leaves alone.
  *
  * A block is first translated for the usual case, every base below 12 GB and
  * an index that is not negative: three instructions for a base below 8 GB,
@@ -1616,16 +1619,29 @@ static int g_llh_greg[LLH_MAX];
 static int64_t g_llh_lo[LLH_MAX], g_llh_hi[LLH_MAX];
 static uint8_t g_llh_ix[LLH_MAX], g_llh_pre[LLH_MAX], g_llh_quick[LLH_MAX];
 static uint8_t g_llh_cov[JIT_MAX_BLOCK_INSNS];      /* two bits an operand: its slot plus one */
+static uint8_t g_llh_loose[JIT_MAX_BLOCK_INSNS];    /* a bit an operand: it checks its own index */
+#define LLH_ARMS_MAX 64
+static struct { uint32_t *site, *back; int reg, idx; uint8_t base, other, scale; int32_t disp; } g_larm[LLH_ARMS_MAX];
+static int g_n_larm;
 static uint32_t *g_llh_bail_tb[3 * LLH_MAX], *g_llh_bail_cb[2 * LLH_MAX + 1];
 static int g_n_llh_bail_tb, g_n_llh_bail_cb;
-/* The hoist's slot for an operand it covers, or -1. */
-static int llh_slot(const X86Insn *insn, const X86Operand *op)
+/* The hoist's slot for an operand it covers, or -1; *loose says the operand checks its own index. */
+static int llh_slot_ex(const X86Insn *insn, const X86Operand *op, int *loose)
 {
     if (!g_llh_n) return -1;
     uintptr_t i = (uintptr_t)insn - (uintptr_t)g_llh_insns, k = (uintptr_t)op - (uintptr_t)insn->ops;
     if (i >= (uintptr_t)g_llh_ninsn * sizeof *insn || i % sizeof *insn || k >= sizeof insn->ops || k % sizeof *op)
         return -1;
-    return (g_llh_cov[i / sizeof *insn] >> (2 * (k / sizeof *op)) & 3) - 1;
+    i /= sizeof *insn;
+    k /= sizeof *op;
+    *loose = g_llh_loose[i] >> k & 1;
+    return (g_llh_cov[i] >> (2 * k) & 3) - 1;
+}
+/* The slot of an operand the block's own checks cover entirely, or -1. */
+static int llh_slot(const X86Insn *insn, const X86Operand *op)
+{
+    int loose = 0, k = llh_slot_ex(insn, op, &loose);
+    return loose ? -1 : k;
 }
 static int llh_uses(int hreg)
 {
@@ -4337,8 +4353,38 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     }
     if (insn->addrsize != 8)
         return 0;
-    int ls = llh_slot(insn, op);
-    if (ls >= 0) {
+    int loose = 0, ls = llh_slot_ex(insn, op, &loose);
+    if (ls >= 0 && loose && g_n_larm < LLH_ARMS_MAX) {
+        /*
+         * The operand's own index check, then the address off the hoisted
+         * base.  Out of range, the arm forms and translates the whole address
+         * and comes back past the displacement.
+         */
+        int hx = pin_hreg(pin_slot(llh_other(op, ls))), sc = op->scale & 3;
+        if (g_llh_wide) {
+            a64_add_reg(b, 1, JTT, JMEMAUX, hx, sc);
+            a64_lsr_imm(b, 1, JTT, JTT, 31);
+        } else {
+            a64_lsr_imm(b, 1, JTT, hx, 31 - sc);
+        }
+        g_larm[g_n_larm].site = a64_label(b);
+        a64_cbnz(b, 1, JTT, 0);
+        a64_add_reg(b, 1, addr_reg, g_llh_hreg[ls], hx, sc);
+        if (op->disp > 0)      a64_add_imm(b, 1, addr_reg, addr_reg, (uint32_t)op->disp);
+        else if (op->disp < 0) a64_sub_imm(b, 1, addr_reg, addr_reg, (uint32_t)-op->disp);
+        g_larm[g_n_larm].back = a64_label(b);
+        g_larm[g_n_larm].reg = addr_reg;
+        g_larm[g_n_larm].idx = g_cur_insn_idx;
+        g_larm[g_n_larm].base = (uint8_t)g_llh_greg[ls];
+        g_larm[g_n_larm].other = (uint8_t)llh_other(op, ls);
+        g_larm[g_n_larm].scale = (uint8_t)sc;
+        g_larm[g_n_larm].disp = (int32_t)op->disp;
+        g_n_larm++;
+        g_ea_lowhoisted = 1;
+        g_ea_lowhoisted_reg = addr_reg;
+        return 1;
+    }
+    if (ls >= 0 && !loose) {
         int from = g_llh_hreg[ls];
         if (op->index != OCERZ_REG_NONE) {
             if (addr_reg != JTA || !ea_cache_reusable(b, op)) {
@@ -18058,11 +18104,11 @@ static int llh_step(const X86Insn *in, unsigned r, int64_t *by)
  * The registers a memory operand the hoist may cover is based on (*rb) and
  * indexed by (*rx, or -1), swapped when the scale is 1 and only the index is
  * left alone.  An operand reads a register's value from before its own
- * instruction, so one on a base or index that instruction writes still counts
- * when the instruction is a plain load: mov rax, [rax+8].
+ * instruction, so one on a base that instruction writes still counts when
+ * the instruction is a plain load: mov rax, [rax+8].
  */
 static int llh_roles(const X86Insn *insns, int n, int i, const X86Operand *m, const int *firstw, const int *stepend,
-                     int *rb, int *rx)
+                     int *rb, int *rx, int *steady)
 {
     const X86Insn *in = &insns[i];
     if (m->kind != OCERZ_OPK_MEM || m->riprel || m->base > 15 || (m->index > 15 && m->index != OCERZ_REG_NONE) ||
@@ -18074,9 +18120,10 @@ static int llh_roles(const X86Insn *insns, int n, int i, const X86Operand *m, co
     int load = (in->op == OCERZ_OP_MOV || in->op == OCERZ_OP_MOVZX || in->op == OCERZ_OP_MOVSX ||
                 in->op == OCERZ_OP_MOVSXD) && m == &in->ops[1];
     if (b == OCERZ_RSP || pin_slot((unsigned)b) < 0 || i > firstw[b] - !load) return 0;
-    if (x >= 0 && (x == OCERZ_RSP || pin_slot((unsigned)x) < 0 || i > stepend[x] - !load)) return 0;
+    if (x >= 0 && (x == OCERZ_RSP || pin_slot((unsigned)x) < 0)) return 0;
     *rb = b;
     *rx = x;
+    *steady = x >= 0 && i <= stepend[x] - !load;     /* the index has only been stepped by constants so far */
     return 1;
 }
 /* The block's hoist: its bases, index and covered operands; g_llh_n stays 0 when nothing pays. */
@@ -18096,11 +18143,11 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
     const X86Insn *t = &insns[n - 1];
     int loops = (t->op == OCERZ_OP_JCC || t->op == OCERZ_OP_JMP) && t->nops == 1 &&
                 t->ops[0].kind == OCERZ_OPK_IMM && t->ops[0].imm == rip;
-    int no_ix = ENV_ON("OCERZ_NO_LOW_HOIST_INDEX");
+    int no_ix = ENV_ON("OCERZ_NO_LOW_HOIST_INDEX"), no_loose = ENV_ON("OCERZ_NO_LOW_HOIST_LOOSE");
     /* firstw: the first instruction to write a register; stepend: the first to write it other than by a constant step */
     int firstw[16], stepend[16], cnt[16] = {0}, ixn[16][4] = {{0}};
     int64_t lo[16] = {0}, hi[16] = {0};
-    uint8_t ix[16] = {0}, role[JIT_MAX_BLOCK_INSNS][3];
+    uint8_t ix[16] = {0}, role[JIT_MAX_BLOCK_INSNS][3], lse[JIT_MAX_BLOCK_INSNS];
     for (unsigned r = 0; r < 16; r++) {
         firstw[r] = stepend[r] = n;
         for (int i = n - 1; i >= 0; i--) {
@@ -18110,38 +18157,47 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
             if (!llh_step(&insns[i], r, &by)) stepend[r] = i;
         }
     }
-    /* Two passes: the index and scale most operands share, then the spans, with the index's steps so far added in. */
+    /*
+     * Two passes: the index and scale most operands share, which the block
+     * checks itself when three do; then the spans, with that index's steps so
+     * far added in.  Every other indexed operand is left to check its own.
+     */
     int bx = -1, bs = 0;
     for (int pass = 0; pass < 2; pass++) {
         int64_t stepped = 0;
         for (int i = 0; i < n; i++) {
             const X86Insn *in = &insns[i];
+            if (pass) lse[i] = 0;
             for (int k = 0; k < in->nops && k < 3; k++) {
                 const X86Operand *m = &in->ops[k];
-                int rb, rx;
+                int rb, rx, steady;
                 if (pass) role[i][k] = 0;
-                if (!llh_roles(insns, n, i, m, firstw, stepend, &rb, &rx) || (rx >= 0 && no_ix)) continue;
+                if (!llh_roles(insns, n, i, m, firstw, stepend, &rb, &rx, &steady) || (rx >= 0 && no_ix)) continue;
                 if (!pass) {
-                    if (rx >= 0) ixn[rx][m->scale & 3]++;
+                    if (rx >= 0 && steady) ixn[rx][m->scale & 3]++;
                     continue;
                 }
-                if (rx >= 0 && (rx != bx || (m->scale & 3) != bs)) continue;
-                int64_t at = m->disp + (rx >= 0 ? stepped * (1 << bs) : 0);
+                int tight = rx >= 0 && steady && rx == bx && (m->scale & 3) == bs;
+                if (rx >= 0 && !tight && no_loose) continue;
+                int64_t at = m->disp + (tight ? stepped * (1 << bs) : 0);
                 int sz = m->size ? m->size : 64;
                 if (at < -(1ll << 30) || at > (1ll << 30)) continue;
                 cnt[rb]++;
-                if (rx >= 0) ix[rb] = 1;
+                if (rx >= 0) ix[rb] |= tight ? 1 : 2;
                 if (at < lo[rb]) lo[rb] = at;
                 if (at + sz > hi[rb]) hi[rb] = at + sz;
                 role[i][k] = (uint8_t)(rb + 1);
+                if (rx >= 0 && !tight) lse[i] |= (uint8_t)(1 << k);
             }
             int64_t by;
             if (pass && bx >= 0 && llh_step(in, (unsigned)bx, &by)) stepped += by;
         }
-        if (!pass)
+        if (!pass) {
             for (int x = 0; x < 16; x++)
                 for (int sc = 0; sc < 4; sc++)
                     if (ixn[x][sc] > (bx < 0 ? 0 : ixn[bx][bs])) { bx = x; bs = sc; }
+            if (bx >= 0 && ixn[bx][bs] < 3) bx = -1;
+        }
     }
     /*
      * What a base must carry to pay.  Settled before a loop, a base costs the
@@ -18174,7 +18230,7 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
             g_llh_ix[g_llh_n] = ix[best];
             g_llh_pre[g_llh_n] = loops && firstw[best] == n;
             g_llh_quick[g_llh_n] = (uint8_t)quick[best];
-            if (ix[best]) { g_llh_index = bx; g_llh_scale = bs; }
+            if (ix[best] & 1) { g_llh_index = bx; g_llh_scale = bs; }
         }
         /*
          * The registers hold what the block is about to be entered with.  If
@@ -18186,7 +18242,7 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
             uint64_t v = g_xlat_cpu->gpr[g_llh_greg[k]];
             uint64_t end = v + (uint64_t)g_llh_hi[k] + (g_llh_ix[k] ? LLH_REACH : 0);
             if ((int64_t)(v + (uint64_t)g_llh_lo[k]) < 0 || ((v | end) >> 32) >= (OCERZ_LOW_LIMIT >> 32)) fits = 0;
-            if (g_llh_ix[k] && g_xlat_cpu->gpr[g_llh_index] >> (31 - g_llh_scale)) fits = 0;
+            if ((g_llh_ix[k] & 1) && g_xlat_cpu->gpr[g_llh_index] >> (31 - g_llh_scale)) fits = 0;
         }
         if (fits) break;
         g_llh_wide = 1;
@@ -18199,6 +18255,7 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
     g_llh_ninsn = n;
     for (int i = 0; i < n; i++) {
         g_llh_cov[i] = 0;
+        g_llh_loose[i] = lse[i];
         for (int k = 0; k < insns[i].nops && k < 3; k++)
             if (role[i][k] && slot_of[role[i][k] - 1] >= 0)
                 g_llh_cov[i] |= (uint8_t)((slot_of[role[i][k] - 1] + 1) << (2 * k));
@@ -18247,7 +18304,8 @@ static void emit_llh_base(A64Buf *b, int k)
  */
 static void emit_low_hoist_setup(A64Buf *b, int pre)
 {
-    int zero = g_llh_wide && g_llh_index >= 0;
+    int zero = 0;
+    for (int k = 0; g_llh_wide && k < g_llh_n; k++) zero |= g_llh_ix[k];
     for (int k = 0; k < g_llh_n; k++) {
         if (g_llh_pre[k] != pre) continue;
         int hb = pin_hreg(pin_slot((unsigned)g_llh_greg[k])), hr = g_llh_hreg[k], t = hb;
@@ -18915,6 +18973,25 @@ static void emit_misaligned_arm(A64Buf *b, const OrderedSlowPend *o)
 
 static void emit_guard_arms(A64Buf *b, const uint32_t *entry)
 {
+    /* The hoist's operands whose own index was out of range: the whole address, translated, then back. */
+    for (int k = 0; k < g_n_larm; k++) {
+        uint32_t *lo = a64_label(b);
+        int r = g_larm[k].reg;
+        a64_patch_cbz(g_larm[k].site, lo);
+        a64_add_reg(b, 1, r, pin_hreg(pin_slot(g_larm[k].base)), pin_hreg(pin_slot(g_larm[k].other)), g_larm[k].scale);
+        if (g_larm[k].disp > 0)      a64_add_imm(b, 1, r, r, (uint32_t)g_larm[k].disp);
+        else if (g_larm[k].disp < 0) a64_sub_imm(b, 1, r, r, (uint32_t)-g_larm[k].disp);
+        emit_guard_full(b, r);
+        uint32_t *here = a64_label(b);
+        a64_b(b, (int32_t)(g_larm[k].back - here));
+        if (g_n_fpbmap < JIT_MAX_BLOCK_INSNS) {
+            g_fpbmap[g_n_fpbmap].lo = (uint32_t)(lo - entry);
+            g_fpbmap[g_n_fpbmap].hi = (uint32_t)(a64_label(b) - entry);
+            g_fpbmap[g_n_fpbmap].idx = g_larm[k].idx;
+            g_n_fpbmap++;
+        }
+    }
+    g_n_larm = 0;
     for (int k = 0; k < g_n_garm; k++) {
         uint32_t *lo = a64_label(b);
         a64_patch_cbz(g_garm[k].site, lo);
@@ -20613,7 +20690,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_side = 0;
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
-    g_n_llh_bail_tb = g_n_llh_bail_cb = 0;
+    g_n_llh_bail_tb = g_n_llh_bail_cb = g_n_larm = 0;
     g_llh_n = g_llh_live = g_llh_wide = 0;
     g_llh_index = -1;
     g_mem_hoist_greg2 = -1;
