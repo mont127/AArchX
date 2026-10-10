@@ -627,6 +627,8 @@
  * Shifts by cl are translated in 32-bit blocks too.  A masked count of 0
  * skips the shift there, leaving the register and the flags as they were, as
  * the interpreter does in 32-bit code (64-bit code writes the register back).
+ * MMX is translated in 32-bit blocks as in 64-bit ones (emit_mmx): Bink's
+ * video decoder and Feral's IndirectX use it in i386 code.
  *
  * An fs- or gs-relative operand adds the segment base to the wrapped address
  * without wrapping the sum, as ocerz_ea does, and then takes the same guard and
@@ -11877,7 +11879,7 @@ static int emit_mmx(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
 static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (ocerz_insn_has_mmx(insn))
-        return insn->mode32 ? 0 : emit_mmx(b, insn, exit_sites, n_exits);
+        return emit_mmx(b, insn, exit_sites, n_exits);
     if (!sse_enabled()) return 0;
     if (insn->seg != OCERZ_SEG_NONE) return 0;
     switch (insn->op) {
@@ -14976,7 +14978,7 @@ static int emit_sidt(A64Buf *b, const X86Insn *insn)
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
-    if (ocerz_insn_has_mmx(insn)) return insn->mode32 ? 0 : emit_mmx(b, insn, exit_sites, n_exits);
+    if (ocerz_insn_has_mmx(insn)) return emit_mmx(b, insn, exit_sites, n_exits);
     if (insn->vex) return emit_vex(b, insn, exit_sites, n_exits);
     if (insn->mode32 && !m32_inline_ok(insn))
         return 0;
