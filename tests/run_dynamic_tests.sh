@@ -858,6 +858,7 @@ run_golden_case dret_flags_seam tests/dynamic/ret_flags_seam.c tests/dynamic/ret
 run_golden_case dshufps_self tests/dynamic/shufps_self.c tests/dynamic/shufps_self.out
 run_golden_case dcmp_mem_setcc tests/dynamic/cmp_mem_setcc.c tests/dynamic/cmp_mem_setcc.out
 run_golden_case dleaf_low tests/dynamic/leaf_low.c tests/dynamic/leaf_low.out
+run_golden_case dslot_jump tests/dynamic/slot_jump.c tests/dynamic/slot_jump.out
 run_golden_case dlowstack_disp tests/dynamic/lowstack_disp.c tests/dynamic/lowstack_disp.out
 run_golden_case dtest_jcc_gap tests/dynamic/test_jcc_gap.c tests/dynamic/test_jcc_gap.out
 run_golden_case dsetcc_zx tests/dynamic/setcc_zx.c tests/dynamic/setcc_zx.out
@@ -1100,6 +1101,7 @@ run_low_golden_case dret_flags_seam_low tests/dynamic/ret_flags_seam.c tests/dyn
 run_low_golden_case dshufps_self_low tests/dynamic/shufps_self.c tests/dynamic/shufps_self.out
 run_low_golden_case dcmp_mem_setcc_low tests/dynamic/cmp_mem_setcc.c tests/dynamic/cmp_mem_setcc.out
 run_low_golden_case dleaf_low_low tests/dynamic/leaf_low.c tests/dynamic/leaf_low.out
+run_low_golden_case dslot_jump_low tests/dynamic/slot_jump.c tests/dynamic/slot_jump.out
 run_low_golden_case dlowstack_disp_low tests/dynamic/lowstack_disp.c tests/dynamic/lowstack_disp.out
 run_low_golden_case dtest_jcc_gap_low tests/dynamic/test_jcc_gap.c tests/dynamic/test_jcc_gap.out
 run_low_golden_case dsetcc_zx_low tests/dynamic/setcc_zx.c tests/dynamic/setcc_zx.out
