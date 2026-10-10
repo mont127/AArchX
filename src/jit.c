@@ -5720,12 +5720,14 @@ static int emit_movx(A64Buf *b, const X86Insn *insn, int is_signed,
             return 0;
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         emit_add_const(b, JTA, gbase - ea_fold());
-        emit_guest_load_ordered(b, s->size, JT1, JTA, JTU);
+        /* A pinned destination takes the load, or the extension, itself: the address is already in JTA. */
+        int rd = ds >= 0 ? pin_hreg(ds) : JT1;
+        emit_guest_load_ordered(b, s->size, is_signed ? JT1 : rd, JTA, JTU);
         if (is_signed) {
-            if (s->size == 1) a64_sxtb(b, sf, JT1, JT1);
-            else              a64_sxth(b, sf, JT1, JT1);
+            if (s->size == 1) a64_sxtb(b, sf, rd, JT1);
+            else              a64_sxth(b, sf, rd, JT1);
         }
-        emit_gpr_wr(b, JT1, d->reg);
+        if (ds < 0) emit_gpr_wr(b, JT1, d->reg);
         patch_guard_skip(skip, a64_label(b));
         return 1;
     }
@@ -6105,8 +6107,12 @@ static int emit_movsxd(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, in
         uint32_t *skip = emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
         emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
         emit_guest_load_ordered(b, 4, JT1, JTA, JTU);
-        a64_sxtw(b, JT1, JT1);
-        emit_gpr_wr(b, JT1, d->reg);
+        if (ds >= 0) {
+            a64_sxtw(b, pin_hreg(ds), JT1);
+        } else {
+            a64_sxtw(b, JT1, JT1);
+            emit_gpr_wr(b, JT1, d->reg);
+        }
         patch_guard_skip(skip, a64_label(b));
         return 1;
     }
