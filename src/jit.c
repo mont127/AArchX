@@ -4072,10 +4072,57 @@ static int emit_shift_eager(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
+/*
+ * A shift of memory by an immediate, with its flags dead, is a load, the
+ * shift and a store; a count that masks to 0 writes nothing, as in the
+ * interpreter.  It went to the interpreter in both modes: in Batman: Arkham
+ * Asylum's i386 render thread `shr dword [ebp-0x3c], 2` and its kin were a
+ * fifth of the instructions still interpreted.
+ */
+static int mem_native_store_ok(void);
+static int emit_shift_mem_imm(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (need || insn->nops != 2 || d->kind != OCERZ_OPK_MEM || s->kind != OCERZ_OPK_IMM || insn->lock)
+        return 0;
+    if (insn->op != OCERZ_OP_SHL && insn->op != OCERZ_OP_SHR && insn->op != OCERZ_OP_SAR)
+        return 0;
+    int size = d->size;
+    if (size != 1 && size != 2 && size != 4 && size != 8)
+        return 0;
+    if (insn->seg != OCERZ_SEG_NONE || !mem_native_store_ok() ||
+        (insn->addrsize != 8 && !(insn->addrsize == 4 && insn->mode32)))
+        return 0;
+    if (rsp_is_ptr() && (d->base == OCERZ_RSP || d->index == OCERZ_RSP))
+        return 0;
+    unsigned cnt = (unsigned)s->imm & (size == 8 ? 63u : 31u);
+    if (cnt == 0)
+        return 1;
+    int sf = size == 8;
+    if (!emit_mem_ea(b, insn, d, JTA))
+        return 0;
+    (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
+    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+    emit_guest_load_ordered(b, size, JT0, JTA, JTU);
+    switch (insn->op) {
+    case OCERZ_OP_SHL: a64_lsl_imm(b, sf, JT0, JT0, (int)cnt); break;
+    case OCERZ_OP_SHR: a64_lsr_imm(b, sf, JT0, JT0, (int)cnt); break;
+    default:
+        if (size == 1) a64_sxtb(b, 0, JT0, JT0);
+        else if (size == 2) a64_sxth(b, 0, JT0, JT0);
+        a64_asr_imm(b, sf, JT0, JT0, (int)cnt);
+        break;
+    }
+    emit_guest_store_ordered(b, size, JT0, JTA, JTU);
+    return 1;
+}
+
 static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (!g_defer)
         return emit_shift_eager(b, insn, need);
+    if (insn->ops[0].kind == OCERZ_OPK_MEM)
+        return emit_shift_mem_imm(b, insn, need);
     const X86Operand *d = &insn->ops[0];
     const X86Operand *s = &insn->ops[1];
     if (d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 1 || d->size == 2) &&
