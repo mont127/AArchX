@@ -3518,6 +3518,50 @@ static uint32_t *emit_commpage_guard(A64Buf *b, const X86Insn *insn,
 static inline void patch_guard_skip(uint32_t *skip, uint32_t *target);
 static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scratch);
 
+/*
+ * cmp and test of a byte with ah, ch, dh or bh on either side: the operands
+ * are taken as bytes (bits 8-15 of the register by ubfx) and the result
+ * becomes a flag record.  A consumer that asked for NZCV (g_nzcv_want) finds
+ * no forwarding from here and reads the record, so one is written whenever
+ * the flags are wanted at all.  OCERZ_NO_HIGH8_ARITH=1 interprets them.
+ */
+static int emit_cmp_test_high8(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    const X86Operand *ops[2] = { &insn->ops[0], &insn->ops[1] };
+    if (!g_defer || insn->seg != OCERZ_SEG_NONE || ENV_ON("OCERZ_NO_HIGH8_ARITH"))
+        return 0;
+    if (!need && !g_nzcv_want)
+        return 1;
+    for (int k = 0; k < 2; k++)
+        if (ops[k]->kind == OCERZ_OPK_MEM) {
+            if (!emit_mem_load_plain(b, insn, ops[k], 1, JT2)) {
+                if (!emit_mem_ea(b, insn, ops[k], JTA)) return 0;
+                (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
+                emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+                emit_guest_load_ordered(b, 1, JT2, JTA, JTU);
+            }
+        }
+    for (int k = 0; k < 2; k++) {
+        const X86Operand *o = ops[k];
+        int r = k ? JT1 : JT0;
+        if (o->kind == OCERZ_OPK_MEM) {
+            a64_mov_reg(b, 0, r, JT2);
+        } else if (o->kind == OCERZ_OPK_IMM) {
+            a64_mov_imm64(b, r, (uint64_t)o->imm & 0xff);
+        } else {
+            emit_gpr_rd(b, 1, r, o->reg);
+            if (o->high8) a64_ubfx(b, 0, r, r, 8, 8); else a64_uxtb(b, r, r);
+        }
+    }
+    if (insn->op == OCERZ_OP_CMP) {
+        emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, 1, 0), JT0, JT1);
+    } else {
+        a64_and_reg(b, 0, JT2, JT0, JT1, 0);
+        emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, 1, 0), JT2, JT2);
+    }
+    return 1;
+}
+
 static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
                                 uint32_t **exit_sites, int *n_exits)
 {
@@ -3536,12 +3580,11 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
     int d_mem = d->kind == OCERZ_OPK_MEM, s_mem = s->kind == OCERZ_OPK_MEM;
     if (d_mem && s_mem)
         return 0;
-    if (d->kind == OCERZ_OPK_REG && d->high8)
-        return 0;
+    int dh = d->kind == OCERZ_OPK_REG && d->high8, sh8 = s->kind == OCERZ_OPK_REG && s->high8;
     if (d->kind != OCERZ_OPK_REG && !d_mem)
         return 0;
     if (s->kind == OCERZ_OPK_REG) {
-        if (s->high8 || s->size != d->size)
+        if (s->size != d->size)
             return 0;
     } else if (s->kind == OCERZ_OPK_MEM) {
         if (s->size != d->size)
@@ -3552,6 +3595,8 @@ static int emit_cmp_test_narrow(A64Buf *b, const X86Insn *insn, uint64_t need,
     if ((d_mem || s_mem) && (!g_defer || (insn->seg != OCERZ_SEG_NONE && insn->seg != OCERZ_SEG_GS && insn->seg != OCERZ_SEG_FS)))
         return 0;
 
+    if (dh || sh8)
+        return emit_cmp_test_high8(b, insn, need);
     if (!g_defer && need == 0)
         return 1;
     if ((d_mem || s_mem) && need == 0 && !g_nzcv_want)
@@ -7792,10 +7837,19 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (!g_defer) return 0;
-    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 1 && d->size != 2)) return 0;
+    if (d->kind != OCERZ_OPK_REG || (d->size != 1 && d->size != 2)) return 0;
     if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
+    /*
+     * ah, ch, dh and bh take the general path at the end: the byte is bits
+     * 8-15 of the register, read with ubfx and put back with bfi.  Feral's
+     * i386 code (Batman: Arkham Asylum's render thread) tests and combines
+     * flag bytes in them, and every such instruction was interpreted.
+     * OCERZ_NO_HIGH8_ARITH=1 interprets them again.
+     */
+    int dh = d->high8, sh = s->kind == OCERZ_OPK_REG && s->high8;
+    if ((dh || sh) && ENV_ON("OCERZ_NO_HIGH8_ARITH")) return 0;
     int s_mem = 0;
-    if (s->kind == OCERZ_OPK_REG) { if (s->high8 || s->size != d->size) return 0; }
+    if (s->kind == OCERZ_OPK_REG) { if (s->size != d->size) return 0; }
     else if (s->kind == OCERZ_OPK_MEM) { if (s->size != d->size || insn->seg != OCERZ_SEG_NONE) return 0; s_mem = 1; }
     else if (s->kind != OCERZ_OPK_IMM) return 0;
     unsigned op = insn->op;
@@ -7803,7 +7857,7 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
         op != OCERZ_OP_OR && op != OCERZ_OP_XOR) return 0;
     int size = d->size, bits = size * 8;
     uint64_t mask = size == 1 ? 0xffull : 0xffffull;
-    if (s_mem) {
+    if (s_mem && !dh) {
         int ds = pin_slot(d->reg);
         if (ds < 0) return 0;
         if (!emit_mem_load_plain(b, insn, s, size, JT1)) {
@@ -7839,7 +7893,7 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
                emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2); }
         return 1;
     }
-    if (!need && pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
+    if (!need && !dh && !sh && pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
         int rd = pin_hreg(pin_slot(d->reg));
         int rm;
         if (s->kind == OCERZ_OPK_REG) {
@@ -7866,12 +7920,24 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
         a64_bfi(b, 1, rd, JT2, 0, bits);
         return 1;
     }
+    if (s_mem) {
+        if (!emit_mem_load_plain(b, insn, s, size, JT1)) {
+            if (!emit_mem_ea(b, insn, s, JTA)) return 0;
+            (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
+            emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+            emit_guest_load_ordered(b, size, JT1, JTA, JTU);
+        }
+    }
     emit_gpr_rd(b, 1, JT0, d->reg);
-    if (size == 1) a64_uxtb(b, JTT, JT0); else a64_uxth(b, JTT, JT0);
+    if (dh) a64_ubfx(b, 0, JTT, JT0, 8, 8);
+    else if (size == 1) a64_uxtb(b, JTT, JT0);
+    else a64_uxth(b, JTT, JT0);
     if (s->kind == OCERZ_OPK_REG) {
         emit_gpr_rd(b, 1, JT1, s->reg);
-        if (size == 1) a64_uxtb(b, JT1, JT1); else a64_uxth(b, JT1, JT1);
-    } else
+        if (sh) a64_ubfx(b, 0, JT1, JT1, 8, 8);
+        else if (size == 1) a64_uxtb(b, JT1, JT1);
+        else a64_uxth(b, JT1, JT1);
+    } else if (!s_mem)
         a64_mov_imm64(b, JT1, (uint64_t)s->imm & mask);
     switch (op) {
     case OCERZ_OP_ADD: a64_add_reg(b, 0, JT2, JTT, JT1, 0); break;
@@ -7880,9 +7946,9 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
     case OCERZ_OP_OR:  a64_orr_reg(b, 0, JT2, JTT, JT1, 0); break;
     case OCERZ_OP_XOR: a64_eor_reg(b, 0, JT2, JTT, JT1, 0); break;
     }
-    a64_bfi(b, 1, JT0, JT2, 0, bits);
+    a64_bfi(b, 1, JT0, JT2, dh ? 8 : 0, bits);
     emit_gpr_wr(b, JT0, d->reg);
-    if (need) {
+    if (need || ((dh || sh) && g_nzcv_want)) {
         if (op == OCERZ_OP_ADD)      emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_ADD, size, 0), JTT, JT1);
         else if (op == OCERZ_OP_SUB) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JTT, JT1);
         else {
