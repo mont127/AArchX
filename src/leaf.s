@@ -18,7 +18,9 @@
  * Nothing else the translation relies on is touched: a routine changes x9 to x15,
  * v0 to v3 and the flags, and nothing more.  It makes no call, uses no stack and
  * never writes x30.  The guest base is zero wherever these are used, so a guest
- * pointer is the host address and is dereferenced as it arrives.
+ * pointer is the host address and is dereferenced as it arrives; in the Wine
+ * layout, where one below 12 GB is not, the calling block translates the
+ * pointers before the call and puts the guest's values back after it.
  *
  * Leaving x30 alone is what keeps a fault exact.  A guest that hands strlen a bad
  * pointer faults at a program counter inside this file, which belongs to no
