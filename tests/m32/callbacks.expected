@@ -1,0 +1,7 @@
+ctors 2 1 2
+1 2 3 4 5 7 8 9
+-1.00 0.00 2.50 9.75
+bsearch 7
+atexit ran first
+atexit ran
+exit 5

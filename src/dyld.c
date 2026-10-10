@@ -880,6 +880,11 @@ const char *ocerz_dyld_main_path(void)
     return g_main_hostpath[0] ? g_main_hostpath : NULL;
 }
 
+void ocerz_dyld_set_main_path(const char *path)
+{
+    snprintf(g_main_hostpath, sizeof g_main_hostpath, "%s", path);
+}
+
 static int map_segments(DynImage *img, int is_main)
 {
     const uint8_t *mh = img->slice;

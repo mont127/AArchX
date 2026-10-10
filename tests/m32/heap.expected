@@ -1,0 +1,10 @@
+heap-a
+calloc-zero 0
+realloc keeps heap-a
+in-window 1
+msize-ok 1
+memalign 0 1
+dup'd 1
+fmt-7 5
+churn-ok
+exit 0

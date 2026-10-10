@@ -1,0 +1,1 @@
+-L../../runtime/guest32/usr/lib -lstdc++.6

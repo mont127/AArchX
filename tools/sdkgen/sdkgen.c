@@ -238,6 +238,12 @@
 #define MAX_FIELDS 4096
 
 static const char *g_arch_name[2] = { "x86_64", "arm64" };
+/* --guest i386 generates m32's database (runtime/apis32): the first parse is i386 instead of x86_64,
+ * each function keeps both notations, and the guest side adds s (a C string), P (one pointer written through a
+ * pointer), W/V (one signed/unsigned long written through a pointer) and Q (a pointer to data whose i386 and arm64
+ * layouts differ). g_guest_side is set while the i386 notation is being written. */
+static int g_guest32;
+static int g_guest_side;
 
 static void die(const char *fmt, ...)
 {
@@ -382,6 +388,8 @@ static void map_set(Map *m, const char *k, int v)
 
 static struct {
     int FunctionDecl, VarDecl, TypedefDecl, LinkageSpec, UnexposedDecl, UnionDecl;
+    int ObjCInterfaceDecl, ObjCCategoryDecl, ObjCProtocolDecl, ObjCInstanceMethodDecl, ObjCClassMethodDecl,
+        ObjCPropertyDecl, ObjCClassRef;   /* M32's method encodings */
 } CK;
 
 static struct {
@@ -399,6 +407,9 @@ static void resolve_kinds(void)
         { "FunctionDecl", &CK.FunctionDecl }, { "VarDecl", &CK.VarDecl },
         { "TypedefDecl", &CK.TypedefDecl }, { "LinkageSpec", &CK.LinkageSpec },
         { "UnexposedDecl", &CK.UnexposedDecl }, { "UnionDecl", &CK.UnionDecl },
+        { "ObjCInterfaceDecl", &CK.ObjCInterfaceDecl }, { "ObjCCategoryDecl", &CK.ObjCCategoryDecl },
+        { "ObjCProtocolDecl", &CK.ObjCProtocolDecl }, { "ObjCInstanceMethodDecl", &CK.ObjCInstanceMethodDecl },
+        { "ObjCClassMethodDecl", &CK.ObjCClassMethodDecl }, { "ObjCPropertyDecl", &CK.ObjCPropertyDecl },
     };
     struct { const char *name; int *slot; } types[] = {
         { "Invalid", &TK.Invalid }, { "Unexposed", &TK.Unexposed }, { "Void", &TK.Void },
@@ -423,6 +434,7 @@ static void resolve_kinds(void)
     size_t nt = sizeof types / sizeof types[0];
     for (size_t i = 0; i < nc; i++)
         *cursors[i].slot = -1;
+    CK.ObjCClassRef = -1;
     for (size_t i = 0; i < nt; i++)
         *types[i].slot = -1;
     for (int k = 0; k < 4096; k++) {
@@ -442,6 +454,13 @@ static void resolve_kinds(void)
             if (*types[i].slot < 0 && strcmp(c, types[i].name) == 0)
                 *types[i].slot = k;
         clang_disposeString(s);
+    }
+    for (int k = 40; k < 60 && CK.ObjCClassRef < 0; k++) {   /* a reference (CXCursor_FirstRef is 40); spelling other kinds crashes */
+        CXString sp = clang_getCursorKindSpelling(k);
+        const char *c = clang_getCString(sp);
+        if (c && strcmp(c, "ObjCClassRef") == 0)
+            CK.ObjCClassRef = k;
+        clang_disposeString(sp);
     }
     for (size_t i = 0; i < nc; i++)
         if (*cursors[i].slot < 0)
@@ -796,7 +815,9 @@ static const char *flat_type(Flat *f, CXType t, int depth, int level, long long 
         } else {
             char k = buf_str(&one)[0];
             *size = strchr("bB", k) ? 1 : strchr("hH", k) ? 2 : strchr("iuf", k) ? 4 : 8;
-            *align = *size;
+            if (g_guest_side && strchr("psPQWV@#:", k))
+                *size = 4;
+            *align = g_guest_side ? clang_Type_getAlignOf(c) : *size;   /* I386 aligns 8-byte members to 4 */
             if (clang_Type_getSizeOf(c) != *size)
                 f->layout_bad = 1;
             buf_add(f->out, k == 'T' ? "L" : buf_str(&one));
@@ -925,6 +946,10 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
         }
         if (is_va_list_tag(pc))
             return "va-list";
+        if (g_guest_side && (pc.kind == TK.Char_S || pc.kind == TK.Char_U || pc.kind == TK.SChar || pc.kind == TK.UChar)) {
+            buf_addc(out, 's');
+            return NULL;
+        }
         CXType q = pc;
         for (int guard = 0; guard < 16 && q.kind == TK.Pointer; guard++) {
             q = canon(clang_getPointeeType(q));
@@ -948,7 +973,8 @@ static const char *type_class(CXType t, int depth, int is_result, Buf *out)
         return r;
     }
     if (k == TK.ObjCObjectPointer || k == TK.ObjCId || k == TK.ObjCClass || k == TK.ObjCSel) {
-        buf_addc(out, 'p');
+        /* M32 converts objects, classes and selectors each their own way */
+        buf_addc(out, !g_guest32 ? 'p' : k == TK.ObjCClass ? '#' : k == TK.ObjCSel ? ':' : '@');
         return NULL;
     }
     if (k == TK.Record) {
@@ -1531,6 +1557,8 @@ static int collect_visit(CXCursor c, CXCursor parent, CXClientData d)
     int idx = p->ndecl[a];
     p->decl[a][p->ndecl[a]++] = c;
     char *key = a == ARCH_X86 ? cx(clang_Cursor_getMangling(c)) : cx(clang_getCursorUSR(c));
+    if (g_guest32 && a == ARCH_X86 && strchr(key, '$'))
+        *strchr(key, '$') = 0;   /* _fopen$UNIX2003 declares the export _fopen */
     Map *m = a == ARCH_X86 ? &p->mangled : &p->usr;
     int old = map_get(m, key);
     if (old < 0) {
@@ -1549,7 +1577,8 @@ static void parse_pass(CXIndex index, Pass *p)
 {
     for (int arch = 0; arch < 2; arch++) {
         char target[96];
-        snprintf(target, sizeof target, "%s-apple-macos%s", g_arch_name[arch], g_version);
+        snprintf(target, sizeof target, "%s-apple-macos%s", g_arch_name[arch],
+                 g_guest32 && arch == ARCH_X86 ? "10.14" : g_version);   /* The last i386 macOS */
         const char *args[16 + MAX_DEFINES];
         int n = 0;
         int objc = strcmp(g_lib.language, "objective-c") == 0;
@@ -1564,7 +1593,12 @@ static void parse_pass(CXIndex index, Pass *p)
         args[n++] = "-w";
         for (int i = 0; i < p->ndefines; i++)
             args[n++] = p->defines[i];
-        char *src = xprintf("#include \"%s\"\n", p->header);
+        /* Foundation keeps these 64-bit-only classes out of an i386 parse while AppKit, CoreImage and
+         * UniformTypeIdentifiers still name them */
+        const char *prelude = g_guest32 && arch == ARCH_X86 && objc
+            ? "#import <Foundation/NSObject.h>\n@interface NSExtensionContext : NSObject @end\n"
+              "@interface NSItemProvider : NSObject @end\n@interface NSUserActivity : NSObject @end\n" : "";
+        char *src = xprintf("%s#include \"%s\"\n", prelude, p->header);
         struct CXUnsavedFile uf = { file, src, strlen(src) };
         CXTranslationUnit tu = NULL;
         int rc = clang_parseTranslationUnit2(index, file, args, n, &uf, 1,
@@ -2033,8 +2067,244 @@ static int same_but_signedness(const char *x, const char *a)
     return 1;
 }
 
+/* The guest (i386) class of one argument or result, given the arm64 type beside it */
+static const char *class32(CXType tx, CXType ta, int is_result, Buf *out, int host)
+{
+    CXType x = canon(tx), a = canon(ta);
+    if (x.kind == TK.Pointer && a.kind == TK.Pointer && !is_imp(tx)) {
+        CXType pxs = clang_getPointeeType(x), pas = clang_getPointeeType(a);
+        CXType px = canon(pxs), pa = canon(pas);
+        int k = px.kind, sign = 0;
+        if (!is_fn_kind(k) && !is_va_list_tag(px)) {
+            if (k == TK.Char_S || k == TK.Char_U || k == TK.SChar || k == TK.UChar) {
+                buf_addc(out, host ? 'p' : 's');
+                return NULL;
+            }
+            int cst = clang_isConstQualifiedType(pxs);
+            if (k == TK.Pointer || k == TK.ObjCObjectPointer || k == TK.ObjCId || k == TK.ObjCClass ||
+                k == TK.ObjCSel || k == TK.BlockPointer) {
+                /* char **endptr, void **out, CFStringRef *outName: one pointer written back.  const void **values
+                 * is an array: an unnamed pointer to const data, where a CF out-parameter is a named ...Ref */
+                CXType sug = tx;   /* the written type keeps the typedef the canonical one lost */
+                for (int g = 0; g < 8 && (sug.kind == TK.Attributed || sug.kind == TK.Elaborated); g++)
+                    sug = sug.kind == TK.Attributed ? clang_Type_getModifiedType(sug) : clang_Type_getNamedType(sug);
+                char *pname = cx(clang_getTypeSpelling(sug.kind == TK.Pointer ? clang_getPointeeType(sug) : pxs));
+                int named_ref = strstr(pname, "Ref") != NULL;   /* "CFStringRef _Nullable" */
+                free(pname);
+                int inner_const = k == TK.Pointer && !named_ref && clang_isConstQualifiedType(clang_getPointeeType(px));
+                buf_addc(out, host ? 'p' : cst || inner_const || is_result ? 'Q' : 'P');
+                return NULL;
+            }
+            /* a pointer straight at one scalar of the same size is the same to both sides: alignment only matters
+             * inside structures (long long and double are 4-aligned there on i386) */
+            int same_scalar = (is_integer_kind(k, &sign) || k == TK.Float || k == TK.Double) &&
+                              clang_Type_getSizeOf(px) == clang_Type_getSizeOf(pa);
+            if (!same_scalar && !layout_same(px, pa, pxs)) {
+                if (is_integer_kind(k, &sign) && !cst && !is_result) {
+                    buf_addc(out, host ? 'p' : sign ? 'W' : 'V');
+                    return NULL;
+                }
+                if (px.kind == TK.Record && !is_result) {   /* a structure read, or written back, through a pointer */
+                    Buf sb = { 0 };
+                    g_guest_side = !host;
+                    const char *e = type_class(host ? pas : pxs, 0, 0, &sb);
+                    g_guest_side = 0;
+                    if (!e && sb.s && sb.s[0] == '{') {
+                        buf_addc(out, cst ? 'r' : 'R');
+                        buf_add(out, sb.s);
+                        free(sb.s);
+                        return NULL;
+                    }
+                    free(sb.s);
+                }
+                buf_addc(out, host ? 'p' : 'Q');
+                return NULL;
+            }
+            buf_addc(out, 'p');
+            return NULL;
+        }
+    }
+    g_guest_side = !host;
+    const char *r = type_class(host ? ta : tx, 0, is_result, out);
+    g_guest_side = 0;
+    return r;
+}
+
+static void classify32(Rec *r)
+{
+    if (r->objc == OBJC_DATA || r->objc == OBJC_IVAR) {
+        set_omit(r, "objc");
+        return;
+    }
+    Pass *p = NULL;
+    CXCursor x = { 0 }, a = { 0 };
+    int have_arm = 0;
+    for (int pi = 0; pi < g_lib.npasses && !p; pi++) {
+        int idx = map_get(&g_lib.passes[pi].mangled, r->name);
+        if (idx < 0)
+            continue;
+        p = &g_lib.passes[pi];
+        x = p->decl[ARCH_X86][idx];
+        char *usr = cx(clang_getCursorUSR(x));
+        int ai = map_get(&p->usr, usr);
+        free(usr);
+        if (ai >= 0) {
+            a = p->decl[ARCH_ARM][ai];
+            have_arm = 1;
+        }
+    }
+    if (!p || !have_arm || a.kind != x.kind) {
+        set_stub(r, p ? "no-arm64-declaration" : "no-declaration");
+        return;
+    }
+    char *mangled = cx(clang_Cursor_getMangling(a));
+    r->host = host_name(mangled);
+    free(mangled);
+    CXType tx = clang_getCursorType(x), ta = clang_getCursorType(a);
+    if (x.kind != CK.FunctionDecl) {
+        if (clang_getCursorTLSKind(x) != CXTLS_None) {
+            set_stub(r, "thread-local");
+            return;
+        }
+        CXType cx_ = canon(tx), ca = canon(ta);
+        long long gs = clang_Type_getSizeOf(cx_), hs = clang_Type_getSizeOf(ca);
+        int sign;
+        const char *kind = NULL;
+        if (gs <= 0 || hs <= 0)
+            kind = "opaque";   /* an incomplete type: only its address is ever used (&_dispatch_main_q) */
+        else if (cx_.kind == TK.ObjCObjectPointer || cx_.kind == TK.ObjCId)
+            kind = "obj";      /* NSApp: the guest sees its twin or a handle */
+        else if (cx_.kind == TK.Pointer || cx_.kind == TK.BlockPointer || cx_.kind == TK.ObjCClass)
+            kind = "ptr";
+        else if (is_integer_kind(cx_.kind, &sign) || cx_.kind == TK.Enum || cx_.kind == TK.Bool)
+            kind = "int";
+        else if (layout_same(cx_, ca, tx))
+            kind = "blob";
+        if (!kind) {
+            set_stub(r, "layout");
+            return;
+        }
+        r->kind = R_DATA;
+        r->bytes = xprintf("%lld %lld %s", gs, hs, kind);
+        r->host_missing = !host_has(r->host);
+        return;
+    }
+    CXType fx = desugar_to(tx, TK.FunctionProto, TK.FunctionNoProto), fa = canon(ta);
+    CXType fxc = canon(fx);
+    if (fxc.kind != TK.FunctionProto || fa.kind != TK.FunctionProto) {
+        set_stub(r, "no-prototype");
+        return;
+    }
+    if (clang_isFunctionTypeVariadic(fxc)) {
+        set_stub(r, "variadic");
+        return;
+    }
+    int n = clang_getNumArgTypes(fxc);
+    if (n != clang_getNumArgTypes(fa)) {
+        set_stub(r, "arch-mismatch");
+        return;
+    }
+    Buf sx = { 0 }, sa = { 0 };
+    const char *why = NULL;
+    for (int side = 0; side < 2 && !why; side++) {   /* guest, then host: each writes its own layouts */
+        Buf *b = side ? &sa : &sx;
+        why = class32(clang_getResultType(fx), clang_getResultType(fa), 1, b, side);
+        buf_addc(b, '(');
+        for (int i = 0; !why && i < n; i++)
+            why = class32(clang_getArgType(fx, (unsigned)i), clang_getArgType(fa, (unsigned)i), 0, b, side);
+        buf_addc(b, ')');
+    }
+    if (why) {
+        set_stub(r, why);
+    } else {
+        r->kind = R_FN;
+        r->sig = xprintf("%s %s", buf_str(&sx), buf_str(&sa));
+        r->host_missing = !host_has(r->host);
+    }
+    free(sx.s);
+    free(sa.s);
+}
+
+/* <leaf>.objc32, "m <class|@Protocol> <-|+><selector> <i386 encoding>" for every method and property
+ * accessor the i386 parse declares */
+static FILE *g_objc_out;
+static Map g_objc_seen;
+
+static void objc_emit(const char *container, int cls, const char *sel, const char *enc, int variadic)
+{
+    if (!enc || !*enc || strchr(enc, ' '))
+        return;
+    char *key = xprintf("%s %c%s", container, cls ? '+' : '-', sel);
+    if (map_get(&g_objc_seen, key) < 0) {
+        map_set(&g_objc_seen, key, 1);
+        fprintf(g_objc_out, "m %s %s%s\n", key, enc, variadic ? " variadic" : "");
+    }
+    free(key);
+}
+
+static int objc_member(CXCursor c, CXCursor parent, CXClientData d)
+{
+    (void)parent;
+    const char *container = d;
+    int k = c.kind;
+    if (k == CK.ObjCInstanceMethodDecl || k == CK.ObjCClassMethodDecl) {
+        char *sel = cx(clang_getCursorSpelling(c)), *enc = cx(clang_getDeclObjCTypeEncoding(c));
+        objc_emit(container, k == CK.ObjCClassMethodDecl, sel, enc, clang_Cursor_isVariadic(c) != 0);
+        free(sel);
+        free(enc);
+    } else if (k == CK.ObjCPropertyDecl) {
+        unsigned attrs = clang_Cursor_getObjCPropertyAttributes(c, 0);
+        int cls = (attrs & 0x1000) != 0;   /* CXObjCPropertyAttr_class */
+        char *t = cx(clang_Type_getObjCEncoding(clang_getCursorType(c)));
+        char *get = cx(clang_Cursor_getObjCPropertyGetterName(c)), *set = cx(clang_Cursor_getObjCPropertySetterName(c));
+        char *genc = xprintf("%s@:", t), *senc = xprintf("v@:%s", t);
+        objc_emit(container, cls, get, genc, 0);
+        if (!(attrs & 0x1))                /* CXObjCPropertyAttr_readonly */
+            objc_emit(container, cls, set, senc, 0);
+        free(t); free(get); free(set); free(genc); free(senc);
+    }
+    return CXChildVisit_Continue;
+}
+
+static int objc_class_ref(CXCursor c, CXCursor parent, CXClientData d)
+{
+    (void)parent;
+    if (c.kind == CK.ObjCClassRef) {
+        *(char **)d = cx(clang_getCursorSpelling(c));
+        return CXChildVisit_Break;
+    }
+    return CXChildVisit_Continue;
+}
+
+static int objc_top(CXCursor c, CXCursor parent, CXClientData d)
+{
+    (void)parent; (void)d;
+    int k = c.kind;
+    if (k == CK.LinkageSpec || k == CK.UnexposedDecl)
+        return CXChildVisit_Recurse;
+    char *name = NULL;
+    if (k == CK.ObjCInterfaceDecl)
+        name = cx(clang_getCursorSpelling(c));
+    else if (k == CK.ObjCCategoryDecl)
+        clang_visitChildren(c, objc_class_ref, &name);
+    else if (k == CK.ObjCProtocolDecl) {
+        char *p = cx(clang_getCursorSpelling(c));
+        name = xprintf("@%s", p);
+        free(p);
+    }
+    if (name) {
+        clang_visitChildren(c, objc_member, name);
+        free(name);
+    }
+    return CXChildVisit_Continue;
+}
+
 static void classify(Rec *r)
 {
+    if (g_guest32) {
+        classify32(r);
+        return;
+    }
     if (r->objc == OBJC_DATA) {
         r->kind = R_DATA;
         r->host = host_name(r->name);
@@ -2327,6 +2597,11 @@ int main(int argc, char **argv)
             out = argv[++i];
         else if (strcmp(argv[i], "--build") == 0)
             build = argv[++i];
+        else if (strcmp(argv[i], "--guest") == 0 && strcmp(argv[i + 1], "i386") == 0) {
+            g_guest32 = 1;
+            g_arch_name[ARCH_X86] = "i386";
+            i++;
+        }
         else
             usage();
     }
@@ -2365,7 +2640,8 @@ int main(int argc, char **argv)
     for (int pi = 0; pi < g_lib.npasses; pi++)
         parse_pass(index, &g_lib.passes[pi]);
 
-    verify_shapes();
+    if (!g_guest32)   /* Shapes describe the 64-bit layouts */
+        verify_shapes();
 
     Rec *recs = calloc((size_t)ex.n, sizeof *recs);
     if (!recs)
@@ -2375,9 +2651,9 @@ int main(int argc, char **argv)
         recs[i].objc = map_get(&ex.objc_kind, ex.v[i]) > 0 ? map_get(&ex.objc_kind, ex.v[i]) : OBJC_NONE;
         classify(&recs[i]);
     }
-    for (int i = 0; i < ex.n; i++)
+    for (int i = 0; i < ex.n && !g_guest32; i++)
         overrides_for(&recs[i]);
-    for (int i = 0; i < g_novr; i++) {
+    for (int i = 0; i < g_novr && !g_guest32; i++) {
         Override *o = &g_ovr[i];
         if (strcmp(o->kind, "struct") == 0 || strcmp(o->kind, "inplace") == 0) {
             int idx = map_get(&ex.names, o->f[1]);
@@ -2408,7 +2684,8 @@ int main(int argc, char **argv)
     fprintf(api, "# %s's .tbd, matched to their declarations in the SDK headers\n", g_lib.name);
     fprintf(api, "# parsed for x86_64 and arm64.  Do not edit; change tools/sdkgen/overrides\n");
     fprintf(api, "# or the generator and run tools/sdkgen.sh %s again.\n", g_lib.name);
-    fprintf(api, "ocerz-apidb 1\nlibrary %s\nsdk macos %s\n", g_lib.install, g_version);
+    fprintf(api, "%s 1\nlibrary %s\nsdk macos %s\n", g_guest32 ? "ocerz-apidb32" : "ocerz-apidb",
+            g_lib.install, g_version);
 
     int nfn = 0, ndata = 0, nvar = 0, nspecial = 0, nmissing = 0, novr = 0;
     Count *stubs = NULL, *omits = NULL;
@@ -2419,6 +2696,17 @@ int main(int argc, char **argv)
             novr++;
         if (r->host_missing)
             nmissing++;
+        if (g_guest32) {   /* M32's records */
+            if (r->kind == R_FN)
+                fprintf(api, "fn32 %s %s %s\n", r->name, r->host, r->sig), nfn++;
+            else if (r->kind == R_DATA)
+                fprintf(api, "data32 %s %s %s\n", r->name, r->host, r->bytes), ndata++;
+            else if (r->kind == R_STUB)
+                fprintf(api, "bad32 %s %s\n", r->name, r->reason), count_reason(&stubs, &nstubs, r->reason);
+            else
+                count_reason(&omits, &nomits, r->reason);
+            continue;
+        }
         switch (r->kind) {
         case R_FN:
             fprintf(api, "fn %s %s %s\n", r->name, r->host, r->sig);
@@ -2461,6 +2749,8 @@ int main(int argc, char **argv)
     }
     qsort(shapes, (size_t)nshapes, sizeof *shapes, cmp_shape);
     qsort(structs, (size_t)nstructs, sizeof *structs, cmp_struct);
+    if (g_guest32)   /* Shapes and struct records describe the 64-bit layouts */
+        nshapes = nstructs = 0;
     for (int i = 0; i < nshapes; i++) {
         fputs("shape", api);
         for (int j = 1; j < shapes[i]->nf; j++)
@@ -2469,7 +2759,7 @@ int main(int argc, char **argv)
     }
     for (int i = 0; i < nstructs; i++)
         fprintf(api, "struct %s %s %s\n", structs[i]->f[1], structs[i]->f[2], structs[i]->f[3]);
-    for (int i = 0; i < g_novr; i++)
+    for (int i = 0; i < g_novr && !g_guest32; i++)
         if (strcmp(g_ovr[i].kind, "inplace") == 0 && g_ovr[i].used)
             fprintf(api, "inplace %s %s %s %s\n", g_ovr[i].f[1], g_ovr[i].f[2], g_ovr[i].f[3],
                     g_ovr[i].f[4]);
@@ -2544,6 +2834,14 @@ int main(int argc, char **argv)
     fprintf(stderr, "sdkgen: wrote %s, %s and %s (%d measured records)\n", api_path, cov_path,
             lay_path, g_nmeas);
 
+    if (g_guest32 && strcmp(g_lib.language, "objective-c") == 0) {
+        char *objc_path = xprintf("%s/%s.objc32", dir, leaf);
+        g_objc_out = open_out(objc_path);
+        for (int pi = 0; pi < g_lib.npasses; pi++)
+            clang_visitChildren(clang_getTranslationUnitCursor(g_lib.passes[pi].tu[ARCH_X86]), objc_top, NULL);
+        fclose(g_objc_out);
+        fprintf(stderr, "sdkgen: wrote %s (%zu methods)\n", objc_path, (size_t)g_objc_seen.n);
+    }
     for (int pi = 0; pi < g_lib.npasses; pi++)
         for (int a = 0; a < 2; a++)
             clang_disposeTranslationUnit(g_lib.passes[pi].tu[a]);

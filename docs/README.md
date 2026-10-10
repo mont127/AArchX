@@ -16,6 +16,7 @@ These pages describe what it does, how to run it, and how it works.
 | [How AArchX works (PDF)](AArchX-Deep-Dive.pdf) | A 231-page deep dive into the whole translator, written for contributors: every subsystem, its data structures and the history behind each rule |
 | [Modes](modes.md) | Cache mode and native mode: what each binds against, what each needs, which to pick |
 | [Native mode in depth](native-mode.md) | How native mode crosses into the Mac's own frameworks, what it costs, and what it cannot run yet |
+| [32-bit Mac programs](m32.md) | m32: running i386 Mach-O programs, which macOS dropped, against the Mac's arm64 frameworks |
 | [Reference](reference.md) | Every command-line option and every environment variable that is meant to be used |
 | [Architecture](architecture.md) | How a guest program is loaded, decoded, translated and run |
 | [Performance](performance.md) | Measured results against Rosetta, how to reproduce them, and where the remaining costs are |
