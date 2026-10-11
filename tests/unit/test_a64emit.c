@@ -111,6 +111,9 @@ static void b_mul(A64Buf *b) { a64_mul(b, 1, 0, 0, 1); a64_ret(b); }
 static void b_umulh(A64Buf *b) { a64_umulh(b, 0, 0, 1); a64_ret(b); }
 static void b_smulh(A64Buf *b) { a64_smulh(b, 0, 0, 1); a64_ret(b); }
 static void b_csel(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_csel(b, 1, 0, 0, 1, A64_LT); a64_ret(b); }
+static void b_csinc_t(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_csinc(b, 1, 0, 0, 1, A64_LT); a64_ret(b); }
+static void b_csinc_f(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_csinc(b, 1, 0, 0, 1, A64_GE); a64_ret(b); }
+static void b_csinc_w(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 0, 0); a64_csinc(b, 0, 0, 0, 0, A64_NE); a64_ret(b); }
 static void b_ccmn_vc(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmn_imm(b, 1, 0, 1, 1, A64_VC); a64_cset(b, 0, A64_VS); a64_ret(b); }
 static void b_ccmn_else(A64Buf *b) { a64_adds_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmn_imm(b, 1, 0, 1, 1, A64_VC); a64_cset(b, 0, A64_VS); a64_ret(b); }
 static void b_ccmp_w(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmp_imm(b, 0, 0, 7, 0, A64_EQ); a64_cset(b, 0, A64_EQ); a64_ret(b); }
@@ -485,6 +488,9 @@ int main(void)
     CHECK(run2(b_umulh, 0xffffffffffffffffull, 2) == 1, "umulh");
     CHECK(run2(b_smulh, (uint64_t)-1, 2) == (uint64_t)-1, "smulh");
     CHECK(run2(b_csel, 3, 9) == 3, "csel LT picks rn");
+    CHECK(run2(b_csinc_t, 3, 9) == 3, "csinc LT picks rn");
+    CHECK(run2(b_csinc_f, 3, 9) == 10, "csinc GE fails to rm + 1");
+    CHECK(run2(b_csinc_w, 0xffffffffull, 0) == 0, "csinc w wraps and clears the upper half");
     CHECK(run2(b_ccmn_vc, 0x7fffffffffffffffull, 0) == 1, "ccmn VC leg: INT64_MAX + 1 overflows");
     CHECK(run2(b_ccmn_vc, 5, 0) == 0, "ccmn VC leg: 5 + 1 does not");
     CHECK(run2(b_ccmn_vc, 0, 0) == 0, "ccmn VC leg: 0 + 1 does not");

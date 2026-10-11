@@ -17,6 +17,8 @@
  *   maps the page and the step goes on;
  * - vc_load: a sub whose consumers test ZF or SF, which may read its result's
  *   register instead of NZCV, with loads between;
+ * - carry_imm: adc and sbb of immediates of each sign and size, 32 and 64 bits,
+ *   each after its own compare (a csinc after at most one add or sub);
  * each over inputs on both sides of every condition.  Against Rosetta.
  */
 #include <signal.h>
@@ -132,6 +134,19 @@ __asm__(
     "    add $0x99, %r11d\n"
     "2:  shl $20, %r10\n    xor %r10, %rax\n    shl $40, %r8\n    xor %r8, %rax\n    shl $8, %r9\n    xor %r9, %rax\n"
     "    shl $32, %rcx\n    xor %rcx, %rax\n    shl $48, %rsi\n    xor %rsi, %rax\n    shl $12, %r11\n    xor %r11, %rax\n"
+    "    ret\n"
+    ".p2align 4\n"
+    /* carry_imm(a, b, c) */
+    "_carry_imm:\n"
+    "    mov %edx, %r8d\n    mov %rdx, %r9\n    mov %edx, %r10d\n    mov %rdx, %r11\n    mov %rdx, %rcx\n"
+    "    cmp %esi, %edi\n    sbb $-2, %r8d\n"
+    "    cmp %edi, %esi\n    adc $-0x1000, %r9\n"
+    "    cmp %esi, %edi\n    adc $0x12345, %r10d\n"
+    "    cmp %edi, %esi\n    sbb $0x7fffffff, %r11\n"
+    "    cmp %rsi, %rdi\n    sbb $-0x80000000, %rcx\n"
+    "    mov %edi, %eax\n    sub %esi, %eax\n    adc $-1, %edx\n"
+    "    shl $8, %r8\n    xor %r8, %rax\n    rol $16, %r9\n    xor %r9, %rax\n    shl $24, %r10\n    xor %r10, %rax\n"
+    "    rol $32, %r11\n    xor %r11, %rax\n    rol $40, %rcx\n    xor %rcx, %rax\n    shl $48, %rdx\n    xor %rdx, %rax\n"
     "    ret\n");
 
 uint64_t lz_bit(uint32_t range, uint32_t code, uint32_t prob, uint32_t sym);
@@ -140,6 +155,7 @@ uint64_t edge(uint32_t a, uint32_t b);
 uint64_t jcc_after(uint32_t a, uint32_t b);
 uint64_t lz_load(uint32_t range, uint32_t code, const uint16_t *probs, uint32_t prob);
 uint64_t vc_load(uint32_t a, uint32_t b, const uint8_t *p);
+uint64_t carry_imm(uint64_t a, uint64_t b, uint64_t c);
 
 static uint8_t *g_page;
 static volatile int g_faults, g_fault_cf;
@@ -206,5 +222,14 @@ int main(void)
         hv = hv * 31 + vc_load(x, y, bytes);
     }
     printf("vc_load %llx\n", (unsigned long long)hv);
+
+    uint64_t hc = 0;
+    for (int i = 0; i < 400000; i++) {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        uint64_t x = s, y = s * 0x9e3779b97f4a7c15ull;
+        if (i & 1) y = (i & 2) ? x : x ^ ((uint64_t)1 << (i & 63));
+        hc = hc * 31 + carry_imm(x, y, s ^ (s >> 29));
+    }
+    printf("carry_imm %llx\n", (unsigned long long)hc);
     return 0;
 }

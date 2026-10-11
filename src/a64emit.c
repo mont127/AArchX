@@ -455,6 +455,11 @@ void a64_csel(A64Buf *b, int sf, int rd, int rn, int rm, int cond)
     a64_emit32(b, 0x1a800000u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
 }
 
+void a64_csinc(A64Buf *b, int sf, int rd, int rn, int rm, int cond)
+{
+    a64_emit32(b, 0x1a800400u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
+}
+
 void a64_csneg(A64Buf *b, int sf, int rd, int rn, int rm, int cond)
 {
     a64_emit32(b, 0x5a800400u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) | ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));

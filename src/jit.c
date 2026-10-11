@@ -7925,6 +7925,25 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
         (s->kind == OCERZ_OPK_IMM || s_mem || (pin_slot(s->reg) >= 0 && !(rsp_is_ptr() && s->reg == OCERZ_RSP)))) {
         int rd = pin_hreg(pin_slot(d->reg));
         emit_cc_predicate_ex(b, OCERZ_CC_B, 1);
+        if (g_cc_direct >= 0 && s->kind == OCERZ_OPK_IMM && !ENV_ON("OCERZ_NO_ADC_CINC")) {
+            /*
+             * With CF a condition on NZCV, sbb r, imm is r - (imm + 1) plus one
+             * where CF is clear and adc r, imm is r + imm plus one where it is
+             * set: a csinc after at most one add or sub.  7-Zip's LZMA decoder
+             * steps its symbol with sbb r, -1, which is the csinc alone, on the
+             * chain to the next probability's load.  OCERZ_NO_ADC_CINC=1 sets
+             * the carry in a register and adds it, as before.
+             */
+            uint64_t mask = sf ? ~0ull : 0xffffffffull;
+            uint64_t v = (uint64_t)ocerz_sext(s->imm, s->size) & mask;
+            uint64_t k = is_sbb ? (v + 1) & mask : v, nk = (0 - k) & mask;
+            int sub = is_sbb;
+            if (k && nk < k) { k = nk; sub = !sub; }
+            if (k && k <= 4095) { if (sub) a64_sub_imm(b, sf, rd, rd, (uint32_t)k); else a64_add_imm(b, sf, rd, rd, (uint32_t)k); }
+            else if (k) { a64_mov_imm64(b, JT1, k); if (sub) a64_sub_reg(b, sf, rd, rd, JT1, 0); else a64_add_reg(b, sf, rd, rd, JT1, 0); }
+            a64_csinc(b, sf, rd, rd, rd, is_sbb ? g_cc_direct : (g_cc_direct ^ 1));
+            return 1;
+        }
         a64_cset(b, JTT, g_cc_direct >= 0 ? g_cc_direct : A64_NE);
         if (s->kind == OCERZ_OPK_REG || s_mem) {
             int rs = JT1;

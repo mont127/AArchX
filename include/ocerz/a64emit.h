@@ -109,6 +109,7 @@ void a64_sxtw(A64Buf *b, int rd, int rn);
 void a64_cset(A64Buf *b, int rd, int cond);
 void a64_csetm(A64Buf *b, int rd, int cond);
 void a64_csel(A64Buf *b, int sf, int rd, int rn, int rm, int cond);
+void a64_csinc(A64Buf *b, int sf, int rd, int rn, int rm, int cond);
 void a64_csneg(A64Buf *b, int sf, int rd, int rn, int rm, int cond);
 
 void a64_mul(A64Buf *b, int sf, int rd, int rn, int rm);
