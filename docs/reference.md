@@ -102,6 +102,7 @@ bug is in what that switch controls.
 | --- | --- |
 | `OCERZ_NO_AFP=1` | check NaN results in translated code even where the processor can produce x86's NaNs itself |
 | `OCERZ_NO_JIT_MMX=1` | run MMX instructions in the interpreter |
+| `OCERZ_NO_LAZY_RSP=1` | move rsp's register at every push, pop, call and ret of a call spliced into its caller, instead of leaving it where it was before the call and giving each stack access a fixed offset from it |
 | `OCERZ_NO_FAST_LOW_GUARD=1` | in a Wine process, map every guest address with the general three-range check instead of the short form |
 | `OCERZ_NO_WINE_LIM=1` | in a Wine process, test each address against 12 GB with a shift and a compare again, instead of comparing it with x29 (which then holds 12 GB) and laying out the side it was on when translated |
 | `OCERZ_WLIM_CHECK=1` | in a Wine process, trap before every guard whose x29 is not 12 GB (a debugging aid) |

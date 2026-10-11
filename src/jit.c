@@ -808,7 +808,7 @@ typedef struct JitBlock {
     uint8_t n_stop_extra;
     uint32_t *push_fix;
     uint16_t n_push_fix;
-    struct JitPushElide { int32_t ci, rj; uint64_t ra; } *pushelide;
+    struct JitPushElide { int32_t ci, rj; uint64_t ra; int32_t lazy; } *pushelide;
     uint16_t n_pushelide;
     struct JitPromo { int32_t pi, qi; uint8_t hreg; };
     struct JitBlock *stop_next;
@@ -1251,6 +1251,24 @@ static int superblock_back_enabled(void)
 }
 static uint32_t g_push_fix[JIT_MAX_BLOCK_INSNS];
 static int g_n_push_fix;
+/*
+ * rsp kept behind in a spliced call region (lazy_rsp_scan).  Inside a call
+ * whose return-address push was elided and whose callee only pushes, pops,
+ * calls, returns and works on registers, rsp's register keeps the value it had
+ * before the call: each push, pop, call and ret moves g_rsp_pend instead, and
+ * the accesses are at fixed offsets from the register.  So none of them waits
+ * for the last one's write-back; leafcall's iteration made a chain of thirteen.
+ * Guest rsp is the register plus g_rsp_pend, which recovery works out from the
+ * region's instructions as for the elided return address.
+ */
+static int32_t g_rsp_pend;
+static int g_lazy_end = -1;
+static uint8_t g_lazy_root[JIT_MAX_BLOCK_INSNS];
+static void emit_add_simm(A64Buf *b, int rd, int rn, int32_t v)
+{
+    if (v >= 0) a64_add_imm(b, 1, rd, rn, (uint32_t)v);
+    else a64_sub_imm(b, 1, rd, rn, (uint32_t)-v);
+}
 
 #define CP_MARK_SIZE (1u << 18)
 static uint64_t g_cp_marks[CP_MARK_SIZE];
@@ -6525,6 +6543,16 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
             return 0;
         }
 
+        if (g_lazy_end >= 0) {
+            int hs = pin_hreg(pin_slot(OCERZ_RSP));
+            int rv = JT1;
+            if (o->kind == OCERZ_OPK_REG && pin_slot(o->reg) >= 0) rv = pin_hreg(pin_slot(o->reg));
+            else if (o->kind == OCERZ_OPK_REG) emit_gpr_rd(b, 1, JT1, o->reg);
+            else a64_mov_imm64(b, JT1, (uint64_t)o->imm);
+            a64_stur(b, 8, rv, hs, g_rsp_pend - 8);
+            g_rsp_pend -= 8;
+            return 1;
+        }
         if (g_lowstack && stack_plain_access_ok()) {
             /* The slot is rsp - 8 plus the stack delta; rsp moves only once the store is done. */
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
@@ -6625,6 +6653,15 @@ static int emit_push_pop(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     if (insn->op == OCERZ_OP_POP) {
         if (o->kind != OCERZ_OPK_REG || o->high8 || o->size != 8)
             return 0;
+        if (g_lazy_end >= 0 && o->reg != OCERZ_RSP) {
+            int hs = pin_hreg(pin_slot(OCERZ_RSP));
+            int ds = pin_slot(o->reg);
+            int rd = ds >= 0 ? pin_hreg(ds) : JT1;
+            a64_ldur(b, 8, rd, hs, g_rsp_pend);
+            if (ds < 0) emit_gpr_wr(b, JT1, o->reg);
+            g_rsp_pend += 8;
+            return 1;
+        }
 
         if (g_lowstack && stack_plain_access_ok() && o->reg != OCERZ_RSP) {
             int hs = pin_hreg(pin_slot(OCERZ_RSP));
@@ -18637,6 +18674,10 @@ static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_si
 
 static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
+    int32_t lazy_pend = g_lazy_end >= 0 ? g_rsp_pend : 0;
+    int lazy_hs = pin_slot(OCERZ_RSP) >= 0 ? pin_hreg(pin_slot(OCERZ_RSP)) : -1;
+    if (lazy_pend && lazy_hs >= 0)
+        emit_add_simm(b, lazy_hs, lazy_hs, lazy_pend);
 
     if (g_pe_insns && g_n_pe_real && pin_slot(OCERZ_RSP) >= 0) {
         int hsp = pin_hreg(pin_slot(OCERZ_RSP));
@@ -18705,6 +18746,13 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             }
             a64_ldr(b, 8, p->hreg, hsp, (uint32_t)(-delta));
         }
+    }
+    if (g_lazy_end >= 0 && lazy_hs >= 0) {
+        if (insn->op == OCERZ_OP_PUSH && insn->opsize == 8 && !insn->mode32) lazy_pend -= 8;
+        else if (insn->op == OCERZ_OP_POP && insn->opsize == 8 && !insn->mode32) lazy_pend += 8;
+        g_rsp_pend = lazy_pend;
+        if (lazy_pend)
+            emit_add_simm(b, lazy_hs, lazy_hs, -lazy_pend);
     }
 }
 
@@ -19820,7 +19868,7 @@ static void emit_slowcall_keep_lanes(A64Buf *b, const X86Insn *insn, uint32_t **
 }
 static int oolslow_add(const X86Insn *insn, uint32_t **sites, int nsites, uint32_t *back)
 {
-    if (g_n_oolslow >= OOLSLOW_MAX || nsites > 3) return 0;
+    if (g_n_oolslow >= OOLSLOW_MAX || nsites > 3 || g_lazy_end >= 0) return 0;
     ea_cache_reset();
     for (int i = 0; i < nsites; i++) g_oolslow[g_n_oolslow].sites[i] = sites[i];
     g_oolslow[g_n_oolslow].nsites = nsites;
@@ -20384,6 +20432,31 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
     if (mov_idx > last) mov_at = -1;
     if (k < 2) return 0;
     int hs = pin_hreg(pin_slot(OCERZ_RSP));
+    if (g_lazy_end >= 0) {
+        int32_t at = g_rsp_pend;
+        int j = 0;
+        if (op == OCERZ_OP_PUSH) {
+            for (; j + 1 < k; j += 2)
+                a64_stp_off(b, regs[j + 1], regs[j], hs, at - 8 * (j + 2));
+            if (j < k)
+                a64_stur(b, 8, regs[j], hs, at - 8 * (j + 1));
+            if (mov_at >= 0) {
+                emit_add_simm(b, mov_hd, hs, at - 8 * mov_at);
+                if (!jgb_zero())
+                    a64_sub_reg(b, 1, mov_hd, mov_hd, JGB, 0);
+            }
+            g_rsp_pend -= 8 * k;
+        } else {
+            for (; j + 1 < k; j += 2)
+                a64_ldp_off(b, regs[j], regs[j + 1], hs, at + 8 * j);
+            if (j < k)
+                a64_ldur(b, 8, regs[j], hs, at + 8 * j);
+            g_rsp_pend += 8 * k;
+        }
+        for (int m = i + 1; m <= last; m++)
+            g_mov_skip[m] = 1;
+        return k;
+    }
     int base = hs;
     if (!direct) {
         a64_add_reg(b, 1, JTA, hs, JGB, 0);
@@ -20425,6 +20498,64 @@ static int rsp_run_member(const X86Insn *insns, int j, int n, int fast3)
     if (g_promo_reg[j] && insns[j].op == OCERZ_OP_POP) return 1;
     if (g_ic_kind[j] == 3 && fast3) return 1;
     return 0;
+}
+static int lazy_rsp_mov(const X86Insn *in)
+{
+    const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+    return in->op == OCERZ_OP_MOV && !in->mode32 && in->nops == 2 && in->seg == OCERZ_SEG_NONE &&
+           d->kind == OCERZ_OPK_REG && !d->high8 && d->size == 8 && d->reg != OCERZ_RSP &&
+           s->kind == OCERZ_OPK_REG && !s->high8 && s->size == 8 && s->reg == OCERZ_RSP;
+}
+static int lazy_names_rsp(const X86Insn *in)
+{
+    for (int q = 0; q < in->nops; q++) {
+        const X86Operand *o = &in->ops[q];
+        if (o->kind == OCERZ_OPK_REG && o->reg == OCERZ_RSP) return 1;
+        if (o->kind == OCERZ_OPK_MEM && (o->base == OCERZ_RSP || o->index == OCERZ_RSP)) return 1;
+    }
+    return 0;
+}
+/*
+ * A spliced call region whose rsp can stay behind: its accesses are the
+ * region's own pushes and pops, every other rsp read is a mov of it into a
+ * 64-bit register, nested calls are spliced with their pushes elided too, and
+ * the deepest offset fits an unscaled access.  A region inside one that stays
+ * behind rides on it.  OCERZ_NO_LAZY_RSP=1 moves rsp at every step again.
+ */
+static void lazy_rsp_scan(const X86Insn *insns, int n)
+{
+    memset(g_lazy_root, 0, (size_t)n);
+    if (ENV_ON("OCERZ_NO_LAZY_RSP") || !stack_inline_enabled()) return;
+    for (int ci = 0; ci < n; ci++) {
+        if (g_ic_kind[ci] != 1 || !g_ic_pushelide[ci] || insns[ci].mode32) continue;
+        int rj = g_ic_pair_rj[ci];
+        if (rj <= ci || rj >= n) continue;
+        int pend = -8, lo = -8, ok = 1;
+        for (int m = ci + 1; m < rj && ok; m++) {
+            const X86Insn *in = &insns[m];
+            if (g_ic_kind[m] == 1) { if (!g_ic_pushelide[m]) ok = 0; pend -= 8; }
+            else if (g_ic_kind[m] == 3) pend += 8;
+            else if (g_ic_kind[m]) ok = 0;
+            else if (in->op == OCERZ_OP_PUSH || in->op == OCERZ_OP_POP) {
+                const X86Operand *o = &in->ops[0];
+                if (in->nops != 1 || in->opsize != 8 || in->seg != OCERZ_SEG_NONE || in->mode32) ok = 0;
+                else if (o->kind == OCERZ_OPK_REG) { if (o->high8 || o->size != 8 || o->reg == OCERZ_RSP) ok = 0; }
+                else if (in->op != OCERZ_OP_PUSH || o->kind != OCERZ_OPK_IMM || o->size != 8) ok = 0;
+                pend += in->op == OCERZ_OP_PUSH ? -8 : 8;
+            } else if (!lazy_rsp_mov(in) && lazy_names_rsp(in)) ok = 0;
+            if (pend < lo) lo = pend;
+        }
+        if (ok && lo >= -240) { g_lazy_root[ci] = 1; ci = rj; }
+    }
+}
+/* rsp's register is a host pointer the accesses use as it is, and every elided call inside can be recorded. */
+static int lazy_rsp_start_ok(int ci)
+{
+    if (!g_lazy_root[ci] || g_lazy_end >= 0 || g_rsp_lag) return 0;
+    if (!rsp_is_ptr() || (g_lowstack && !g_lowptr) || !mem_native_store_ok()) return 0;
+    int calls = 0;
+    for (int m = ci; m <= g_ic_pair_rj[ci]; m++) calls += g_ic_kind[m] == 1;
+    return g_n_pe_real + calls <= PE_MAX;
 }
 static int inline_calls_off(void)
 {
@@ -21800,6 +21931,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_pe_real = 0;
     g_n_promo_real = 0;
     g_rsp_lag = 0;
+    g_rsp_pend = 0;
+    g_lazy_end = -1;
     g_pe_insns = blk->insns;
     g_n_call_edges = 0;
     g_n_oolslow = 0;
@@ -22531,6 +22664,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             else leaf_lowp = &leaf_low;
         }
     }
+    lazy_rsp_scan(blk->insns, n);
     dep_plain_mark(blk->insns, n);
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
@@ -22871,7 +23005,9 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 int f3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 &&
                          stack_plain_access_ok() && ((jgb_usable() && !stack_guard_needed()) || g_lowptr);
                 a64_mov_reg(&b, 1, gr, pr);
-                if (rsp_run_member(blk->insns, i + 1, n, f3)) {
+                if (g_lazy_end >= 0) {
+                    g_rsp_pend += 8;
+                } else if (rsp_run_member(blk->insns, i + 1, n, f3)) {
                     g_rsp_lag += 8;
                 } else {
                     a64_add_imm(&b, 1, hsp, hsp, 8 + g_rsp_lag);
@@ -22892,7 +23028,7 @@ promo_push_fallthrough:
                     (stack_identity() || rsp_is_ptr())) {
                     a64_sub_imm(&b, 1, hs, hs, 8);
                     g_pe_real[g_n_pe_real++] = (struct JitPushElide){
-                        (int32_t)i, g_ic_pair_rj[i], insn->rip + insn->len };
+                        (int32_t)i, g_ic_pair_rj[i], insn->rip + insn->len, 0 };
                 } else if (g_ic_kind[i] == 3) {
                     if (rsp_run_member(blk->insns, i + 1, n, 1)) {
                         g_rsp_lag += 8;
@@ -22944,15 +23080,25 @@ promo_push_fallthrough:
             if (g_ic_kind[i] == 1) {
                 if (g_ic_pushelide[i] && g_n_pe_real < PE_MAX &&
                     (stack_identity() || rsp_is_ptr())) {
-                    a64_sub_imm(&b, 1, hs, hs, 8);
+                    int root = lazy_rsp_start_ok(i);
+                    if (root) { g_lazy_end = g_ic_pair_rj[i]; g_rsp_pend = 0; }
+                    if (g_lazy_end >= 0) g_rsp_pend -= 8;
+                    else a64_sub_imm(&b, 1, hs, hs, 8);
                     g_pe_real[g_n_pe_real++] = (struct JitPushElide){
-                        (int32_t)i, g_ic_pair_rj[i], insn->rip + insn->len };
+                        (int32_t)i, g_ic_pair_rj[i], insn->rip + insn->len, root };
                 } else {
                     a64_mov_imm64(&b, JT1, insn->rip + insn->len);
                     emit_push_pinned(&b, hs, JT1);
                 }
             } else if (g_ic_kind[i] == 3) {
-                if (rsp_run_member(blk->insns, i + 1, n, fast3)) {
+                if (g_lazy_end >= 0) {
+                    g_rsp_pend += 8;
+                    if (i == g_lazy_end) {
+                        if (g_rsp_pend) emit_add_simm(&b, hs, hs, g_rsp_pend);
+                        g_rsp_pend = 0;
+                        g_lazy_end = -1;
+                    }
+                } else if (rsp_run_member(blk->insns, i + 1, n, fast3)) {
                     g_rsp_lag += 8;
                 } else {
                     a64_add_imm(&b, 1, hs, hs, 8 + g_rsp_lag);
@@ -22996,6 +23142,15 @@ promo_push_fallthrough:
         if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_stchk[i]) fpb_emit_store_check(&b, i, fpb_open);
         if (fpb_open >= 0 && fpb_of[i] == fpb_open && g_fpb_undo[i] && !g_fpb_undo_done[i]) fpb_emit_undo_save(&b, insn, i, exit_sites, &n_exits);
         g_undo_want_slot = -1; g_undo_saved = 0;
+        if (g_lazy_end >= 0 && lazy_rsp_mov(insn)) {
+            int ds = pin_slot(insn->ops[0].reg);
+            int rd = ds >= 0 ? pin_hreg(ds) : JT1;
+            emit_gpr_rd(&b, 1, rd, OCERZ_RSP);
+            emit_add_simm(&b, rd, rd, g_rsp_pend);
+            if (ds < 0) emit_gpr_wr(&b, JT1, insn->ops[0].reg);
+            blk->n_inlined++;
+            continue;
+        }
         if (i + 1 < n && !g_mov_skip[i + 1] && emit_mov128_pair(&b, insn, &blk->insns[i + 1], i)) {
             blk->n_inlined++;
             continue;
@@ -23673,6 +23828,25 @@ static const JitBlock *fault_block(const OcerzJit *jit, const uint32_t *pc)
 
 static int fault_insn_index(const JitBlock *b, const uint32_t *pc);
 
+/* What rsp's register was behind guest rsp at host_pc, in a spliced region that kept it behind (lazy_rsp_scan). */
+static int64_t lazy_rsp_behind(const JitBlock *b, const void *host_pc)
+{
+    if (!b->n_pushelide || !b->pushelide || !(b->insns || b->iref)) return 0;
+    int k = fault_insn_index(b, (const uint32_t *)host_pc);
+    for (int i = 0; k > 0 && i < b->n_pushelide; i++) {
+        const struct JitPushElide *p = &b->pushelide[i];
+        if (!p->lazy || k <= p->ci || k >= p->rj) continue;
+        int64_t pend = -8;
+        for (int m = p->ci + 1; m < k; m++) {
+            unsigned op2 = blk_insn_op(b, m);
+            if (op2 == OCERZ_OP_PUSH || op2 == OCERZ_OP_CALL) pend -= 8;
+            else if (op2 == OCERZ_OP_POP || op2 == OCERZ_OP_RET) pend += 8;
+        }
+        return pend;
+    }
+    return 0;
+}
+
 /*
  * Guest rsp from the host register of a block keeping it as a pointer: guest
  * plus guest_base, or in the Wine layout guest plus the stack delta, which the
@@ -23704,6 +23878,7 @@ int ocerz_jit_guest_gprs_at(const struct OcerzVM *vm, const void *host_pc,
             value = guest_rsp_from_host(b, value);
         out[b->host_holds[i]] = value;
     }
+    out[OCERZ_RSP] += (uint64_t)lazy_rsp_behind(b, host_pc);
     return 1;
 }
 
@@ -23722,6 +23897,7 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
             value = guest_rsp_from_host(b, value);
         cpu->gpr[b->host_holds[i]] = value;
     }
+    cpu->gpr[OCERZ_RSP] += (uint64_t)lazy_rsp_behind(b, host_pc);
     if (b->n_push_fix && b->code) {
         uint32_t off = (uint32_t)((const uint32_t *)host_pc - (const uint32_t *)b->code);
         for (int i = 0; i < b->n_push_fix; i++)
