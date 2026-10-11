@@ -1096,6 +1096,8 @@ run_low_golden_case dx87_trans_low tests/dynamic/x87_trans.c tests/dynamic/x87_t
 run_low_golden_case dx87_state_low tests/dynamic/x87_state.c tests/dynamic/x87_state.out
 run_low_golden_case dlow_stack_switch tests/dynamic/low_stack_switch.c tests/dynamic/low_stack_switch.out
 run_low_golden_case dlow_hoist tests/dynamic/low_hoist.c tests/dynamic/low_hoist.out
+run_golden_case dhoist_share tests/dynamic/hoist_share.c tests/dynamic/hoist_share.out
+run_low_golden_case dhoist_share_low tests/dynamic/hoist_share.c tests/dynamic/hoist_share.out
 run_low_golden_case drep_string_low tests/dynamic/rep_string.c tests/dynamic/rep_string.out
 run_low_golden_case dcomis_mem_low tests/dynamic/comis_mem.c tests/dynamic/comis_mem.out
 run_low_golden_case dstack_pair_low tests/dynamic/stack_pair.c tests/dynamic/stack_pair.out

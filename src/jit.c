@@ -19546,10 +19546,22 @@ restart_wide:;
             if (pass && bx >= 0 && llh_step(in, (unsigned)bx, &by)) stepped += by;
         }
         if (!pass) {
+            /*
+             * Two operands on the index already pay for its check each time
+             * round: two instructions, against two each where they check it
+             * themselves.  7-Zip's LZ copy loop (mov [r14+rdx], bl; movzx ebx,
+             * [rdi+rdx]; inc rdx; jne) runs rdx up from below zero, so those
+             * per-operand checks failed on every access and each one formed its
+             * address out of line; checked by the block, the first failure
+             * translates it in the wide form, which takes an index of either
+             * sign.  OCERZ_LOW_HOIST_SHARE=<n> asks n operands (3 before).
+             */
+            static int share = -1;
+            if (share < 0) { const char *e = getenv("OCERZ_LOW_HOIST_SHARE"); share = e ? atoi(e) : 2; if (share < 1) share = 1; }
             for (int x = 0; x < 16; x++)
                 for (int sc = 0; sc < 4; sc++)
                     if (ixn[x][sc] > (bx < 0 ? 0 : ixn[bx][bs])) { bx = x; bs = sc; }
-            if (bx >= 0 && ixn[bx][bs] < 3) bx = -1;
+            if (bx >= 0 && ixn[bx][bs] < share) bx = -1;
         }
     }
     /*

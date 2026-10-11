@@ -110,6 +110,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_LAZY_RSP=1` | move rsp's register at every push, pop, call and ret of a call spliced into its caller, instead of leaving it where it was before the call and giving each stack access a fixed offset from it |
 | `OCERZ_NO_FAST_LOW_GUARD=1` | in a Wine process, map every guest address with the general three-range check instead of the short form |
 | `OCERZ_NO_WINE_LIM=1` | in a Wine process, test each address against 12 GB with a shift and a compare again, instead of comparing it with x29 (which then holds 12 GB) and laying out the side it was on when translated |
+| `OCERZ_LOW_HOIST_SHARE=<n>` | in a Wine process, check an index register once per trip round a block when n of its memory operands share it (default 2; 3 before 2026-10-11), instead of at each operand |
 | `OCERZ_WLIM_CHECK=1` | in a Wine process, trap before every guard whose x29 is not 12 GB (a debugging aid) |
 | `OCERZ_NO_LOW_STACK_PTR=1` | in a Wine process, keep rsp's own value in its register and add the stack's offset on every stack access, instead of keeping the host address rsp points at and converting only when rsp is read or written as a value |
 | `OCERZ_LOWSTACK_CHECK=1` | in a Wine process, trap before any instruction where the stack offset kept for rsp no longer matches rsp (a debugging aid) |
