@@ -895,6 +895,8 @@ static int sp_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
         set_dlerror("dlopen(%s): image not found", name);
     } else if (!path[0]) {
         handle = system_handle(name);
+    } else if ((handle = m32_steam_dlopen(path)) != 0) {
+        /* a steamclient.dylib with no i386 slice: the host's own, bridged (src/m32_steam.c) */
     } else {
         M32Image *img = find_loaded(path);
         if (img)
@@ -942,7 +944,7 @@ static int sp_dlsym(struct OcerzVM *vm, OcerzCPU *cpu)
             v = system_symbol(NULL, sym);
     } else if (h && m32_rd(h) == DL_SYSTEM_MAGIC && m32_rd(h + 4) < (uint32_t)g_nsyslibs) {
         v = system_symbol(g_syslibs[m32_rd(h + 4)], sym);
-    } else {
+    } else if (!(v = m32_steam_dlsym(h, sym))) {
         for (int i = 0; i < m32_nimages; i++)
             if (m32_images[i]->base == h)
                 v = lookup_in(m32_images[i], sym, 0);
