@@ -2626,10 +2626,28 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     }
 
     uint64_t live = OCERZ_FL_ALL;
+    /*
+     * A block whose jcc or jmp goes back to its own start: what is live there
+     * is what this block reads before writing, on its way to its other
+     * successor or round again, the least fixed point from nothing.  Following
+     * the edge as any other gave up at OCERZ_XLIVE_DEPTH with every flag live,
+     * so an inc or dec closing the loop, which leaves CF, rebuilt the flags in
+     * C on each trip to keep a CF nobody reads: 7-Zip's LZ copy loop (mov
+     * byte; movzx; inc rdx; jne) spent a fifth of its time there.
+     * OCERZ_NO_XLIVE_SELF=1 follows the edge as before.
+     */
+    static int no_self = -1;
+    if (no_self < 0) no_self = getenv("OCERZ_NO_XLIVE_SELF") ? 1 : 0;
+    int self = 0;
     if (depth < maxd && is_terminator(insns[n - 1].op)) {
         const X86Insn *t = &insns[n - 1];
         uint64_t slot_to;
-        if ((t->op == OCERZ_OP_JMP || t->op == OCERZ_OP_CALL) && t->ops[0].kind == OCERZ_OPK_IMM)
+        int to_self = !no_self && (t->op == OCERZ_OP_JMP || t->op == OCERZ_OP_JCC) &&
+                      t->ops[0].kind == OCERZ_OPK_IMM && t->ops[0].imm == rip;
+        if (to_self) {
+            self = 1;
+            live = t->op == OCERZ_OP_JCC ? xlive_succ_live_d(g_xlat_jit, t->rip + t->len, depth + 1) : 0;
+        } else if ((t->op == OCERZ_OP_JMP || t->op == OCERZ_OP_CALL) && t->ops[0].kind == OCERZ_OPK_IMM)
             live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1);
         else if (t->op == OCERZ_OP_JMP && !t->mode32 && slot_value_now(&t->ops[0], &slot_to))
             live = xlive_succ_live_d(g_xlat_jit, slot_to, depth + 1);
@@ -2640,11 +2658,16 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     if (is_terminator(insns[n - 1].op) && insns[n - 1].op == OCERZ_OP_RET && !g_xlat_mode32 &&
         !ret_flags_live_at(insns[n - 1].rip) && !ENV_ON("OCERZ_NO_RET_RESOLVE"))
         live = getenv("OCERZ_RET_FLAGS_DEAD") ? 0 : XLIVE_RETDEP;
-    live = xlive_resolve(live, insns, n - 1);
-    for (int i = n - 1; i >= 0; i--) {
-        uint64_t def, use;
-        ocerz_flags_defuse(&insns[i], &def, &use);
-        live = (live & ~def) | use;
+    uint64_t out = live, in = 0;
+    for (;;) {
+        live = xlive_resolve(out | in, insns, n - 1);
+        for (int i = n - 1; i >= 0; i--) {
+            uint64_t def, use;
+            ocerz_flags_defuse(&insns[i], &def, &use);
+            live = (live & ~def) | use;
+        }
+        if (!self || live == in) break;
+        in = live;
     }
     if (g_xlive_log) fprintf(stderr, "ocerz: XLIVE rip=%#llx depth=%d n=%d term=%d live=%#llx\n", (unsigned long long)rip, depth, n, (int)insns[n-1].op, (unsigned long long)live);
     if (have_head) {
