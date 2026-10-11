@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <servers/bootstrap.h>
 #include <wchar.h>
 #include <math.h>
 #include <fcntl.h>
@@ -81,6 +82,7 @@ static int sp_stub_binder(struct OcerzVM *vm, OcerzCPU *cpu)
 static double argd(OcerzCPU *cpu, int n) { uint64_t v = ARG64(n); double d; memcpy(&d, &v, 8); return d; }
 static float argf(OcerzCPU *cpu, int n) { uint32_t v = m32_arg(cpu, n); float f; memcpy(&f, &v, 4); return f; }
 #define RET64(v) (m32_ret64(cpu, (uint64_t)(v)), OCERZ_STEP_OK)
+#define RETV_PLAIN(v) (m32_ret(cpu, (uint32_t)(v), 0, 0), OCERZ_STEP_OK)
 static int sp_udivdi3(struct OcerzVM *vm, OcerzCPU *cpu) { uint64_t b = ARG64(2); return RET64(b ? ARG64(0) / b : 0); }
 static int sp_umoddi3(struct OcerzVM *vm, OcerzCPU *cpu) { uint64_t b = ARG64(2); return RET64(b ? ARG64(0) % b : 0); }
 static int sp_divdi3(struct OcerzVM *vm, OcerzCPU *cpu) { int64_t b = (int64_t)ARG64(2); return RET64(b ? (int64_t)ARG64(0) / b : 0); }
@@ -905,7 +907,29 @@ static int sp_AbsoluteToDuration(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* bootstrap_look_up and bootstrap_check_in take the service as a name_t, a char[128] typedef the generator cannot
+ * describe: the name is a C string in the window, and the port comes back as a 32-bit name in both modes, written
+ * only on success as the host does.  Steam's libsteam_api finds the running client through
+ * bootstrap_look_up("com.valvesoftware.steam.ipctool"). */
+static int sp_bootstrap_look_up(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    mach_port_t port = MACH_PORT_NULL;
+    kern_return_t kr = bootstrap_look_up(m32_arg(cpu, 0), (const char *)m32_h(m32_arg(cpu, 1)), &port);
+    if (kr == KERN_SUCCESS && m32_arg(cpu, 2))
+        m32_wr(m32_arg(cpu, 2), port);
+    return RETV_PLAIN(kr);
+}
+static int sp_bootstrap_check_in(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    mach_port_t port = MACH_PORT_NULL;
+    kern_return_t kr = bootstrap_check_in(m32_arg(cpu, 0), (const char *)m32_h(m32_arg(cpu, 1)), &port);
+    if (kr == KERN_SUCCESS && m32_arg(cpu, 2))
+        m32_wr(m32_arg(cpu, 2), port);
+    return RETV_PLAIN(kr);
+}
+
 static const M32SpecialEntry g_specials[] = {
+    { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },
     { "_mach_absolute_time", sp_mach_absolute_time }, { "_mach_timebase_info", sp_mach_timebase_info },
     { "_UpTime", sp_mach_absolute_time }, { "_AbsoluteToNanoseconds", sp_AbsoluteToNanoseconds },
     { "_AbsoluteToDuration", sp_AbsoluteToDuration },

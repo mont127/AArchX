@@ -1,0 +1,4 @@
+notification_center: kr 0 port set
+no-such-service: kr 1102 port untouched
+check_in unknown: kr ok
+exit 0
