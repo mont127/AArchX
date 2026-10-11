@@ -19113,6 +19113,13 @@ static void chain_activate(uint32_t *patch_b, void *dst)
         return;
     int ok;
     int veneered = 0;
+    /* OCERZ_FORCE_VENEER=1 chains everything through a veneer, as only far targets are: for tests. */
+    static int force_v = -1;
+    if (force_v < 0) force_v = getenv("OCERZ_FORCE_VENEER") ? 1 : 0;
+    if (force_v && g_xlat_jit) {
+        uint32_t *v = veneer_make(g_xlat_jit, patch_b, dst, g_chain_batching);
+        if (v) dst = v;
+    }
     if (g_chain_batching) {
         ok = a64_try_patch_b(patch_b, (uint32_t *)dst);
         if (!ok && g_xlat_jit) {
@@ -24944,6 +24951,31 @@ static uint32_t *branch_word_target(uint32_t *site, uint32_t w)
     return 0;
 }
 
+/*
+ * Where the chained branch at site lands.  A target out of a branch's reach is
+ * chained through a veneer (veneer_make: a literal load and a br), and the branch
+ * lands on the veneer, not on the code it goes to.  Unchaining compared the
+ * veneer's address with the retired code, so a chain through a veneer was never
+ * cut and the retired block went on running from it.  OCERZ_NO_VENEER_UNCHAIN=1
+ * compares the veneer's address again.
+ */
+static uint32_t *chain_target(const OcerzJit *jit, uint32_t *site, uint32_t w)
+{
+    uint32_t *t = branch_word_target(site, w);
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_VENEER_UNCHAIN") ? 1 : 0;
+    if (!t || !jit || off) return t;
+    for (unsigned i = 0; i < jit->veneer_n; i++) {
+        const uint8_t *p = (const uint8_t *)jit->veneer_pool[i];
+        if ((const uint8_t *)t < p || (const uint8_t *)t >= p + VENEER_POOL_BYTES) continue;
+        if (t[0] != (0x58000040u | (uint32_t)JTA) || t[1] != (0xd61f0000u | ((uint32_t)JTA << 5))) return t;
+        uint64_t dst;
+        memcpy(&dst, &t[2], sizeof dst);
+        return (uint32_t *)(uintptr_t)dst;
+    }
+    return t;
+}
+
 static int ptr_in_block_code(const JitBlock *b, const uint32_t *p)
 {
     const uint32_t *lo = (const uint32_t *)(uintptr_t)b->code;
@@ -24971,16 +25003,33 @@ static int hit_code_cmp(const void *pa, const void *pb)
     return (uintptr_t)a->code > (uintptr_t)b->code;
 }
 
+/*
+ * Where blk is in jit->live, or n_live when it is not live.  A block goes in with
+ * its index in live_idx and leaves by the last one moving into its place with its
+ * live_idx set, so one whose live_idx does not point back at it is not live: it
+ * was retired, or the arena was reset under it.  The whole list was searched for
+ * it then, and in a CEF process the exits of retired blocks asked for their
+ * retirement again and again, each a search of over 700,000 blocks that never
+ * found it.  OCERZ_LIVE_SCAN=1 searches again.
+ */
+static size_t live_index_of(const OcerzJit *jit, const JitBlock *blk)
+{
+    size_t idx = blk->live_idx;
+    if (idx < jit->n_live && jit->live[idx] == blk) return idx;
+    static int scan = -1;
+    if (scan < 0) scan = getenv("OCERZ_LIVE_SCAN") ? 1 : 0;
+    if (scan)
+        for (size_t k = 0; k < jit->n_live; k++)
+            if (jit->live[k] == blk) return k;
+    return jit->n_live;
+}
+
 static void retire_unlink_hits(OcerzJit *jit, JitBlock **hits, size_t n_hits)
 {
     for (size_t m = 0; m < n_hits; m++) {
         JitBlock *b = hits[m];
-        size_t idx = b->live_idx;
-        if (idx >= jit->n_live || jit->live[idx] != b) {
-            for (idx = 0; idx < jit->n_live && jit->live[idx] != b; idx++)
-                ;
-            if (idx == jit->n_live) continue;
-        }
+        size_t idx = live_index_of(jit, b);
+        if (idx == jit->n_live) continue;
         jit->live[idx] = jit->live[jit->n_live - 1];
         jit->live[idx]->live_idx = idx;
         jit->n_live--;
@@ -25087,13 +25136,13 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
         uint32_t *at = (sblk)->edges[i].patch_b; \
         uint32_t fallback = (sblk)->edges[i].fallback_insn; \
         if (at && fallback && *at != fallback && \
-            ptr_in_hits(hits, n_hits, branch_word_target(at, *at))) { \
+            ptr_in_hits(hits, n_hits, chain_target(jit, at, *at))) { \
             __atomic_store_n(at, fallback, __ATOMIC_RELEASE); \
             sys_icache_invalidate(at, 4); \
         } \
         uint32_t *cs = (sblk)->edges[i].cond_site; \
         if (cs && (sblk)->edges[i].cond_orig && *cs != (sblk)->edges[i].cond_orig && \
-            ptr_in_hits(hits, n_hits, branch_word_target(cs, *cs))) { \
+            ptr_in_hits(hits, n_hits, chain_target(jit, cs, *cs))) { \
             __atomic_store_n(cs, (sblk)->edges[i].cond_orig, __ATOMIC_RELEASE); \
             sys_icache_invalidate(cs, 4); \
         } \
@@ -25520,12 +25569,7 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
 {
     const uint32_t *lo = (const uint32_t *)blk->code, *hi = lo + blk->code_words;
 #define IN_BLK(p) ((const uint32_t *)(p) >= lo && (const uint32_t *)(p) < hi)
-    size_t idx = blk->live_idx;
-    if (idx >= jit->n_live || jit->live[idx] != blk) {
-        idx = jit->n_live;
-        for (size_t k = 0; k < jit->n_live; k++)
-            if (jit->live[k] == blk) { idx = k; break; }
-    }
+    size_t idx = live_index_of(jit, blk);
     if (idx == jit->n_live) return;
     pthread_jit_write_protect_np(0);
     if (blk->stop_patch && blk->stop_insn && *blk->stop_patch != blk->stop_insn) {
@@ -25555,14 +25599,14 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
             uint32_t *at = sblk->edges[i].patch_b;
             uint32_t fallback = sblk->edges[i].fallback_insn;
             int cut = 0;
-            if (at && fallback && *at != fallback && IN_BLK(branch_word_target(at, *at))) {
+            if (at && fallback && *at != fallback && IN_BLK(chain_target(jit, at, *at))) {
                 __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
                 sys_icache_invalidate(at, 4);
                 cut = 1;
             }
             uint32_t *cs = sblk->edges[i].cond_site;
             if (cs && sblk->edges[i].cond_orig && *cs != sblk->edges[i].cond_orig &&
-                IN_BLK(branch_word_target(cs, *cs))) {
+                IN_BLK(chain_target(jit, cs, *cs))) {
                 __atomic_store_n(cs, sblk->edges[i].cond_orig, __ATOMIC_RELEASE);
                 sys_icache_invalidate(cs, 4);
                 cut = 1;

@@ -881,6 +881,13 @@ run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
 run_file_case dsmc_high tests/dynamic/smc_high.c 'OK'
 run_file_case dsmc_ras tests/dynamic/smc_ras.c 'OK'
 run_file_case dsmc_chain tests/dynamic/smc_chain.c 'OK'
+# every chain through a veneer, as far targets are chained in a big process
+export OCERZ_FORCE_VENEER=1
+run_file_case dsmc_chain_veneer tests/dynamic/smc_chain.c 'OK'
+run_file_case dsmc_ras_veneer tests/dynamic/smc_ras.c 'OK'
+run_golden_case dflip_phase_veneer tests/dynamic/flip_phase.c tests/dynamic/flip_phase.out
+run_golden_case dxlive_self_veneer tests/dynamic/xlive_self.c tests/dynamic/xlive_self.out
+unset OCERZ_FORCE_VENEER
 run_low_golden_case dsmc_ras_low tests/dynamic/smc_ras.c tests/dynamic/smc_ras.out
 run_low_golden_case dsmc_chain_low tests/dynamic/smc_chain.c tests/dynamic/smc_chain.out
 run_file_case dtc_policy tests/dynamic/tc_policy.c 'OK'
