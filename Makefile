@@ -88,7 +88,7 @@ APIS32_LIBS := libSystem CoreFoundation libobjc Foundation CoreGraphics AppKit l
 	OpenGL libGL Accelerate ApplicationServices CoreText OpenAL AudioUnit libcurl ImageIO
 APIS32_STAMP := runtime/apis32/.generated-$(APIS_VER)
 
-apis32: $(APIS32_STAMP)
+apis32: apis $(APIS32_STAMP)
 
 $(APIS32_STAMP): $(APIS_INPUTS)
 	@echo "generating i386 API databases from the macOS $(APIS_VER) SDK"
