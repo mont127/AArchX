@@ -819,6 +819,7 @@ typedef struct JitBlock {
 
     uint8_t pin_class;
     uint8_t inv_hit;
+    uint64_t glo, ghi;                  /* the guest span its instructions cover, spliced callees and far superblock legs included (block_gspan) */
 
     struct {
         uint64_t target_rip;
@@ -2362,6 +2363,27 @@ static void shrink_edges(JitBlock *b)
     }
 }
 
+/*
+ * The least and the end of the greatest guest address b's instructions cover.  A
+ * callee spliced into its caller (splice_callee) lies anywhere, not between the
+ * block's first instruction and its last, and so may a superblock's leg at a
+ * jcc's target: invalidation took that first-to-last range as the block's, so a
+ * write to a spliced callee's code missed every caller it had been spliced into,
+ * and they went on running the old code - a function hooked by patching its first
+ * bytes stayed unhooked for them.
+ */
+static void block_gspan(JitBlock *b)
+{
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (int i = 0; i < b->n_insns; i++) {
+        uint64_t r = blk_insn_rip(b, i), e = r + blk_insn_len(b, i);
+        if (r < lo) lo = r;
+        if (e > hi) hi = e;
+    }
+    b->glo = hi ? lo : 0;
+    b->ghi = hi;
+}
+
 static void cache_insert(OcerzJit *jit, JitBlock *b)
 {
     shrink_edges(b);
@@ -2375,6 +2397,7 @@ static void cache_insert(OcerzJit *jit, JitBlock *b)
     }
     if (jit->n_live < jit->cap_live) { b->live_idx = jit->n_live; jit->live[jit->n_live++] = b; }
     gran_block(b, +1);
+    block_gspan(b);
     if (b->n_insns > 0) {
         uint64_t lo = blk_insn_rip(b, 0);
         uint64_t hi = lo + blk_insn_len(b, 0);
@@ -25179,9 +25202,9 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
                 b = jit->live[k];
                 b->inv_hit = 0;
             }
-            uint64_t blo = blk_insn_rip(b, 0);
-            uint64_t bhi = blk_insn_rip(b, b->n_insns - 1) + blk_insn_len(b, b->n_insns - 1);
-            if (!ranges_overlap(xlo, xlen, blo, bhi - blo)) continue;
+            if (b->n_insns <= 0) continue;
+            if (!b->ghi) block_gspan(b);
+            if (!ranges_overlap(xlo, xlen, b->glo, b->ghi - b->glo)) continue;
             for (int i = 0; i < b->n_insns; i++)
                 if (ranges_overlap(xlo, xlen, blk_insn_rip(b, i), blk_insn_len(b, i))) {
                     b->inv_hit = 1;
