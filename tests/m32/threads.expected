@@ -1,0 +1,4 @@
+counter 400000 once 1 sum 420 main-tls 100
+trylock 0 1
+attr 1048576 self-eq 1
+exit 0

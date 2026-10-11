@@ -1,0 +1,2 @@
+deflate 1 small 1 inflate 0 1 out 4000 same 1
+exit 0

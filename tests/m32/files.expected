@@ -1,0 +1,15 @@
+stat 0 size 18 reg 1
+fgets line one
+fread 9 line two
+eof 1
+lseek 18
+fstat 0 18
+missing -1 errno 2 No such file or directory
+readdir 1
+gone -1
+time-sane 1
+1971-01-01 00:00
+mktime-roundtrip 1
+nanosleep 0
+getenv unset
+exit 0

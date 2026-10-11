@@ -480,6 +480,10 @@ void ocerz_abi_callback_dispatch(unsigned slot, const uint64_t *x, const uint64_
 
 void ocerz_abi_postfork_child(void);
 
+typedef void (*OcerzAbiForeignDispatch)(unsigned slot, const uint64_t *x, const uint64_t *v, const uint8_t *stack,
+                                        void *x8, uint64_t *out_x, uint64_t *out_v);
+void *ocerz_abi_callback_reserve(OcerzAbiForeignDispatch dispatch, unsigned *slot_out);
+
 extern const char ocerz_abi_callback_bank[];
 extern const char ocerz_abi_callback_bank_end[];
 

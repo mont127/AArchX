@@ -3501,11 +3501,11 @@ static void call_sentinel_init(void)
 }
 
 static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ngpr, int nxmm,
-                        uint64_t stack_top, const uint64_t *context)
+                        uint64_t stack_top, const uint64_t *context, uint32_t m32_sentinel)
 {
     static const int ar[6] = { OCERZ_RDI, OCERZ_RSI, OCERZ_RDX, OCERZ_RCX, OCERZ_R8, OCERZ_R9 };
     pthread_once(&g_call_sentinel_once, call_sentinel_init);
-    const uint64_t sentinel = g_call_sentinel;
+    const uint64_t sentinel = m32_sentinel ? m32_sentinel : g_call_sentinel;
     OcerzCPU *prev_cpu = g_cur_cpu;
     OcerzCPU local = prev_cpu ? *prev_cpu : vm->cpu;
     local.sig_pending = prev_cpu ? __atomic_exchange_n(&prev_cpu->sig_pending, 0, __ATOMIC_SEQ_CST) : 0;
@@ -3532,11 +3532,20 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     if (context)
         local.gpr[OCERZ_R13] = *context;
     int nstack = call->nstack < 0 ? 0 : call->nstack > 16 ? 16 : call->nstack;
-    uint64_t argbase = ((stack_top & ~0xfull) - 8 * (uint64_t)nstack) & ~0xfull;
-    uint64_t sp = argbase - 8;
-    ocerz_st(sp, 8, sentinel);
-    for (int i = 0; i < nstack; i++)
-        ocerz_st(argbase + 8 * (uint64_t)i, 8, call->stack[i]);
+    uint64_t argbase, sp;
+    if (m32_sentinel) {
+        argbase = ((stack_top & ~0xfull) - 4 * (uint64_t)nstack) & ~0xfull;
+        sp = argbase - 4;
+        ocerz_st(sp, 4, sentinel);
+        for (int i = 0; i < nstack; i++)
+            ocerz_st(argbase + 4 * (uint64_t)i, 4, (uint32_t)call->stack[i]);
+    } else {
+        argbase = ((stack_top & ~0xfull) - 8 * (uint64_t)nstack) & ~0xfull;
+        sp = argbase - 8;
+        ocerz_st(sp, 8, sentinel);
+        for (int i = 0; i < nstack; i++)
+            ocerz_st(argbase + 8 * (uint64_t)i, 8, call->stack[i]);
+    }
     local.gpr[OCERZ_RSP] = sp;
     local.rip = func;
     g_cur_cpu = &local;
@@ -3762,7 +3771,17 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     call->xmm0 = local.xmm[0].lo;
     call->rdx = local.gpr[OCERZ_RDX];
     call->xmm1 = local.xmm[1].lo;
+    if (m32_sentinel) {
+        call->rax &= 0xffffffffull;
+        call->rdx &= 0xffffffffull;
+        memcpy(&call->xmm0, &local.fpr[local.ftop & 7], 8);
+    }
     return (local.rip != sentinel || vm->exited) ? 1 : 0;
+}
+
+int ocerz_vm_call32(OcerzVM *vm, uint32_t func, OcerzGuestCall *call, uint32_t stack_top, uint32_t sentinel)
+{
+    return vm_call_core(vm, func, call, 0, 0, stack_top, NULL, sentinel);
 }
 
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top)
@@ -3771,20 +3790,20 @@ uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nar
     for (int i = 0; i < nargs && i < 6; i++)
         call.gpr[i] = args[i];
     call.nstack = 0;
-    vm_call_core(vm, func, &call, nargs, 0, stack_top, NULL);
+    vm_call_core(vm, func, &call, nargs, 0, stack_top, NULL, 0);
     return call.rax;
 }
 
 int ocerz_vm_call_abi(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, uint64_t stack_top)
 {
-    return vm_call_core(vm, func, call, 6, 8, stack_top, NULL);
+    return vm_call_core(vm, func, call, 6, 8, stack_top, NULL, 0);
 }
 
 int ocerz_vm_call_swift_context(OcerzVM *vm, uint64_t func, uint64_t context, uint64_t stack_top)
 {
     OcerzGuestCall call;
     memset(&call, 0, sizeof call);
-    return vm_call_core(vm, func, &call, 0, 0, stack_top, &context);
+    return vm_call_core(vm, func, &call, 0, 0, stack_top, &context, 0);
 }
 
 #define OCERZ_ATTACH_REGION 0x200000ull

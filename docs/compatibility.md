@@ -240,7 +240,8 @@ export WINEPREFIX="$HOME/.wine-ocerz"
 
 Wine boots to `cmd /c ver` in about fourteen seconds. Rosetta runs i386 PE code
 through WoW64 too, so AArchX's i386 support is parity rather than something
-new; standalone i386 Mach-O programs are not supported by current macOS at all.
+new. Standalone i386 Mach-O programs, which current macOS does not run at all,
+run through m32: see [32-bit Mac programs](m32.md).
 The i386 side has its own differential gate of twenty thousand generated cases.
 
 A few things it took, because they explain behaviour a Wine user may notice:

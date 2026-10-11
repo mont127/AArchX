@@ -73,6 +73,7 @@
 #include <string.h>
 #include "ocerz/version.h"
 #include "ocerz/vm.h"
+#include "ocerz/m32.h"
 #include "ocerz/mem.h"
 #include "ocerz/dyld.h"
 #include "ocerz/mode.h"
@@ -382,6 +383,8 @@ int main(int argc, char **argv)
 
     int dynamic = ocerz_peek_dynamic(load_path);
     if (dynamic == -2) {
+        if (m32_is_i386(load_path))
+            return m32_run(&vm, load_path, argc - i, argv + i, env_snapshot(environ));
         OCERZ_FATAL("%s has no x86_64 slice: it is not an Intel program, so there is nothing to translate\n", load_path);
         return 64;
     }

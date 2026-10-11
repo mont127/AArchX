@@ -139,6 +139,14 @@ long long clang_Cursor_getOffsetOfField(CXCursor cursor);
 int clang_getFieldDeclBitWidth(CXCursor cursor);
 unsigned clang_Cursor_isBitField(CXCursor cursor);
 
+/* ObjC method encodings for m32's i386 database */
+CXString clang_getDeclObjCTypeEncoding(CXCursor cursor);
+CXString clang_Type_getObjCEncoding(CXType type);
+unsigned clang_Cursor_getObjCPropertyAttributes(CXCursor cursor, unsigned reserved);
+CXString clang_Cursor_getObjCPropertyGetterName(CXCursor cursor);
+CXString clang_Cursor_getObjCPropertySetterName(CXCursor cursor);
+unsigned clang_Cursor_isVariadic(CXCursor cursor);
+
 void *clang_getCursorPrintingPolicy(CXCursor cursor);
 void clang_PrintingPolicy_dispose(void *policy);
 CXString clang_getCursorPrettyPrinted(CXCursor cursor, void *policy);

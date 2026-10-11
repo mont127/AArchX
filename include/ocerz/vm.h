@@ -92,6 +92,7 @@ OcerzVM *ocerz_vm_process(void);
 OcerzCPU *ocerz_thread_attach(OcerzVM *vm);
 void ocerz_thread_detach(void);
 int ocerz_vm_call_abi(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, uint64_t stack_top);
+int ocerz_vm_call32(OcerzVM *vm, uint32_t func, OcerzGuestCall *call, uint32_t stack_top, uint32_t sentinel);
 int ocerz_vm_call_swift_context(OcerzVM *vm, uint64_t func, uint64_t context, uint64_t stack_top);
 unsigned ocerz_vm_riphist(uint64_t *out, unsigned max);
 void ocerz_vm_purge_jit_ras(OcerzVM *vm);

@@ -1,0 +1,6 @@
+longjmp 7 kept 12
+siglongjmp 0 -> 1
+loop 3
+signal 1
+sigaction 0
+exit 0
