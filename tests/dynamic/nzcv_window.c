@@ -11,10 +11,19 @@
  *   is past the window and reads the flags another way;
  * - jcc_after: a jcc after cmov siblings that rewrote the compare's operands,
  *   which may not take the handed-on flags;
+ * - lz_load: the decoder's step with the load of the next probability between
+ *   the sub and its last consumers, whose guard may clobber NZCV, and the same
+ *   with that load faulting once: the handler sees the sub's carry in rflags,
+ *   maps the page and the step goes on;
+ * - vc_load: a sub whose consumers test ZF or SF, which may read its result's
+ *   register instead of NZCV, with loads between;
  * each over inputs on both sides of every condition.  Against Rosetta.
  */
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
 
 __asm__(
     ".text\n"
@@ -80,12 +89,68 @@ __asm__(
     "    jb 1f\n"
     "    lea 0x1000(%rax,%rcx), %eax\n"
     "1:  shl $20, %rcx\n    xor %rcx, %rax\n"
+    "    ret\n"
+    ".p2align 4\n"
+    /* lz_load(range, code, probs, prob): a load from probs between the sub and its last consumers */
+    "_lz_load:\n"
+    "    push %rbx\n    push %rbp\n"
+    "    mov %edi, %eax\n    mov %esi, %ebp\n    mov %rdx, %r11\n    mov $5, %edx\n    mov $0x7ff, %r10d\n"
+    "    mov %eax, %edi\n"
+    "    shr $0xb, %eax\n"
+    "    imul %ecx, %eax\n"
+    "    sub %eax, %edi\n"
+    "    mov %ebp, %esi\n"
+    "    sub %eax, %ebp\n"
+    "    cmovae %edi, %eax\n"
+    "    movzwl 0x6(%r11), %edi\n"
+    "    cmovae %edi, %edx\n"
+    "    mov $0x1f, %edi\n"
+    "    cmovb %esi, %ebp\n"
+    "    cmovb %r10d, %edi\n"
+    "    mov $2, %ebx\n"
+    "    sbb $-1, %ebx\n"
+    "    shl $9, %rbp\n    xor %rbp, %rax\n    shl $3, %rdi\n    xor %rdi, %rax\n"
+    "    shl $17, %rdx\n    xor %rdx, %rax\n    shl $29, %rbx\n    xor %rbx, %rax\n"
+    "    pop %rbp\n    pop %rbx\n"
+    "    ret\n"
+    ".p2align 4\n"
+    /* vc_load(a, b, p): sub; load; cmove; load; cmovs; jne, then the same in 64 bits with an immediate */
+    "_vc_load:\n"
+    "    mov %edi, %eax\n    mov %esi, %ecx\n    mov $0x11, %r8d\n    mov $0x22, %r9d\n    mov $0x33, %r11d\n"
+    "    sub %ecx, %eax\n"
+    "    movslq 4(%rdx), %r10\n"
+    "    cmove %r9d, %r10d\n"
+    "    movzwl 2(%rdx), %r9d\n"
+    "    cmovs %ecx, %r8d\n"
+    "    jne 1f\n"
+    "    add $0x77, %r11d\n"
+    "1:  mov %edi, %ecx\n"
+    "    sub $0x1000, %rcx\n"
+    "    movzbl 1(%rdx), %esi\n"
+    "    cmove %r8d, %esi\n"
+    "    je 2f\n"
+    "    add $0x99, %r11d\n"
+    "2:  shl $20, %r10\n    xor %r10, %rax\n    shl $40, %r8\n    xor %r8, %rax\n    shl $8, %r9\n    xor %r9, %rax\n"
+    "    shl $32, %rcx\n    xor %rcx, %rax\n    shl $48, %rsi\n    xor %rsi, %rax\n    shl $12, %r11\n    xor %r11, %rax\n"
     "    ret\n");
 
 uint64_t lz_bit(uint32_t range, uint32_t code, uint32_t prob, uint32_t sym);
 uint64_t adc_late(uint32_t a, uint32_t b, uint32_t c);
 uint64_t edge(uint32_t a, uint32_t b);
 uint64_t jcc_after(uint32_t a, uint32_t b);
+uint64_t lz_load(uint32_t range, uint32_t code, const uint16_t *probs, uint32_t prob);
+uint64_t vc_load(uint32_t a, uint32_t b, const uint8_t *p);
+
+static uint8_t *g_page;
+static volatile int g_faults, g_fault_cf;
+
+static void on_segv(int sig, siginfo_t *si, void *ctx)
+{
+    ucontext_t *uc = ctx;
+    g_faults++;
+    g_fault_cf = g_fault_cf << 1 | (int)(uc->uc_mcontext->__ss.__rflags & 1);
+    mprotect(g_page, 16384, PROT_READ | PROT_WRITE);
+}
 
 int main(void)
 {
@@ -101,5 +166,45 @@ int main(void)
     }
     printf("lz_bit %llx adc_late %llx edge %llx jcc_after %llx\n", (unsigned long long)h[0],
            (unsigned long long)h[1], (unsigned long long)h[2], (unsigned long long)h[3]);
+
+    uint16_t probs[8];
+    uint64_t hl = 0;
+    for (int i = 0; i < 400000; i++) {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        uint32_t x = (uint32_t)(s >> 32), y = (uint32_t)s;
+        for (int k = 0; k < 8; k++) probs[k] = (uint16_t)(y >> k);
+        uint32_t range = x | 0x1000000u, code = y % range;
+        hl = hl * 31 + lz_load(range, code, probs, (x >> 20) & 0x7ff);
+    }
+    /* the load faults once: probs + 6 is the first byte of a page not yet readable */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_segv;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    uint8_t *map = mmap(NULL, 32768, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (map == MAP_FAILED) { printf("map\n"); return 1; }
+    g_page = map + 16384;
+    uint64_t hf = 0;
+    for (int r = 0; r < 4; r++) {
+        mprotect(g_page, 16384, PROT_NONE);
+        uint32_t range = 0x1234567u + (uint32_t)r * 0x10000000u, code = (r & 1) ? 0x10 : range - 0x10;
+        hf = hf * 31 + lz_load(range, code, (const uint16_t *)(void *)(g_page - 6), 0x400);
+    }
+    printf("lz_load %llx fault %llx faults %d cf %x\n", (unsigned long long)hl, (unsigned long long)hf, g_faults, g_fault_cf);
+
+    static const uint32_t edge[] = { 0, 1, 0x1000, 0x7fffffff, 0x80000000u, 0xffffffffu, 0xfff, 0x1001 };
+    uint8_t bytes[8];
+    uint64_t hv = 0;
+    for (int i = 0; i < 400000; i++) {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        uint32_t x = (uint32_t)(s >> 32), y = (uint32_t)s;
+        for (int k = 0; k < 8; k++) bytes[k] = (uint8_t)(y >> (3 * k));
+        if (i & 1) x = edge[(y >> 3) & 7];
+        if (i & 2) y = (i & 4) ? x : edge[(y >> 9) & 7];
+        hv = hv * 31 + vc_load(x, y, bytes);
+    }
+    printf("vc_load %llx\n", (unsigned long long)hv);
     return 0;
 }

@@ -7343,6 +7343,32 @@ static int nzcv_producer_candidate(const X86Insn *p)
         return 0;
     }
 }
+/*
+ * A load into a pinned register, flag-free in x86 terms, may sit in the window
+ * too: 7-Zip's LZMA decoder loads the next probability between the sub and the
+ * last cmovs and sbb reading it.  Its translation may clobber NZCV (a Wine-layout
+ * guard compares with x29; a slow path calls out), so the producer keeps its flag
+ * record and NZCV is built again from it after the load (nzcv_regen_emit): only
+ * a cmp, sub or add of two 32- or 64-bit registers or a register and an
+ * immediate, whose record is its two operands.  OCERZ_NO_NZCV_GAP_LOAD=1 ends the
+ * window at a load again.
+ */
+static int nzcv_gap_load(const X86Insn *in)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_NZCV_GAP_LOAD") ? 1 : 0;
+    if (off || in->nops != 2 || in->mode32 || in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || g_pin_class != 3)
+        return 0;
+    const X86Operand *d = &in->ops[0], *m = &in->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8) || val_slot(d->reg) < 0) return 0;
+    if (m->kind != OCERZ_OPK_MEM) return 0;
+    switch (in->op) {
+    case OCERZ_OP_MOV: return m->size == d->size;
+    case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: return m->size == 1 || m->size == 2;
+    case OCERZ_OP_MOVSXD: return m->size == 4 && d->size == 8;
+    default: return 0;
+    }
+}
 static int nzcv_gap_shape(const X86Insn *in)
 {
     if (nzcv_gap_max() == 0) return 0;
@@ -7356,6 +7382,7 @@ static int nzcv_gap_shape(const X86Insn *in)
         const X86Operand *d = &in->ops[0];
         return d->kind == OCERZ_OPK_REG && !d->high8 && d->size == 1 && g_pin_class == 3;
     }
+    if (nzcv_gap_load(in)) return 1;
     return flag_neutral_ok(in);
 }
 static int nzcv_dc_for(unsigned kind, unsigned cc);
@@ -7374,9 +7401,67 @@ static int nzcv_gap_ok(const X86Insn *insns, int m, int k)
         int dc = nzcv_dc_for(kind, in->cc);
         return dc >= 0 && dc != A64_AL && dc != A64_NV;
     }
+    if (nzcv_gap_load(in)) return 1;
     return flag_neutral_ok(in);
 }
+static int nzcv_fuse_producer_core(const X86Insn *insns, int ci);
+static int nzcv_regen_producer(const X86Insn *p)
+{
+    if (p->nops != 2 || p->seg != OCERZ_SEG_NONE || p->mode32) return 0;
+    if (p->op != OCERZ_OP_CMP && p->op != OCERZ_OP_SUB && p->op != OCERZ_OP_ADD) return 0;
+    const X86Operand *d = &p->ops[0], *r = &p->ops[1];
+    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
+    if (r->kind == OCERZ_OPK_REG) return !r->high8 && r->size == d->size;
+    return r->kind == OCERZ_OPK_IMM;
+}
+static int nzcv_window_has_load(const X86Insn *insns, int k, int ci)
+{
+    for (int m = k + 1; m < ci; m++)
+        if (nzcv_gap_load(&insns[m])) return 1;
+    return 0;
+}
 static int nzcv_fuse_producer(const X86Insn *insns, int ci)
+{
+    int k = nzcv_fuse_producer_core(insns, ci);
+    if (k >= 0 && nzcv_window_has_load(insns, k, ci)) {
+        if (!nzcv_regen_producer(&insns[k])) return -1;
+        /*
+         * A jcc, setcc or cmov testing ZF or SF after an add or sub may test the
+         * result's register instead (value_cond_fuse_producer), and the liveness
+         * pass then drops its flag use, so the producer writes no record to build
+         * NZCV again from: such a consumer takes that path.
+         */
+        unsigned op = insns[ci].op;
+        if ((op == OCERZ_OP_JCC || op == OCERZ_OP_SETCC || op == OCERZ_OP_CMOVCC) &&
+            value_cond_fuse_producer(insns, ci) >= 0)
+            return -1;
+    }
+    return k;
+}
+static int16_t g_nzcv_regen[JIT_MAX_BLOCK_INSNS];
+/* Which loads sit in a window a consumer takes NZCV through, and from which producer. */
+static void nzcv_regen_scan(const X86Insn *insns, int n)
+{
+    for (int i = 0; i < n; i++) g_nzcv_regen[i] = -1;
+    for (int ci = 1; ci < n; ci++) {
+        unsigned op = insns[ci].op;
+        if (op != OCERZ_OP_SETCC && op != OCERZ_OP_CMOVCC && op != OCERZ_OP_ADC && op != OCERZ_OP_SBB && op != OCERZ_OP_JCC)
+            continue;
+        int k = nzcv_fuse_producer(insns, ci);
+        if (k < 0) continue;
+        for (int m = k + 1; m < ci; m++)
+            if (nzcv_gap_load(&insns[m])) g_nzcv_regen[m] = (int16_t)k;
+    }
+}
+/* NZCV from the producer's record, as its subs or adds left it. */
+static void nzcv_regen_emit(A64Buf *b, const X86Insn *p)
+{
+    int sf = p->ops[0].size == 8;
+    a64_ldp_off(b, JT0, JT1, 20, (int)CC_SRC_OFF);
+    if (p->op == OCERZ_OP_ADD) a64_adds_reg(b, sf, A64_ZR, JT0, JT1, 0);
+    else a64_subs_reg(b, sf, A64_ZR, JT0, JT1, 0);
+}
+static int nzcv_fuse_producer_core(const X86Insn *insns, int ci)
 {
     static int dis = -1;
     if (dis < 0) dis = getenv("OCERZ_NO_NZCVFWD") ? 1 : 0;
@@ -22447,9 +22532,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
                 use = 0;
             if ((blk->insns[i].op == OCERZ_OP_SETCC || blk->insns[i].op == OCERZ_OP_CMOVCC ||
                  blk->insns[i].op == OCERZ_OP_ADC || blk->insns[i].op == OCERZ_OP_SBB ||
-                 blk->insns[i].op == OCERZ_OP_JCC) &&
-                nzcv_fuse_producer(blk->insns, i) >= 0)
-                use &= ~(uint64_t)JIT_ARITH_FLAGS;
+                 blk->insns[i].op == OCERZ_OP_JCC)) {
+                int fk = nzcv_fuse_producer(blk->insns, i);
+                if (fk >= 0 && !nzcv_window_has_load(blk->insns, fk, i))
+                    use &= ~(uint64_t)JIT_ARITH_FLAGS;
+            }
             if (side_fused)
                 use = 0;
             fl_need[i] = def & live_seam;
@@ -22665,10 +22752,20 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
     }
     lazy_rsp_scan(blk->insns, n);
+    nzcv_regen_scan(blk->insns, n);
+    int regen_after = -1, regen_k = -1;
     dep_plain_mark(blk->insns, n);
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
         g_dep_plain_op = g_dep_plain[i] ? &insn->ops[1] : NULL;
+        if (regen_after >= 0 && i > regen_after) {
+            nzcv_regen_emit(&b, &blk->insns[regen_k]);
+            regen_after = -1;
+        }
+        if (g_nzcv_regen[i] >= 0) {
+            regen_after = i;
+            regen_k = g_nzcv_regen[i];
+        }
         g_cur_insn_idx = i;
         g_cur_insn_start = b.p;
         g_align_guard = g_align_blk || (g_align_any && al_marked(jit_key(insn->rip, mode32)));
