@@ -275,6 +275,29 @@ uint32_t m32_export(const char *lib, const char *name)
     return addr;
 }
 
+/* A crossing made from inside a translated block (src/jit.c emit_bridge_fastcall32), the i386 form of
+ * ocerz_vdylib_fastcall: the export at trap runs with esp at the return address the guest's call pushed.  0 when it
+ * came back the way a function does - rip the word that was at esp, esp 4 (cdecl) to 4+256 (stdcall) higher - with
+ * nothing pending and no translation retired meanwhile, so the block can return in place; otherwise the step code
+ * + 1, and the block leaves for the dispatcher to carry on from rip. */
+int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap)
+{
+    uint64_t epoch = ocerz_jit_retire_epoch();
+    uint32_t esp0 = (uint32_t)cpu->gpr[OCERZ_RSP], ret = m32_rd(esp0);
+    cpu->rip = trap;
+    if (cpu->cc_op != OCERZ_CC_NONE)
+        ocerz_flags_materialize(cpu);
+    int rc = m32_trap(vm, cpu);
+    uint32_t moved = (uint32_t)cpu->gpr[OCERZ_RSP] - esp0;
+    if (rc == OCERZ_STEP_OK && cpu->rip == ret && moved >= 4 && moved <= 4 + 256 && !cpu->interrupt &&
+        !cpu->terminated && !vm->exited && !cpu->suspend_count && !cpu->interp_once &&
+        ocerz_jit_retire_epoch() == epoch)
+        return 0;
+    if (rc == OCERZ_STEP_EXIT || rc == OCERZ_STEP_FATAL)
+        return rc + 1;
+    return OCERZ_STEP_OK + 1;
+}
+
 int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t id = (uint32_t)(cpu->rip - OCERZ_DYLDAPI_LO);

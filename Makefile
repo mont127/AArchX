@@ -51,6 +51,8 @@ ocerz: $(OBJS)
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+src/m32_leaf.o: CFLAGS += -mgeneral-regs-only
+
 src/%.o: src/%.m
 	$(CC) $(CFLAGS) -fobjc-exceptions -c -o $@ $<
 
