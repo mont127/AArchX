@@ -391,6 +391,7 @@ pub(super) unsafe fn load_disk_dylib(
             install_name,
         );
         super::dimg_record_id(v);
+        super::dimg_registry_changed();
         if super::map::map_segments(v, 0) != ffi::OCERZ_OK {
             crate::ocerz_fatal!("cannot map segments of virtual %s\n", install_name);
             native_dl_reason(
@@ -398,6 +399,7 @@ pub(super) unsafe fn load_disk_dylib(
                 ptr::null(),
             );
             super::g_dimgs_n -= 1;
+            super::dimg_registry_changed();
             libc::free(vbuf.cast());
             return ptr::null_mut();
         }
@@ -454,6 +456,7 @@ pub(super) unsafe fn load_disk_dylib(
                 cstr_ptr(c"%s"),
                 install_name,
             );
+            super::dimg_registry_changed();
         }
         return d;
     }
@@ -557,10 +560,12 @@ pub(super) unsafe fn load_disk_dylib(
     (*d).file_dev = fdev;
     (*d).file_ino = fino;
     super::dimg_record_id(d);
+    super::dimg_registry_changed();
     if super::map::map_segments(d, 0) != ffi::OCERZ_OK {
         crate::ocerz_fatal!("cannot map segments of %s\n", resolved.as_ptr());
         native_dl_reason(cstr_ptr(c"its segments could not be mapped"), ptr::null());
         super::g_dimgs_n -= 1;
+        super::dimg_registry_changed();
         libc::free(buf.cast());
         return ptr::null_mut();
     }
@@ -745,9 +750,11 @@ pub(super) unsafe fn dlopen_load_image(
     );
     super::file_identity(install_path, &mut (*d).file_dev, &mut (*d).file_ino);
     super::dimg_record_id(d);
+    super::dimg_registry_changed();
     if super::map::map_segments(d, 0) != ffi::OCERZ_OK {
         dlerror_set(cstr_ptr(c"dlopen(%s): cannot map segments"), install_path);
         super::g_dimgs_n -= 1;
+        super::dimg_registry_changed();
         libc::free(buf.cast());
         return ptr::null_mut();
     }

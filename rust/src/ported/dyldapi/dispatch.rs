@@ -4,6 +4,8 @@ use core::ffi::{c_char, c_int, c_void};
 use core::mem;
 use core::ptr;
 
+use crate::ported::syscall::util::env_set;
+
 use crate::ffi::{
     OCERZ_BRIDGE_OFF, OCERZ_DYLDAPI_LO, OCERZ_ENOMEM, OCERZ_EUNSUP, OCERZ_OK, OCERZ_RAX, OCERZ_RBP,
     OCERZ_RCX, OCERZ_RDI, OCERZ_RDX, OCERZ_RSI, OCERZ_RSP, OCERZ_STEP_OK as STEP_OK_RAW, OcerzCPU,
@@ -646,7 +648,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                     let host = ocerz_g2h(pathg).cast::<c_char>();
                     ok = (cache_find_canonical(host, ptr::null_mut()) != 0
                         || libc::access(host, libc::R_OK) == 0) as u64;
-                    if !libc::getenv(cstr_ptr(c"OCERZ_DLPATH")).is_null() {
+                    if env_set!("OCERZ_DLPATH") {
                         libc::fprintf(
                             crate::log::stderr(),
                             cstr_ptr(c"ocerz: dlopen_preflight(\"%s\") -> %llu\n"),
@@ -666,7 +668,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                 } else {
                     0
                 };
-                if !libc::getenv(cstr_ptr(c"OCERZ_DLSYMLOG")).is_null() {
+                if env_set!("OCERZ_DLSYMLOG") {
                     let rsp = (*cpu).gpr[OCERZ_RSP as usize];
                     libc::fprintf(
                         crate::log::stderr(),
@@ -835,7 +837,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                     ocerz_st(info + 16, 8, if eh != 0 { eh_sz } else { 0 });
                     ocerz_st(info + 24, 8, cu);
                     ocerz_st(info + 32, 8, if cu != 0 { cu_sz } else { 0 });
-                    if !libc::getenv(cstr_ptr(c"OCERZ_UNWLOG")).is_null() {
+                    if env_set!("OCERZ_UNWLOG") {
                         libc::fprintf(
                             crate::log::stderr(),
                             cstr_ptr(c"ocerz: UNWLOG pc=%#llx mh=%#llx eh=%#llx eh_sz=%#llx cu=%#llx cu_sz=%#llx\n"),
@@ -847,7 +849,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                             cu_sz as libc::c_ulonglong,
                         );
                     }
-                } else if !libc::getenv(cstr_ptr(c"OCERZ_UNWLOG")).is_null() {
+                } else if env_set!("OCERZ_UNWLOG") {
                     libc::fprintf(
                         crate::log::stderr(),
                         cstr_ptr(c"ocerz: UNWLOG pc=%#llx mh=0 (no image)\n"),
@@ -939,7 +941,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                 {
                     addr = find_section_sz(mh, kindsect[kind as usize], &mut size);
                 }
-                if !libc::getenv(cstr_ptr(c"OCERZ_SECLOG")).is_null() {
+                if env_set!("OCERZ_SECLOG") {
                     libc::fprintf(
                         crate::log::stderr(),
                         c"ocerz: SECINFO mh=%#llx kind=%llu (%s) -> addr=%#llx size=%#llx\n"
@@ -982,7 +984,7 @@ pub unsafe extern "C" fn ocerz_dyldapi_dispatch(vm: *mut OcerzVM, cpu: *mut Ocer
                 } else {
                     0
                 };
-                if result == 0 && name != 0 && !libc::getenv(cstr_ptr(c"OCERZ_SELLOG")).is_null() {
+                if result == 0 && name != 0 && env_set!("OCERZ_SELLOG") {
                     libc::fprintf(
                         crate::log::stderr(),
                         cstr_ptr(c"ocerz: SELMISS \"%s\"\n"),

@@ -1,11 +1,19 @@
 //! Guest signal state, signal-frame construction, and signal syscall shims.
+//!
+//! sigsuspend and sigwait park the calling thread on a Mach semaphore that
+//! lives for the length of one wait.  ocerz_guest_post_to_waiter signals it
+//! after setting the pending bit, and the host async-signal and SIGEMT kick
+//! handlers signal it for the thread they run on, so exit and interrupt
+//! requests wake it too.  Each wake rechecks the same pending, exited and
+//! interrupt conditions; the wait also times out after 100 ms as a safety net,
+//! and falls back to the old 2 ms sleep if no semaphore could be created.
 
 use super::util::*;
 use super::*;
 
 use core::ffi::{c_char, c_int};
 use core::ptr;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 const GUEST_SELFSIG_HOST: c_int = 0;
 const GUEST_SELFSIG_PENDING: c_int = 1;
@@ -28,6 +36,8 @@ const OCERZ_UCTX_SEGBASE_COOKIE: u64 = 0x4f43_4552_5a53_4547;
 const OCERZ_UC_SET_ALT_STACK: u32 = 0x4000_0000;
 const GUEST_WAITERS: usize = 64;
 const CLOCK_UPTIME_RAW: libc::clockid_t = 8;
+const SYNC_POLICY_FIFO: c_int = 0;
+const GUEST_WAIT_FALLBACK_NS: c_int = 100 * 1000 * 1000;
 
 pub(super) type SysRingEntry = crate::ffi::OcerzCPU__bindgen_ty_2;
 
@@ -36,12 +46,23 @@ pub(super) type SysRingEntry = crate::ffi::OcerzCPU__bindgen_ty_2;
 struct GuestWaiter {
     cpu: *mut OcerzCPU,
     accept: u64,
+    sem: semaphore_t,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MachTimespec {
+    tv_sec: u32,
+    tv_nsec: c_int,
 }
 
 static mut GUEST_WAITERS_LIST: [GuestWaiter; GUEST_WAITERS] = [GuestWaiter {
     cpu: ptr::null_mut(),
     accept: 0,
+    sem: 0,
 }; GUEST_WAITERS];
+#[thread_local]
+static T_GUEST_WAIT_SEM: AtomicU32 = AtomicU32::new(0);
 static mut GUEST_WAITERS_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
 #[unsafe(no_mangle)]
 #[thread_local]
@@ -57,6 +78,15 @@ unsafe extern "C" {
     fn mach_port_deallocate(task: mach_port_t, name: mach_port_t) -> c_int;
     fn pthread_mach_thread_np(thread: libc::pthread_t) -> mach_port_t;
     fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
+    fn semaphore_create(
+        task: mach_port_t,
+        semaphore: *mut semaphore_t,
+        policy: c_int,
+        value: c_int,
+    ) -> c_int;
+    fn semaphore_destroy(task: mach_port_t, semaphore: semaphore_t) -> c_int;
+    fn semaphore_signal(semaphore: semaphore_t) -> c_int;
+    fn semaphore_timedwait(semaphore: semaphore_t, wait_time: MachTimespec) -> c_int;
     static mut mach_task_self_: mach_port_t;
 }
 
@@ -229,7 +259,7 @@ pub(super) unsafe fn sys_pthread_kill(
     unsafe {
         let a = &*a;
         let signo = a[1];
-        if !libc::getenv(c"OCERZ_PTKILL".as_ptr()).is_null() {
+        if env_set!("OCERZ_PTKILL") {
             let selfport = raw::ocerz_host_mach_trap(27, a);
             let handler = if signo < OCERZ_NSIG as u64 {
                 (*guest_sigact_ptr(signo as usize)).handler
@@ -927,7 +957,7 @@ pub(super) unsafe fn sys_sigreturn(
             (*cpu).fs_base = ocerz_ld(uc.wrapping_add(64), 8);
             ocerz_st(uc.wrapping_add(72), 8, 0);
         }
-        if !libc::getenv(c"OCERZ_GSTRACE".as_ptr()).is_null() {
+        if env_set!("OCERZ_GSTRACE") {
             libc::fprintf(
                 crate::log::stderr(),
                 c"ocerz: GS sigreturn[%d] cpu#%u gs %#llx rip=%#llx%s\n".as_ptr(),
@@ -1192,7 +1222,7 @@ pub unsafe extern "C" fn ocerz_guest_pthread_kill(
     }
 }
 
-unsafe fn guest_waiter(cpu: *mut OcerzCPU, accept: u64) {
+unsafe fn guest_waiter(cpu: *mut OcerzCPU, accept: u64, sem: semaphore_t) {
     unsafe {
         libc::pthread_mutex_lock(ptr::addr_of_mut!(GUEST_WAITERS_LOCK));
         let waiters = ptr::addr_of_mut!(GUEST_WAITERS_LIST).cast::<GuestWaiter>();
@@ -1201,8 +1231,10 @@ unsafe fn guest_waiter(cpu: *mut OcerzCPU, accept: u64) {
             let waiter = waiters.add(k);
             if (*waiter).cpu == cpu {
                 (*waiter).accept = accept;
+                (*waiter).sem = sem;
                 if accept == 0 {
                     (*waiter).cpu = ptr::null_mut();
+                    (*waiter).sem = 0;
                 }
                 libc::pthread_mutex_unlock(ptr::addr_of_mut!(GUEST_WAITERS_LOCK));
                 return;
@@ -1215,6 +1247,7 @@ unsafe fn guest_waiter(cpu: *mut OcerzCPU, accept: u64) {
             let waiter = waiters.add(free_at as usize);
             (*waiter).cpu = cpu;
             (*waiter).accept = accept;
+            (*waiter).sem = sem;
         }
         libc::pthread_mutex_unlock(ptr::addr_of_mut!(GUEST_WAITERS_LOCK));
     }
@@ -1234,6 +1267,9 @@ pub unsafe extern "C" fn ocerz_guest_post_to_waiter(sig: c_int) -> c_int {
             let waiter = waiters.add(k);
             if !(*waiter).cpu.is_null() && (*waiter).accept & bit != 0 {
                 sig_pending_atomic((*waiter).cpu).fetch_or(bit, Ordering::SeqCst);
+                if (*waiter).sem != 0 {
+                    semaphore_signal((*waiter).sem);
+                }
                 posted = 1;
                 break;
             }
@@ -1243,24 +1279,72 @@ pub unsafe extern "C" fn ocerz_guest_post_to_waiter(sig: c_int) -> c_int {
     }
 }
 
-unsafe fn guest_suspend_wait(vm: *mut OcerzVM, cpu: *mut OcerzCPU, suspend: u64) -> c_int {
+pub(crate) unsafe fn guest_wait_kick() {
+    let sem = T_GUEST_WAIT_SEM.load(Ordering::Relaxed);
+    if sem != 0 {
+        unsafe {
+            semaphore_signal(sem);
+        }
+    }
+}
+
+unsafe fn guest_wait_sleep(sem: semaphore_t) {
     unsafe {
+        if sem != 0 {
+            semaphore_timedwait(
+                sem,
+                MachTimespec {
+                    tv_sec: 0,
+                    tv_nsec: GUEST_WAIT_FALLBACK_NS,
+                },
+            );
+            return;
+        }
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 2 * 1000 * 1000,
+        };
+        libc::nanosleep(&ts, ptr::null_mut());
+    }
+}
+
+unsafe fn guest_block_wait(
+    vm: *mut OcerzVM,
+    cpu: *mut OcerzCPU,
+    waiter: Option<u64>,
+    suspend: Option<u64>,
+    async_accept: u32,
+    ready_mask: u64,
+    consume: bool,
+) -> c_int {
+    unsafe {
+        let outer_sem = T_GUEST_WAIT_SEM.load(Ordering::Relaxed);
+        let mut sem: semaphore_t = 0;
+        if semaphore_create(mach_task_self_, &mut sem, SYNC_POLICY_FIFO, 0) != 0 {
+            sem = 0;
+        }
+        T_GUEST_WAIT_SEM.store(sem, Ordering::Relaxed);
         let saved = (*cpu).sig_mask;
-        guest_waiter(cpu, !suspend & 0xffff_ffff);
-        (*cpu).sig_mask = suspend;
+        if let Some(accept) = waiter {
+            guest_waiter(cpu, accept, sem);
+        }
+        if let Some(mask) = suspend {
+            (*cpu).sig_mask = mask;
+        }
         (*cpu).block_nokick = 1;
         (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        let mut caught = 0;
+        let mut got = 0;
         loop {
             sig_pending_atomic(cpu).fetch_or(
-                (crate::ffi::ocerz_take_pending_async_sig_mask(super::hostwq::async_accept(
-                    suspend,
-                )) >> 1) as u64,
+                (crate::ffi::ocerz_take_pending_async_sig_mask(async_accept) >> 1) as u64,
                 Ordering::SeqCst,
             );
-            let ready = sig_pending_atomic(cpu).load(Ordering::SeqCst) & !suspend;
-            if ready != 0 {
-                caught = ready.trailing_zeros() as c_int + 1;
+            let hit = sig_pending_atomic(cpu).load(Ordering::SeqCst) & ready_mask;
+            if hit != 0 {
+                got = hit.trailing_zeros() as c_int + 1;
+                if consume {
+                    sig_pending_atomic(cpu).fetch_and(!(1u64 << (got - 1)), Ordering::SeqCst);
+                }
                 break;
             }
             if AtomicI32::from_ptr(ptr::addr_of_mut!((*vm).exited)).load(Ordering::Acquire) != 0
@@ -1268,16 +1352,35 @@ unsafe fn guest_suspend_wait(vm: *mut OcerzVM, cpu: *mut OcerzCPU, suspend: u64)
             {
                 break;
             }
-            let ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 2 * 1000 * 1000,
-            };
-            libc::nanosleep(&ts, ptr::null_mut());
+            guest_wait_sleep(sem);
         }
-        guest_waiter(cpu, 0);
+        if waiter.is_some() {
+            guest_waiter(cpu, 0, 0);
+        }
         (*cpu).block_since_ns = 0;
         (*cpu).block_nokick = 0;
-        (*cpu).sig_mask = saved;
+        if suspend.is_some() {
+            (*cpu).sig_mask = saved;
+        }
+        T_GUEST_WAIT_SEM.store(outer_sem, Ordering::Relaxed);
+        if sem != 0 {
+            semaphore_destroy(mach_task_self_, sem);
+        }
+        got
+    }
+}
+
+unsafe fn guest_suspend_wait(vm: *mut OcerzVM, cpu: *mut OcerzCPU, suspend: u64) -> c_int {
+    unsafe {
+        let caught = guest_block_wait(
+            vm,
+            cpu,
+            Some(!suspend & 0xffff_ffff),
+            Some(suspend),
+            super::hostwq::async_accept(suspend),
+            !suspend,
+            false,
+        );
         if caught != 0 {
             sig_pending_atomic(cpu).fetch_and(!(1u64 << (caught - 1)), Ordering::SeqCst);
         }
@@ -1324,40 +1427,15 @@ unsafe fn guest_sigwait_loop(
     waiter: bool,
 ) -> c_int {
     unsafe {
-        if waiter {
-            guest_waiter(cpu, want as u64);
-        }
-        (*cpu).block_nokick = 1;
-        (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        let mut got = 0;
-        loop {
-            sig_pending_atomic(cpu).fetch_or(
-                (crate::ffi::ocerz_take_pending_async_sig_mask(want.wrapping_shl(1)) >> 1) as u64,
-                Ordering::SeqCst,
-            );
-            let hit = sig_pending_atomic(cpu).load(Ordering::SeqCst) as u32 & want;
-            if hit != 0 {
-                got = hit.trailing_zeros() as c_int + 1;
-                sig_pending_atomic(cpu).fetch_and(!(1u64 << (got - 1)), Ordering::SeqCst);
-                break;
-            }
-            if AtomicI32::from_ptr(ptr::addr_of_mut!((*vm).exited)).load(Ordering::Acquire) != 0
-                || (*cpu).interrupt != 0
-            {
-                break;
-            }
-            let ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 2 * 1000 * 1000,
-            };
-            libc::nanosleep(&ts, ptr::null_mut());
-        }
-        if waiter {
-            guest_waiter(cpu, 0);
-        }
-        (*cpu).block_since_ns = 0;
-        (*cpu).block_nokick = 0;
-        got
+        guest_block_wait(
+            vm,
+            cpu,
+            waiter.then_some(want as u64),
+            None,
+            want.wrapping_shl(1),
+            want as u64,
+            true,
+        )
     }
 }
 
@@ -1395,38 +1473,16 @@ pub(super) unsafe fn sys_sigsuspend(
     a: *mut [u64; 8],
 ) -> c_int {
     unsafe {
-        let saved = (*cpu).sig_mask;
         let suspend = (*a)[0] as u32 as u64;
-        (*cpu).sig_mask = suspend;
-        (*cpu).block_nokick = 1;
-        (*cpu).block_since_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        let mut caught = 0;
-        loop {
-            sig_pending_atomic(cpu).fetch_or(
-                (crate::ffi::ocerz_take_pending_async_sig_mask(super::hostwq::async_accept(
-                    suspend,
-                )) >> 1) as u64,
-                Ordering::SeqCst,
-            );
-            let ready = sig_pending_atomic(cpu).load(Ordering::SeqCst) & !suspend;
-            if ready != 0 {
-                caught = ready.trailing_zeros() as c_int + 1;
-                break;
-            }
-            if AtomicI32::from_ptr(ptr::addr_of_mut!((*vm).exited)).load(Ordering::Acquire) != 0
-                || (*cpu).interrupt != 0
-            {
-                break;
-            }
-            let ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 2 * 1000 * 1000,
-            };
-            libc::nanosleep(&ts, ptr::null_mut());
-        }
-        (*cpu).block_since_ns = 0;
-        (*cpu).block_nokick = 0;
-        (*cpu).sig_mask = saved;
+        let caught = guest_block_wait(
+            vm,
+            cpu,
+            None,
+            Some(suspend),
+            super::hostwq::async_accept(suspend),
+            !suspend,
+            false,
+        );
         ret_err(cpu, libc::EINTR as u64);
         if caught != 0 {
             sig_pending_atomic(cpu).fetch_and(!(1u64 << (caught - 1)), Ordering::SeqCst);

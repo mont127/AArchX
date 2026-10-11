@@ -23,6 +23,10 @@
 //! block again).  Only the overlapping blocks are retired - dropping the whole
 //! cache per flip made CEF startup a full retranslation storm.  Their code stays
 //! allocated on a retired list, so a thread still inside runs to its next exit.
+//! The words a retirement puts back (stop sites, their conditional sites, the
+//! chains of its predecessors) are collected and synchronised together once
+//! write protection is back on, one barrier per retirement rather than one per
+//! word, before the JIT lock is released.
 //! A 64 KB region whose translations keep being invalidated (a JS engine
 //! W^X-flipping its code space) is run interpreted after a few hits, but not
 //! permanently: module-load fixups also retire blocks a few times and then
@@ -65,6 +69,17 @@
 //! the stop-site words it changed, and the next attempt waits two seconds; a
 //! thread that is itself inside translated code never flushes.
 //! OCERZ_NO_JIT_FLUSH=1 keeps the old behaviour.
+//!
+//! Retiring one block clears the return-address cells that predict a return
+//! into it.  Walking every registered cell for that held the JIT lock for time
+//! proportional to all the code translated since the last flush, so each cell
+//! is also filed under the 512-byte granule of the entry it was given (at
+//! emission, at a tcache bind, or when a pending return target arrives), and a
+//! retire visits only the granules its code covers, re-checking each cell's
+//! current value and dropping entries that have since moved on.  Cells are code
+//! words, so the only writers are those three and the clears; slots are data and
+//! are still walked.  The index is emptied with the cells: at a flush, when all
+//! code is invalidated, and abandoned unfreed in a fork child.
 //!
 //! ---- faults and fork ----
 //! A fault inside a block reconstructs the guest state from the host registers:
@@ -271,6 +286,87 @@ pub static mut g_cap_ras_cells: usize = 0;
 
 #[unsafe(no_mangle)]
 pub static mut g_n_ras_cells: usize = 0;
+
+const RAS_GRAN_SHIFT: u32 = 9;
+
+#[derive(Default)]
+struct RasGranHasher(u64);
+
+impl core::hash::Hasher for RasGranHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (n as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    }
+}
+
+type RasGranMap = std::collections::HashMap<
+    usize,
+    Vec<*mut *mut c_void>,
+    core::hash::BuildHasherDefault<RasGranHasher>,
+>;
+
+static mut G_RAS_BY_GRAN: RasGranMap =
+    RasGranMap::with_hasher(core::hash::BuildHasherDefault::new());
+
+pub unsafe fn ras_cell_note(cell: *mut *mut c_void, value: *mut c_void) {
+    unsafe {
+        if value.is_null() {
+            return;
+        }
+        (*(&raw mut G_RAS_BY_GRAN))
+            .entry(value as usize >> RAS_GRAN_SHIFT)
+            .or_default()
+            .push(cell);
+    }
+}
+
+pub unsafe fn ras_cells_clear_range(lo: usize, hi: usize) {
+    unsafe {
+        if hi <= lo {
+            return;
+        }
+        let map = &mut *(&raw mut G_RAS_BY_GRAN);
+        for g in (lo >> RAS_GRAN_SHIFT)..=((hi - 1) >> RAS_GRAN_SHIFT) {
+            let Some(cells) = map.get_mut(&g) else {
+                continue;
+            };
+            cells.retain(|&cell| {
+                let v = AtomicPtr::<c_void>::from_ptr(cell).load(Ordering::Relaxed) as usize;
+                if v >= lo && v < hi {
+                    AtomicPtr::<c_void>::from_ptr(cell)
+                        .store(core::ptr::null_mut(), Ordering::Release);
+                    return false;
+                }
+                v != 0 && v >> RAS_GRAN_SHIFT == g
+            });
+            if cells.is_empty() {
+                map.remove(&g);
+            }
+        }
+    }
+}
+
+unsafe fn ras_index_clear() {
+    unsafe {
+        (*(&raw mut G_RAS_BY_GRAN)).clear();
+    }
+}
+
+unsafe fn ras_index_abandon() {
+    unsafe {
+        core::ptr::write(
+            &raw mut G_RAS_BY_GRAN,
+            RasGranMap::with_hasher(core::hash::BuildHasherDefault::new()),
+        );
+    }
+}
 
 static mut g_churn_suppress: c_int = 0;
 
@@ -1920,6 +2016,14 @@ pub unsafe extern "C" fn ras_slot_alloc() -> *mut *mut c_void {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pending_add_ras(target_key: u64, ras_slot: *mut *mut c_void) {
+    unsafe { pending_add_ras_tagged(target_key, ras_slot, 0) }
+}
+
+pub unsafe fn pending_add_ras_cell(target_key: u64, cell: *mut *mut c_void) {
+    unsafe { pending_add_ras_tagged(target_key, cell, 1) }
+}
+
+unsafe fn pending_add_ras_tagged(target_key: u64, ras_slot: *mut *mut c_void, cell: u8) {
     unsafe {
         let e = libc::malloc(core::mem::size_of::<PendingChain>()).cast::<PendingChain>();
         if e.is_null() {
@@ -1931,7 +2035,7 @@ pub unsafe extern "C" fn pending_add_ras(target_key: u64, ras_slot: *mut *mut c_
         (*e).cond_site = core::ptr::null_mut();
         (*e).ras_slot = ras_slot;
         (*e).src = core::ptr::null_mut();
-        (*e).edge = 0;
+        (*e).edge = cell;
         (*e).kind = EDGE_XBLOCK as u8;
         (*e).pin_class = 0;
         let pending = core::ptr::addr_of_mut!(g_pending).cast::<*mut PendingChain>();
@@ -1976,6 +2080,9 @@ unsafe fn pending_drain(key: u64, target: *mut JitBlock) {
                     chaincheck(b"ras_slot\0".as_ptr().cast(), ras_entry_for(target));
                     AtomicPtr::<c_void>::from_ptr((*e).ras_slot)
                         .store(ras_entry_for(target), Ordering::Release);
+                    if (*e).edge != 0 {
+                        ras_cell_note((*e).ras_slot, ras_entry_for(target));
+                    }
                 } else if (*e).kind as c_uint == EDGE_BODY {
                     let compatible = if (*e).pin_class != 0 {
                         (*target).pin_class == (*e).pin_class
@@ -3032,6 +3139,7 @@ pub unsafe extern "C" fn ocerz_jit_forget(vm: *mut OcerzVM) {
         pthread_mutex_init(core::ptr::addr_of_mut!(jit_lock), core::ptr::null());
         g_xlat_jit = core::ptr::null_mut();
         g_n_ras_cells = 0;
+        ras_index_abandon();
         g_ras_slot_n = 0;
         libc::memset(
             core::ptr::addr_of_mut!(g_pending).cast(),
@@ -3264,6 +3372,7 @@ unsafe fn invalidate_all_locked(jit: *mut OcerzJit) {
             AtomicPtr::<c_void>::from_ptr(*g_ras_cells.add(i as usize))
                 .store(core::ptr::null_mut(), Ordering::Release);
         }
+        ras_index_clear();
         for k in 0..(*jit).n_live {
             let b = *(*jit).live.add(k);
             for i in 0..(*b).n_edges {
@@ -3740,6 +3849,61 @@ pub unsafe extern "C" fn psc_retire_cols(vm: *mut OcerzVM, cols: u32) {
     }
 }
 
+static mut g_retire_sites: *mut *mut u32 = core::ptr::null_mut();
+static mut g_retire_nsites: usize = 0;
+static mut g_retire_sites_cap: usize = 0;
+
+unsafe fn retire_site_note(site: *mut u32) {
+    unsafe {
+        if g_retire_nsites == g_retire_sites_cap {
+            let cap = if g_retire_sites_cap != 0 {
+                g_retire_sites_cap.wrapping_mul(2)
+            } else {
+                64
+            };
+            let ns = libc::realloc(
+                g_retire_sites.cast(),
+                cap.wrapping_mul(core::mem::size_of::<*mut u32>()),
+            )
+            .cast::<*mut u32>();
+            if ns.is_null() {
+                sys_icache_invalidate(site.cast(), 4);
+                return;
+            }
+            g_retire_sites = ns;
+            g_retire_sites_cap = cap;
+        }
+        *g_retire_sites.add(g_retire_nsites) = site;
+        g_retire_nsites = g_retire_nsites.wrapping_add(1);
+    }
+}
+
+unsafe fn retire_sites_sync() {
+    unsafe {
+        let n = g_retire_nsites;
+        if n == 0 {
+            return;
+        }
+        for i in 0..n {
+            core::arch::asm!(
+                "dc cvau, {site}",
+                site = in(reg) *g_retire_sites.add(i),
+                options(preserves_flags)
+            );
+        }
+        core::arch::asm!("dsb ish", options(preserves_flags));
+        for i in 0..n {
+            core::arch::asm!(
+                "ic ivau, {site}",
+                site = in(reg) *g_retire_sites.add(i),
+                options(preserves_flags)
+            );
+        }
+        core::arch::asm!("dsb ish", "isb", options(preserves_flags));
+        g_retire_nsites = 0;
+    }
+}
+
 unsafe fn unchain_edge(sblk: *mut JitBlock, i: c_int, hits: *const *mut JitBlock, n_hits: usize) {
     unsafe {
         let edge = (*sblk).edges.add(i as usize);
@@ -3751,7 +3915,7 @@ unsafe fn unchain_edge(sblk: *mut JitBlock, i: c_int, hits: *const *mut JitBlock
             && ptr_in_hits(hits, n_hits, branch_word_target(at, *at)) != 0
         {
             AtomicU32::from_ptr(at).store(fallback, Ordering::Release);
-            sys_icache_invalidate(at.cast(), 4);
+            retire_site_note(at);
         }
         let cs = (*edge).cond_site;
         if !cs.is_null()
@@ -3760,7 +3924,7 @@ unsafe fn unchain_edge(sblk: *mut JitBlock, i: c_int, hits: *const *mut JitBlock
             && ptr_in_hits(hits, n_hits, branch_word_target(cs, *cs)) != 0
         {
             AtomicU32::from_ptr(cs).store((*edge).cond_orig, Ordering::Release);
-            sys_icache_invalidate(cs.cast(), 4);
+            retire_site_note(cs);
         }
     }
 }
@@ -3818,13 +3982,13 @@ unsafe fn retire_hit_blocks_locked(
                 && *(*b).stop_patch != (*b).stop_insn
             {
                 AtomicU32::from_ptr((*b).stop_patch).store((*b).stop_insn, Ordering::Release);
-                sys_icache_invalidate((*b).stop_patch.cast(), 4);
+                retire_site_note((*b).stop_patch);
             }
             for i in 0..(*b).n_stop_extra {
                 let extra = (*b).stop_extra.as_mut_ptr().add(i as usize);
                 if *(*extra).site != (*extra).insn {
                     AtomicU32::from_ptr((*extra).site).store((*extra).insn, Ordering::Release);
-                    sys_icache_invalidate((*extra).site.cast(), 4);
+                    retire_site_note((*extra).site);
                 }
             }
             for i in 0..(*b).n_edges {
@@ -3840,7 +4004,7 @@ unsafe fn retire_hit_blocks_locked(
                 }
                 if !cs.is_null() && (*edge).cond_orig != 0 && *cs != (*edge).cond_orig && is_stop {
                     AtomicU32::from_ptr(cs).store((*edge).cond_orig, Ordering::Release);
-                    sys_icache_invalidate(cs.cast(), 4);
+                    retire_site_note(cs);
                 }
             }
         }
@@ -3870,6 +4034,7 @@ unsafe fn retire_hit_blocks_locked(
             }
         }
         pthread_jit_write_protect_np(1);
+        retire_sites_sync();
         retire_unlink_hits(jit, hits, n_hits);
         for i in 0..g_ras_slot_n {
             let slot = core::ptr::addr_of_mut!(*g_ras_slots.add(i as usize));
@@ -4565,6 +4730,7 @@ unsafe fn jit_arena_reset_locked(jit: *mut OcerzJit) {
         pending_clear();
         AtomicI32::from_ptr(core::ptr::addr_of_mut!(g_flush_want)).store(0, Ordering::Relaxed);
         g_n_ras_cells = 0;
+        ras_index_clear();
         g_ras_slot_n = 0;
         g_n_psc_tables = 0;
         g_psc_used = 0;

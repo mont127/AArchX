@@ -9,7 +9,13 @@
 //! wrong version.  In the export trie, a terminal size of 0 with the name fully
 //! consumed is not a miss: the node carries an empty edge to the terminal child,
 //! which happens whenever a symbol is a strict prefix of others (_libiconv
-//! versus _libiconv_open), so the search falls through to the child.
+//! versus _libiconv_open), so the search falls through to the child.  Each
+//! fixup pass resolves a library ordinal to its dependency image once, through
+//! a per-pass table over the image's dylib load commands, instead of scanning
+//! every loaded image by name for every import.  An entry is reused only while
+//! g_dimgs_gen still matches; it moves whenever an image is registered, gains
+//! an rpath alias or is dropped, so an image loaded in the middle of a pass is
+//! seen exactly as the per-import scan saw it.
 //!
 //! Real dyld maps each segment with its initprot; this one maps every image
 //! read-write so the copy and the fixups can land, then gives __TEXT its real
@@ -24,7 +30,11 @@
 //! any dylib, and the cache path followed upward links, so CoreFoundation's
 //! handle found OpenGL's glBegin by way of Foundation.  A cache image met on the
 //! way hands its own closure to ocerz_cache_dlsym_image.  OCERZ_NO_DLSYM_DEPS
-//! restores the image-only search for disk images.
+//! restores the image-only search for disk images.  In native mode that
+//! breadth-first order depends only on the image and the published count, as a
+//! published image never changes its names or leaves, so it is built once per
+//! (image, published count) under G_NDL_DEPS_LOCK and every later dlsym on the
+//! handle runs only the symbol lookups.
 //!
 //! ---- the initial stack ----
 //! Every argument and environment entry goes onto the guest stack, counted first
@@ -661,6 +671,7 @@ struct DynImage {
     file_dev: u64,
     file_ino: u64,
     symidx: *mut SymIndex,
+    symtab_hash: *mut dlopen::SymtabHash,
 }
 
 impl DynImage {
@@ -699,6 +710,7 @@ impl DynImage {
         file_dev: 0,
         file_ino: 0,
         symidx: ptr::null_mut(),
+        symtab_hash: ptr::null_mut(),
     };
 }
 
@@ -736,6 +748,7 @@ pub static mut ocerz_main_mh: u64 = 0;
 static mut g_dynlookup_miss: c_ulong = 0;
 static mut g_dimgs: [DynImage; DYN_DIMG_MAX] = [DynImage::ZERO; DYN_DIMG_MAX];
 static mut g_dimgs_n: c_int = 0;
+static mut g_dimgs_gen: u32 = 1;
 static mut g_main_dimg: DynImage = DynImage::ZERO;
 static mut g_main_dimg_valid: c_int = 0;
 static mut g_main_hostpath: [c_char; 1024] = [0; 1024];
@@ -914,6 +927,13 @@ unsafe fn dimg_find_by_install_name(iname: *const c_char) -> *mut DynImage {
         }
     }
     ptr::null_mut()
+}
+
+unsafe fn dimg_registry_changed() {
+    g_dimgs_gen = g_dimgs_gen.wrapping_add(1);
+    if g_dimgs_gen == 0 {
+        g_dimgs_gen = 1;
+    }
 }
 
 unsafe fn dimg_record_id(d: *mut DynImage) {

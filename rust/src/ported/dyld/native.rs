@@ -439,19 +439,23 @@ unsafe fn ndl_dep_of(img: *mut DynImage, name: *const c_char, published: c_int) 
     ptr::null_mut()
 }
 
-unsafe fn ndl_search_deps(root: *mut DynImage, usym: *const c_char, found: *mut c_int) -> u64 {
-    let published = ndl_pub() as c_int;
-    let mut queue = [ptr::null_mut::<DynImage>(); DYN_DIMG_MAX + 1];
+struct NdlDeps {
+    published: c_int,
+    n: usize,
+    order: [*mut DynImage; DYN_DIMG_MAX + 1],
+}
+
+static mut G_NDL_DEPS: [*mut NdlDeps; DYN_DIMG_MAX] = [ptr::null_mut(); DYN_DIMG_MAX];
+static mut G_NDL_DEPS_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
+
+unsafe fn ndl_dep_order(root: *mut DynImage, published: c_int, queue: *mut *mut DynImage) -> usize {
+    let cap = DYN_DIMG_MAX + 1;
     let mut qn = 1;
-    queue[0] = root;
+    *queue = root;
     let mut qi = 0;
     while qi < qn {
-        let d = queue[qi];
+        let d = *queue.add(qi);
         qi += 1;
-        let value = ndl_lookup_in(d, usym, found);
-        if *found != 0 {
-            return value;
-        }
         let mh = (*d).slice;
         let ncmds = rd32(mh.add(16));
         let mut lc = mh.add(core::mem::size_of::<MachHeader64>());
@@ -464,17 +468,65 @@ unsafe fn ndl_search_deps(root: *mut DynImage, usym: *const c_char, found: *mut 
                 let dep = ndl_dep_of(d, lc.add(noff as usize).cast(), published);
                 let mut seen = dep.is_null();
                 for k in 0..qn {
-                    if queue[k] == dep {
+                    if *queue.add(k) == dep {
                         seen = true;
                         break;
                     }
                 }
-                if !seen && qn < queue.len() {
-                    queue[qn] = dep;
+                if !seen && qn < cap {
+                    *queue.add(qn) = dep;
                     qn += 1;
                 }
             }
             lc = lc.add(rd32(lc.add(4)) as usize);
+        }
+    }
+    qn
+}
+
+unsafe fn ndl_deps_of(root: *mut DynImage, queue: *mut *mut DynImage) -> usize {
+    let published = ndl_pub() as c_int;
+    let base = ptr::addr_of_mut!(super::g_dimgs) as usize;
+    let off = (root as usize).wrapping_sub(base);
+    let size = core::mem::size_of::<DynImage>();
+    if off >= DYN_DIMG_MAX * size || off % size != 0 {
+        return ndl_dep_order(root, published, queue);
+    }
+    let idx = off / size;
+    libc::pthread_mutex_lock(ptr::addr_of_mut!(G_NDL_DEPS_LOCK));
+    let slot = ptr::addr_of_mut!(G_NDL_DEPS)
+        .cast::<*mut NdlDeps>()
+        .add(idx);
+    if (*slot).is_null() {
+        let e = libc::malloc(core::mem::size_of::<NdlDeps>()).cast::<NdlDeps>();
+        if !e.is_null() {
+            (*e).published = -1;
+            (*e).n = 0;
+            *slot = e;
+        }
+    }
+    let e = *slot;
+    let n = if e.is_null() {
+        ndl_dep_order(root, published, queue)
+    } else {
+        if (*e).published != published {
+            (*e).n = ndl_dep_order(root, published, ptr::addr_of_mut!((*e).order).cast());
+            (*e).published = published;
+        }
+        ptr::copy_nonoverlapping(ptr::addr_of!((*e).order).cast(), queue, (*e).n);
+        (*e).n
+    };
+    libc::pthread_mutex_unlock(ptr::addr_of_mut!(G_NDL_DEPS_LOCK));
+    n
+}
+
+unsafe fn ndl_search_deps(root: *mut DynImage, usym: *const c_char, found: *mut c_int) -> u64 {
+    let mut order = [ptr::null_mut::<DynImage>(); DYN_DIMG_MAX + 1];
+    let n = ndl_deps_of(root, order.as_mut_ptr());
+    for &d in &order[..n] {
+        let value = ndl_lookup_in(d, usym, found);
+        if *found != 0 {
+            return value;
         }
     }
     *found = 0;
@@ -1248,9 +1300,11 @@ unsafe fn ndl_load_file(t: *mut NdlTarget, chain: *const super::RpathList) -> *m
     );
     super::file_identity((*t).path.as_ptr(), &mut (*d).file_dev, &mut (*d).file_ino);
     super::dimg_record_id(d);
+    super::dimg_registry_changed();
     if super::map::map_segments(d, 0) != ffi::OCERZ_OK {
         super::load::native_dl_reason(cstr_ptr(c"its segments could not be mapped"), ptr::null());
         super::g_dimgs_n -= 1;
+        super::dimg_registry_changed();
         libc::free((*d).owned_buf.cast());
         ptr::write_bytes(d, 0, 1);
         return ptr::null_mut();
@@ -1297,10 +1351,12 @@ unsafe fn ndl_rollback(before: c_int) {
             ffi::ocerz_unmap((*d).map_base, (*d).map_size);
         }
         libc::free((*d).owned_buf.cast());
+        super::dlopen::symtab_hash_free(d);
         ptr::write_bytes(d, 0, 1);
         i -= 1;
     }
     super::g_dimgs_n = before;
+    super::dimg_registry_changed();
 }
 
 static mut G_NDL_ADD_FUNCS: *mut u64 = ptr::null_mut();

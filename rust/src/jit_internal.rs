@@ -286,7 +286,7 @@ pub unsafe fn tc_noload_has(key: u64) -> c_int {
 }
 
 #[inline(always)]
-pub unsafe fn ras_cell_register(cell: *mut *mut c_void) {
+pub unsafe fn ras_cell_register(cell: *mut *mut c_void) -> c_int {
     unsafe {
         if g_n_ras_cells == g_cap_ras_cells {
             let ncap = if g_cap_ras_cells != 0 { g_cap_ras_cells * 2 } else { 1024 };
@@ -295,13 +295,14 @@ pub unsafe fn ras_cell_register(cell: *mut *mut c_void) {
                 ncap * core::mem::size_of::<*mut *mut c_void>(),
             ) as *mut *mut *mut c_void;
             if nv.is_null() {
-                return;
+                return 0;
             }
             g_ras_cells = nv;
             g_cap_ras_cells = ncap;
         }
         *g_ras_cells.add(g_n_ras_cells) = cell;
         g_n_ras_cells += 1;
+        1
     }
 }
 

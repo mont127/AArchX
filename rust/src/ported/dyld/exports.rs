@@ -63,7 +63,7 @@ pub(super) unsafe fn image_export_trie(slice: *const u8, size_out: *mut u32) -> 
     0
 }
 
-unsafe fn symidx_hash(s: *const c_char) -> u32 {
+pub(super) unsafe fn symidx_hash(s: *const c_char) -> u32 {
     let mut hash = 2_166_136_261u32;
     let mut p = s;
     while p.read() != 0 {

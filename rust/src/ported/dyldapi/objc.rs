@@ -4,6 +4,8 @@ use core::ffi::{c_char, c_int};
 use core::mem;
 use core::ptr;
 
+use crate::ported::syscall::util::env_set;
+
 use crate::ffi::{
     OCERZ_RAX, OCERZ_RDX, OCERZ_RSI, OCERZ_RSP, OCERZ_STEP_OK as STEP_OK_RAW, OcerzCPU, OcerzVM,
     ocerz_cache_image_addr, ocerz_map_anywhere, ocerz_vm_call,
@@ -911,7 +913,7 @@ pub(crate) unsafe fn selpool_canonical(want: *const c_char) -> u64 {
         }
         if g_selopt != 0 {
             let r = selopt_canonical(want);
-            if !libc::getenv(cstr_ptr(c"OCERZ_SELVERIFY")).is_null() && g_sel_pool != 0 {
+            if env_set!("OCERZ_SELVERIFY") && g_sel_pool != 0 {
                 if g_selidx.is_null() {
                     selpool_build();
                 }

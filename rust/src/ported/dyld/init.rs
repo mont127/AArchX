@@ -3,6 +3,10 @@
 use super::*;
 
 const INIT_VISITED_MAX: usize = 8192;
+const INIT_INDEX_BITS: u32 = 14;
+const INIT_INDEX_SLOTS: usize = 1 << INIT_INDEX_BITS;
+const _: () =
+    assert!(INIT_INDEX_SLOTS >= 2 * INIT_VISITED_MAX && INIT_VISITED_MAX < u16::MAX as usize);
 pub(super) const INIT_CLOSURE_CAP: usize = 4096;
 const DYLIB_USE_MARKER: u32 = 0x1a74_1800;
 const DYLIB_USE_UPWARD: u32 = 0x04;
@@ -14,6 +18,7 @@ static mut G_INIT_DONE: [u8; INIT_VISITED_MAX] = [0; INIT_VISITED_MAX];
 static mut G_LOAD_DONE: [u8; INIT_VISITED_MAX] = [0; INIT_VISITED_MAX];
 pub(super) static mut G_INIT_BEING: [u8; INIT_VISITED_MAX] = [0; INIT_VISITED_MAX];
 static mut G_INIT_VISITED_N: c_int = 0;
+static mut G_INIT_INDEX: [u16; INIT_INDEX_SLOTS] = [0; INIT_INDEX_SLOTS];
 pub(super) static mut G_INIT_CUR_GEN: u32 = 0;
 pub(super) static mut G_INIT_FORCE: c_int = 0;
 static mut G_INIT_COLLECT_DEPTH: c_int = 0;
@@ -158,19 +163,41 @@ pub(super) unsafe fn run_image_inits(vm: *mut OcerzVM, mh: u64, ia: *const u64, 
     }
 }
 
-pub(super) unsafe fn init_mark(mh: u64) -> c_int {
-    let visited = ptr::addr_of_mut!(G_INIT_VISITED).cast::<u64>();
-    for i in 0..G_INIT_VISITED_N {
-        if visited.add(i as usize).read() == mh {
-            return i;
+unsafe fn init_find(mh: u64) -> Result<c_int, usize> {
+    let index = ptr::addr_of!(G_INIT_INDEX).cast::<u16>();
+    let visited = ptr::addr_of!(G_INIT_VISITED).cast::<u64>();
+    let mut slot = (mh.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - INIT_INDEX_BITS)) as usize;
+    loop {
+        let entry = index.add(slot).read();
+        if entry == 0 {
+            return Err(slot);
         }
+        let i = entry as usize - 1;
+        if visited.add(i).read() == mh {
+            return Ok(i as c_int);
+        }
+        slot = (slot + 1) & (INIT_INDEX_SLOTS - 1);
     }
+}
+
+pub(super) unsafe fn init_mark(mh: u64) -> c_int {
+    let slot = match init_find(mh) {
+        Ok(i) => return i,
+        Err(slot) => slot,
+    };
     if G_INIT_VISITED_N >= INIT_VISITED_MAX as c_int {
         return -1;
     }
     let i = G_INIT_VISITED_N;
     G_INIT_VISITED_N += 1;
-    visited.add(i as usize).write(mh);
+    ptr::addr_of_mut!(G_INIT_VISITED)
+        .cast::<u64>()
+        .add(i as usize)
+        .write(mh);
+    ptr::addr_of_mut!(G_INIT_INDEX)
+        .cast::<u16>()
+        .add(slot)
+        .write((i + 1) as u16);
     ptr::addr_of_mut!(G_INIT_GEN)
         .cast::<u32>()
         .add(i as usize)
@@ -187,14 +214,16 @@ pub(super) unsafe fn init_mark(mh: u64) -> c_int {
 }
 
 pub(super) unsafe fn init_is_done(mh: u64) -> bool {
-    let visited = ptr::addr_of!(G_INIT_VISITED).cast::<u64>();
-    let done = ptr::addr_of!(G_INIT_DONE).cast::<u8>();
-    for i in 0..G_INIT_VISITED_N {
-        if visited.add(i as usize).read() == mh {
-            return done.add(i as usize).read() != 0;
+    match init_find(mh) {
+        Ok(i) => {
+            ptr::addr_of!(G_INIT_DONE)
+                .cast::<u8>()
+                .add(i as usize)
+                .read()
+                != 0
         }
+        Err(_) => false,
     }
-    false
 }
 
 unsafe fn is_umbrella_path(path: *const c_char) -> bool {

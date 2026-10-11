@@ -373,7 +373,7 @@ unsafe fn private_file_backing(gaddr: u64, len: u64, fd: c_int, pos: u64) -> c_i
                         pos.wrapping_add(ilo.wrapping_sub(lo)) as libc::off_t,
                     ) == hp
                     {
-                        if !libc::getenv(c"OCERZ_MEMTRACE".as_ptr()).is_null() {
+                        if env_set!("OCERZ_MEMTRACE") {
                             libc::fprintf(
                                 crate::log::stderr(),
                                 c"ocerz: FILEMAP-DIRECT gaddr=%#llx interior=[%#llx,%#llx) of len=%#llx\n".as_ptr(),
@@ -470,7 +470,7 @@ unsafe fn guest_mmap_apply(
             }
             let mut gaddr = 0;
             if addr != 0
-                && libc::getenv(c"OCERZ_NO_MMAP_HINT".as_ptr()).is_null()
+                && !env_set!("OCERZ_NO_MMAP_HINT")
                 && crate::ffi::ocerz_map_hint(addr, len, prot) == crate::ffi::OCERZ_OK
             {
                 gaddr = addr & !0x3fff;
@@ -515,7 +515,7 @@ unsafe fn guest_mmap_apply(
             }
             invalidate_guest_mapping(vm, gaddr, len);
         }
-        if !libc::getenv(c"OCERZ_MEMTRACE".as_ptr()).is_null() {
+        if env_set!("OCERZ_MEMTRACE") {
             let mut path = [0 as c_char; 256];
             libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr());
             libc::fprintf(
@@ -537,8 +537,7 @@ unsafe fn guest_mmap_apply(
             } else {
                 crate::ffi::ocerz_map_shared_file(gaddr, len, prot, fd, pos)
             };
-            let sharedlog = !libc::getenv(c"OCERZ_MEMTRACE".as_ptr()).is_null()
-                || !libc::getenv(c"OCERZ_SHAREDLOG".as_ptr()).is_null();
+            let sharedlog = env_set!("OCERZ_MEMTRACE") || env_set!("OCERZ_SHAREDLOG");
             if sharedlog {
                 let mut path = [0 as c_char; 256];
                 libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr());
@@ -682,7 +681,7 @@ unsafe fn guest_mprotect_apply(
         }
         invalidate_guest_mapping(vm, addr, len);
         let rc = crate::ffi::ocerz_protect(addr, len, prot);
-        if rc != crate::ffi::OCERZ_OK && !libc::getenv(c"OCERZ_MAPFAILLOG".as_ptr()).is_null() {
+        if rc != crate::ffi::OCERZ_OK && env_set!("OCERZ_MAPFAILLOG") {
             libc::fprintf(
                 crate::log::stderr(),
                 c"ocerz: PROTFAIL[%d] addr=%#llx len=%#llx prot=%#x rc=%d rip=%#llx\n".as_ptr(),

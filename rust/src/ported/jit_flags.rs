@@ -4061,17 +4061,8 @@ pub unsafe extern "C" fn flip_retire_locked(
             let p = p as usize;
             p >= lo && p < hi
         };
-        let mut idx = (*blk).live_idx;
+        let idx = (*blk).live_idx;
         if idx >= (*jit).n_live || *(*jit).live.add(idx) != blk {
-            idx = (*jit).n_live;
-            for k in 0..(*jit).n_live {
-                if *(*jit).live.add(k) == blk {
-                    idx = k;
-                    break;
-                }
-            }
-        }
-        if idx == (*jit).n_live {
             return;
         }
         pthread_jit_write_protect_np(0);
@@ -4150,13 +4141,7 @@ pub unsafe extern "C" fn flip_retire_locked(
             }
         }
         (*blk).n_preds = 0;
-        for i in 0..ffi::g_n_ras_cells {
-            let cell = *ffi::g_ras_cells.add(i);
-            let value = *cell;
-            if in_block(value) {
-                store_pointer_release(cell, ptr::null_mut());
-            }
-        }
+        crate::ported::jit_cache::ras_cells_clear_range(lo, hi);
         pthread_jit_write_protect_np(1);
         let h = jit_internal::hash_key((*blk).key);
         let mut pp = ptr::addr_of_mut!((*jit).buckets)

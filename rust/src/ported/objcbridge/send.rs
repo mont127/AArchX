@@ -10,6 +10,17 @@
 //! untouched and jumps to the implementation, which is what makes one engine
 //! crossing correct for every method.
 //!
+//! ---- the descriptor cache ----
+//! A described (class, selector) pair is kept, one node per pair, and is good
+//! for the generation it was described in; registering or realizing a class
+//! and replacing an implementation start a new generation.  A send that finds
+//! its pair from an older generation looks the method up again, and when the
+//! method's type encoding still reads the same it refreshes the node's
+//! generation instead of describing it again, since the description depends on
+//! nothing but the encoding and the selector.  A pair whose encoding did change
+//! gets a new node in the old one's place; the old node stays allocated, as
+//! another thread may still be sending through it.
+//!
 //! ---- results the two ABIs return differently, ----
 //! ---- super, ----
 //! ---- nil ----
@@ -59,6 +70,7 @@ pub struct ObSend {
     blocks: u32,
     fnptrs: u32,
     objects: u32,
+    enc: *const c_char,
     generation: u64,
 }
 
@@ -128,44 +140,80 @@ unsafe fn ob_shape(notation: *const c_char) -> *const ObShape {
     }
 }
 
+unsafe fn ob_send_generation<'a>(e: *mut ObSend) -> &'a AtomicU64 {
+    unsafe { AtomicU64::from_ptr(&raw mut (*e).generation) }
+}
+
+unsafe fn ob_send_link<'a>(e: *mut ObSend) -> &'a AtomicPtr<ObSend> {
+    unsafe { AtomicPtr::from_ptr(&raw mut (*e).next) }
+}
+
+unsafe fn ob_send_bucket<'a>(b: usize) -> &'a AtomicPtr<ObSend> {
+    unsafe { &*G_OB_SENDS.as_ptr().add(b) }
+}
+
+unsafe fn ob_entry(cls: *mut c_void, sel: *mut c_void) -> *mut ObSend {
+    unsafe {
+        let mut e = ob_send_bucket(ob_send_hash(cls, sel) as usize).load(Ordering::SeqCst);
+        while !e.is_null() {
+            if (*e).cls == cls && (*e).sel == sel {
+                return e;
+            }
+            e = ob_send_link(e).load(Ordering::Acquire);
+        }
+        null_mut()
+    }
+}
+
 unsafe fn ob_cached(cls: *mut c_void, sel: *mut c_void) -> *const ObSend {
     unsafe {
         let generation = G_OB_GENERATION.load(Ordering::SeqCst);
-        let mut e = (*G_OB_SENDS.as_ptr().add(ob_send_hash(cls, sel) as usize)).load(Ordering::SeqCst);
-        while !e.is_null() {
-            if (*e).cls == cls && (*e).sel == sel && (*e).generation == generation {
-                return e;
-            }
-            e = (*e).next;
+        let e = ob_entry(cls, sel);
+        if !e.is_null() && ob_send_generation(e).load(Ordering::SeqCst) == generation {
+            return e;
         }
         null()
     }
 }
 
-unsafe fn ob_remember(scratch: *const ObSend) -> *const ObSend {
+unsafe fn ob_remember(scratch: *mut ObSend, enc: *const c_char) -> *const ObSend {
     unsafe {
         let b = ob_send_hash((*scratch).cls, (*scratch).sel) as usize;
-        let made = libc::malloc(size_of::<ObSend>()) as *mut ObSend;
+        let len = if enc.is_null() { 0 } else { libc::strlen(enc) + 1 };
+        let made = libc::malloc(size_of::<ObSend>() + len) as *mut ObSend;
         if made.is_null() {
             return scratch;
         }
         *made = *scratch;
+        (*made).enc = null();
+        if len != 0 {
+            let text = made.add(1) as *mut c_char;
+            libc::memcpy(text as *mut c_void, enc as *const c_void, len);
+            (*made).enc = text;
+        }
         libc::pthread_mutex_lock(&raw mut G_OB_LOCK);
-        let mut found: *mut ObSend = null_mut();
-        let mut e = (*G_OB_SENDS.as_ptr().add(b)).load(Ordering::SeqCst);
-        while !e.is_null() && found.is_null() {
-            if (*e).cls == (*scratch).cls && (*e).sel == (*scratch).sel
-                && (*e).generation == (*scratch).generation
-            {
-                found = e;
+        let mut link = ob_send_bucket(b);
+        let mut e = link.load(Ordering::SeqCst);
+        while !e.is_null() && !((*e).cls == (*scratch).cls && (*e).sel == (*scratch).sel) {
+            link = ob_send_link(e);
+            e = link.load(Ordering::Acquire);
+        }
+        let found: *mut ObSend = if e.is_null() {
+            (*made).next = ob_send_bucket(b).load(Ordering::SeqCst);
+            ob_send_bucket(b).store(made, Ordering::SeqCst);
+            made
+        } else {
+            let have = ob_send_generation(e).load(Ordering::SeqCst);
+            if have == (*scratch).generation {
+                e
+            } else if have > (*scratch).generation {
+                scratch
+            } else {
+                (*made).next = ob_send_link(e).load(Ordering::Acquire);
+                link.store(made, Ordering::SeqCst);
+                made
             }
-            e = (*e).next;
-        }
-        if found.is_null() {
-            (*made).next = (*G_OB_SENDS.as_ptr().add(b)).load(Ordering::SeqCst);
-            (*(&raw const G_OB_SENDS).cast::<AtomicPtr<ObSend>>().add(b)).store(made, Ordering::SeqCst);
-            found = made;
-        }
+        };
         libc::pthread_mutex_unlock(&raw mut G_OB_LOCK);
         if found != made {
             libc::free(made as *mut c_void);
@@ -276,9 +324,15 @@ unsafe fn ob_method(cls: *mut c_void, sel: *mut c_void, scratch: *mut ObSend) ->
         if m.is_null() {
             return null();
         }
-        ob_describe(cls, sel, ob_method_get_type_encoding(m), c"method".as_ptr(), scratch);
+        let enc = ob_method_get_type_encoding(m);
+        let e = ob_entry(cls, sel);
+        if !e.is_null() && !enc.is_null() && !(*e).enc.is_null() && libc::strcmp((*e).enc, enc) == 0 {
+            ob_send_generation(e).fetch_max(generation, Ordering::SeqCst);
+            return e;
+        }
+        ob_describe(cls, sel, enc, c"method".as_ptr(), scratch);
         (*scratch).generation = generation;
-        ob_remember(scratch)
+        ob_remember(scratch, enc)
     }
 }
 

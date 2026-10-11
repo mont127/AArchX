@@ -4,7 +4,10 @@
 //! Each is given a guest thunk instead: a page of 16-byte stubs, each carrying
 //! its number in r10 and jumping into ocerz's native-IMP trampoline, which
 //! lands back in ocerz_objc_imp_trap and the send it describes.  64 pages of
-//! 128 stubs each, made on demand and never freed, same as C.
+//! 128 stubs each, made on demand and never freed, same as C.  An IMP's
+//! thunk number is its place in the table, found again through an
+//! open-addressed index of twice the table's size, so asking for a bound IMP
+//! costs a hash probe rather than a walk over every IMP bound before it.
 //!
 //! imp_implementationWithBlock's implementation is guest code, as libobjc's
 //! own trampolines are: a stub that moves self over _cmd, puts the block in
@@ -28,6 +31,8 @@ const OB_IMP_PAGES: usize = 64;
 const OB_IMP_MAX: usize = OB_IMP_PER_PAGE * OB_IMP_PAGES;
 const OB_IMP_STRIDE: usize = 16;
 const OB_IMP_SLOT: usize = 0x800;
+const OB_IMP_HASH: usize = OB_IMP_MAX * 2;
+const OB_IMP_HASH_BITS: u32 = OB_IMP_HASH.trailing_zeros();
 
 #[repr(C)]
 pub struct ObImp {
@@ -43,6 +48,24 @@ pub static G_OB_IMPS_N: AtomicU32 = AtomicU32::new(0);
 static G_OB_IMP_PAGES: [AtomicU64; OB_IMP_PAGES] =
     [const { AtomicU64::new(0) }; OB_IMP_PAGES];
 static mut G_OB_IMP_LOCK: libc::pthread_mutex_t = libc::PTHREAD_MUTEX_INITIALIZER;
+static mut G_OB_IMP_INDEX: [u16; OB_IMP_HASH] = [0; OB_IMP_HASH];
+
+const _: () = assert!(OB_IMP_HASH.is_power_of_two() && OB_IMP_MAX < u16::MAX as usize);
+
+unsafe fn ob_imp_find_locked(imp: *mut c_void) -> (usize, usize) {
+    unsafe {
+        let mask = OB_IMP_HASH - 1;
+        let mut h = ((imp as u64 >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> (64 - OB_IMP_HASH_BITS)) as usize;
+        loop {
+            let at = G_OB_IMP_INDEX[h];
+            if at == 0 || G_OB_IMPS[at as usize - 1].imp == imp {
+                return (h, at as usize);
+            }
+            h = (h + 1) & mask;
+        }
+    }
+}
 
 pub static G_OB_SEL_METHOD_FOR: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 pub static G_OB_SEL_INSTANCE_METHOD_FOR: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
@@ -147,14 +170,10 @@ pub unsafe extern "C" fn ocerz_objc_imp_for_guest(native_imp: *mut c_void, types
         let mut answer = 0u64;
         libc::pthread_mutex_lock(&raw mut G_OB_IMP_LOCK);
         let n = G_OB_IMPS_N.load(Ordering::SeqCst) as usize;
-        let mut k = 0usize;
-        while k < n {
-            if G_OB_IMPS[k].imp == native_imp {
-                break;
-            }
-            k += 1;
-        }
+        let (slot, at) = ob_imp_find_locked(native_imp);
+        let k = if at != 0 { at - 1 } else { n };
         if k == n && n < OB_IMP_MAX {
+            G_OB_IMP_INDEX[slot] = (n + 1) as u16;
             G_OB_IMPS[n].imp = native_imp;
             G_OB_IMPS[n].types = if types.is_null() { null_mut() } else { libc::strdup(types) };
             G_OB_IMPS[n].stret = ob_types_stret(types);

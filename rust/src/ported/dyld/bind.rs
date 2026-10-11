@@ -184,9 +184,105 @@ unsafe fn native_guest_runtime_for(
     }
 }
 
+struct OrdDep {
+    name: *const c_char,
+    seen: u32,
+    dep: *mut DynImage,
+}
+
+struct OrdDeps {
+    n: c_int,
+    ent: *mut OrdDep,
+}
+
+unsafe fn ord_deps_new(img: *mut DynImage) -> OrdDeps {
+    let mh = (*img).slice;
+    let ncmds = rd32(mh.add(16));
+    let mut lc = mh.add(core::mem::size_of::<MachHeader64>());
+    let mut n = 0;
+    for _ in 0..ncmds {
+        let cmd = rd32(lc);
+        if cmd == 0xc || cmd == 0x8000_0018 || cmd == 0x8000_001f || cmd == 0x8000_0023 {
+            n += 1;
+        }
+        lc = lc.add(rd32(lc.add(4)) as usize);
+    }
+    let ent = if n != 0 {
+        libc::calloc(n as usize, core::mem::size_of::<OrdDep>()).cast::<OrdDep>()
+    } else {
+        ptr::null_mut()
+    };
+    if ent.is_null() {
+        return OrdDeps {
+            n: 0,
+            ent: ptr::null_mut(),
+        };
+    }
+    lc = mh.add(core::mem::size_of::<MachHeader64>());
+    let mut k = 0;
+    for _ in 0..ncmds {
+        let cmd = rd32(lc);
+        if cmd == 0xc || cmd == 0x8000_0018 || cmd == 0x8000_001f || cmd == 0x8000_0023 {
+            (*ent.add(k)).name = lc.add(rd32(lc.add(8)) as usize).cast();
+            k += 1;
+        }
+        lc = lc.add(rd32(lc.add(4)) as usize);
+    }
+    OrdDeps { n, ent }
+}
+
+unsafe fn ord_deps_free(deps: *mut OrdDeps) {
+    libc::free((*deps).ent.cast());
+    (*deps).ent = ptr::null_mut();
+    (*deps).n = 0;
+}
+
+unsafe fn ordinal_dep_lookup(img: *mut DynImage, tgt: *const c_char) -> *mut DynImage {
+    let mut dep = dimg_find_by_install_name(tgt);
+    if dep.is_null() {
+        dep = dimg_find_by_path(tgt);
+    }
+    if dep.is_null() && tgt.read() == b'@' as c_char {
+        let mut ex = [0 as c_char; 1024];
+        if super::load::expand_at_prefix(img, tgt, ex.as_mut_ptr(), ex.len()) != 0 {
+            dep = dimg_find_by_path(ex.as_ptr());
+            if dep.is_null() {
+                dep = dimg_find_by_install_name(ex.as_ptr());
+            }
+        }
+    }
+    dep
+}
+
+unsafe fn ordinal_dep(
+    img: *mut DynImage,
+    deps: *mut OrdDeps,
+    libord: c_int,
+    dep: *mut *mut DynImage,
+) -> *const c_char {
+    if deps.is_null() || (*deps).ent.is_null() {
+        let tgt = dimg_ordinal_name(img, libord);
+        if !tgt.is_null() {
+            *dep = ordinal_dep_lookup(img, tgt);
+        }
+        return tgt;
+    }
+    if libord > (*deps).n {
+        return ptr::null();
+    }
+    let e = (*deps).ent.add(libord as usize - 1);
+    if (*e).seen != g_dimgs_gen {
+        (*e).dep = ordinal_dep_lookup(img, (*e).name);
+        (*e).seen = g_dimgs_gen;
+    }
+    *dep = (*e).dep;
+    (*e).name
+}
+
 unsafe fn resolve_import(
     cache: *mut OcerzCache,
     img: *mut DynImage,
+    deps: *mut OrdDeps,
     name: *const c_char,
     libord: c_int,
     weak: c_int,
@@ -196,21 +292,9 @@ unsafe fn resolve_import(
     let mut virtual_dep = 0;
     let mut tgt = ptr::null();
     if libord > 0 {
-        tgt = dimg_ordinal_name(img, libord);
+        let mut dep = ptr::null_mut();
+        tgt = ordinal_dep(img, deps, libord, &mut dep);
         if !tgt.is_null() {
-            let mut dep = dimg_find_by_install_name(tgt);
-            if dep.is_null() {
-                dep = dimg_find_by_path(tgt);
-            }
-            if dep.is_null() && tgt.read() == b'@' as c_char {
-                let mut ex = [0 as c_char; 1024];
-                if super::load::expand_at_prefix(img, tgt, ex.as_mut_ptr(), ex.len()) != 0 {
-                    dep = dimg_find_by_path(ex.as_ptr());
-                    if dep.is_null() {
-                        dep = dimg_find_by_install_name(ex.as_ptr());
-                    }
-                }
-            }
             if !dep.is_null() {
                 native_guest_runtime_for(cache, img, dep, name);
                 value = ocerz_image_self_resolve_ex(dep, name, &mut found);
@@ -357,6 +441,7 @@ pub(super) unsafe fn apply_fixups(img: *mut DynImage, cache: *mut OcerzCache) ->
         libc::free(ivals.cast());
         ivals = ptr::null_mut();
     }
+    let mut deps = ord_deps_new(img);
     let sii = cf.add(starts_off as usize);
     let seg_count = rd32(sii);
     for s in 0..seg_count {
@@ -377,6 +462,7 @@ pub(super) unsafe fn apply_fixups(img: *mut DynImage, cache: *mut OcerzCache) ->
             );
             libc::free(ivals.cast());
             libc::free(idone.cast());
+            ord_deps_free(&mut deps);
             return ffi::OCERZ_EUNSUP;
         }
         for pg in 0..page_count {
@@ -408,7 +494,7 @@ pub(super) unsafe fn apply_fixups(img: *mut DynImage, cache: *mut OcerzCache) ->
                         if !idone.is_null() && idone.add(ordinal as usize).read() != 0 {
                             value = ivals.add(ordinal as usize).read();
                         } else {
-                            value = resolve_import(cache, img, name, libord, weakimp);
+                            value = resolve_import(cache, img, &mut deps, name, libord, weakimp);
                             if !idone.is_null() {
                                 ivals.add(ordinal as usize).write(value);
                                 idone.add(ordinal as usize).write(1);
@@ -435,6 +521,7 @@ pub(super) unsafe fn apply_fixups(img: *mut DynImage, cache: *mut OcerzCache) ->
     }
     libc::free(ivals.cast());
     libc::free(idone.cast());
+    ord_deps_free(&mut deps);
     ffi::OCERZ_OK
 }
 
@@ -454,6 +541,7 @@ unsafe fn classic_resolve(
     libord: c_int,
     weak: c_int,
     memo: *mut ClassicMemo,
+    deps: *mut OrdDeps,
 ) -> u64 {
     if (*memo).valid != 0
         && name == (*memo).name
@@ -462,7 +550,7 @@ unsafe fn classic_resolve(
     {
         return (*memo).value;
     }
-    let value = resolve_import(cache, img, name, libord, weak);
+    let value = resolve_import(cache, img, deps, name, libord, weak);
     (*memo).name = name;
     (*memo).libord = libord;
     (*memo).weak = weak;
@@ -541,6 +629,7 @@ unsafe fn classic_bind_stream(
     mut p: *const u8,
     end: *const u8,
     is_lazy: c_int,
+    deps: *mut OrdDeps,
 ) {
     let mut memo = ClassicMemo {
         name: ptr::null(),
@@ -596,7 +685,7 @@ unsafe fn classic_bind_stream(
             }
             0x80 => addr = addr.wrapping_add(self_uleb(&mut p, end)),
             0x90 => {
-                let value = classic_resolve(img, cache, name, libord, weak, &mut memo);
+                let value = classic_resolve(img, cache, name, libord, weak, &mut memo, deps);
                 crate::ported::dyldapi::hostmem::ocerz_st(
                     addr,
                     8,
@@ -609,7 +698,7 @@ unsafe fn classic_bind_stream(
                 addr = addr.wrapping_add(8);
             }
             0xa0 => {
-                let value = classic_resolve(img, cache, name, libord, weak, &mut memo);
+                let value = classic_resolve(img, cache, name, libord, weak, &mut memo, deps);
                 crate::ported::dyldapi::hostmem::ocerz_st(
                     addr,
                     8,
@@ -622,7 +711,7 @@ unsafe fn classic_bind_stream(
                 addr = addr.wrapping_add(8).wrapping_add(self_uleb(&mut p, end));
             }
             0xb0 => {
-                let value = classic_resolve(img, cache, name, libord, weak, &mut memo);
+                let value = classic_resolve(img, cache, name, libord, weak, &mut memo, deps);
                 crate::ported::dyldapi::hostmem::ocerz_st(
                     addr,
                     8,
@@ -638,7 +727,7 @@ unsafe fn classic_bind_stream(
                 let count = self_uleb(&mut p, end);
                 let skip = self_uleb(&mut p, end);
                 for _ in 0..count {
-                    let value = classic_resolve(img, cache, name, libord, weak, &mut memo);
+                    let value = classic_resolve(img, cache, name, libord, weak, &mut memo, deps);
                     crate::ported::dyldapi::hostmem::ocerz_st(
                         addr,
                         8,
@@ -677,6 +766,7 @@ unsafe fn legacy_symbol(
     strs: *const c_char,
     strsize: u32,
     index: u32,
+    deps: *mut OrdDeps,
 ) -> u64 {
     const N_ABS: u8 = 0x02;
     const N_WEAK_REF: u16 = 0x0040;
@@ -700,6 +790,7 @@ unsafe fn legacy_symbol(
     resolve_import(
         cache,
         img,
+        deps,
         strs.add(strx as usize),
         legacy_ordinal(img, desc),
         (desc & N_WEAK_REF != 0) as c_int,
@@ -742,6 +833,7 @@ pub(super) unsafe fn apply_legacy_relocations(img: *mut DynImage, cache: *mut Oc
     if symtab.is_null() || dysymtab.is_null() {
         return ffi::OCERZ_OK;
     }
+    let mut deps = ord_deps_new(img);
     let syms = h.add(rd32(symtab.add(8)) as usize);
     let nsyms = rd32(symtab.add(12));
     let strs = h.add(rd32(symtab.add(16)) as usize).cast::<c_char>();
@@ -782,7 +874,16 @@ pub(super) unsafe fn apply_legacy_relocations(img: *mut DynImage, cache: *mut Oc
                 continue;
             }
             let at = reloc_base.wrapping_add(addr as i64 as u64);
-            let target = legacy_symbol(img, cache, syms, nsyms, strs, strsize, info & 0x00ff_ffff);
+            let target = legacy_symbol(
+                img,
+                cache,
+                syms,
+                nsyms,
+                strs,
+                strsize,
+                info & 0x00ff_ffff,
+                &mut deps,
+            );
             let value = crate::ported::dyldapi::hostmem::ocerz_ld(at, 8).wrapping_add(target);
             crate::ported::dyldapi::hostmem::ocerz_st(at, 8, value);
         }
@@ -821,7 +922,8 @@ pub(super) unsafe fn apply_legacy_relocations(img: *mut DynImage, cache: *mut Oc
                             .wrapping_add((*img).slide);
                         crate::ported::dyldapi::hostmem::ocerz_st(at, 8, value);
                     } else {
-                        let value = legacy_symbol(img, cache, syms, nsyms, strs, strsize, index);
+                        let value =
+                            legacy_symbol(img, cache, syms, nsyms, strs, strsize, index, &mut deps);
                         crate::ported::dyldapi::hostmem::ocerz_st(at, 8, value);
                     }
                 }
@@ -829,6 +931,7 @@ pub(super) unsafe fn apply_legacy_relocations(img: *mut DynImage, cache: *mut Oc
         }
         lc = lc.add(size as usize);
     }
+    ord_deps_free(&mut deps);
     ffi::OCERZ_OK
 }
 
@@ -837,6 +940,7 @@ pub(super) unsafe fn apply_classic_fixups(img: *mut DynImage, cache: *mut OcerzC
         return apply_legacy_relocations(img, cache);
     }
     classic_rebase(img);
+    let mut deps = ord_deps_new(img);
     if (*img).bind_size != 0 {
         classic_bind_stream(
             img,
@@ -846,6 +950,7 @@ pub(super) unsafe fn apply_classic_fixups(img: *mut DynImage, cache: *mut OcerzC
                 .slice
                 .add((*img).bind_off.wrapping_add((*img).bind_size) as usize),
             0,
+            &mut deps,
         );
     }
     if (*img).weak_bind_size != 0 {
@@ -857,6 +962,7 @@ pub(super) unsafe fn apply_classic_fixups(img: *mut DynImage, cache: *mut OcerzC
                 .slice
                 .add((*img).weak_bind_off.wrapping_add((*img).weak_bind_size) as usize),
             0,
+            &mut deps,
         );
     }
     if (*img).lazy_bind_size != 0 {
@@ -868,7 +974,9 @@ pub(super) unsafe fn apply_classic_fixups(img: *mut DynImage, cache: *mut OcerzC
                 .slice
                 .add((*img).lazy_bind_off.wrapping_add((*img).lazy_bind_size) as usize),
             1,
+            &mut deps,
         );
     }
+    ord_deps_free(&mut deps);
     ffi::OCERZ_OK
 }

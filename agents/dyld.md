@@ -72,6 +72,8 @@ The full gate on detached tip commit `ff3e398` also times out in `datomic_counte
 
 The libc Darwin `pthread_mutex_t` fields are private in the pinned libc version. The recursive load mutex is therefore initialized from its 64-byte C ABI representation, with `_PTHREAD_RECURSIVE_MUTEX_SIG_init` (`0x32aaaba2`) in the signature word; compile-time size assertions and the dlopen smoke cover the layout and use. `ndl_err!` formats into the native thread's error buffer through `snprintf`, preserving the C format strings without Rust C variadics.
 
+Two lookups are memoized beyond the C. `resolve_import` takes the library ordinal's dependency image from a per-pass `OrdDeps` table, valid while `g_dimgs_gen` is unchanged; every site that registers an image, sets `rpath_name` or drops images calls `dimg_registry_changed()`, and a new such site must too. Native `dlsym(handle)` reuses the handle's breadth-first dependency order, keyed on the published count, from `G_NDL_DEPS`.
+
 TLV descriptors retain the C packed layout and first-touch behavior; the full native gate passes `tlv_main`, `tlv_bss`, `tlv_layout`, `tlv_threads`, `tlv_thread_churn`, and `tlv_dylib`. Guest-memory, VM, and callback paths use plain data and libc allocation; the dyld modules contain no `Vec`, `Box`, or `String`. `ocerz_main_mh` belongs to dyld, while `g_main_path` remains defined by dyldapi.
 
 ### Verification

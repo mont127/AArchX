@@ -42,6 +42,7 @@ use core::ptr::{self, addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::ffi;
+use crate::ported::jit_cache;
 use crate::jit_internal::{
     blk_mode32, blk_rip, jit_key, ocerz_g2h, ras_cell_register, ras_entry_for, tc_noload_has,
 };
@@ -421,14 +422,22 @@ unsafe fn tc_ras_fill(
     cell: *mut *mut c_void,
     retaddr: u64,
     mode32: c_int,
+    registered: bool,
 ) {
     unsafe {
         let rb = ffi::cache_lookup(jit, retaddr, mode32);
         if !rb.is_null() && (*rb).code.is_some() {
             *cell = ras_entry_for(rb);
+            if registered {
+                jit_cache::ras_cell_note(cell, *cell);
+            }
         } else {
             *cell = ptr::null_mut();
-            ffi::pending_add_ras(jit_key(retaddr, mode32), cell);
+            if registered {
+                jit_cache::pending_add_ras_cell(jit_key(retaddr, mode32), cell);
+            } else {
+                ffi::pending_add_ras(jit_key(retaddr, mode32), cell);
+            }
         }
     }
 }
@@ -476,8 +485,8 @@ pub unsafe extern "C" fn tc_bind(
             let r = rel.wrapping_offset(i as isize);
             let w = code.wrapping_offset((*r).off as isize);
             if (*r).kind as c_int == ffi::TCR_RASCELL as c_int {
-                ras_cell_register(w.cast());
-                tc_ras_fill(jit, w.cast(), (*r).arg, mode32);
+                let registered = ras_cell_register(w.cast()) != 0;
+                tc_ras_fill(jit, w.cast(), (*r).arg, mode32, registered);
                 continue;
             }
             if fresh == 0 {
@@ -485,7 +494,13 @@ pub unsafe extern "C" fn tc_bind(
             }
             let val = *tc_val_ptr().wrapping_offset(i as isize);
             if (*r).kind as c_int == ffi::TCR_RASSLOT as c_int {
-                tc_ras_fill(jit, val as usize as *mut *mut c_void, (*r).arg, mode32);
+                tc_ras_fill(
+                    jit,
+                    val as usize as *mut *mut c_void,
+                    (*r).arg,
+                    mode32,
+                    false,
+                );
             }
             if (*r).form == 1 {
                 w.cast::<u64>().write(val);

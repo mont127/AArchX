@@ -1125,7 +1125,7 @@ pub(super) unsafe fn sys_kevent_id(
             }
             return crate::ffi::OCERZ_STEP_OK as c_int;
         }
-        if !libc::getenv(c"OCERZ_KEVENT_WORKER".as_ptr()).is_null()
+        if env_set!("OCERZ_KEVENT_WORKER")
             && a[2] as i32 > 0
             && a[1] != 0
             && workers::g_wq_running_load() == 0
@@ -1173,7 +1173,7 @@ pub(super) unsafe fn sys_kevent_qos(
             (*cpu).gpr[crate::ffi::OCERZ_RSP as usize].wrapping_add(16),
             8,
         );
-        if !libc::getenv(c"OCERZ_MGRPROBE".as_ptr()).is_null() && kq_flags & 0x20 != 0 {
+        if env_set!("OCERZ_MGRPROBE") && kq_flags & 0x20 != 0 {
             let nch = a[2] as i32;
             libc::fprintf(
                 crate::log::stderr(),

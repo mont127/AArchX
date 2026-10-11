@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, Ordering};
 
 use crate::ffi::{self, OcerzCache};
 use crate::inline::VM_INHERIT_DEFAULT;
+use crate::ported::syscall::util::env_set;
 
 use super::{rd32, rd64};
 
@@ -344,7 +345,7 @@ pub unsafe extern "C" fn ocerz_cache_lazy_fault(addr: usize) -> c_int {
                         );
                         installed = 1;
                     }
-                    if !libc::getenv(c"OCERZ_LAZYCHECK".as_ptr()).is_null() && kr == KERN_SUCCESS {
+                    if env_set!("OCERZ_LAZYCHECK") && kr == KERN_SUCCESS {
                         let chk = libc::mmap(
                             ptr::null_mut(),
                             hp as usize,

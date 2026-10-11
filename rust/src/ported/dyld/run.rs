@@ -304,6 +304,7 @@ pub unsafe extern "C" fn ocerz_dyld_run(
 
     if super::g_main_dimg_valid != 0 {
         libc::free(super::g_main_dimg.owned_buf.cast());
+        super::dlopen::symtab_hash_free(ptr::addr_of_mut!(super::g_main_dimg));
     }
     super::g_main_dimg = img;
     super::g_main_dimg.owned_buf = buf;

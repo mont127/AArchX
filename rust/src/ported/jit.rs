@@ -2979,10 +2979,18 @@ pub unsafe extern "C" fn translate(jit: *mut OcerzJit, rip: u64, mode32: c_int) 
                 tc_note(cell as *mut u32, TCR_RASCELL as _, 1, (*rl).retaddr);
                 continue;
             }
-            ras_cell_register(cell);
+            let registered = ras_cell_register(cell) != 0;
             let rb = cache_lookup(g_xlat_jit, (*rl).retaddr, g_xlat_mode32);
             if !rb.is_null() && (*rb).code.is_some() {
                 *cell = ras_entry_for(rb);
+                if registered {
+                    crate::ported::jit_cache::ras_cell_note(cell, *cell);
+                }
+            } else if registered {
+                crate::ported::jit_cache::pending_add_ras_cell(
+                    jit_key((*rl).retaddr, g_xlat_mode32),
+                    cell,
+                );
             } else {
                 pending_add_ras(jit_key((*rl).retaddr, g_xlat_mode32), cell);
             }

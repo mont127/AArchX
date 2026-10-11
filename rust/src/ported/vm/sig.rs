@@ -3335,11 +3335,14 @@ pub(super) unsafe extern "C" fn async_sig_handler(
                 AtomicU32::from_ptr(&raw mut (*c).sig_host_rcvd[sig as usize])
                     .fetch_add(1, Ordering::Relaxed);
             }
+            crate::ported::syscall::signals::guest_wait_kick();
         }
     }
 }
 
-unsafe extern "C" fn ocerz_kick_handler(_sig: c_int, _si: *mut siginfo_t, _uc: *mut c_void) {}
+unsafe extern "C" fn ocerz_kick_handler(_sig: c_int, _si: *mut siginfo_t, _uc: *mut c_void) {
+    unsafe { crate::ported::syscall::signals::guest_wait_kick() }
+}
 
 pub(super) unsafe fn ocerz_install_kick_handler() {
     unsafe {

@@ -35,7 +35,11 @@ unsafe extern "C" {
         ctx: *mut c_void,
     ) -> c_int;
     fn sigsetjmp(env: *mut sigjmp_buf, savemask: c_int) -> c_int;
+    fn __sigreturn(uctx: *mut c_void, infostyle: c_int, token: usize) -> c_int;
 }
+
+const UC_SET_ALT_STACK: c_int = 0x4000_0000;
+const UC_RESET_ALT_STACK: c_int = 0x8000_0000u32 as c_int;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ocerz_vm_init(vm: *mut OcerzVM) -> c_int {
@@ -295,12 +299,27 @@ struct CallCtx {
     any_diag: c_int,
     prof_next: u64,
     esc_r: c_int,
+    onstack: c_int,
 }
 
 unsafe extern "C" fn vm_call_body(ctx_: *mut c_void, rc: c_int) -> c_int {
     unsafe {
         let ctx = ctx_ as *mut CallCtx;
         let c = &mut *ctx;
+        if rc != 0 {
+            let mut empty: sigset_t = core::mem::zeroed();
+            sigemptyset(&mut empty);
+            pthread_sigmask(SIG_SETMASK, &empty, ptr::null_mut());
+            __sigreturn(
+                ptr::null_mut(),
+                if c.onstack & libc::SS_ONSTACK != 0 {
+                    UC_SET_ALT_STACK
+                } else {
+                    UC_RESET_ALT_STACK
+                },
+                0,
+            );
+        }
         c.esc_r = if rc == 2 { T_JIT_ESCAPE_R } else { 0 };
         T_JIT_ESCAPE_R = 0;
         ffi::ocerz_jit_thread_restore(c.jmark);
@@ -723,14 +742,18 @@ unsafe fn vm_call_core(
             any_diag,
             prof_next,
             esc_r: 0,
+            onstack: 0,
         };
         G_CUR_CPU = &mut c.local;
         G_SIG_RECOVER = &mut c.jb;
         ocerz_host_sigmask_clear(c"callback".as_ptr());
         c.jmark = ffi::ocerz_jit_thread_mark();
+        let mut oss: stack_t = core::mem::zeroed();
+        sigaltstack(ptr::null(), &mut oss);
+        c.onstack = oss.ss_flags;
         ocerz_vm_setjmp_run(
             &mut c.jb,
-            1,
+            0,
             vm_call_body,
             &mut c as *mut CallCtx as *mut c_void,
         )

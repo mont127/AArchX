@@ -76,7 +76,7 @@ pub(super) unsafe fn ocerz_release_received_ool(
     keep_port_rights: c_int,
 ) {
     unsafe {
-        if address == 0 || bytes == 0 || !libc::getenv(c"OCERZ_KEEP_RAW_OOL".as_ptr()).is_null() {
+        if address == 0 || bytes == 0 || env_set!("OCERZ_KEEP_RAW_OOL") {
             return;
         }
         if ty == MACH_MSG_OOL_PORTS_DESCRIPTOR as u8 && keep_port_rights == 0 {
@@ -103,7 +103,7 @@ pub(super) unsafe fn ocerz_bridge_mach_msg(hbuf: u64, sz: u64) -> u64 {
             return 0;
         }
         let mut total = sz;
-        if libc::getenv(c"OCERZ_NO_AUXTAIL".as_ptr()).is_null() {
+        if !env_set!("OCERZ_NO_AUXTAIL") {
             let mut aux = [0u32; 2];
             ptr::copy_nonoverlapping(
                 hbuf.wrapping_add(sz) as usize as *const u32,
@@ -635,7 +635,7 @@ unsafe fn vmmap_pad_save(gmsg: u64, send_size: u32) {
         G_VMMAP_PAD.head = vmmap_pad_take(G_VMMAP_PAD.head_lo, G_VMMAP_PAD.head_n);
         G_VMMAP_PAD.tail = vmmap_pad_take(G_VMMAP_PAD.tail_lo, G_VMMAP_PAD.tail_n);
         G_VMMAP_PAD.armed = c_int::from(!G_VMMAP_PAD.head.is_null() || !G_VMMAP_PAD.tail.is_null());
-        if G_VMMAP_PAD.armed != 0 && !libc::getenv(c"OCERZ_VMMAPLOG".as_ptr()).is_null() {
+        if G_VMMAP_PAD.armed != 0 && env_set!("OCERZ_VMMAPLOG") {
             libc::fprintf(
                 crate::log::stderr(),
                 c"ocerz: VMMAP-PAD save addr=%#llx size=%#llx head=%#llx+%#llx tail=%#llx+%#llx\n"
@@ -799,7 +799,7 @@ unsafe fn xlate_gpu_nocopy_buffer(gmsg: u64, send_size: u32, saved: *mut OcerzOo
             (*saved.add(k)).orig = a0;
             ocerz_st(gmsg.wrapping_add((*saved.add(k)).off), 8, ha);
         }
-        if !libc::getenv(c"OCERZ_MIGTRACE".as_ptr()).is_null() {
+        if env_set!("OCERZ_MIGTRACE") {
             libc::fprintf(
                 crate::log::stderr(),
                 c"ocerz: GPU-NOCOPY[%d] buffer %#llx+%#llx -> host %#llx\n".as_ptr(),
@@ -874,9 +874,7 @@ pub(super) unsafe fn ocerz_send_xlate_descriptors(
             xlate_task_vm_request(gmsg, send_size, msg_id);
         }
         if msg_id == 4811 {
-            if (send_size == 0 || send_size >= 0x4c)
-                && !libc::getenv(c"OCERZ_VMMAPLOG".as_ptr()).is_null()
-            {
+            if (send_size == 0 || send_size >= 0x4c) && env_set!("OCERZ_VMMAPLOG") {
                 libc::fprintf(
                     crate::log::stderr(),
                     c"ocerz: VMMAP-REQ addr=%#llx size=%#llx mask=%#llx flags=%#x\n".as_ptr(),
@@ -892,7 +890,7 @@ pub(super) unsafe fn ocerz_send_xlate_descriptors(
             && crate::ffi::ocerz_low_base != 0
             && bits & 0x80000000 != 0
             && (send_size == 0 || send_size >= 0x4c)
-            && libc::getenv(c"OCERZ_NO_VMMAP_STEER".as_ptr()).is_null()
+            && !env_set!("OCERZ_NO_VMMAP_STEER")
         {
             let flags = ocerz_ld(gmsg.wrapping_add(0x48), 4) as u32;
             let size = ocerz_ld(gmsg.wrapping_add(0x38), 8);
@@ -917,7 +915,7 @@ pub(super) unsafe fn ocerz_send_xlate_descriptors(
                 {
                     ocerz_st(gmsg.wrapping_add(0x30), 8, g);
                     ocerz_st(gmsg.wrapping_add(0x48), 4, ((flags & !1) | 0x4000) as u64);
-                    if !libc::getenv(c"OCERZ_MIGTRACE".as_ptr()).is_null() {
+                    if env_set!("OCERZ_MIGTRACE") {
                         libc::fprintf(
                             crate::log::stderr(),
                             c"ocerz: VMMAP-STEER[%d] size=%#llx mask=%#llx -> guest identity %#llx\n".as_ptr(),

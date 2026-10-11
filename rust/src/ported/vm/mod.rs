@@ -19,7 +19,11 @@
 //! trampoline (ocerz_vm_setjmp_run): the post-setjmp code is a body function
 //! taking a #[repr(C)] context struct in the outer frame, and siglongjmp
 //! lands back inside the trampoline, which returns the body's result.  No
-//! value with a destructor is live across the jump.  macOS arm64 ucontext /
+//! value with a destructor is live across the jump.  The guest call path takes
+//! its sigsetjmp with savemask 0, since the mask it would save is the empty one
+//! ocerz_host_sigmask_clear just left: it records only the sigaltstack flags,
+//! and its body restores the empty mask and that on-stack state itself after a
+//! jump, as siglongjmp of a savemask 1 buffer would.  macOS arm64 ucontext /
 //! mcontext64 are declared repr(C) here with const layout asserts; libc has
 //! no bindings for them.
 
