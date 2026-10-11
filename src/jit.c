@@ -15753,9 +15753,18 @@ static int flag_neutral_ok(const X86Insn *in)
 {
     if (g_pin_class != 3) return 0;
     if (in->op == OCERZ_OP_LEA) {
+        /*
+         * A lea with a 32-bit address in 64-bit code (lea edi, [ebx-8], which
+         * MSVC writes in 7-Zip's LZMA decoder between the sub and its cmovs)
+         * is emit_lea's same add or sub on w registers, flag-free too.
+         * OCERZ_NO_LEA32_GAP=1 keeps it out.
+         */
+        static int no32 = -1;
+        if (no32 < 0) no32 = getenv("OCERZ_NO_LEA32_GAP") ? 1 : 0;
+        int asz_ok = in->addrsize == 8 || (in->addrsize == 4 && !in->mode32 && !no32);
         const X86Operand *d = &in->ops[0], *m = &in->ops[1];
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
-        if (m->kind != OCERZ_OPK_MEM || m->riprel || in->addrsize != 8 || in->seg != OCERZ_SEG_NONE) return 0;
+        if (m->kind != OCERZ_OPK_MEM || m->riprel || !asz_ok || in->seg != OCERZ_SEG_NONE) return 0;
         if (m->base == OCERZ_REG_NONE || pin_slot(m->base) < 0) return 0;
         int has_idx = m->index != OCERZ_REG_NONE;
         if (has_idx && pin_slot(m->index) < 0) return 0;

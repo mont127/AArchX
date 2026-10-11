@@ -19,6 +19,9 @@
  *   register instead of NZCV, with loads between;
  * - carry_imm: adc and sbb of immediates of each sign and size, 32 and 64 bits,
  *   each after its own compare (a csinc after at most one add or sub);
+ * - lz_lea32: the decoder's step with a lea of a 32-bit address between the
+ *   sub and its cmovs (lea edi, [ebx-8], as MSVC writes it), one into a 64-bit
+ *   register, which zero-extends, and a cmp, such a lea and a jcc;
  * each over inputs on both sides of every condition.  Against Rosetta.
  */
 #include <signal.h>
@@ -147,6 +150,34 @@ __asm__(
     "    mov %edi, %eax\n    sub %esi, %eax\n    adc $-1, %edx\n"
     "    shl $8, %r8\n    xor %r8, %rax\n    rol $16, %r9\n    xor %r9, %rax\n    shl $24, %r10\n    xor %r10, %rax\n"
     "    rol $32, %r11\n    xor %r11, %rax\n    rol $40, %rcx\n    xor %rcx, %rax\n    shl $48, %rdx\n    xor %rdx, %rax\n"
+    "    ret\n"
+    ".p2align 4\n"
+    /* lz_lea32(range, code, sym) */
+    "_lz_lea32:\n"
+    "    push %rbx\n    push %rbp\n"
+    "    mov %edi, %eax\n    mov %esi, %ebp\n    mov %rdx, %rbx\n    mov $0x7ff, %r10d\n    mov $0x400, %ecx\n    mov $2, %r11d\n"
+    "    mov %eax, %edi\n"
+    "    shr $0xb, %eax\n"
+    "    imul %ecx, %eax\n"
+    "    sub %eax, %edi\n"
+    "    mov %ebp, %esi\n"
+    "    sub %eax, %ebp\n"
+    "    cmovae %edi, %eax\n"
+    "    leal -0x8(%ebx), %edi\n"
+    "    cmovb %edi, %ebx\n"
+    "    leaq 0x10(%ebx,%esi,2), %r8\n"
+    "    cmovb %esi, %ebp\n"
+    "    mov $0x1f, %edi\n"
+    "    cmovb %r10d, %edi\n"
+    "    sbb $-1, %r11d\n"
+    "    mov %rdx, %rcx\n"
+    "    cmp %esi, %eax\n"
+    "    leal 4(%ecx,%ecx,2), %r9d\n"
+    "    jb 1f\n"
+    "    add $0x100, %r11d\n"
+    "1:  shl $7, %rbx\n    xor %rbx, %rax\n    rol $13, %r8\n    xor %r8, %rax\n    shl $29, %rbp\n    xor %rbp, %rax\n"
+    "    shl $3, %rdi\n    xor %rdi, %rax\n    shl $41, %r11\n    xor %r11, %rax\n    rol $50, %r9\n    xor %r9, %rax\n"
+    "    pop %rbp\n    pop %rbx\n"
     "    ret\n");
 
 uint64_t lz_bit(uint32_t range, uint32_t code, uint32_t prob, uint32_t sym);
@@ -156,6 +187,7 @@ uint64_t jcc_after(uint32_t a, uint32_t b);
 uint64_t lz_load(uint32_t range, uint32_t code, const uint16_t *probs, uint32_t prob);
 uint64_t vc_load(uint32_t a, uint32_t b, const uint8_t *p);
 uint64_t carry_imm(uint64_t a, uint64_t b, uint64_t c);
+uint64_t lz_lea32(uint32_t range, uint32_t code, uint64_t sym);
 
 static uint8_t *g_page;
 static volatile int g_faults, g_fault_cf;
@@ -231,5 +263,16 @@ int main(void)
         hc = hc * 31 + carry_imm(x, y, s ^ (s >> 29));
     }
     printf("carry_imm %llx\n", (unsigned long long)hc);
+
+    uint64_t h32 = 0;
+    for (int i = 0; i < 400000; i++) {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        uint32_t x = (uint32_t)(s >> 32), y = (uint32_t)s;
+        uint32_t range = x | 0x1000000u, code = y % range;
+        uint64_t sym = (s * 0x9e3779b97f4a7c15ull) | ((i & 1) ? 0xfffffff800000000ull : 0);
+        if (i & 2) sym = (sym & ~0xffffffffull) | (i & 7);
+        h32 = h32 * 31 + lz_lea32(range, code, sym);
+    }
+    printf("lz_lea32 %llx\n", (unsigned long long)h32);
     return 0;
 }
