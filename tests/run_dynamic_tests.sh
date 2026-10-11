@@ -864,6 +864,7 @@ run_golden_case dlowstack_disp tests/dynamic/lowstack_disp.c tests/dynamic/lowst
 run_golden_case dlowstack_ptr tests/dynamic/lowstack_ptr.c tests/dynamic/lowstack_ptr.out
 run_golden_case dwine_base tests/dynamic/wine_base.c tests/dynamic/wine_base.out
 run_golden_case dlazy_rsp tests/dynamic/lazy_rsp.c tests/dynamic/lazy_rsp.out
+run_golden_case dnzcv_window tests/dynamic/nzcv_window.c tests/dynamic/nzcv_window.out
 export OCERZ_NO_PROMO=1
 run_golden_case dlazy_rsp_nopromo tests/dynamic/lazy_rsp.c tests/dynamic/lazy_rsp.out
 unset OCERZ_NO_PROMO
@@ -1117,6 +1118,7 @@ export OCERZ_NO_LOW_HOIST=1
 run_low_golden_case dwine_base_low_nohoist tests/dynamic/wine_base.c tests/dynamic/wine_base.out
 unset OCERZ_NO_LOW_HOIST
 run_low_golden_case dlazy_rsp_low tests/dynamic/lazy_rsp.c tests/dynamic/lazy_rsp.out
+run_low_golden_case dnzcv_window_low tests/dynamic/nzcv_window.c tests/dynamic/nzcv_window.out
 export OCERZ_NO_HIGH8_ARITH=1
 run_low_golden_case dlazy_rsp_low_slow tests/dynamic/lazy_rsp.c tests/dynamic/lazy_rsp.out
 unset OCERZ_NO_HIGH8_ARITH

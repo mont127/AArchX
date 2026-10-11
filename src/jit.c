@@ -7324,7 +7324,7 @@ static int rmw_nzcv_ok(const X86Insn *p, const X86Operand *m)
 static int nzcv_fuse_producer(const X86Insn *insns, int ci);
 static int insn_writes_reg(const X86Insn *in, unsigned reg);
 static int flag_neutral_ok(const X86Insn *in);
-#define NZCV_GAP_MAX 3
+#define NZCV_GAP_MAX 8
 static int nzcv_gap_max(void)
 {
     static int v = -1;
@@ -7389,7 +7389,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     else if (c->op == OCERZ_OP_JCC) cc = c->cc;
     else return -1;
     int k = ci - 1;
-    while (k >= 0 && ci - 1 - k < NZCV_GAP_MAX && !nzcv_producer_candidate(&insns[k]) && nzcv_gap_shape(&insns[k]))
+    while (k >= 0 && ci - 1 - k < nzcv_gap_max() && !nzcv_producer_candidate(&insns[k]) && nzcv_gap_shape(&insns[k]))
         k--;
     if (k < 0 || !nzcv_producer_candidate(&insns[k])) return -1;
     for (int m = k + 1; m < ci; m++) {
@@ -7401,7 +7401,7 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
          * (cmp [rcx],eax ; setg al ; setl dl).  A jcc can re-derive its
          * condition from them, so it keeps the rule.
          */
-        if ((c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC) &&
+        if ((c->op == OCERZ_OP_SETCC || c->op == OCERZ_OP_CMOVCC || c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) &&
             (insns[m].op == OCERZ_OP_SETCC || insns[m].op == OCERZ_OP_CMOVCC) && !ENV_ON("OCERZ_NO_NZCV_SIBLING"))
             continue;
         for (int o = 0; o < p->nops; o++) {
