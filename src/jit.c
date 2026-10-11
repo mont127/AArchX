@@ -24956,8 +24956,10 @@ static uint32_t *branch_word_target(uint32_t *site, uint32_t w)
  * chained through a veneer (veneer_make: a literal load and a br), and the branch
  * lands on the veneer, not on the code it goes to.  Unchaining compared the
  * veneer's address with the retired code, so a chain through a veneer was never
- * cut and the retired block went on running from it.  OCERZ_NO_VENEER_UNCHAIN=1
- * compares the veneer's address again.
+ * cut and the retired block went on running from it: after a write to its guest
+ * code, the old code (smc_ras, with every chain made through a veneer, fails with
+ * a stale return site without this).  OCERZ_NO_VENEER_UNCHAIN=1 compares the
+ * veneer's address again.
  */
 static uint32_t *chain_target(const OcerzJit *jit, uint32_t *site, uint32_t w)
 {

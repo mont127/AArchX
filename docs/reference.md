@@ -123,7 +123,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_MEMFN_PLAIN=1` | translate the system's string and memory routines with ordered accesses when the rest of the process has them |
 | `OCERZ_NO_FPB_DEFER=1` | check every floating-point result immediately instead of once per batch |
 | `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
-| `OCERZ_NO_VENEER_UNCHAIN=1` | when a block is retired, leave chains that reach it through a veneer (the way far targets are chained) in place, as before 2026-10-11 |
+| `OCERZ_NO_VENEER_UNCHAIN=1` | when a block is retired, leave chains that reach it through a veneer (the way far targets are chained) in place, as before 2026-10-11: after a write to guest code they reach the old translation |
 | `OCERZ_FORCE_VENEER=1` | chain every block through a veneer, as only far targets are (for tests) |
 | `OCERZ_LIVE_SCAN=1` | search the whole list of live blocks for one being retired whose index does not point back at it |
 | `OCERZ_NO_MOVFUSE=1` | do not fold a `mov` into a following shift |
