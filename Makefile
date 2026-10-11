@@ -97,6 +97,9 @@ $(APIS32_STAMP): $(APIS_INPUTS)
 	done
 	@touch $@
 
+steam32:
+	bash tools/steamgen.sh
+
 check-m32: ocerz apis32
 	bash tests/run_m32_tests.sh
 
@@ -144,4 +147,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: unit guest check apis apis32 check-m32 clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift
+.PHONY: unit guest check apis apis32 steam32 check-m32 clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift
