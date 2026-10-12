@@ -102,6 +102,8 @@ bug is in what that switch controls.
 | --- | --- |
 | `OCERZ_NO_AFP=1` | check NaN results in translated code even where the processor can produce x86's NaNs itself |
 | `OCERZ_NO_JIT_MMX=1` | run MMX instructions in the interpreter |
+| `OCERZ_NO_HIGH8_ARITH=1` | run arithmetic, compares, moves and setcc on ah, ch, dh and bh in the interpreter, in 64-bit code as in 32-bit |
+| `OCERZ_NO_SHIFT_MEM_IMM=1` | run a shift of memory by an immediate (`shr dword [ebp-0x3c], 2`) in the interpreter, in 64-bit code as in 32-bit |
 | `OCERZ_NZCV_GAP=<n>` | hand a compare's flags straight to the setcc, cmov, adc, sbb or jcc reading them only across at most n instructions between (0 to 8, default 8; 3 was the limit before 2026-10-11) |
 | `OCERZ_NO_NZCV_GAP_LOAD=1` | end the window at a load, instead of letting a load sit in it and building the flags again from the compare's record after it |
 | `OCERZ_NO_ADC_CINC=1` | set the carry in a register and add it for an adc or sbb of an immediate whose carry comes straight from a compare, instead of one csinc after at most one add or sub |

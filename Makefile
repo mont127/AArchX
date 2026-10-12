@@ -102,6 +102,7 @@ steam32:
 
 check-m32: ocerz apis32
 	bash tests/run_m32_tests.sh
+	OCERZ_NO_HIGH8_ARITH=1 OCERZ_NO_SHIFT_MEM_IMM=1 bash tests/run_m32_tests.sh high8 shiftmem
 
 check: ocerz unit guest apis
 	bash tests/run_guest_tests.sh --no-jit
