@@ -8,8 +8,9 @@ Steam you already have installed, so it signs in and reaches the Steam API as
 it did on an Intel Mac. Nothing of Valve's is bundled and no Steam emulator is
 involved.
 
-This is experimental. It has been tested mostly with one game, Batman: Arkham
-Asylum. Other 32-bit games may run, stop early or misbehave; the
+This is experimental. It has been tested mostly with two games, Batman: Arkham
+Asylum and Call of Duty: Modern Warfare 3. Other 32-bit games may run, stop early
+or misbehave; the
 [games table](#games) says what has been tried, and grows as more is tested.
 
 ## What you need
@@ -18,8 +19,8 @@ Asylum. Other 32-bit games may run, stop early or misbehave; the
   (`xcode-select --install`).
 - Steam for Mac, signed in to the account that owns the game.
 - A network connection for the one-time setup, which downloads Valve's
-  Steamworks headers (about 50 MB, from Valve's Proton repository) and, for
-  games built with GCC, a 32-bit C++ runtime (from MacPorts).
+  Steamworks headers (about 50 MB, from Valve's Proton repository) and the
+  32-bit C++ runtimes games built with GCC or Apple's clang need (from MacPorts).
 
 ## One-time setup
 
@@ -29,7 +30,7 @@ cd AArchX
 make -j
 make apis32                   # the 32-bit API databases; also makes the 64-bit ones (make apis)
 make steam32                  # the Steam interface database the bridge reads
-tools/fetch_guest32_cxx.sh    # the 32-bit GNU C++ runtime, for games that use it (Batman does)
+tools/fetch_guest32_cxx.sh    # the 32-bit GNU and LLVM C++ runtimes, for games that use them (Batman, MW3)
 ```
 
 Each step is generated from your own Mac's SDK or fetched at a pinned version;
@@ -39,7 +40,10 @@ none of it is committed. Run the setup again after updating AArchX or Xcode.
 
 1. **Install the game in Steam** as usual. Steam marks 32-bit games with a
    warning ("Your current macOS version is unable to run 32-bit games"); it
-   still installs them and lets you press Play.
+   still installs them and lets you press Play. If Steam installs a game's
+   Windows version instead, a tool that changes which platform Steam picks
+   (one that runs Windows games through Steam) is probably active; turn it off
+   for the install.
 2. **Set its launch options.** In Steam, right-click the game, choose
    **Properties**, and under **General → Launch Options** enter, with the path
    to your AArchX folder:
@@ -60,12 +64,18 @@ cannot find Steam and asks Steam to relaunch it.
 | Game | Status | Notes |
 | --- | --- | --- |
 | Batman: Arkham Asylum Game of the Year Edition (Feral, 2014) | Plays | About 60 frames a second on an M4 Max. Signs in to Steam and gets the Steam interfaces it asks for. See below. |
+| Call of Duty: Modern Warfare 3 (Aspyr, 2011), campaign | Plays | Launcher, intro movies with sound, and the campaign, on an M4 Max. Signs in to Steam. See below. |
 
 **Batman: Arkham Asylum.** Its options window (Feral's launcher) opens as a
 black window; the game starts after it. The first run writes default settings,
 key bindings included, and starts full screen. Sound, keyboard, mouse and
 gameplay work. Not yet verified through the bridge: achievements, statistics
 and cloud saves. The Steam overlay is not expected to appear.
+
+**Call of Duty: Modern Warfare 3.** Aspyr's launcher opens first; its Play
+button starts the campaign, which plays its movies and sound. Multiplayer is a
+separate Steam app and has not been tried. Not yet verified through the bridge:
+achievements and cloud saves.
 
 Tried another 32-bit game? Open a
 [compatibility report](https://github.com/mont127/AArchX/issues/new/choose)
