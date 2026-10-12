@@ -1,0 +1,3 @@
+strlcpy 14 [truncat]
+strlcat 8 [abcdefg]
+exit 0

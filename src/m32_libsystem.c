@@ -163,6 +163,16 @@ static int sp_strncat_chk(struct OcerzVM *vm, OcerzCPU *cpu)
     m32_ret(cpu, d, 0, 0);
     return OCERZ_STEP_OK;
 }
+static int sp_strlcpy_chk(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    m32_ret(cpu, (uint32_t)strlcpy(m32_h(m32_arg(cpu, 0)), m32_h(m32_arg(cpu, 1)), m32_arg(cpu, 2)), 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_strlcat_chk(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    m32_ret(cpu, (uint32_t)strlcat(m32_h(m32_arg(cpu, 0)), m32_h(m32_arg(cpu, 1)), m32_arg(cpu, 2)), 0, 0);
+    return OCERZ_STEP_OK;
+}
 
 /* ---- 32-bit layouts of file and time structures (offsets measured with clang -arch i386, 10.8 SDK rules) ---- */
 
@@ -1033,6 +1043,7 @@ static const M32SpecialEntry g_specials[] = {
     { "___memcpy_chk", sp_memcpy_chk }, { "___memmove_chk", sp_memcpy_chk }, { "___memset_chk", sp_memset_chk },
     { "___strcpy_chk", sp_strcpy_chk }, { "___stpcpy_chk", sp_stpcpy_chk }, { "___strcat_chk", sp_strcat_chk },
     { "___strncpy_chk", sp_strncpy_chk }, { "___strncat_chk", sp_strncat_chk },
+    { "___strlcpy_chk", sp_strlcpy_chk }, { "___strlcat_chk", sp_strlcat_chk },
     { "_stat", sp_stat }, { "_lstat", sp_lstat }, { "_fstat", sp_fstat },
     { "_stat$INODE64", sp_stat64 }, { "_lstat$INODE64", sp_lstat64 }, { "_fstat$INODE64", sp_fstat64 },
     { "_stat64", sp_stat64 }, { "_lstat64", sp_lstat64 }, { "_fstat64", sp_fstat64 },
