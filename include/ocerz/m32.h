@@ -93,6 +93,7 @@ uint32_t m32_static_alloc(uint32_t size, uint32_t align);   /* zeroed guest memo
 uint32_t m32_static_code(uint32_t size);                    /* the same, for i386 code m32 generates */
 /* the guest heap (src/m32_mem.c): a dlmalloc mspace inside the window */
 int m32_heap_init(void);
+uint32_t m32_map(uint64_t n);   /* a read-write mapping below the handle cells, or 0 */
 uint32_t m32_malloc(uint32_t n);
 uint32_t m32_calloc(uint32_t n, uint32_t size);
 uint32_t m32_realloc(uint32_t g, uint32_t n);

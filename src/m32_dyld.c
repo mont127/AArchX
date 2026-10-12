@@ -380,10 +380,10 @@ static int map(M32Image *img, int want_fixed)
             return -1;
         img->slide = 0;
     } else {
-        uint64_t base = ocerz_map_anywhere(span, PROT_READ | PROT_WRITE);
-        if (!base || base + span > M32_HANDLE_LO)
+        uint32_t base = m32_map(span);
+        if (!base)
             return -1;
-        img->slide = (int32_t)((uint32_t)base - lo);
+        img->slide = (int32_t)(base - lo);
     }
     img->lo = lo + (uint32_t)img->slide;
     img->hi = hi + (uint32_t)img->slide;

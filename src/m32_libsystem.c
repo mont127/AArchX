@@ -551,8 +551,8 @@ static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
             RETV(M32_MAP_FAILED);
         }
     } else {
-        g = (uint32_t)ocerz_map_anywhere(size, PROT_READ | PROT_WRITE);
-        if (!g || (uint64_t)g + size > M32_HANDLE_LO) {
+        g = m32_map(size);
+        if (!g) {
             errno = ENOMEM;
             RETV(M32_MAP_FAILED);
         }
@@ -590,7 +590,7 @@ static int sp_vm_allocate(struct OcerzVM *vm, OcerzCPU *cpu)
         if ((g & 0x3fff) || ocerz_map_fixed(g, size, PROT_READ | PROT_WRITE) != OCERZ_OK)
             g = 0;
     } else
-        g = (uint32_t)ocerz_map_anywhere(size, PROT_READ | PROT_WRITE);
+        g = m32_map(size);
     if (!g)
         RETV(3);   /* KERN_NO_SPACE */
     m32_wr(addrp, g);
