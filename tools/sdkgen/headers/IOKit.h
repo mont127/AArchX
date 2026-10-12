@@ -16,4 +16,5 @@
 #include <IOKit/hid/IOHIDQueue.h>
 #include <IOKit/hid/IOHIDTransaction.h>
 #include <IOKit/hidsystem/IOHIDLib.h>
+#include <IOKit/graphics/IOGraphicsLib.h>
 #include <SystemConfiguration/SystemConfiguration.h>
