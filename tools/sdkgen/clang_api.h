@@ -142,6 +142,9 @@ unsigned clang_Cursor_isBitField(CXCursor cursor);
 /* C++ interface classes for steamgen (the Steam bridge's vtables) */
 unsigned clang_isCursorDefinition(CXCursor cursor);
 unsigned clang_CXXMethod_isVirtual(CXCursor cursor);
+unsigned clang_CXXMethod_isDefaulted(CXCursor cursor);
+unsigned clang_CXXConstructor_isCopyConstructor(CXCursor cursor);
+unsigned clang_CXXConstructor_isMoveConstructor(CXCursor cursor);
 CXType clang_getCursorResultType(CXCursor cursor);
 int clang_Cursor_getNumArguments(CXCursor cursor);
 CXCursor clang_Cursor_getArgument(CXCursor cursor, unsigned index);

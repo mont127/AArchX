@@ -37,7 +37,7 @@
 #include "clang_api.h"
 
 enum {
-    K_STRUCT = 2, K_CLASS = 4, K_CXXMETHOD = 21, K_NAMESPACE = 22, K_DESTRUCTOR = 25, K_BASE = 44,
+    K_STRUCT = 2, K_CLASS = 4, K_CXXMETHOD = 21, K_NAMESPACE = 22, K_CONSTRUCTOR = 24, K_DESTRUCTOR = 25, K_BASE = 44,
     T_VOID = 2, T_BOOL = 3, T_CHAR_U = 4, T_UCHAR = 5, T_USHORT = 8, T_UINT = 9, T_ULONG = 10, T_ULONGLONG = 11,
     T_CHAR_S = 13, T_SCHAR = 14, T_SHORT = 16, T_INT = 17, T_LONG = 18, T_LONGLONG = 19, T_FLOAT = 21,
     T_DOUBLE = 22, T_POINTER = 101, T_LVALUEREF = 103, T_RECORD = 105, T_ENUM = 106, T_FUNCPROTO = 111,
@@ -84,6 +84,25 @@ static int has_float(CXType rec)
     return f;
 }
 
+/* a record a call passes as its bytes has no copy or move constructor and no destructor of its own (CSteamID and
+ * CGameID have none); with one, both ABIs pass a hidden reference to a copy instead.  ponytail: its own members only,
+ * not its fields' or bases' */
+static int own_copy(CXCursor c, CXCursor parent, CXClientData d)
+{
+    (void)parent;
+    if ((c.kind == K_CONSTRUCTOR && (clang_CXXConstructor_isCopyConstructor(c) || clang_CXXConstructor_isMoveConstructor(c)) &&
+         !clang_CXXMethod_isDefaulted(c)) ||
+        (c.kind == K_DESTRUCTOR && !clang_CXXMethod_isDefaulted(c)))
+        *(int *)d = 1;
+    return CXChildVisit_Continue;
+}
+static int trivially_copied(CXType rec)
+{
+    int own = 0;
+    clang_visitChildren(clang_getTypeDeclaration(rec), own_copy, &own);
+    return !own;
+}
+
 static int is_iface_record(CXType t)
 {
     char *n = cstr(clang_getCursorSpelling(clang_getTypeDeclaration(t)));
@@ -128,6 +147,10 @@ static char type_char(CXType t, int is_result, char *flag, const char **why)
         return 'p';
     }
     case T_RECORD:
+        if (!trivially_copied(c)) {
+            *why = "copied-by-constructor";
+            return 0;
+        }
         if (size == 8 && !has_float(c)) return 'L';
         if (size == 4 && !has_float(c)) return 'u';
         *why = "struct-by-value";
@@ -158,10 +181,8 @@ static int method_visit(CXCursor c, CXCursor parent, CXClientData d)
 {
     (void)parent;
     Class *k = d;
-    if (c.kind == K_BASE) {
-        add_method(k, "(base)", "", 0, "base-class");
-        return CXChildVisit_Continue;
-    }
+    if (c.kind == K_BASE)   /* its virtual methods would take slots before these, as many as it has */
+        die("%s derives from another class, whose vtable slots steamgen does not count\n", k->cls);
     if (c.kind == K_DESTRUCTOR && clang_CXXMethod_isVirtual(c)) {
         add_method(k, "~", "v(p)", 0, "destructor");
         add_method(k, "~", "v(p)", 0, "destructor");
