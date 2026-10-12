@@ -8,6 +8,7 @@
 #include <servers/bootstrap.h>
 #include <wchar.h>
 #include <math.h>
+#include <netdb.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
@@ -1009,6 +1010,110 @@ static int sp_dispatch_once_f(struct OcerzVM *vm, OcerzCPU *cpu)
     return RETV_PLAIN(0);
 }
 
+/* getaddrinfo(node, service, hints, res*) and freeaddrinfo(list): the i386 struct addrinfo is {flags, family,
+ * socktype, protocol, addrlen, canonname, addr, next}, 32 bytes, where the host's pointers are 8 bytes.  The host's
+ * list is copied to guest memory, one block per entry holding its address and name, and freed at once; freeaddrinfo
+ * frees the guest copy.  A sockaddr is the same bytes to both sides.  MW3 aborted in the host's freeaddrinfo. */
+enum { AI_ADDRLEN = 16, AI_CANON = 20, AI_ADDR = 24, AI_NEXT = 28, AI_SIZE32 = 32 };
+static void addrinfo_free(uint32_t g)
+{
+    for (uint32_t next; g; g = next) {
+        next = m32_rd(g + AI_NEXT);
+        m32_free(g);
+    }
+}
+static int sp_getaddrinfo(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t node = m32_arg(cpu, 0), serv = m32_arg(cpu, 1), gh = m32_arg(cpu, 2), gres = m32_arg(cpu, 3);
+    struct addrinfo hints = { 0 }, *list = NULL;
+    if (gh)
+        memcpy(&hints, m32_h(gh), 16);   /* flags, family, socktype, protocol */
+    int r = getaddrinfo(node ? m32_h(node) : NULL, serv ? m32_h(serv) : NULL, gh ? &hints : NULL, &list);
+    uint32_t head = 0, prev = 0;
+    for (struct addrinfo *a = list; !r && a; a = a->ai_next) {
+        uint32_t alen = a->ai_addr ? a->ai_addrlen : 0, nlen = a->ai_canonname ? (uint32_t)strlen(a->ai_canonname) + 1 : 0;
+        uint32_t g = m32_malloc(AI_SIZE32 + alen + nlen);
+        if (!g) {
+            r = EAI_MEMORY;
+            break;
+        }
+        memcpy(m32_h(g), a, 16);
+        m32_wr(g + AI_ADDRLEN, alen);
+        m32_wr(g + AI_ADDR, alen ? g + AI_SIZE32 : 0);
+        m32_wr(g + AI_CANON, nlen ? g + AI_SIZE32 + alen : 0);
+        m32_wr(g + AI_NEXT, 0);
+        memcpy(m32_h(g + AI_SIZE32), a->ai_addr, alen);
+        memcpy(m32_h(g + AI_SIZE32 + alen), a->ai_canonname, nlen);
+        if (prev)
+            m32_wr(prev + AI_NEXT, g);
+        else
+            head = g;
+        prev = g;
+    }
+    if (list)
+        freeaddrinfo(list);
+    if (r) {
+        addrinfo_free(head);
+        head = 0;
+    }
+    if (gres)
+        m32_wr(gres, head);
+    RETV(r);
+}
+static int sp_freeaddrinfo(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    addrinfo_free(m32_arg(cpu, 0));
+    return RETV_PLAIN(0);
+}
+/* gethostbyname(name): the i386 struct hostent {name, aliases, addrtype, length, addr_list}, 20 bytes, rebuilt in guest
+ * memory with its arrays, names and addresses; like the host's static one, the next call replaces it */
+static int sp_gethostbyname(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static uint32_t last;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    uint32_t name = m32_arg(cpu, 0);
+    pthread_mutex_lock(&lock);
+    struct hostent *h = name ? gethostbyname(m32_h(name)) : NULL;
+    uint32_t g = 0;
+    if (h) {
+        uint32_t na = 0, nd = 0, size = 20 + (uint32_t)strlen(h->h_name) + 1;
+        for (; h->h_aliases && h->h_aliases[na]; na++)
+            size += (uint32_t)strlen(h->h_aliases[na]) + 1;
+        for (; h->h_addr_list && h->h_addr_list[nd]; nd++)
+            size += (uint32_t)h->h_length;
+        size += 4 * (na + 1 + nd + 1);
+        g = m32_malloc(size);
+    }
+    if (g) {
+        uint32_t aliases = g + 20, na = 0, nd = 0;
+        while (h->h_aliases && h->h_aliases[na])
+            na++;
+        while (h->h_addr_list && h->h_addr_list[nd])
+            nd++;
+        uint32_t addrs = aliases + 4 * (na + 1), data = addrs + 4 * (nd + 1);
+        m32_wr(g + 8, (uint32_t)h->h_addrtype);
+        m32_wr(g + 12, (uint32_t)h->h_length);
+        m32_wr(g + 4, aliases);
+        m32_wr(g + 16, addrs);
+        for (uint32_t i = 0; i < nd; i++, data += (uint32_t)h->h_length) {
+            memcpy(m32_h(data), h->h_addr_list[i], (size_t)h->h_length);
+            m32_wr(addrs + 4 * i, data);
+        }
+        m32_wr(addrs + 4 * nd, 0);
+        for (uint32_t i = 0; i <= na; i++) {
+            const char *str = i < na ? h->h_aliases[i] : h->h_name;
+            memcpy(m32_h(data), str, strlen(str) + 1);
+            m32_wr(i < na ? aliases + 4 * i : g, data);
+            data += (uint32_t)strlen(str) + 1;
+        }
+        m32_wr(aliases + 4 * na, 0);
+        m32_free(last);
+        last = g;
+    }
+    pthread_mutex_unlock(&lock);
+    return RETV_PLAIN(g);
+}
+
 /* ioctl(fd, request, ...): one argument, guest memory when the request carries data (IOC_IN/IOC_OUT), else a number */
 static int sp_ioctl(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -1039,6 +1144,7 @@ static const M32SpecialEntry g_specials[] = {
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
     { "_execv", sp_execv }, { "_execve", sp_execve },
     { "_ioctl", sp_ioctl },
+    { "_getaddrinfo", sp_getaddrinfo }, { "_freeaddrinfo", sp_freeaddrinfo }, { "_gethostbyname", sp_gethostbyname },
     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },
     { "_mach_absolute_time", sp_mach_absolute_time }, { "_mach_timebase_info", sp_mach_timebase_info },
     { "_UpTime", sp_mach_absolute_time }, { "_AbsoluteToNanoseconds", sp_AbsoluteToNanoseconds },

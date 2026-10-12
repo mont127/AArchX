@@ -1,0 +1,5 @@
+getaddrinfo 0
+  family 2 socktype 1 addrlen 16 127.0.0.1:8080 canon localhost
+missing 1
+gethostbyname localhost type 2 length 4 first 127.0.0.1
+exit 0
