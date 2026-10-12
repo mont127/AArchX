@@ -40,7 +40,7 @@
 typedef struct Slot { char *name; char flag; int bad; M32Export ex; } Slot;
 typedef struct Iface { char *version; Slot *slots; int n; } Iface;
 typedef struct Vt { const Iface *iface; void **hostvt; uint32_t gvt; } Vt;
-typedef struct Proxy { void *host; uint32_t guest; } Proxy;
+typedef struct Proxy { void *host; const Iface *iface; uint32_t guest; } Proxy;
 typedef struct Flagged { uint32_t id; Slot *slot; } Flagged;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -245,20 +245,20 @@ static uint32_t proxy_for(void *host, const char *version)
     if (!host)
         return 0;
     pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_nproxies; i++)
-        if (g_proxies[i].host == host) {
+    load_db();
+    const Iface *f = find_iface(version);
+    for (int i = 0; f && i < g_nproxies; i++)
+        if (g_proxies[i].host == host && g_proxies[i].iface == f) {   /* one object may serve two versions */
             uint32_t g = g_proxies[i].guest;
             pthread_mutex_unlock(&g_lock);
             return g;
         }
-    load_db();
-    const Iface *f = find_iface(version);
     uint32_t g = 0, gvt = f ? vtable_for(*(void ***)host, f) : 0;
     if (gvt && (g = m32_static_alloc(8, 4))) {
         m32_wr(g, gvt);
         m32_alias(g, host);
         g_proxies = realloc(g_proxies, (size_t)(g_nproxies + 1) * sizeof *g_proxies);
-        g_proxies[g_nproxies++] = (Proxy){ host, g };
+        g_proxies[g_nproxies++] = (Proxy){ host, f, g };
     }
     pthread_mutex_unlock(&g_lock);
     if (steam_log() || !f)

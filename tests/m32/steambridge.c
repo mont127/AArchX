@@ -2,7 +2,8 @@
  * that tests/m32/build.sh puts beside the programs: an i386 program that dlopens a steamclient.dylib with no i386
  * slice gets the host's, and its interfaces cross by the notations in steam.api (make steam32). Plain results, a
  * 64-bit result and argument, a C string, output pointers, interfaces returned by an interface and by name, an unknown
- * version, the callback queue, a call result, and string results from two threads at once. steambridge.expected is this program built for arm64 and run
+ * version, one object under two versions (each gets its own vtable), the callback queue, a call result, and string
+ * results from two threads at once. steambridge.expected is this program built for arm64 and run
  * natively against the same stand-in. */
 #include <dlfcn.h>
 #include <pthread.h>
@@ -60,6 +61,8 @@ int main(void)
     printf("user %s utils %s same utils %s wrong version %s\n", u ? "object" : "null", t ? "object" : "null",
            t == t2 ? "yes" : "no", bad ? "object" : "null");
     if (!u || !t) return 1;
+    void *t8 = SLOT(client, 9, void *(*)(void *, int, const char *))(client, pipe, "SteamUtils008");
+    printf("utils 008 %s, big picture %d\n", t8 ? "object" : "null", t8 ? SLOT(t8, 26, bool (*)(void *))(t8) : -1);
 
     uint64_t id = SLOT(u, 2, uint64_t (*)(void *))(u);
     char folder[64] = "";

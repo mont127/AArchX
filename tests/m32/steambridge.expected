@@ -3,6 +3,7 @@ unknown version: null rc 1
 client: object rc 0
 pipe 7 user 71
 user object utils object same utils yes wrong version null
+utils 008 object, big picture 1
 steamid 0110000100000042 folder 1 '/fake/userdata'
 appid 35140 realtime 1234567890 country NZ image 1 10x15 reason 307
 callback 1: user 71 id 1101 size 12 payload 44 89 00 00 00 00 00 00 01 00 00 00
