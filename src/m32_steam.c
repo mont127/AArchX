@@ -77,7 +77,7 @@ static void load_db(void)
         return;
     }
     char line[1024];
-    Iface *cur = NULL;
+    Iface *cur = NULL, *warned = NULL;
     while (fgets(line, sizeof line, f)) {
         char a[256], b[256], c[256], d[256], e[8] = "";
         if (!strncmp(line, "iface ", 6) && sscanf(line, "iface %255s %255s %255s", a, b, c) >= 1) {
@@ -105,8 +105,13 @@ static void load_db(void)
         } else {
             continue;
         }
-        if (k != cur->n)
+        if (k != cur->n) {   /* the generator and the bridge disagree: the later slots would sit one off */
+            if (warned != cur)
+                fprintf(stderr, "ocerz: m32: steam: %s in %s has slot %d where %d belongs; its slots from there are "
+                                "left out (make steam32 again)\n", cur->version, path, k, cur->n);
+            warned = cur;
             continue;
+        }
         cur->slots = realloc(cur->slots, (size_t)(cur->n + 1) * sizeof *cur->slots);
         cur->slots[cur->n++] = s;
     }
