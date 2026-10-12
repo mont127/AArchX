@@ -1,0 +1,4 @@
+parent
+execv argc 3 [two words]
+execve argc 2 M32_EXEC=set
+exit 0

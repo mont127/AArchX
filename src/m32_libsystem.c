@@ -26,6 +26,7 @@
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
 #include "ocerz/m32_objc.h"
+#include "ocerz/syscall.h"
 #include "ocerz/types.h"
 #include "ocerz/vm.h"
 
@@ -965,8 +966,27 @@ static int sp_dispatch_once_f(struct OcerzVM *vm, OcerzCPU *cpu)
     return RETV_PLAIN(0);
 }
 
+/* execv/execve: the vectors hold 4-byte pointers; the new program runs under ocerz as well (an i386 one by m32) */
+static int exec_guest(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t genv)
+{
+    extern char **environ;
+    char *v[2][512];
+    uint32_t gv[2] = { m32_arg(cpu, 1), genv };
+    for (int k = 0; k < 2; k++) {
+        int n = 0;
+        for (uint32_t p; gv[k] && n < 511 && (p = m32_rd(gv[k] + 4 * (uint32_t)n)); n++)
+            v[k][n] = (char *)m32_h(p);
+        v[k][n] = NULL;
+    }
+    errno = ocerz_guest_execve(vm, cpu, (const char *)m32_h(m32_arg(cpu, 0)), v[0], genv ? v[1] : environ);
+    RETV(-1);
+}
+static int sp_execv(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, cpu, 0); }
+static int sp_execve(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, cpu, m32_arg(cpu, 2)); }
+
 static const M32SpecialEntry g_specials[] = {
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
+    { "_execv", sp_execv }, { "_execve", sp_execve },
     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },
     { "_mach_absolute_time", sp_mach_absolute_time }, { "_mach_timebase_info", sp_mach_timebase_info },
     { "_UpTime", sp_mach_absolute_time }, { "_AbsoluteToNanoseconds", sp_AbsoluteToNanoseconds },
