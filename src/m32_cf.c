@@ -6,6 +6,7 @@
  * long length}.  Each one gets an immortal host CFString, and the guest address is aliased to it, so passing the
  * literal to any CF or Foundation function reaches a real string while the guest keeps its own pointer.
  */
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -469,6 +470,62 @@ static int sp_FSGetCatalogInfo(struct OcerzVM *vm, OcerzCPU *cpu)
     m32_ret(cpu, (uint32_t)(int32_t)r, 0, 0);
     return OCERZ_STEP_OK;
 }
+/* FSGetCatalogInfoBulk(iterator, maximumObjects, actualObjects*, containerChanged*, whichInfo, catalogInfos, refs,
+ * specs, names): the catalog records convert one by one and the count is an ItemCount; FSRef, FSSpec and HFSUniStr255
+ * are the same bytes to both sides */
+static int sp_FSGetCatalogInfoBulk(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int16_t (*f)(void *, unsigned long, unsigned long *, void *, uint32_t, void *, void *, void *, void *) =
+        cs("FSGetCatalogInfoBulk");
+    uint32_t max = m32_arg(cpu, 1), gact = m32_arg(cpu, 2), gchg = m32_arg(cpu, 3), info = m32_arg(cpu, 5);
+    uint32_t refs = m32_arg(cpu, 6), specs = m32_arg(cpu, 7), names = m32_arg(cpu, 8);
+    uint8_t *h = info && max && max < (1u << 20) ? calloc(max, CAT_SIZE64) : NULL;
+    unsigned long n = 0;
+    int16_t r = f && (h || !info) ? f(m32_host(m32_arg(cpu, 0)), max, &n, gchg ? m32_h(gchg) : NULL, m32_arg(cpu, 4), h,
+                                      refs ? m32_h(refs) : NULL, specs ? m32_h(specs) : NULL, names ? m32_h(names) : NULL)
+                                  : -50;
+    for (unsigned long i = 0; h && i < n; i++)
+        cat_to_guest(h + i * CAT_SIZE64, info + (uint32_t)i * CAT_SIZE32);
+    free(h);
+    if (gact)
+        m32_wr(gact, (uint32_t)n);
+    m32_ret(cpu, (uint32_t)(int32_t)r, 0, 0);
+    return OCERZ_STEP_OK;
+}
+/* PBReadForkAsync(FSForkIOParam *): the i386 block (offsets measured with clang -arch i386) is read on a queue standing
+ * in for the File Manager's thread, as on a Mac: ioResult is 1 while queued, then the read's result and actualCount,
+ * then the guest's ioCompletion(block) runs on that thread. */
+enum { FIO_COMPLETION = 12, FIO_RESULT = 16, FIO_REFNUM = 24, FIO_BUFFER = 32, FIO_REQUEST = 36, FIO_ACTUAL = 40,
+       FIO_MODE = 44, FIO_OFFSET = 46 };
+static void fork_read(void *ctx)
+{
+    uint32_t pb = (uint32_t)(uintptr_t)ctx;
+    int16_t (*rd)(int, uint16_t, int64_t, unsigned long, void *, unsigned long *) = cs("FSReadFork");
+    int64_t off;
+    memcpy(&off, m32_h(pb + FIO_OFFSET), 8);
+    uint16_t mode;
+    memcpy(&mode, m32_h(pb + FIO_MODE), 2);
+    int16_t ref;
+    memcpy(&ref, m32_h(pb + FIO_REFNUM), 2);
+    unsigned long got = 0;
+    int16_t r = rd ? rd(ref, mode, off, m32_rd(pb + FIO_REQUEST), m32_h(m32_rd(pb + FIO_BUFFER)), &got) : -50;
+    m32_wr(pb + FIO_ACTUAL, (uint32_t)got);
+    __atomic_store_n((int16_t *)m32_h(pb + FIO_RESULT), r, __ATOMIC_RELEASE);
+    uint32_t done = m32_rd(pb + FIO_COMPLETION);
+    if (done)
+        ((void (*)(uint32_t))m32_callback(done, "v(u)", "v(u)"))(pb);
+}
+static int sp_PBReadForkAsync(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("ocerz.m32.file-manager", DISPATCH_QUEUE_SERIAL); });
+    uint32_t pb = m32_arg(cpu, 0);
+    __atomic_store_n((int16_t *)m32_h(pb + FIO_RESULT), (int16_t)1, __ATOMIC_RELEASE);
+    dispatch_async_f(q, (void *)(uintptr_t)pb, fork_read);
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
 /* FSSetCatalogInfo(ref, whichInfo, catalogInfo) */
 static int sp_FSSetCatalogInfo(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -491,6 +548,7 @@ const M32SpecialEntry m32_cf_specials[] = {
     { "_CFDataGetBytePtr", sp_CFDataGetBytePtr }, { "_CFDataGetMutableBytePtr", sp_CFDataGetBytePtr },
     { "_IOHIDValueGetBytePtr", sp_IOHIDValueGetBytePtr },
     { "_FSGetCatalogInfo", sp_FSGetCatalogInfo }, { "_FSSetCatalogInfo", sp_FSSetCatalogInfo },
+    { "_FSGetCatalogInfoBulk", sp_FSGetCatalogInfoBulk }, { "_PBReadForkAsync", sp_PBReadForkAsync },
     { "_CFDictionaryGetKeysAndValues", sp_CFDictionaryGetKeysAndValues }, { "_CFSetGetValues", sp_CFSetGetValues },
     { "_CFBagGetValues", sp_CFBagGetValues }, { "_CFArrayGetValues", sp_CFArrayGetValues },
     { "_GetProcessBundleLocation", sp_GetProcessBundleLocation }, { "_SecCodeCheckValidity", sp_SecCodeCheckValidity },

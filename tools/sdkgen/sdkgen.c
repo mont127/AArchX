@@ -2100,8 +2100,8 @@ static const char *class32(CXType tx, CXType ta, int is_result, Buf *out, int ho
             int same_scalar = (is_integer_kind(k, &sign) || k == TK.Float || k == TK.Double) &&
                               clang_Type_getSizeOf(px) == clang_Type_getSizeOf(pa);
             if (!same_scalar && !layout_same(px, pa, pxs)) {
-                if (is_integer_kind(k, &sign) && !cst && !is_result) {
-                    buf_addc(out, host ? 'p' : sign ? 'W' : 'V');
+                if (is_integer_kind(k, &sign) && !cst && !is_result) {   /* FSIORefNum *: 16 bits on i386, 32 on the host */
+                    buf_addc(out, host ? 'p' : clang_Type_getSizeOf(px) == 2 ? 'S' : sign ? 'W' : 'V');
                     return NULL;
                 }
                 if (px.kind == TK.Record && !is_result) {   /* a structure read, or written back, through a pointer */

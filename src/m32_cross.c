@@ -35,7 +35,7 @@ static int scalar_size(char c, int guest)
     case 'h': case 'H': return 2;
     case 'i': case 'u': case 'f': return 4;
     case 'l': case 'L': case 'T': case 'd': return 8;
-    case 'p': case 's': case 'P': case 'Q': case 'W': case 'V': case 'c': case 'k': case '@': case '#': case ':':
+    case 'p': case 's': case 'P': case 'Q': case 'W': case 'V': case 'S': case 'c': case 'k': case '@': case '#': case ':':
         return guest ? 4 : 8;
     default: return -1;
     }
@@ -733,12 +733,12 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             put_int(&hc, (uint64_t)(uintptr_t)hs, 8);
             continue;
         }
-        if (ga->cls == 'P' || ga->cls == 'W' || ga->cls == 'V') {
+        if (ga->cls == 'P' || ga->cls == 'W' || ga->cls == 'V' || ga->cls == 'S') {
             uint64_t *cell = raw ? scratch(&hc, 8) : NULL;
             if (cell) {
-                uint32_t cur = m32_rd((uint32_t)raw);
+                uint32_t cur = ga->cls == 'S' ? (uint32_t)(int32_t)*(int16_t *)m32_h((uint32_t)raw) : m32_rd((uint32_t)raw);
                 *cell = ga->cls == 'P' ? (uint64_t)(uintptr_t)m32_host(cur)
-                      : ga->cls == 'W' ? (uint64_t)(int64_t)(int32_t)cur : cur;
+                      : ga->cls == 'W' || ga->cls == 'S' ? (uint64_t)(int64_t)(int32_t)cur : cur;
                 wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell, NULL, NULL };
             }
             put_int(&hc, (uint64_t)(uintptr_t)cell, 8);
@@ -830,7 +830,10 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             continue;
         }
         uint64_t v = *wb[i].cell;
-        m32_wr(wb[i].guest, wb[i].cls == 'P' ? m32_handle((void *)(uintptr_t)v) : (uint32_t)v);
+        if (wb[i].cls == 'S')
+            *(int16_t *)m32_h(wb[i].guest) = (int16_t)v;
+        else
+            m32_wr(wb[i].guest, wb[i].cls == 'P' ? m32_handle((void *)(uintptr_t)v) : (uint32_t)v);
     }
     const M32Type *gr = &g->ret, *hr = &h->ret;
     if (gr->cls == 'v') {

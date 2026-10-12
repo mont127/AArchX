@@ -1,0 +1,4 @@
+open 0 guard 0x1234
+read 0 actual 10 [opqrstuvwx] completed 1
+bulk 0 count 3 files 3 bytes 6000
+exit 0
