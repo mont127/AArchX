@@ -10,6 +10,7 @@
  * method's two encodings (i386 from runtime/apis32's .objc32 files or the guest's own method list, host from the
  * host runtime).
  */
+#include <dispatch/dispatch.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
@@ -591,10 +592,42 @@ static void initialize(struct OcerzVM *vm, uint32_t cls)
 typedef struct SendKey { char *genc, *henc; M32Export *e; } SendKey;
 static Map g_sends;   /* hash(genc|henc) -> M32Export* */
 
-static M32Export *send_export(const char *sel, const char *genc, const char *henc, int super)
+/* -[NSOpenGLContext setView:] and -update trap off the main thread in today's AppKit; the Intel Macs these games ran on
+ * allowed them, and SDL 2 makes both from its render thread. They run on the main thread, which the guest's event loop
+ * keeps serving. ponytail: only these two; another AppKit call that traps off the main thread joins on_main. */
+typedef struct MainSend { void *fn, *self; SEL sel; void *arg; } MainSend;
+static void main_send_run(void *p)
+{
+    MainSend *m = p;
+    ((void (*)(void *, SEL, void *))m->fn)(m->self, m->sel, m->arg);
+}
+static void main_call(void *fn, void *self, SEL sel, void *arg)
+{
+    MainSend m = { fn, self, sel, arg };
+    if (pthread_main_np())
+        main_send_run(&m);
+    else
+        dispatch_sync_f(dispatch_get_main_queue(), &m, main_send_run);
+}
+static void main_send(void *self, SEL sel, void *arg) { main_call(M32_MSGSEND, self, sel, arg); }
+static void main_send_super(void *sup, SEL sel, void *arg) { main_call(M32_MSGSENDSUPER, sup, sel, arg); }
+static int on_main(Class cls, const char *sel)
+{
+    static Class gl;
+    if (!gl)
+        gl = objc_getClass("NSOpenGLContext");
+    if (strcmp(sel, "setView:") && strcmp(sel, "update"))
+        return 0;
+    for (; cls; cls = class_getSuperclass(cls))
+        if (cls == gl)
+            return 1;
+    return 0;
+}
+
+static M32Export *send_export(const char *sel, const char *genc, const char *henc, int super, int main)
 {
     char key[2100];
-    snprintf(key, sizeof key, "%s|%s|%d", genc, henc, super);
+    snprintf(key, sizeof key, "%s|%s|%d|%s", genc, henc, super, main ? sel : "");
     uint64_t h = hash_str(key), v;
     LOCK();
     for (;; h += 2) {
@@ -615,7 +648,7 @@ static M32Export *send_export(const char *sel, const char *genc, const char *hen
         e->kind = M32_EX_FN;
         e->gnote = strdup(gn);
         e->hnote = strdup(hn);
-        e->host_fn = super ? M32_MSGSENDSUPER : M32_MSGSEND;
+        e->host_fn = main ? (super ? (void *)main_send_super : (void *)main_send) : super ? M32_MSGSENDSUPER : M32_MSGSEND;
         map_put(&g_sends, h, (uint64_t)(uintptr_t)e);
     }
     UNLOCK();
@@ -821,7 +854,7 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
     }
     if (m32_objc_last_variadic() && !gtypes)
         return send_variadic(vm, cpu, is_super ? NULL : hself, super_cls, hs, name, genc, henc);
-    M32Export *e = send_export(name, genc, henc, is_super);
+    M32Export *e = send_export(name, genc, henc, is_super, on_main(lookup_cls, name));
     if (!e) {
         m32_log_once("a message m32 cannot carry (union, bitfield, long double):", name);
         return ret_nil(cpu, 0);
