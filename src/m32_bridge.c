@@ -179,7 +179,6 @@ static void *hud_wrap(const char *sym, void *fn)
     return w ? w : fn;
 }
 
-/* The trap address for an import of name from lib (NULL: flat lookup). One export per symbol name. */
 /* an export answered by fn, which finds what it serves by its trap (cpu->rip) */
 uint32_t m32_export_special(const char *name, M32Special fn)
 {
@@ -199,6 +198,7 @@ uint32_t m32_export_special(const char *name, M32Special fn)
     return M32_TRAP(id);
 }
 
+/* The trap address for an import of name from lib (NULL: flat lookup). One export per symbol name. */
 uint32_t m32_export(const char *lib, const char *name)
 {
     pthread_mutex_lock(&g_lock);
