@@ -2,8 +2,10 @@
 # fetch_guest32_cxx.sh -- the guest i386 GNU libstdc++ and libgcc_s that m32 programs built with GCC import from
 # /usr/lib, which macOS no longer ships (Batman: Arkham Asylum takes the old-ABI std::string, iostreams and
 # _Rb_tree_* from libstdc++.6.dylib).  Source: MacPorts' i386 build of GCC 15.2's runtime for darwin_10, pinned by
-# SHA-256 (GPLv3 with the GCC Runtime Library Exception).  It runs as guest code from runtime/guest32, where m32
-# looks for /usr/lib names first; the directory is not tracked.
+# SHA-256 (GPLv3 with the GCC Runtime Library Exception).  Games built with Apple's clang import LLVM's libc++ instead
+# (Call of Duty: Modern Warfare 3's std::__1 strings): MacPorts' i386 libc++ 5.0.1 and libc++abi for darwin_10, also
+# pinned (MIT and UIUC licenses).  They run as guest code from runtime/guest32, where m32 looks for /usr/lib names
+# first; the directory is not tracked.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 G=runtime/guest32/usr/lib
@@ -24,6 +26,17 @@ for l in libstdc++.6.dylib libgcc_s.1.dylib libgcc_s.1.1.dylib libgcc_ehs.1.1.dy
   for dep in $(otool -L "$G/$l" | awk 'NR>1 {print $1}' | grep '^/opt/local'); do
     install_name_tool -change "$dep" "/usr/lib/$(basename "$dep")" "$G/$l" 2>/dev/null
   done
+done
+# libc++: the package holds an archive of /usr/lib, its install names already the /usr/lib ones
+F=libcxx-5.0.1_5+emulated_tls+universal.darwin_10.i386-x86_64.tbz2
+SHA=2a1fc50fd469ab7aa2e4efe11574e7590fad186265b83bdc2f3e2ee9ae11e243
+curl -sfL -o "$T/$F" "https://packages.macports.org/libcxx/$F"
+echo "$SHA  $T/$F" | shasum -a 256 -c -
+mkdir -p "$T/libcxx" "$T/libcxx-root"
+tar -xjf "$T/$F" -C "$T/libcxx"
+tar -xzf "$T/libcxx/opt/local/var/system_roots/libcxx-5.0.1-5.tgz" -C "$T/libcxx-root"
+for l in libc++.1.dylib libc++abi.dylib; do
+  lipo "$T/libcxx-root/usr/lib/$l" -thin i386 -output "$G/$l"
 done
 otool -L $G/*.dylib
 rm -rf "$T"

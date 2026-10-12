@@ -2,8 +2,9 @@
 # The i386 (m32) gate. Every tests/m32/<name>.expected is the program's stdout plus a final
 # "exit <status>" line. Names on the command line run just those programs.
 # The programs are committed in tests/m32/bin, as tests/guest/bin's are, because linking i386 needs Xcode 26's
-# ld-classic: M32_REBUILD=1 rebuilds them first (tests/m32/build.sh). The C++ programs need the guest GNU libstdc++
-# that tools/fetch_guest32_cxx.sh puts in runtime/guest32, and are skipped without it; steambridge needs the Steam
+# ld-classic: M32_REBUILD=1 rebuilds them first (tests/m32/build.sh). The C++ programs need the guest GNU libstdc++,
+# or LLVM libc++ for those whose .link names it, that tools/fetch_guest32_cxx.sh puts in runtime/guest32, and are
+# skipped without it; steambridge needs the Steam
 # interface database make steam32 writes, and is skipped without it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -14,8 +15,12 @@ names=("$@"); [ ${#names[@]} -gt 0 ] || names=($(cd tests/m32 && ls *.expected |
 log=${TMPDIR:-/tmp}
 fail=0
 for n in "${names[@]}"; do
-  if [ -e "tests/m32/$n.cpp" ] && [ ! -e runtime/guest32/usr/lib/libstdc++.6.dylib ]; then
-    echo "SKIP $n (no runtime/guest32: tools/fetch_guest32_cxx.sh)"; continue
+  if [ -e "tests/m32/$n.cpp" ]; then
+    lib=libstdc++.6.dylib
+    grep -qs -- -lc++ "tests/m32/$n.link" && lib=libc++.1.dylib
+    if [ ! -e "runtime/guest32/usr/lib/$lib" ]; then
+      echo "SKIP $n (no runtime/guest32/usr/lib/$lib: tools/fetch_guest32_cxx.sh)"; continue
+    fi
   fi
   if [ "$n" = steambridge ] && ! ls runtime/apis32/macos/*/steam.api >/dev/null 2>&1; then
     echo "SKIP $n (no Steam interface database: make steam32)"; continue

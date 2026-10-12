@@ -1,0 +1,4 @@
+string 34 short and now longer than one word
+static 1 1 calls 1
+caught 42
+exit 0
