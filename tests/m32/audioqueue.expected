@@ -1,0 +1,8 @@
+new 0
+buffer 0 0 capacity 4096
+buffer 1 0 capacity 4096
+buffer 2 0 capacity 4096
+start 0
+callbacks 1 same 1 intact 1
+dispose 0
+exit 0

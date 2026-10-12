@@ -12,6 +12,7 @@
  * never freed (an app sets a handful).
  */
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -121,6 +122,132 @@ static int sp_AudioUnitSetProperty(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(f(unit, id, scope, element, m32_host(data), size));
 }
 
+/* AudioQueue output (Bink's and Miles' CoreAudio drivers, MW3's movies and sound).  An AudioQueueBuffer is a
+ * structure the guest writes through: i386 {capacity, mAudioData, mAudioDataByteSize, mUserData,
+ * mPacketDescriptionCapacity, mPacketDescriptions, mPacketDescriptionCount}, 28 bytes (clang -arch i386), where the
+ * host's pointers are 8 bytes (mAudioData at 8, mAudioDataByteSize at 16).  Each host
+ * buffer gets a guest twin in that layout with its samples in guest memory; enqueueing copies the samples to the host
+ * buffer, and the output callback hands the guest its twin.  AudioStreamPacketDescription and
+ * AudioStreamBasicDescription are the same bytes to both sides.
+ * ponytail: a table of 512 buffers, searched linearly; AudioQueueNewInput and AudioQueueFreeBuffer are not covered
+ * (Bink and Miles free their buffers with the queue). */
+enum { AQB_CAP = 0, AQB_DATA = 4, AQB_SIZE = 8, AQB_SIZE32 = 28 };
+typedef struct { void *queue, *host; uint32_t guest; } QueueBuffer;
+static QueueBuffer g_qbufs[512];
+static pthread_mutex_t g_qlock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { void *proc; uint32_t user; } QueueOut;
+
+static void *at(const char *sym)
+{
+    return ocerz_bridge_host_symbol(AT_LIB, sym);
+}
+static uint32_t queue_guest(void *host)
+{
+    uint32_t g = 0;
+    pthread_mutex_lock(&g_qlock);
+    for (int i = 0; i < 512 && !g; i++)
+        if (g_qbufs[i].host == host)
+            g = g_qbufs[i].guest;
+    pthread_mutex_unlock(&g_qlock);
+    return g;
+}
+static void *queue_host(uint32_t guest)
+{
+    void *h = NULL;
+    pthread_mutex_lock(&g_qlock);
+    for (int i = 0; i < 512 && !h; i++)
+        if (g_qbufs[i].guest == guest)
+            h = g_qbufs[i].host;
+    pthread_mutex_unlock(&g_qlock);
+    return h;
+}
+static void queue_out(void *ctx, void *queue, void *host)
+{
+    QueueOut *q = ctx;
+    uint32_t g = queue_guest(host);
+    if (g)
+        ((void (*)(uint32_t, uint32_t, uint32_t))q->proc)(q->user, m32_handle(queue), g);
+}
+/* AudioQueueNewOutput(format, callback, userData, runLoop, runLoopMode, flags, outQueue*) */
+static int sp_AudioQueueNewOutput(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int32_t (*f)(const void *, void *, void *, void *, void *, uint32_t, void **) = at("AudioQueueNewOutput");
+    uint32_t fmt = m32_arg(cpu, 0), cb = m32_arg(cpu, 1), out = m32_arg(cpu, 6);
+    QueueOut *q = calloc(1, sizeof *q);
+    if (!f || !q || !cb || !fmt || !out)
+        RET(-50);   /* kAudio_ParamError */
+    q->proc = m32_callback(cb, "v(uuu)", "v(uuu)");
+    q->user = m32_arg(cpu, 2);
+    void *queue = NULL;
+    int32_t r = f(m32_h(fmt), (void *)queue_out, q, m32_host(m32_arg(cpu, 3)), m32_host(m32_arg(cpu, 4)), m32_arg(cpu, 5),
+                  &queue);
+    m32_wr(out, r ? 0 : m32_handle(queue));
+    RET(r);
+}
+/* AudioQueueAllocateBuffer(queue, capacity, outBuffer*) */
+static int sp_AudioQueueAllocateBuffer(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int32_t (*f)(void *, uint32_t, void **) = at("AudioQueueAllocateBuffer");
+    void *queue = m32_host(m32_arg(cpu, 0)), *host = NULL;
+    uint32_t cap = m32_arg(cpu, 1), out = m32_arg(cpu, 2);
+    int32_t r = f ? f(queue, cap, &host) : -4;
+    uint32_t g = r ? 0 : m32_malloc(AQB_SIZE32 + cap);
+    if (!r && !g)
+        r = -108;   /* memFullErr */
+    pthread_mutex_lock(&g_qlock);
+    int i = 0;
+    while (g && i < 512 && g_qbufs[i].host)
+        i++;
+    if (g && i < 512)
+        g_qbufs[i] = (QueueBuffer){ queue, host, g };
+    pthread_mutex_unlock(&g_qlock);
+    if (g && i == 512) {
+        m32_free(g);
+        g = 0;
+        r = -108;
+    }
+    if (g) {
+        memset(m32_h(g), 0, AQB_SIZE32);
+        m32_wr(g + AQB_CAP, cap);
+        m32_wr(g + AQB_DATA, g + AQB_SIZE32);
+    }
+    if (out)
+        m32_wr(out, g);
+    RET(r);
+}
+/* AudioQueueEnqueueBuffer(queue, buffer, numPacketDescs, packetDescs) */
+static int sp_AudioQueueEnqueueBuffer(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int32_t (*f)(void *, void *, uint32_t, const void *) = at("AudioQueueEnqueueBuffer");
+    uint32_t g = m32_arg(cpu, 1), descs = m32_arg(cpu, 3);
+    uint8_t *host = queue_host(g);
+    if (!f || !host)
+        RET(-66687);   /* kAudioQueueErr_InvalidBuffer */
+    uint32_t size = m32_rd(g + AQB_SIZE), cap = m32_rd(g + AQB_CAP);
+    if (size > cap)
+        size = cap;
+    void *data;
+    memcpy(&data, host + 8, sizeof data);   /* the host's mAudioData */
+    memcpy(data, m32_h(m32_rd(g + AQB_DATA)), size);
+    memcpy(host + 16, &size, 4);            /* the host's mAudioDataByteSize */
+    RET(f(m32_host(m32_arg(cpu, 0)), host, m32_arg(cpu, 2), descs ? m32_h(descs) : NULL));
+}
+/* AudioQueueDispose(queue, immediate): its buffers go with it */
+static int sp_AudioQueueDispose(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int32_t (*f)(void *, uint8_t) = at("AudioQueueDispose");
+    void *queue = m32_host(m32_arg(cpu, 0));
+    int32_t r = f ? f(queue, (uint8_t)m32_arg(cpu, 1)) : -4;
+    pthread_mutex_lock(&g_qlock);
+    for (int i = 0; i < 512; i++)
+        if (g_qbufs[i].host && g_qbufs[i].queue == queue) {
+            m32_free(g_qbufs[i].guest);
+            g_qbufs[i] = (QueueBuffer){ 0 };
+        }
+    pthread_mutex_unlock(&g_qlock);
+    RET(r);
+}
+
 /* The classic Sound Manager is gone on arm64.  Unresolved, SndNewChannel answered 0 (noErr) without a channel, and
  * Bink (Batman's movies) then waited on callbacks that never came: about half of the launches hung at the intro or
  * skipped to a blank screen.  No channel and an honest error: Bink plays its movies without sound.
@@ -140,6 +267,8 @@ static int sp_SndBadChannel(struct OcerzVM *vm, OcerzCPU *cpu)
 
 const M32SpecialEntry m32_audio_specials[] = {
     { "_AudioUnitSetProperty", sp_AudioUnitSetProperty },
+    { "_AudioQueueNewOutput", sp_AudioQueueNewOutput }, { "_AudioQueueAllocateBuffer", sp_AudioQueueAllocateBuffer },
+    { "_AudioQueueEnqueueBuffer", sp_AudioQueueEnqueueBuffer }, { "_AudioQueueDispose", sp_AudioQueueDispose },
     { "_SndNewChannel", sp_SndNewChannel },
     { "_SndDoCommand", sp_SndBadChannel }, { "_SndDoImmediate", sp_SndBadChannel },
     { "_SndChannelStatus", sp_SndBadChannel }, { "_SndDisposeChannel", sp_SndBadChannel },
