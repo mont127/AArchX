@@ -539,6 +539,14 @@ static int sp_fcntl(struct OcerzVM *vm, OcerzCPU *cpu)
  * effect (ponytail: a guard page an allocator protects stays writable; nothing we run relies on the fault). */
 #define M32_MAP_FAILED 0xffffffffu
 static uint32_t map_len(uint32_t len) { return (len + 0x3fffu) & ~0x3fffu; }
+/* [a, b) of the 16 KB host page at page, for a fixed anonymous mapping: zeroed, the page mapped if it was not */
+static int map_part(uint32_t page, uint32_t a, uint32_t b)
+{
+    if (!ocerz_addr_readable(page))
+        return ocerz_map_fixed(page, 0x4000, PROT_READ | PROT_WRITE) != OCERZ_OK;
+    memset(m32_h(a), 0, b - a);
+    return 0;
+}
 
 static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -551,13 +559,25 @@ static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
     }
     uint32_t size = map_len(len), g;
     if (flags & MAP_FIXED) {
+        /* 4 KB pages, as on the Intel Macs (MW3's VirtualAlloc commits and decommits single pages): the 16 KB host
+         * pages wholly inside are mapped afresh, and of a host page the range covers only partly, just the covered
+         * part is zeroed, as a fresh anonymous page would be; its other bytes stay */
         g = want;
-        if ((g & 0x3fff) || (uint64_t)g + size > M32_HANDLE_LO) {
+        uint64_t end = (uint64_t)g + ((len + 0xfffu) & ~0xfffu), lo = ((uint64_t)g + 0x3fff) & ~0x3fffull, hi = end & ~0x3fffull;
+        if ((g & 0xfff) || end > M32_HANDLE_LO) {
             errno = EINVAL;
             RETV(M32_MAP_FAILED);
         }
-        ocerz_unmap(g, size);
-        if (ocerz_map_fixed(g, size, PROT_READ | PROT_WRITE) != OCERZ_OK) {
+        int bad = 0;
+        if (lo < hi) {
+            ocerz_unmap(lo, hi - lo);
+            bad |= ocerz_map_fixed(lo, hi - lo, PROT_READ | PROT_WRITE) != OCERZ_OK;
+        }
+        if (g < lo)
+            bad |= map_part(g & ~0x3fffu, g, (uint32_t)(lo < end ? lo : end));
+        if (hi < end && hi >= lo)
+            bad |= map_part((uint32_t)hi, (uint32_t)hi, (uint32_t)end);
+        if (bad) {
             errno = ENOMEM;
             RETV(M32_MAP_FAILED);
         }
@@ -570,7 +590,7 @@ static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
     }
     if (!(flags & MAP_ANON) && fd >= 0) {
         /* a file: shared mappings overlay the file where the offset allows it, anything else is a copy */
-        if ((flags & MAP_SHARED) && !(off & 0x3fff) && ocerz_map_shared_file(g, size, prot | PROT_READ, fd, off) == OCERZ_OK)
+        if ((flags & MAP_SHARED) && !(off & 0x3fff) && !(g & 0x3fff) && ocerz_map_shared_file(g, size, prot | PROT_READ, fd, off) == OCERZ_OK)
             RETV(g);
         uint64_t done = 0;
         while (done < len) {
