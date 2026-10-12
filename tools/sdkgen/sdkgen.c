@@ -2178,6 +2178,8 @@ static void classify32(Rec *r)
             kind = "ptr";
         else if (is_integer_kind(cx_.kind, &sign) || cx_.kind == TK.Enum || cx_.kind == TK.Bool)
             kind = "int";
+        else if ((cx_.kind == TK.Double || cx_.kind == TK.Float) && cx_.kind == ca.kind)
+            kind = "blob";     /* NSAppKitVersionNumber: the same bytes, only aligned to 4 on i386 */
         else if (layout_same(cx_, ca, tx))
             kind = "blob";
         if (!kind) {
