@@ -38,7 +38,7 @@
 #define STEAM_MAGIC 0x5354324du   /* 'M2TS': a guest dlopen handle for the bridged client */
 
 typedef struct Slot { char *name; char flag; int bad; M32Export ex; } Slot;
-typedef struct Iface { char *version; Slot *slots; int n; } Iface;
+typedef struct Iface { char *version, *sdk; Slot *slots; int n; } Iface;
 typedef struct Vt { const Iface *iface; void **hostvt; uint32_t gvt; } Vt;
 typedef struct Proxy { void *host; const Iface *iface; uint32_t guest; } Proxy;
 typedef struct Flagged { uint32_t id; Slot *slot; } Flagged;
@@ -80,10 +80,11 @@ static void load_db(void)
     Iface *cur = NULL;
     while (fgets(line, sizeof line, f)) {
         char a[256], b[256], c[256], d[256], e[8] = "";
-        if (!strncmp(line, "iface ", 6) && sscanf(line, "iface %255s", a) == 1) {
+        if (!strncmp(line, "iface ", 6) && sscanf(line, "iface %255s %255s %255s", a, b, c) >= 1) {
             g_ifaces = realloc(g_ifaces, (size_t)(g_nifaces + 1) * sizeof *g_ifaces);
             cur = &g_ifaces[g_nifaces++];
-            *cur = (Iface){ strdup(a), NULL, 0 };
+            *cur = (Iface){ strdup(a), strdup(c), NULL, 0 };
+            c[0] = 0;
             continue;
         }
         if (!cur)
@@ -264,6 +265,9 @@ static uint32_t proxy_for(void *host, const char *version)
     if (steam_log() || !f)
         fprintf(stderr, "ocerz: m32: steam: %s %s\n", version, !f ? "is not in the interface database, answering 0"
                                                                   : g ? "bridged" : "could not be bridged");
+    if (f && g && steam_log() && !strncmp(version, "SteamClient", 11))   /* which SDK era the game's client is */
+        fprintf(stderr, "ocerz: m32: steam: %s as %s declares it; callbacks are copied as SDK 1.23 and later lay "
+                        "them out\n", version, f->sdk);
     return g;
 }
 
@@ -282,7 +286,11 @@ static int sp_CreateInterface(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
-/* bool Steam_BGetCallback(HSteamPipe, CallbackMsg_t *): the i386 message is {user, id, param, size}, 16 bytes */
+/* bool Steam_BGetCallback(HSteamPipe, CallbackMsg_t *): the i386 message is {user, id, param, size}, 16 bytes.
+ * The payload is copied as it is: since SDK 1.23 the Mac's callback structures are pack(4) and hold no pointers, so
+ * the client's bytes are the i386 game's; a game built with an older SDK may read them differently
+ * (OCERZ_M32LOG=steam names the SDK its SteamClient version comes from).  ponytail: buf is one static buffer, as
+ * a game drains callbacks from one thread (SteamAPI_RunCallbacks); two threads at once would need a lock. */
 static int sp_BGetCallback(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     (void)vm;
