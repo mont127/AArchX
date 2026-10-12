@@ -807,7 +807,8 @@ FAST_I(spin_unlock, (__atomic_store_n(cell32(cpu, 0), 0, __ATOMIC_RELEASE), 0))
  * send a guest's walk over its address space back to the start).  vm_address_t and vm_size_t cells are 32-bit; the
  * info structures carry no pointers, so they are written in place with the guest's count.  ponytail: every task is the
  * guest's own (mach_task_self); a game only looks at itself. */
-static int window_region(uint32_t gaddr_cell, uint32_t gsize_cell, mach_vm_address_t a, mach_vm_size_t sz, kern_return_t kr)
+static int window_region(uint32_t gaddr_cell, uint32_t gsize_cell, int wide, mach_vm_address_t a, mach_vm_size_t sz,
+                         kern_return_t kr)
 {
     uint64_t lo = ocerz_guest_base, hi = lo + M32_WINDOW;
     if (kr == KERN_SUCCESS && (a < lo || a >= hi))
@@ -819,13 +820,22 @@ static int window_region(uint32_t gaddr_cell, uint32_t gsize_cell, mach_vm_addre
             sz = 0xfffff000u;
         m32_wr(gaddr_cell, (uint32_t)(a - lo));
         m32_wr(gsize_cell, (uint32_t)sz);
+        if (wide) {
+            m32_wr(gaddr_cell + 4, 0);
+            m32_wr(gsize_cell + 4, 0);
+        }
     }
     return kr;
 }
-/* vm_region / vm_region_64(task, address*, size*, flavor, info, count*, object_name*) */
-static int sp_vm_region(struct OcerzVM *vm, OcerzCPU *cpu)
+/* vm_region / vm_region_64 / mach_vm_region(task, address*, size*, flavor, info, count*, object_name*); wide: the
+ * address and size cells are mach_vm_address_t and mach_vm_size_t, 64-bit */
+static int region(struct OcerzVM *vm, OcerzCPU *cpu, int wide)
 {
     uint32_t ga = A(1), gs = A(2), gcnt = A(5), gobj = A(6);
+    if (wide && m32_rd(ga + 4)) {
+        m32_ret(cpu, KERN_INVALID_ADDRESS, 0, 0);
+        return OCERZ_STEP_OK;
+    }
     mach_vm_address_t a = (uintptr_t)m32_h(m32_rd(ga));
     mach_vm_size_t sz = 0;
     mach_msg_type_number_t cnt = m32_rd(gcnt);
@@ -840,7 +850,7 @@ static int sp_vm_region(struct OcerzVM *vm, OcerzCPU *cpu)
             break;
         a += sz;   /* as above: the unused window is free address space */
     }
-    kr = window_region(ga, gs, a, sz, kr);
+    kr = window_region(ga, gs, wide, a, sz, kr);
     if (kr == KERN_SUCCESS) {
         m32_wr(gcnt, cnt);
         if (gobj)
@@ -849,6 +859,8 @@ static int sp_vm_region(struct OcerzVM *vm, OcerzCPU *cpu)
     m32_ret(cpu, (uint32_t)kr, 0, 0);
     return OCERZ_STEP_OK;
 }
+static int sp_vm_region(struct OcerzVM *vm, OcerzCPU *cpu) { return region(vm, cpu, 0); }
+static int sp_mach_vm_region(struct OcerzVM *vm, OcerzCPU *cpu) { return region(vm, cpu, 1); }
 /* vm_region_recurse_64(task, address*, size*, nesting_depth*, info, count*) */
 static int sp_vm_region_recurse_64(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -867,7 +879,7 @@ static int sp_vm_region_recurse_64(struct OcerzVM *vm, OcerzCPU *cpu)
             break;
         a += sz;   /* unused window: free, as unmapped address space is in a real 32-bit process */
     }
-    kr = window_region(ga, gs, a, sz, kr);
+    kr = window_region(ga, gs, 0, a, sz, kr);
     static int log = -1;
     static unsigned long n;
     if (log < 0)
@@ -1012,7 +1024,7 @@ static const M32SpecialEntry g_specials[] = {
     { "_aio_read", sp_aio_read }, { "_aio_write", sp_aio_write }, { "_aio_error", sp_aio_error },
     { "_aio_return", sp_aio_return }, { "_aio_cancel", sp_aio_cancel }, { "_aio_suspend", sp_aio_suspend },
     { "_aio_suspend$UNIX2003", sp_aio_suspend },
-    { "_vm_region", sp_vm_region }, { "_vm_region_64", sp_vm_region }, { "_vm_region_recurse_64", sp_vm_region_recurse_64 },
+    { "_vm_region", sp_vm_region }, { "_vm_region_64", sp_vm_region }, { "_mach_vm_region", sp_mach_vm_region }, { "_vm_region_recurse_64", sp_vm_region_recurse_64 },
     { "_vm_read_overwrite", sp_vm_read_overwrite },
     { "_OSAtomicCompareAndSwap32", sp_osa_cas32 }, { "_OSAtomicCompareAndSwap32Barrier", sp_osa_cas32 },
     { "_OSAtomicCompareAndSwapInt", sp_osa_cas32 }, { "_OSAtomicCompareAndSwapIntBarrier", sp_osa_cas32 },
