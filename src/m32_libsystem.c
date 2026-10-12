@@ -928,7 +928,45 @@ static int sp_bootstrap_check_in(struct OcerzVM *vm, OcerzCPU *cpu)
     return RETV_PLAIN(kr);
 }
 
+/* dispatch_once and dispatch_once_f on i386: the predicate is a 4-byte long the program's own inline check compares
+ * with ~0, which the host's 8-byte one would overrun, and the block or function is guest code.  So they run here:
+ * the predicate goes 0 -> 1 (running) -> ~0 (done) under one lock, a thread finding it running waits, and the block's
+ * invoke (offset 12 of an i386 block) or the function is called as guest code. */
+static pthread_mutex_t g_once_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_once_done = PTHREAD_COND_INITIALIZER;
+static void once_run(struct OcerzVM *vm, uint32_t pred, uint32_t fn, uint32_t arg)
+{
+    if (!pred || m32_rd(pred) == 0xffffffffu)
+        return;
+    pthread_mutex_lock(&g_once_lock);
+    while (m32_rd(pred) == 1)
+        pthread_cond_wait(&g_once_done, &g_once_lock);
+    if (m32_rd(pred) == 0xffffffffu) {
+        pthread_mutex_unlock(&g_once_lock);
+        return;
+    }
+    m32_wr(pred, 1);
+    pthread_mutex_unlock(&g_once_lock);
+    m32_call(vm, fn, &arg, 1, NULL, NULL);
+    pthread_mutex_lock(&g_once_lock);
+    m32_wr(pred, 0xffffffffu);
+    pthread_cond_broadcast(&g_once_done);
+    pthread_mutex_unlock(&g_once_lock);
+}
+static int sp_dispatch_once(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t blk = m32_arg(cpu, 1);
+    once_run(vm, m32_arg(cpu, 0), blk ? m32_rd(blk + 12) : 0, blk);
+    return RETV_PLAIN(0);
+}
+static int sp_dispatch_once_f(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    once_run(vm, m32_arg(cpu, 0), m32_arg(cpu, 2), m32_arg(cpu, 1));
+    return RETV_PLAIN(0);
+}
+
 static const M32SpecialEntry g_specials[] = {
+    { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },
     { "_mach_absolute_time", sp_mach_absolute_time }, { "_mach_timebase_info", sp_mach_timebase_info },
     { "_UpTime", sp_mach_absolute_time }, { "_AbsoluteToNanoseconds", sp_AbsoluteToNanoseconds },
