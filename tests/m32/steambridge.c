@@ -2,9 +2,10 @@
  * that tests/m32/build.sh puts beside the programs: an i386 program that dlopens a steamclient.dylib with no i386
  * slice gets the host's, and its interfaces cross by the notations in steam.api (make steam32). Plain results, a
  * 64-bit result and argument, a C string, output pointers, interfaces returned by an interface and by name, an unknown
- * version, the callback queue and a call result. steambridge.expected is this program built for arm64 and run
+ * version, the callback queue, a call result, and string results from two threads at once. steambridge.expected is this program built for arm64 and run
  * natively against the same stand-in. */
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +16,18 @@ typedef struct Obj { void **vt; } Obj;
 #define SLOT(o, k, T) ((T)((Obj *)(o))->vt[k])
 
 typedef struct { int32_t user, id; uint8_t *param; int32_t size; } CallbackMsg;
+
+static void *g_utils;
+static void *languages(void *arg)
+{
+    (void)arg;
+    long bad = 0;
+    for (int i = 0; i < 3000; i++) {
+        const char *s = SLOT(g_utils, 23, const char *(*)(void *))(g_utils);
+        bad += !s || s[0] != 'L' || strlen(s) != 5;
+    }
+    return (void *)bad;
+}
 
 int main(void)
 {
@@ -73,5 +86,12 @@ int main(void)
     printf("call result %d failed %d:", ok, failed);
     for (int i = 0; i < 6; i++) printf(" %02x", buf[i]);
     printf("\n");
+
+    g_utils = t;
+    pthread_t th[2];
+    void *wrong[2] = { 0 };
+    for (int i = 0; i < 2; i++) pthread_create(&th[i], NULL, languages, NULL);
+    for (int i = 0; i < 2; i++) pthread_join(th[i], &wrong[i]);
+    printf("strings from two threads: bad %ld\n", (long)wrong[0] + (long)wrong[1]);
     return 0;
 }

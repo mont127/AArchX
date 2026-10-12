@@ -146,14 +146,12 @@ static uint32_t last_ptr_arg(const char *gnote)
     return at;
 }
 
-/* a C string Steam returns, copied into guest memory once per host string and content */
-static uint32_t guest_string(const char *s)
+/* a C string Steam returns, copied into guest memory once per host string and content; game threads call in at once */
+static uint32_t guest_string_locked(const char *s)
 {
     typedef struct { const char *host; char *copy; uint32_t g; } Str;
     static Str *strs;
     static int n;
-    if (!s)
-        return 0;
     for (int i = 0; i < n; i++)
         if (strs[i].host == s && !strcmp(strs[i].copy, s))
             return strs[i].g;
@@ -171,6 +169,16 @@ static uint32_t guest_string(const char *s)
         }
     strs = realloc(strs, (size_t)(n + 1) * sizeof *strs);
     strs[n++] = (Str){ s, strdup(s), g };
+    return g;
+}
+static uint32_t guest_string(const char *s)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    if (!s)
+        return 0;
+    pthread_mutex_lock(&lock);
+    uint32_t g = guest_string_locked(s);
+    pthread_mutex_unlock(&lock);
     return g;
 }
 

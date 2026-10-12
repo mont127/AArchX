@@ -8,4 +8,5 @@ appid 35140 realtime 1234567890 country NZ image 1 10x15 reason 307
 callback 1: user 71 id 1101 size 12 payload 44 89 00 00 00 00 00 00 01 00 00 00
 after free: 0
 call result 1 failed 0: 0f 10 11 12 13 14
+strings from two threads: bad 0
 exit 0

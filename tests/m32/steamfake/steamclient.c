@@ -2,7 +2,8 @@
  * i386 Steam bridge (src/m32_steam.c) can be tested without Steam: CreateInterface hands out a SteamClient017,
  * which hands out a SteamUser018 and a SteamUtils007, each a C object whose first word is a table of functions in
  * the slots the Steamworks interfaces of those versions put them, `this` first as an Itanium virtual call takes
- * it.  Slots tests/m32/steambridge.c does not call answer 0.  The callback queue holds one message. */
+ * it.  Slots tests/m32/steambridge.c does not call answer 0.  The callback queue holds one message.
+ * GetSteamUILanguage answers another of 4096 strings each call, so two threads calling it race to add strings. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,6 +36,9 @@ static const char *utils_country(Obj *self) { (void)self; return "NZ"; }
 static bool utils_image(Obj *self, int image, uint32_t *w, uint32_t *h) { (void)self; *w = (uint32_t)image * 2; *h = (uint32_t)image * 3; return true; }
 static uint32_t utils_appid(Obj *self) { (void)self; return 35140; }
 static int utils_reason(Obj *self, uint64_t call) { (void)self; return (int)(call >> 32) * 100 + (int)(uint32_t)call; }
+static char g_langs[4096][8];
+static unsigned g_lang;
+static const char *utils_language(Obj *self) { (void)self; return g_langs[__atomic_fetch_add(&g_lang, 1, __ATOMIC_RELAXED) % 4096]; }
 static void *utils_vt[40];
 
 static Obj g_client;
@@ -53,6 +57,9 @@ __attribute__((constructor)) static void init(void)
     utils_vt[5] = (void *)utils_image;
     utils_vt[9] = (void *)utils_appid;
     utils_vt[12] = (void *)utils_reason;
+    utils_vt[23] = (void *)utils_language;
+    for (int i = 0; i < 4096; i++)
+        snprintf(g_langs[i], sizeof g_langs[i], "L%04d", i);
     g_client.vt = client_vt;
     g_user.vt = user_vt;
     g_utils.vt = utils_vt;
