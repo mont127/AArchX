@@ -746,6 +746,50 @@ static int send_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class s
     return OCERZ_STEP_OK;
 }
 
+/* Arrays of objects with their count last (arrayWithObjects:count:, dictionaryWithObjects:forKeys:count:,
+ * getObjects:andKeys:count:): the guest's ids are 4 bytes and the host's 8, so each array crosses as a copy of host
+ * ids, written back as guest ids when the method fills it. */
+static int objects_send(struct OcerzVM *vm, OcerzCPU *cpu, Method m, M32Export *e)
+{
+    M32Sig *g = m32_sig_parse(e->gnote, 1);
+    if (!g || g->nargs < 3 || (g->arg[g->nargs - 1].cls != 'u' && g->arg[g->nargs - 1].cls != 'i')) {
+        free(g);
+        return m32_cross(vm, cpu, e);
+    }
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP], at[8], old[8], buf[8], off = 4, count = 0;
+    int out[8], n = 0;
+    for (int i = 0; i < g->nargs; off += g->arg[i].size > 4 ? 8 : 4, i++) {
+        char t[16];
+        method_getArgumentType(m, (unsigned)i, t, sizeof t);
+        if ((!strcmp(t, "r^@") || !strcmp(t, "^@")) && n < 8) {
+            out[n] = t[0] == '^';
+            at[n++] = esp + off;
+        }
+        count = m32_rd(esp + off);
+    }
+    free(g);
+    if (count > (1u << 24))
+        return m32_cross(vm, cpu, e);
+    for (int a = 0; a < n; a++) {
+        old[a] = m32_rd(at[a]);
+        buf[a] = old[a] ? m32_malloc(count * 8 + 8) : 0;
+        uint64_t *h = buf[a] ? (uint64_t *)m32_h(buf[a]) : NULL;
+        for (uint32_t k = 0; h && k < count; k++)
+            h[k] = (uint64_t)(uintptr_t)m32_objc_to_host(m32_rd(old[a] + 4 * k));
+        m32_wr(at[a], buf[a]);
+    }
+    int r = m32_cross(vm, cpu, e);
+    for (int a = 0; a < n; a++) {
+        uint64_t *h = buf[a] ? (uint64_t *)m32_h(buf[a]) : NULL;
+        for (uint32_t k = 0; h && out[a] && k < count; k++)
+            m32_wr(old[a] + 4 * k, m32_objc_to_guest((void *)(uintptr_t)h[k]));
+        m32_wr(at[a], old[a]);
+        if (buf[a])
+            m32_free(buf[a]);
+    }
+    return r;
+}
+
 /* self_at: the guest stack word holding the receiver (1, or 2 after a stret pointer); super: the objc_super */
 static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, uint32_t gsel, uint32_t gtypes, int is_super)
 {
@@ -788,6 +832,8 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
         sup.super_class = super_cls;
         m32_cross_self = &sup;
     }
+    if (strstr(henc, "^@") && strstr(name, "count:"))
+        return objects_send(vm, cpu, m, e);
     return m32_cross(vm, cpu, e);
 }
 
