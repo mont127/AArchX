@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -1008,6 +1009,14 @@ static int sp_dispatch_once_f(struct OcerzVM *vm, OcerzCPU *cpu)
     return RETV_PLAIN(0);
 }
 
+/* ioctl(fd, request, ...): one argument, guest memory when the request carries data (IOC_IN/IOC_OUT), else a number */
+static int sp_ioctl(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    unsigned long req = m32_arg(cpu, 1);
+    uint32_t a = m32_arg(cpu, 2);
+    RETV(ioctl((int)m32_arg(cpu, 0), req, (req & (IOC_IN | IOC_OUT)) && a ? m32_h(a) : (void *)(uintptr_t)a));
+}
+
 /* execv/execve: the vectors hold 4-byte pointers; the new program runs under ocerz as well (an i386 one by m32) */
 static int exec_guest(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t genv)
 {
@@ -1029,6 +1038,7 @@ static int sp_execve(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, 
 static const M32SpecialEntry g_specials[] = {
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
     { "_execv", sp_execv }, { "_execve", sp_execve },
+    { "_ioctl", sp_ioctl },
     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },
     { "_mach_absolute_time", sp_mach_absolute_time }, { "_mach_timebase_info", sp_mach_timebase_info },
     { "_UpTime", sp_mach_absolute_time }, { "_AbsoluteToNanoseconds", sp_AbsoluteToNanoseconds },

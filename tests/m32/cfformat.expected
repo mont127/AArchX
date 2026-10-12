@@ -1,0 +1,4 @@
+format [42 text object 2.50 1099511627776 beef]
+va_list [dir/00007]
+ioctl 0 FIONREAD 5
+exit 0

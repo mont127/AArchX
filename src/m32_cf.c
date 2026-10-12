@@ -7,6 +7,7 @@
  * literal to any CF or Foundation function reaches a real string while the guest keeps its own pointer.
  */
 #include <dispatch/dispatch.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -431,6 +432,31 @@ static int sp_CFArrayGetValues(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* CFStringCreateWithFormat(alloc, options, format, ...) and CFStringCreateWithFormatAndArguments(alloc, options,
+ * format, va_list): the format is a CFString; its arguments become host slots as printf's do (%@ a host object).
+ * ponytail: a format longer than 4 KB in UTF-8 fails, as an unknown conversion does */
+static int cf_format(OcerzCPU *cpu, uint32_t ap)
+{
+    void *(*make)(void *, void *, void *, va_list) = cf("CFStringCreateWithFormatAndArguments");
+    uint8_t (*utf8)(void *, char *, long, uint32_t) = cf("CFStringGetCString");
+    void *fmt = m32_host(m32_arg(cpu, 2)), *r = NULL;
+    char buf[4096];
+    uint64_t slots[64];
+    if (make && utf8 && fmt && utf8(fmt, buf, sizeof buf, 0x08000100 /* kCFStringEncodingUTF8 */) &&
+        m32_printf_slots(buf, ap, slots, 64, "CFStringCreateWithFormat") >= 0)
+        r = make(m32_host(m32_arg(cpu, 0)), m32_host(m32_arg(cpu, 1)), fmt, (va_list)(void *)slots);
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_CFStringCreateWithFormat(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return cf_format(cpu, (uint32_t)cpu->gpr[OCERZ_RSP] + 16);
+}
+static int sp_CFStringCreateWithFormatAndArguments(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return cf_format(cpu, m32_arg(cpu, 3));
+}
+
 /* FSCatalogInfo: the i386 FSPermissionInfo ends in a 4-byte reserved word where the host's has an 8-byte FileSecRef,
  * so from the permissions on every field sits 4 bytes later on the host (i386 144 bytes, valence at 136; host 148, at
  * 140).  Handed through as is, a directory's valence came back 0 and a game sized its listing from it, then wrote
@@ -549,6 +575,8 @@ const M32SpecialEntry m32_cf_specials[] = {
     { "_IOHIDValueGetBytePtr", sp_IOHIDValueGetBytePtr },
     { "_FSGetCatalogInfo", sp_FSGetCatalogInfo }, { "_FSSetCatalogInfo", sp_FSSetCatalogInfo },
     { "_FSGetCatalogInfoBulk", sp_FSGetCatalogInfoBulk }, { "_PBReadForkAsync", sp_PBReadForkAsync },
+    { "_CFStringCreateWithFormat", sp_CFStringCreateWithFormat },
+    { "_CFStringCreateWithFormatAndArguments", sp_CFStringCreateWithFormatAndArguments },
     { "_CFDictionaryGetKeysAndValues", sp_CFDictionaryGetKeysAndValues }, { "_CFSetGetValues", sp_CFSetGetValues },
     { "_CFBagGetValues", sp_CFBagGetValues }, { "_CFArrayGetValues", sp_CFArrayGetValues },
     { "_GetProcessBundleLocation", sp_GetProcessBundleLocation }, { "_SecCodeCheckValidity", sp_SecCodeCheckValidity },
