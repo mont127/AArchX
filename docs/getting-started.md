@@ -111,17 +111,31 @@ A Windows program runs through Wine, as `ocerz <wine> <program>`:
 
 With CrossOver installed, **CrossOver Bottles…** in the bottom bar lists its
 bottles, each with a box. A ticked bottle runs its Windows programs under
-AArchX instead of Rosetta, started from CrossOver's own window as usual.
-- **How it switches.** The box sets the bottle's `[Wine] "BinPath"`,
-  CrossOver's documented way to use another Wine. That puts two small scripts in
-  `~/Library/Application Support/AArchX/CrossOver/bin` ahead of CrossOver's own
-  `bin`. They run CrossOver's `wineloader` and `wineserver` under `ocerz`, or
-  directly if `ocerz` is gone.
-- **What stays the same.** Nothing inside CrossOver.app changes, so a CrossOver
-  update keeps both the setting and CrossOver's signature.
-- **Switching back.** Unticking the box removes the line.
-- **Before you switch.** Quit the bottle's programs; the change applies when the
-  bottle next starts.
+AArchX instead of Rosetta, started from CrossOver or from their launchers as
+usual. Ticking does two things, and unticking undoes both:
+- **The bottle.** It sets the bottle's `[Wine] "BinPath"`, CrossOver's
+  documented way to use another Wine, to two small scripts in
+  `~/Library/Application Support/AArchX/CrossOver/bin`. They run CrossOver's
+  `wineloader` and `wineserver` under `ocerz`, or directly if `ocerz` is gone.
+- **The launchers.** CrossOver writes a launcher app for each program into
+  `~/Applications/CrossOver`. Normally that launcher is also Wine's alternate
+  loader, which means the program's window processes run inside it, under
+  Rosetta, and that arrangement does not run under `ocerz` yet. So each of the
+  bottle's launchers keeps its own executable beside it as
+  `<name>.cx-original`, and a short script in its place starts the program
+  through CrossOver's `wine` without the alternate loader. Every process then
+  runs under AArchX.
+
+Unticking deletes the scripts and renames the originals back, so the launchers
+are byte for byte as CrossOver wrote them. Nothing inside CrossOver.app changes.
+While a bottle is ticked:
+- its programs show Wine's own Dock icon instead of the launcher's;
+- links such as `steam://` from a browser do not reach the program through its
+  launcher.
+
+If CrossOver writes a launcher again, it is back on Rosetta until you next open
+**CrossOver Bottles…**, which switches it again. Quit a bottle's programs before
+switching it; the change applies when the bottle next starts.
 
 For games, [MacNdCheese](https://github.com/mont127/MacNdCheese) sets up a whole
 Wine environment, with DXMT, DXVK and Steam, and can run its bottles under
