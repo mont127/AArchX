@@ -457,6 +457,31 @@ static int sp_CFStringCreateWithFormatAndArguments(struct OcerzVM *vm, OcerzCPU 
     return cf_format(cpu, m32_arg(cpu, 3));
 }
 
+/* CFUUIDGetConstantUUIDWithBytes and CFUUIDCreateWithBytes(alloc, byte0, ..., byte15): sixteen byte arguments, each
+ * a stack word on i386, are past what a notation describes.  IOKit's plug-in UUIDs (kIOHIDDeviceUserClientTypeID and
+ * the rest) are made this way; answered 0, Source's input system handed the NULL to CoreFoundation. */
+static int uuid_bytes(OcerzCPU *cpu, const char *sym)
+{
+    typedef unsigned char B;
+    void *(*f)(void *, B, B, B, B, B, B, B, B, B, B, B, B, B, B, B, B) = cf(sym);
+    B b[16];
+    for (int i = 0; i < 16; i++)
+        b[i] = (B)m32_arg(cpu, 1 + i);
+    void *r = f ? f(m32_host(m32_arg(cpu, 0)), b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
+                    b[12], b[13], b[14], b[15])
+                : NULL;
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_CFUUIDGetConstantUUIDWithBytes(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return uuid_bytes(cpu, "CFUUIDGetConstantUUIDWithBytes");
+}
+static int sp_CFUUIDCreateWithBytes(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return uuid_bytes(cpu, "CFUUIDCreateWithBytes");
+}
+
 /* FSCatalogInfo: the i386 FSPermissionInfo ends in a 4-byte reserved word where the host's has an 8-byte FileSecRef,
  * so from the permissions on every field sits 4 bytes later on the host (i386 144 bytes, valence at 136; host 148, at
  * 140).  Handed through as is, a directory's valence came back 0 and a game sized its listing from it, then wrote
@@ -577,6 +602,8 @@ const M32SpecialEntry m32_cf_specials[] = {
     { "_FSGetCatalogInfoBulk", sp_FSGetCatalogInfoBulk }, { "_PBReadForkAsync", sp_PBReadForkAsync },
     { "_CFStringCreateWithFormat", sp_CFStringCreateWithFormat },
     { "_CFStringCreateWithFormatAndArguments", sp_CFStringCreateWithFormatAndArguments },
+    { "_CFUUIDGetConstantUUIDWithBytes", sp_CFUUIDGetConstantUUIDWithBytes },
+    { "_CFUUIDCreateWithBytes", sp_CFUUIDCreateWithBytes },
     { "_CFDictionaryGetKeysAndValues", sp_CFDictionaryGetKeysAndValues }, { "_CFSetGetValues", sp_CFSetGetValues },
     { "_CFBagGetValues", sp_CFBagGetValues }, { "_CFArrayGetValues", sp_CFArrayGetValues },
     { "_GetProcessBundleLocation", sp_GetProcessBundleLocation }, { "_SecCodeCheckValidity", sp_SecCodeCheckValidity },
