@@ -1263,7 +1263,9 @@ uint64_t ocerz_cache_dlsym_image(OcerzCache *c, uint64_t mh, const char *symbol,
     uint32_t root = ix ? cix_by_mh(ix, mh) : CIX_NONE;
     if (root == CIX_NONE)
         return ocerz_cache_resolve_from_image(c, mh, symbol, found);
-    return resolve_from_index(c, ix, root, mh, symbol, found, !getenv("OCERZ_DLSYM_UPWARD"));
+    static int upward = -1;
+    if (upward < 0) upward = getenv("OCERZ_DLSYM_UPWARD") ? 1 : 0;
+    return resolve_from_index(c, ix, root, mh, symbol, found, !upward);
 }
 
 uint64_t ocerz_cache_resolve_from_image(OcerzCache *c, uint64_t mh, const char *symbol, int *found)
