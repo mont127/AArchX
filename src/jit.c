@@ -100,7 +100,12 @@
  * a result register (cmp #0, or no compare at all for cbz/cbnz), and the comis
  * fusion, where a jcc/setcc/cmov re-derives its condition by redoing the fcmp.
  * Liveness reaches past the block: an exit's flags are dead if the successor,
- * decoded up to three blocks deep, overwrites them before reading them.  That
+ * decoded up to three blocks deep, overwrites them before reading them.  A
+ * successor is read only as far as the instruction by which it has written
+ * every flag, and its own exits are then not followed: nothing after that
+ * instruction can make a flag live at its entry, so the answer is the one the
+ * whole block and its successors would give, from about a fifth of the
+ * decodes (OCERZ_NO_XLIVE_KILL=1 reads every successor to its end).  That
  * lookahead was a fifth of translation time, because every block branching to
  * an untranslated successor decoded it again, so answers are memoized by rip
  * and depth, and an entry counts only while no translation has been retired
@@ -2687,6 +2692,8 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
             }
         }
     }
+    static int no_kill = -1;
+    if (no_kill < 0) no_kill = getenv("OCERZ_NO_XLIVE_KILL") ? 1 : 0;
     X86Insn insns[JIT_MAX_BLOCK_INSNS];
     volatile int n = 0;
     volatile uint64_t pc = rip;
@@ -2694,6 +2701,7 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     sigjmp_buf *prev = ocerz_jit_decode_recover;
     if (sigsetjmp(db, 0) == 0) {
         ocerz_jit_decode_recover = &db;
+        uint64_t killed = 0;
         while (n < JIT_MAX_BLOCK_INSNS) {
             int rc = jit_decode(pc, &insns[n], g_xlat_mode32);
             if (rc != OCERZ_OK)
@@ -2703,6 +2711,13 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
             n++;
             if (is_terminator(op))
                 break;
+            if (!no_kill) {
+                uint64_t def, use;
+                ocerz_flags_defuse(&insns[n - 1], &def, &use);
+                killed |= def;
+                if ((killed & OCERZ_FL_ALL) == OCERZ_FL_ALL)
+                    break;
+            }
             pc += len;
         }
     }
