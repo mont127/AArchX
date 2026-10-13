@@ -114,6 +114,7 @@ int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **
     char real[1024];
     ocerz_dyld_set_main_path(realpath(path, real) ? real : path);   /* CoreFoundation's main bundle is the game's */
     ocerz_bridge_set_process_args(argc, argv);
+    m32_hud_start();
     M32Image *img = m32_load_program(path);
     if (!img)
         return 65;

@@ -166,16 +166,31 @@ M32Export *m32_export_by_id(uint32_t id)
 
 /* OCERZ_M32_HUD=<overlay dylib>: an FPS overlay (simpleoverlay, whose exported fake_dlsym hands back its
  * CGLFlushDrawable wrapper) is loaded here rather than through DYLD_INSERT_LIBRARIES, which every child process
- * inherits (Batman then ran a shell and quit); each frame the guest presents is drawn on before the real flush */
-static void *hud_wrap(const char *sym, void *fn)
+ * inherits (Batman then ran a shell and quit); each frame the guest presents is drawn on before the real flush.
+ * It is loaded at start, with AppKit, because its first lookup also swizzles -[NSOpenGLContext flushBuffer], which
+ * is how games that never import CGLFlushDrawable present (Left 4 Dead 2).  AppKit is opened as the bridge opens a
+ * framework, CoreFoundation first with the game's identity: opened plainly, the main bundle was ocerz's and MW3's
+ * launcher found no nib. */
+static void *(*g_hud_lookup)(void *, const char *);
+
+void m32_hud_start(void)
 {
     const char *hud = getenv("OCERZ_M32_HUD");
-    if (!hud || !fn || strcmp(sym, "CGLFlushDrawable"))
-        return fn;
+    if (!hud)
+        return;
+    ocerz_bridge_host_library("/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit");
     void *h = dlopen(hud, RTLD_NOW | RTLD_LOCAL);
-    void *(*lookup)(void *, const char *) = h ? (void *(*)(void *, const char *))dlsym(h, "fake_dlsym") : NULL;
-    void *w = lookup ? lookup(RTLD_DEFAULT, sym) : NULL;
-    fprintf(stderr, "ocerz: m32: HUD %s: %s\n", hud, w && w != fn ? "drawing on each CGLFlushDrawable" : "not loaded");
+    g_hud_lookup = h ? (void *(*)(void *, const char *))dlsym(h, "fake_dlsym") : NULL;
+    if (g_hud_lookup)
+        g_hud_lookup(RTLD_DEFAULT, "CGLFlushDrawable");
+    fprintf(stderr, "ocerz: m32: HUD %s: %s\n", hud, g_hud_lookup ? "loaded" : "not loaded");
+}
+
+static void *hud_wrap(const char *sym, void *fn)
+{
+    if (!g_hud_lookup || !fn || strcmp(sym, "CGLFlushDrawable"))
+        return fn;
+    void *w = g_hud_lookup(RTLD_DEFAULT, sym);
     return w ? w : fn;
 }
 
