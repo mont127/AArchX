@@ -19101,11 +19101,33 @@ static void chain_batch_begin(void)
     pthread_jit_write_protect_np(0);
 }
 
+/*
+ * The words a chain install patched, made visible to instruction fetch with
+ * one barrier pair for all of them, as stop_sites_sync does, where a
+ * sys_icache_invalidate per word paid the barriers once for each: on Apple
+ * silicon a call over one word costs about what it costs over a whole block.
+ * The install still finishes, under jit_lock, before translate returns.
+ * OCERZ_NO_CHAIN_SYNC_BATCH=1 calls sys_icache_invalidate for each word.
+ */
+static void chain_sites_sync(uint32_t *const *sites, int n)
+{
+    for (int i = 0; i < n; i++)
+        __asm__ volatile("dc cvau, %0" :: "r"(sites[i]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (int i = 0; i < n; i++)
+        __asm__ volatile("ic ivau, %0" :: "r"(sites[i]) : "memory");
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+
 static void chain_batch_end(void)
 {
     pthread_jit_write_protect_np(1);
-    for (int i = 0; i < g_chain_npatched; i++)
-        sys_icache_invalidate(g_chain_patched[i], 4);
+    if (ENV_ON("OCERZ_NO_CHAIN_SYNC_BATCH")) {
+        for (int i = 0; i < g_chain_npatched; i++)
+            sys_icache_invalidate(g_chain_patched[i], 4);
+    } else if (g_chain_npatched) {
+        chain_sites_sync(g_chain_patched, g_chain_npatched);
+    }
     g_chain_npatched = 0;
     g_chain_batching = 0;
 }
