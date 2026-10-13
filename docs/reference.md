@@ -128,6 +128,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
 | `OCERZ_NO_VENEER_UNCHAIN=1` | when a block is retired, leave chains that reach it through a veneer (the way far targets are chained) in place, as before 2026-10-11: after a write to guest code they reach the old translation |
 | `OCERZ_FORCE_VENEER=1` | chain every block through a veneer, as only far targets are (for tests) |
+| `OCERZ_NO_CHAIN_SYNC_BATCH=1` | after chaining a new block, flush each patched branch from the instruction cache with its own call, instead of one barrier pair for all of them |
 | `OCERZ_LIVE_SCAN=1` | search the whole list of live blocks for one being retired whose index does not point back at it |
 | `OCERZ_NO_MOVFUSE=1` | do not fold a `mov` into a following shift |
 | `OCERZ_NO_BRIDGE_FASTCALL=1` | in native mode, reach every bridged call through the trap and the dispatcher instead of calling it from inside the translated block |
