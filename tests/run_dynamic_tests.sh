@@ -297,6 +297,33 @@ run_chain_rpath_case() {
     done
 }
 
+run_wine_segment_case() {
+    local name="$1"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    printf x > "$dir/reserve"
+    if ! clang -arch x86_64 -o "$dir/cmd.exe" tests/dynamic/wine_segment.c \
+            -Wl,-sectcreate,WINE_RESERVE,__reserve,"$dir/reserve" 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/plain.exe" tests/dynamic/wine_segment.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local exe want out_file err_file got_out got_code
+    for exe in cmd.exe plain.exe; do
+        want=wine
+        [ "$exe" = plain.exe ] && want=plain
+        out_file="$TMP/$name.$exe.out"
+        err_file="$TMP/$name.$exe.err"
+        run_bounded "$out_file" "$err_file" env -u OCERZ_PRELOAD_OBJC "$OCERZ" "$dir/$exe"
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$exe (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$exe (got out='$got_out' exit=$got_code; want out='$want' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_mac_syscall_low_stack_case() {
     local name="$1" want_out="$2"
     local dir="$TMP/$name"
@@ -1115,6 +1142,7 @@ run_load_phase_case ddlopen_load_phase 'OK'
 run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'
 run_caller_rpath_case ddlopen_caller_rpath 'OK'
 run_chain_rpath_case ddlopen_chain_rpath 'OK'
+run_wine_segment_case dwine_segment
 run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
 run_weak_unloaded_case dweak_unloaded 'OK'
 run_metal_nocopy_low_case dmetal_nocopy_low 'OK'
