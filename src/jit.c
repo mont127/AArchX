@@ -6213,6 +6213,8 @@ fold_disp:
 static int emit_mem_load_plain(A64Buf *b, const X86Insn *insn, const X86Operand *op, int size, int rd)
 {
     int ra; uint32_t disp;
+    /* An indexed operand the Wine layout's hoist covers is one load off the hoisted base, as a mov's is. */
+    if (llh_regoff_access(b, insn, op, size, rd, 0, 0)) return 1;
     int plain = mem_plain_access_ok(op);
     X86Operand mview; op = mem_hoist_view(op, &mview);
     int aux_disp_ok = op->disp != 0 && g_pin_class != 2 && g_mem_hoist_aux_index < 0 &&
