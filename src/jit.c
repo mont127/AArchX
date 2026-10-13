@@ -16430,6 +16430,45 @@ static int emit_incdec_jcc(A64Buf *b, const X86Insn *producer,
         fall = (uint32_t)fall;
     int edge_class = body_edge_pin_class();
     int body_edge = edge_class >= 0;
+    /*
+     * A block that loops on itself goes straight back to its loop entry, as
+     * emit_jcc's and emit_cmp_test_jcc's do, when its head reads none of the
+     * flags the inc or dec leaves.  As a chained edge it went to the block's
+     * body entry instead and ran whatever stands before the loop entry, the
+     * hoists' checks and the fixed lanes' setup, every time round.
+     * OCERZ_NO_INCDEC_LOOP=1 chains it again.
+     */
+    if (taken == g_self_rip && g_loop_entry && !g_no_xlive && xlive_succ_live(g_xlat_jit, taken) == 0 &&
+        !ENV_ON("OCERZ_NO_INCDEC_LOOP")) {
+        l0_fixed_backedge(b);
+        g_stop_patch = a64_label(b);
+        a64_bcond(b, taken_cond, (int32_t)(g_loop_entry - g_stop_patch));
+        l0_fixed_fallthrough(b);
+        fpb_emit_exit_check(b);
+        uint32_t *pb = emit_incdec_jcc_arm(b, producer, fall, fall <= g_self_rip, body_edge, -1, epilogue_sites, n_epi, NULL);
+        g_jcc_edge[0].target_rip = fall;
+        g_jcc_edge[0].patch_b = pb;
+        g_jcc_edge[0].cond_site = NULL;
+        g_jcc_edge[0].kind = body_edge ? EDGE_BODY : EDGE_XBLOCK;
+        g_jcc_edge[0].pin_class = body_edge ? (uint8_t)edge_class : 0;
+        g_n_jcc_edges = 1;
+        g_stop_target = a64_label(b);
+        a64_mov_imm64(b, JT0, taken);
+        a64_str(b, 8, JT0, 20, RIP_OFF);
+        a64_mov_imm64(b, 0, OCERZ_STEP_OK);
+        epilogue_sites[*n_epi] = a64_label(b);
+        a64_b(b, 0);
+        (*n_epi)++;
+        return 1;
+    }
+    /*
+     * Both arms leave the block, the taken one too when it is the block's own
+     * head: the fixed lanes go back to their registers first.  The loop that
+     * calls this skips its own flush before the last two instructions of a
+     * block with fixed lanes, and without this one a double carried round
+     * addsd; dec; jnz came out wrong.
+     */
+    l0_flush_all(b);
     uint32_t *to_taken = a64_label(b);
     a64_bcond(b, taken_cond, 0);
 
@@ -16553,6 +16592,7 @@ static int emit_arith_incdec_jcc(A64Buf *b, const X86Insn *arith,
         fall = (uint32_t)fall;
     int edge_class = body_edge_pin_class();
     int body_edge = edge_class >= 0;
+    l0_flush_all(b);          /* as emit_incdec_jcc: both arms leave the block */
     uint32_t *to_taken = a64_label(b);
     a64_bcond(b, taken_cond, 0);
 
