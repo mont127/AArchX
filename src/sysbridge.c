@@ -1729,6 +1729,13 @@ int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu)
     pthread_exit(value);
 }
 
+/* pthread_cancel is refused (it would unwind a host thread through ocerz's
+   frames), so no cancellation can ever be pending and there is nothing to test. */
+int ocerz_sys_pthread_testcancel(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    return sb_ret(vm, cpu, 0);
+}
+
 int ocerz_sys_glob(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     int flags = (int)sb_arg(cpu, 1);
