@@ -262,6 +262,41 @@ run_caller_rpath_case() {
     done
 }
 
+run_chain_rpath_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir/sub" "$dir/plug"
+    if ! clang -arch x86_64 -dynamiclib -install_name @rpath/libchain_dep.dylib \
+            -o "$dir/sub/libchain_dep.dylib" tests/dynamic/dlopen_chain_rpath_dep.c 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name @rpath/libchain_leaf.dylib \
+            -o "$dir/sub/libchain_leaf.dylib" tests/dynamic/dlopen_chain_rpath_dep.c 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name "$dir/plug/libchain_plugin.dylib" \
+            -o "$dir/plug/libchain_plugin.dylib" tests/dynamic/dlopen_chain_rpath_plugin.c \
+            "$dir/sub/libchain_dep.dylib" 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name @rpath/libchain_loader.dylib -Wl,-rpath,@loader_path \
+            -o "$dir/sub/libchain_loader.dylib" tests/dynamic/dlopen_chain_rpath_loader.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/dlopen_chain_rpath.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_mac_syscall_low_stack_case() {
     local name="$1" want_out="$2"
     local dir="$TMP/$name"
@@ -1079,6 +1114,7 @@ run_dlopen_cf_case ddlopen_cf 'OK'
 run_load_phase_case ddlopen_load_phase 'OK'
 run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'
 run_caller_rpath_case ddlopen_caller_rpath 'OK'
+run_chain_rpath_case ddlopen_chain_rpath 'OK'
 run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
 run_weak_unloaded_case dweak_unloaded 'OK'
 run_metal_nocopy_low_case dmetal_nocopy_low 'OK'
