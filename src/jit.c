@@ -2744,7 +2744,7 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
     }
     if (is_terminator(insns[n - 1].op) && insns[n - 1].op == OCERZ_OP_RET && !g_xlat_mode32 &&
         !ret_flags_live_at(insns[n - 1].rip) && !ENV_ON("OCERZ_NO_RET_RESOLVE"))
-        live = getenv("OCERZ_RET_FLAGS_DEAD") ? 0 : XLIVE_RETDEP;
+        live = ENV_ON("OCERZ_RET_FLAGS_DEAD") ? 0 : XLIVE_RETDEP;
     uint64_t out = live, in = 0;
     for (;;) {
         live = xlive_resolve(out | in, insns, n - 1);
@@ -10069,7 +10069,7 @@ static void fpb_scan_v2(const X86Insn *insns, int n, int8_t *bat)
             fb->dblonly = (uint16_t)(written & ~everf);
             fb->site = NULL; fb->back = NULL;
             for (int q = i; q <= end; q++) { bat[q] = (int8_t)g_n_fpb; g_fpb_member[q] = g_fpb_marith[q]; }
-            if (getenv("OCERZ_FPB_DBGPRINT"))
+            if (ENV_ON("OCERZ_FPB_DBGPRINT"))
                 fprintf(stderr, "FPB rip=%#llx batch %d [%d..%d] ckpt=%04x written=%04x Tf=%04x Ts=%04x Td=%04x exit=%04x tainted=%04x live=%04x undo=%d\n",
                         (unsigned long long)insns[0].rip, g_n_fpb, i, end, ckpt, written, Tf, Ts, Td, exitchk, tainted, live, nundo);
             if (exitchk) { g_fpb_exit_mask = exitchk; g_fpb_exit_batch = g_n_fpb; g_fpb_exit_end = end; sites++; }
