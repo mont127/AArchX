@@ -1171,6 +1171,13 @@ run_low_golden_case dlow_stack_switch tests/dynamic/low_stack_switch.c tests/dyn
 run_low_golden_case dlow_hoist tests/dynamic/low_hoist.c tests/dynamic/low_hoist.out
 run_golden_case dhoist_share tests/dynamic/hoist_share.c tests/dynamic/hoist_share.out
 run_low_golden_case dhoist_share_low tests/dynamic/hoist_share.c tests/dynamic/hoist_share.out
+# Loops that end in inc or dec and jz/jnz to their own head: straight back to the loop entry when the head reads no
+# flags, and a double carried round such a loop in a fixed lane comes out right on that path and on the chained one.
+run_golden_case dincdec_loop tests/dynamic/incdec_loop.c tests/dynamic/incdec_loop.out
+run_low_golden_case dincdec_loop_low tests/dynamic/incdec_loop.c tests/dynamic/incdec_loop.out
+export OCERZ_NO_INCDEC_LOOP=1
+run_golden_case dincdec_loop_chained tests/dynamic/incdec_loop.c tests/dynamic/incdec_loop.out
+unset OCERZ_NO_INCDEC_LOOP
 run_low_golden_case drep_string_low tests/dynamic/rep_string.c tests/dynamic/rep_string.out
 run_low_golden_case dcomis_mem_low tests/dynamic/comis_mem.c tests/dynamic/comis_mem.out
 run_low_golden_case dstack_pair_low tests/dynamic/stack_pair.c tests/dynamic/stack_pair.out
