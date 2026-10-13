@@ -595,10 +595,46 @@ static Map g_sends;   /* hash(genc|henc) -> M32Export* */
 /* -[NSOpenGLContext setView:] and -update trap off the main thread in today's AppKit; the Intel Macs these games ran on
  * allowed them, and SDL 2 makes both from its render thread. They run on the main thread, which the guest's event loop
  * keeps serving. ponytail: only these two; another AppKit call that traps off the main thread joins on_main. */
+/* OpenGL views: in a program linked with today's SDK, NSView's wantsBestResolutionOpenGLSurface defaults to YES and
+ * the drawable has the window's pixels, twice its points on a Retina display; the i386 programs were linked when it
+ * defaulted to NO, the drawable in points and the window server scaling it.  One that never sets it draws at its point
+ * size into a drawable twice as big (Left 4 Dead 2's frame filled a quarter of the window), so a view an NSOpenGLContext
+ * is set on gets NO unless the guest chose itself.  ponytail: 256 views remembered as chosen. */
+static void *g_chose_hidpi[256];
+static int g_nchose_hidpi;
+static pthread_mutex_t g_hidpi_lock = PTHREAD_MUTEX_INITIALIZER;
+static int chose_hidpi(void *view, int note)
+{
+    int found = 0;
+    pthread_mutex_lock(&g_hidpi_lock);
+    for (int i = 0; i < g_nchose_hidpi && !found; i++)
+        found = g_chose_hidpi[i] == view;
+    if (note && !found && g_nchose_hidpi < 256)
+        g_chose_hidpi[g_nchose_hidpi++] = view;
+    pthread_mutex_unlock(&g_hidpi_lock);
+    return found;
+}
+
+static void legacy_drawable(void *view)
+{
+    if (view && !chose_hidpi(view, 0))
+        ((void (*)(void *, SEL, signed char))M32_MSGSEND)(view, sel_registerName("setWantsBestResolutionOpenGLSurface:"), 0);
+}
+static int is_kind(Class cls, const char *name)
+{
+    Class want = objc_getClass(name);
+    for (; cls && want; cls = class_getSuperclass(cls))
+        if (cls == want)
+            return 1;
+    return 0;
+}
+
 typedef struct MainSend { void *fn, *self; SEL sel; void *arg; } MainSend;
 static void main_send_run(void *p)
 {
     MainSend *m = p;
+    if (m->sel == sel_registerName("setView:"))   /* an NSOpenGLContext the guest attaches itself */
+        legacy_drawable(m->arg);
     ((void (*)(void *, SEL, void *))m->fn)(m->self, m->sel, m->arg);
 }
 static void main_call(void *fn, void *self, SEL sel, void *arg)
@@ -867,7 +903,12 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
     }
     if (strstr(henc, "^@") && strstr(name, "count:"))
         return objects_send(vm, cpu, m, e);
-    return m32_cross(vm, cpu, e);
+    if (!strcmp(name, "setWantsBestResolutionOpenGLSurface:"))
+        chose_hidpi(hself, 1);
+    int r = m32_cross(vm, cpu, e);
+    if (!strcmp(name, "initWithFrame:pixelFormat:") && is_kind(lookup_cls, "NSOpenGLView"))   /* attaches its own */
+        legacy_drawable(m32_objc_to_host((uint32_t)cpu->gpr[OCERZ_RAX]));
+    return r;
 }
 
 /* the shared body of objc_msgSend and objc_msgSend_stret/_fpret: self at stack word self_at */
