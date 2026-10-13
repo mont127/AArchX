@@ -18,5 +18,6 @@ typedef struct M32DbRec {
 } M32DbRec;
 
 int m32_db_lookup(const char *install_name, const char *symbol, M32DbRec *out);
+const char *m32_db_dir(void);   /* runtime/apis32/macos/<version>, or NULL */
 
 #endif

@@ -4186,7 +4186,8 @@ static int emit_shift_eager(A64Buf *b, const X86Insn *insn, uint64_t need)
  * shift and a store; a count that masks to 0 writes nothing, as in the
  * interpreter.  It went to the interpreter in both modes: in Batman: Arkham
  * Asylum's i386 render thread `shr dword [ebp-0x3c], 2` and its kin were a
- * fifth of the instructions still interpreted.
+ * fifth of the instructions still interpreted.  OCERZ_NO_SHIFT_MEM_IMM=1
+ * interprets them again.
  */
 static int mem_native_store_ok(void);
 static int emit_shift_mem_imm(A64Buf *b, const X86Insn *insn, uint64_t need)
@@ -4199,7 +4200,7 @@ static int emit_shift_mem_imm(A64Buf *b, const X86Insn *insn, uint64_t need)
     int size = d->size;
     if (size != 1 && size != 2 && size != 4 && size != 8)
         return 0;
-    if (insn->seg != OCERZ_SEG_NONE || !mem_native_store_ok() ||
+    if (ENV_ON("OCERZ_NO_SHIFT_MEM_IMM") || insn->seg != OCERZ_SEG_NONE || !mem_native_store_ok() ||
         (insn->addrsize != 8 && !(insn->addrsize == 4 && insn->mode32)))
         return 0;
     if (rsp_is_ptr() && (d->base == OCERZ_RSP || d->index == OCERZ_RSP))

@@ -44,6 +44,10 @@ int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **
 extern int m32_active;   /* set by m32_run: the process is an i386 Mach-O program, not Wine's WoW64 */
 int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu);
 int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap);   /* a trap made from inside a block */
+uint32_t m32_export_special(const char *name, M32Special fn);
+/* the Steam bridge (src/m32_steam.c): a steamclient.dylib with no i386 slice opens as the host's own */
+uint32_t m32_steam_dlopen(const char *path);
+uint32_t m32_steam_dlsym(uint32_t handle, const char *sym);
 /* imports the JIT calls straight from a stub block (m32_leaf.c): nargs 4-byte cdecl arguments, the pointers among
  * them (bit k: argument k) passed as host addresses.  simd: the host code it calls may use SIMD registers, so the
  * JIT saves the guest's xmm around it.  tramp: called as m32_leaf_tramp(leaf, raw arguments...), which converts the
@@ -89,6 +93,7 @@ uint32_t m32_static_alloc(uint32_t size, uint32_t align);   /* zeroed guest memo
 uint32_t m32_static_code(uint32_t size);                    /* the same, for i386 code m32 generates */
 /* the guest heap (src/m32_mem.c): a dlmalloc mspace inside the window */
 int m32_heap_init(void);
+uint32_t m32_map(uint64_t n);   /* a read-write mapping below the handle cells, or 0 */
 uint32_t m32_malloc(uint32_t n);
 uint32_t m32_calloc(uint32_t n, uint32_t size);
 uint32_t m32_realloc(uint32_t g, uint32_t n);

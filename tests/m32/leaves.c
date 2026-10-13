@@ -1,7 +1,8 @@
 /* Libc functions an i386 program calls must answer what the host's do (the
  * interpreter's specials call those): overlapping copies both ways, memset/bzero, memcmp's byte difference, strlen,
  * wcscmp on characters with the high bit set, thread-specific data, the clock, tolower, the barrier, pthread_self and
- * the float classifiers (which once answered 0 for every value).  Each runs in a loop so its stub block is translated. */
+ * the float classifiers (which once answered 0 for every value).  Each runs in a loop so its stub block is translated.
+ * The clock's whole 64-bit value (edx:eax) must agree with clock_gettime_nsec_np, which is not a leaf. */
 #include <ctype.h>
 #include <libkern/OSAtomic.h>
 #include <math.h>
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <wchar.h>
 
 static unsigned sum(const unsigned char *p, int n)
@@ -63,6 +65,10 @@ int main(void)
     uint64_t t0 = mach_absolute_time(), t1 = t0;
     for (int r = 0; r < 50; r++)
         t1 = mach_absolute_time();
-    printf("leaves %08x clock %s\n", acc, t1 >= t0 ? "monotonic" : "BACKWARDS");
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    uint64_t ns = t1 * tb.numer / tb.denom, other = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t gap = other > ns ? other - ns : ns - other;
+    printf("leaves %08x clock %s %s\n", acc, t1 >= t0 ? "monotonic" : "BACKWARDS", gap < 100000000 ? "agrees" : "DISAGREES");
     return 0;
 }

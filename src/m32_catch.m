@@ -2,6 +2,7 @@
  * The one Objective-C file of m32: a host call that stops an NSException at the crossing, so m32 can
  * rethrow it into the guest (src/m32_objc_exc.c) instead of unwinding through the emulator.  Built without ARC.
  */
+#import <objc/NSObject.h>
 #include <stdint.h>
 
 void ocerz_abi_call_native(const void *fn, const uint64_t *x, const uint64_t *v, const uint64_t *stack,
