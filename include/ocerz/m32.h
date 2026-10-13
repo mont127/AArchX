@@ -36,6 +36,7 @@ extern const M32SpecialEntry m32_zlib_specials[];   /* src/m32_zlib.c */
 extern const M32SpecialEntry m32_unwind_specials[];   /* src/m32_unwind.c: C++ exceptions */
 extern const M32SpecialEntry m32_gl_specials[];   /* src/m32_gl.c: mapped GL buffers */
 extern const M32SpecialEntry m32_audio_specials[];   /* src/m32_audio.c: CoreAudio render callbacks */
+extern const M32SpecialEntry m32_atsu_specials[];   /* src/m32_atsu.c: ATSUI text and ATS fonts */
 extern uint32_t m32_argc_var, m32_argv_var, m32_environ_var, m32_progname_var;   /* guest variables */
 int m32_printf_slots(const char *fmt, uint32_t ap, uint64_t *slots, int max, const char *who);
 
