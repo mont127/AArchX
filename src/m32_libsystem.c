@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -217,6 +218,38 @@ static int sp_fstat(struct OcerzVM *vm, OcerzCPU *cpu) { return stat_common(cpu,
 static int sp_stat64(struct OcerzVM *vm, OcerzCPU *cpu) { return stat_common(cpu, 0, 1); }
 static int sp_lstat64(struct OcerzVM *vm, OcerzCPU *cpu) { return stat_common(cpu, 1, 1); }
 static int sp_fstat64(struct OcerzVM *vm, OcerzCPU *cpu) { return stat_common(cpu, 2, 1); }
+
+/* struct statfs: $INODE64's fixed-size layout is the host's (2168 bytes). The legacy one is 272 bytes: f_otype and
+ * f_oflags shorts, seven longs from f_bsize @4, f_fsid @32, f_owner @40, f_type short @46, f_flags @48,
+ * f_fstypename[15] @60, f_mntonname[90] @75, f_mntfromname[90] @165 */
+static int statfs_common(OcerzCPU *cpu, int fd, int inode64)
+{
+    struct statfs h;
+    uint32_t a = m32_arg(cpu, 0), g = m32_arg(cpu, 1);
+    int r = fd ? fstatfs((int)a, &h) : statfs(m32_h(a), &h);
+    if (r == 0 && g && inode64)
+        memcpy(m32_h(g), &h, sizeof h);
+    else if (r == 0 && g) {
+        uint32_t v[7] = { h.f_bsize, (uint32_t)h.f_iosize, (uint32_t)h.f_blocks, (uint32_t)h.f_bfree,
+                          (uint32_t)h.f_bavail, (uint32_t)h.f_files, (uint32_t)h.f_ffree };
+        memset(m32_h(g), 0, 272);
+        w16(g, (uint16_t)h.f_type);
+        w16(g + 2, (uint16_t)h.f_flags);
+        memcpy(m32_h(g + 4), v, sizeof v);
+        memcpy(m32_h(g + 32), &h.f_fsid, 8);
+        m32_wr(g + 40, h.f_owner);
+        w16(g + 46, (uint16_t)h.f_type);
+        m32_wr(g + 48, h.f_flags);
+        strlcpy(m32_h(g + 60), h.f_fstypename, 15);
+        strlcpy(m32_h(g + 75), h.f_mntonname, 90);
+        strlcpy(m32_h(g + 165), h.f_mntfromname, 90);
+    }
+    RETV(r);
+}
+static int sp_statfs(struct OcerzVM *vm, OcerzCPU *cpu) { return statfs_common(cpu, 0, 0); }
+static int sp_fstatfs(struct OcerzVM *vm, OcerzCPU *cpu) { return statfs_common(cpu, 1, 0); }
+static int sp_statfs64(struct OcerzVM *vm, OcerzCPU *cpu) { return statfs_common(cpu, 0, 1); }
+static int sp_fstatfs64(struct OcerzVM *vm, OcerzCPU *cpu) { return statfs_common(cpu, 1, 1); }
 
 /* readdir hands back a buffer that lives until the next readdir on the same DIR: one guest buffer per DIR */
 static pthread_mutex_t g_dir_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1275,6 +1308,8 @@ static const M32SpecialEntry g_specials[] = {
     { "_stat", sp_stat }, { "_lstat", sp_lstat }, { "_fstat", sp_fstat },
     { "_stat$INODE64", sp_stat64 }, { "_lstat$INODE64", sp_lstat64 }, { "_fstat$INODE64", sp_fstat64 },
     { "_stat64", sp_stat64 }, { "_lstat64", sp_lstat64 }, { "_fstat64", sp_fstat64 },
+    { "_statfs", sp_statfs }, { "_fstatfs", sp_fstatfs }, { "_statfs$INODE64", sp_statfs64 },
+    { "_fstatfs$INODE64", sp_fstatfs64 },
     { "_readdir", sp_readdir }, { "_readdir$INODE64", sp_readdir64 },
     { "_scandir", sp_scandir }, { "_scandir$INODE64", sp_scandir64 }, { "_alphasort", sp_alphasort },
     { "_alphasort$INODE64", sp_alphasort64 },
