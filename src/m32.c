@@ -137,6 +137,7 @@ int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **
     uint32_t sp = build_frame(stack_lo + stack_size, path, argc, argv, envp);
     OcerzCPU *cpu = &vm->cpu;
     ocerz_cpu_reset(cpu);
+    cpu->gs_base = m32_static_alloc(4 * M32_TSD_KEYS, 16);   /* the main thread's specific data (m32_tsd_set) */
     cpu->mode32 = 1;
     cpu->cs_sel = M32_CS;
     cpu->seg_sel[OCERZ_SREG_CS] = M32_CS;

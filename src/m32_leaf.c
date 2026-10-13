@@ -82,7 +82,11 @@ static uint64_t leaf_wcscmp(const uint32_t *a, const uint32_t *b)
     return (uint32_t)(*a - *--b);
 }
 static uint64_t leaf_getspecific(uint32_t key) { return (uint32_t)(uintptr_t)pthread_getspecific(key); }
-static uint64_t leaf_setspecific(uint32_t key, uint32_t v) { return (uint32_t)pthread_setspecific(key, (void *)(uintptr_t)v); }
+static uint64_t leaf_setspecific(uint32_t key, uint32_t v)
+{
+    m32_tsd_set(key, v);
+    return (uint32_t)pthread_setspecific(key, (void *)(uintptr_t)v);
+}
 static uint64_t leaf_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }   /* m32_libsystem.c now_ns */
 static uint64_t leaf_tolower(uint32_t c) { return (uint32_t)__tolower((int)c); }
 

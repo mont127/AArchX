@@ -90,6 +90,8 @@ typedef struct M32Export {
 enum { M32_EX_UNRESOLVED, M32_EX_SPECIAL, M32_EX_FN, M32_EX_BAD, M32_EX_DATA };
 
 uint32_t m32_static_alloc(uint32_t size, uint32_t align);   /* zeroed guest memory kept for the whole run */
+#define M32_TSD_KEYS 768   /* Darwin's thread-specific data slots */
+void m32_tsd_set(uint32_t key, uint32_t value);   /* src/m32_thread.c: the calling thread's gs:[key * 4] */
 uint32_t m32_static_code(uint32_t size);                    /* the same, for i386 code m32 generates */
 /* the guest heap (src/m32_mem.c): a dlmalloc mspace inside the window */
 int m32_heap_init(void);

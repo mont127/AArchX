@@ -364,8 +364,18 @@ static int sp_key_create(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 static int sp_key_delete(struct OcerzVM *vm, OcerzCPU *cpu) { RETI(pthread_key_delete(m32_arg(cpu, 0))); }
 static int sp_getspecific(struct OcerzVM *vm, OcerzCPU *cpu) { RETI((int)(uintptr_t)pthread_getspecific(m32_arg(cpu, 0))); }
+/* i386 Darwin's gs points at the thread's specific data, and code reads a key's value straight from gs:[key * 4] (V8,
+ * in Left 4 Dead 2's Chromium, checks that it can): what pthread_setspecific stores is mirrored there.  A thread's gs
+ * is its AArchX thread block's, the main thread's a block of its own (m32_run). */
+void m32_tsd_set(uint32_t key, uint32_t value)
+{
+    OcerzCPU *c = ocerz_vm_current_cpu();
+    if (c && c->gs_base && key < M32_TSD_KEYS)
+        m32_wr((uint32_t)c->gs_base + 4 * key, value);
+}
 static int sp_setspecific(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    m32_tsd_set(m32_arg(cpu, 0), m32_arg(cpu, 1));
     RETI(pthread_setspecific(m32_arg(cpu, 0), (void *)(uintptr_t)m32_arg(cpu, 1)));
 }
 
