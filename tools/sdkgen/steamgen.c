@@ -111,6 +111,15 @@ static int is_iface_record(CXType t)
     return r;
 }
 
+static int is_response_record(CXType t)
+{
+    char *n = cstr(clang_getCursorSpelling(clang_getTypeDeclaration(t)));
+    size_t len = strlen(n);
+    int r = !strncmp(n, "ISteam", 6) && len > 8 && !strcmp(n + len - 8, "Response");
+    free(n);
+    return r;
+}
+
 /* the class of one type, or 0 with *why set; *flag gets I or S for a result */
 static char type_char(CXType t, int is_result, char *flag, const char **why)
 {
@@ -144,6 +153,10 @@ static char type_char(CXType t, int is_result, char *flag, const char **why)
             *flag = 'S';
         else if (is_result && p.kind == T_RECORD && is_iface_record(p))
             *flag = 'I';
+        else if (!is_result && p.kind == T_RECORD && is_response_record(p)) {
+            *why = "callback-object";   /* an ISteam...Response the client calls back through its vtable */
+            return 0;
+        }
         return 'p';
     }
     case T_RECORD:
