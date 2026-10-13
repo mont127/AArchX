@@ -1114,6 +1114,14 @@ static int sp_gethostbyname(struct OcerzVM *vm, OcerzCPU *cpu)
     return RETV_PLAIN(g);
 }
 
+/* pipe(int fds[2]): an array the generator cannot describe, the same bytes to both sides (libevent's wakeup pipe in
+ * Left 4 Dead 2's Chromium) */
+static int sp_pipe(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t fds = m32_arg(cpu, 0);
+    RETV(fds ? pipe((int *)m32_h(fds)) : (errno = EFAULT, -1));
+}
+
 /* ioctl(fd, request, ...): one argument, guest memory when the request carries data (IOC_IN/IOC_OUT), else a number */
 static int sp_ioctl(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -1143,7 +1151,7 @@ static int sp_execve(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, 
 static const M32SpecialEntry g_specials[] = {
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
     { "_execv", sp_execv }, { "_execve", sp_execve },
-    { "_ioctl", sp_ioctl },
+    { "_ioctl", sp_ioctl }, { "_pipe", sp_pipe },
     { "_getaddrinfo", sp_getaddrinfo }, { "_freeaddrinfo", sp_freeaddrinfo }, { "_gethostbyname", sp_gethostbyname },
     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },
     { "_mach_absolute_time", sp_mach_absolute_time }, { "_mach_timebase_info", sp_mach_timebase_info },

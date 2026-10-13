@@ -1,0 +1,1 @@
+-framework SystemConfiguration -framework CoreFoundation

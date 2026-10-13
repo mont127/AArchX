@@ -214,6 +214,48 @@ static int sp_CFRunLoopSourceCreate(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* SCDynamicStoreCreate(allocator, name, callout, ctx), SCDynamicStoreCreateWithOptions(allocator, name, options,
+ * callout, ctx) and SCNetworkReachabilitySetCallback(target, callout, ctx): the context as a timer's (Chromium in Left
+ * 4 Dead 2 watches the network with them) */
+static void *sc(const char *sym)
+{
+    return ocerz_bridge_host_symbol("/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration",
+                                    sym);
+}
+static int sp_SCDynamicStoreCreate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *(*f)(void *, void *, void *, HostCtx *) = sc("SCDynamicStoreCreate");
+    uint32_t callout = m32_arg(cpu, 2);
+    HostCtx ctx;
+    void *r = f ? f(m32_host(m32_arg(cpu, 0)), m32_host(m32_arg(cpu, 1)),
+                    callout ? m32_callback(callout, "v(ppp)", "v(ppp)") : NULL, host_ctx(m32_arg(cpu, 3), &ctx))
+                : NULL;
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_SCDynamicStoreCreateWithOptions(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *(*f)(void *, void *, void *, void *, HostCtx *) = sc("SCDynamicStoreCreateWithOptions");
+    uint32_t callout = m32_arg(cpu, 3);
+    HostCtx ctx;
+    void *r = f ? f(m32_host(m32_arg(cpu, 0)), m32_host(m32_arg(cpu, 1)), m32_host(m32_arg(cpu, 2)),
+                    callout ? m32_callback(callout, "v(ppp)", "v(ppp)") : NULL, host_ctx(m32_arg(cpu, 4), &ctx))
+                : NULL;
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_SCNetworkReachabilitySetCallback(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    unsigned char (*f)(void *, void *, HostCtx *) = sc("SCNetworkReachabilitySetCallback");
+    uint32_t callout = m32_arg(cpu, 1);
+    HostCtx ctx;
+    unsigned char r = f ? f(m32_host(m32_arg(cpu, 0)), callout ? m32_callback(callout, "v(pup)", "v(pup)") : NULL,
+                            host_ctx(m32_arg(cpu, 2), &ctx))
+                        : 0;
+    m32_ret(cpu, r, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 /* CFRunLoopTimerGetContext(timer, ctx): version and info back in the guest's layout.
  * ponytail: the callbacks come back NULL (the host holds slots, not the guest's functions); keep a map if a game
  * reads them back. */
@@ -693,6 +735,9 @@ const M32SpecialEntry m32_cf_specials[] = {
     { "_CFRunLoopTimerGetContext", sp_CFRunLoopTimerGetContext },
     { "_CFRunLoopTimerCreate", sp_CFRunLoopTimerCreate },
     { "_CFRunLoopObserverCreate", sp_CFRunLoopObserverCreate }, { "_CFRunLoopSourceCreate", sp_CFRunLoopSourceCreate },
+    { "_SCDynamicStoreCreate", sp_SCDynamicStoreCreate },
+    { "_SCDynamicStoreCreateWithOptions", sp_SCDynamicStoreCreateWithOptions },
+    { "_SCNetworkReachabilitySetCallback", sp_SCNetworkReachabilitySetCallback },
     { "_CFDictionaryGetValueIfPresent", sp_CFDictionaryGetValueIfPresent },
     { "_CFBundleGetFunctionPointerForName", sp_CFBundleGetFunctionPointerForName },
     { "_CFBundleGetDataPointerForName", sp_CFBundleGetDataPointerForName },
