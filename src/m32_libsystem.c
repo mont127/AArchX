@@ -1269,6 +1269,7 @@ static const M32SpecialEntry g_specials[] = {
     { "___isinff", sp_isinff }, { "___isnanf", sp_isnanf }, { "___isfinitef", sp_isfinitef },
     { "___isnormalf", sp_isnormalf }, { "___signbitf", sp_signbitf },
     { "___isinfd", sp_isinfd }, { "___isnand", sp_isnand }, { "___isfinited", sp_isfinited },
+    { "_finite", sp_isfinited },   /* the old BSD name, which the SDK no longer declares (Left 4 Dead 2's vphysics) */
     { "___isnormald", sp_isnormald }, { "___signbitd", sp_signbitd },
     { "_aio_read", sp_aio_read }, { "_aio_write", sp_aio_write }, { "_aio_error", sp_aio_error },
     { "_aio_return", sp_aio_return }, { "_aio_cancel", sp_aio_cancel }, { "_aio_suspend", sp_aio_suspend },
