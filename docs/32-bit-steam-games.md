@@ -9,8 +9,8 @@ it did on an Intel Mac. Nothing of Valve's is bundled and no Steam emulator is
 involved.
 
 This is experimental. It has been tested mostly with two games, Batman: Arkham
-Asylum and Call of Duty: Modern Warfare 3. Other 32-bit games may run, stop early
-or misbehave; the
+Asylum and Call of Duty: Modern Warfare 3, and with Left 4 Dead 2. Other 32-bit
+games may run, stop early or misbehave; the
 [games table](#games) says what has been tried, and grows as more is tested.
 
 ## What you need
@@ -52,7 +52,9 @@ none of it is committed. Run the setup again after updating AArchX or Xcode.
    "/Users/you/AArchX/ocerz" -native %command%
    ```
 
-   The path must be absolute. Steam replaces `%command%` with the game's app.
+   The path must be absolute. Steam replaces `%command%` with the game's app,
+   or, for a game that starts through a script (Left 4 Dead 2), with the
+   script; ocerz runs the script and has it start the game under ocerz.
 3. **Press Play.**
 
 Always start the game from Steam. Steam tells a game where its client lives
@@ -65,6 +67,7 @@ cannot find Steam and asks Steam to relaunch it.
 | --- | --- | --- |
 | Batman: Arkham Asylum Game of the Year Edition (Feral, 2014) | Plays | About 60 frames a second on an M4 Max. Signs in to Steam and gets the Steam interfaces it asks for. See below. |
 | Call of Duty: Modern Warfare 3 (Aspyr, 2011), campaign | Plays | Launcher, intro movies with sound, and the campaign, on an M4 Max. Signs in to Steam. See below. |
+| Left 4 Dead 2 (Valve) | Plays | Campaigns from Steam, on an M4 Max: 80 to 120 frames a second at the default settings, fewer in the largest fights. Signs in to Steam. See below. |
 
 **Batman: Arkham Asylum.** Its options window (Feral's launcher) opens as a
 black window; the game starts after it. The first run writes default settings,
@@ -76,6 +79,19 @@ and cloud saves. The Steam overlay is not expected to appear.
 button starts the campaign, which plays its movies and sound. Multiplayer is a
 separate Steam app and has not been tried. Not yet verified through the bridge:
 achievements and cloud saves.
+
+**Left 4 Dead 2.** Steam starts it through a script, `hl2.sh`, which runs the
+game under whatever `GAME_DEBUGGER` names; given the script, ocerz sets that
+variable to itself, so the usual launch option works. The folder holding ocerz
+must have no space in its path, because the script splits the variable at
+spaces. The campaigns play with sound and music, ragdolls included, and
+settings and key bindings are saved. The menu's background movies do not play:
+they need QuickTime, which macOS no longer has. Some letters are spaced a
+little wide. Typing in the developer console doubles each letter; a pasted
+command ending in `;` runs once (its copy runs again and is harmless). Exit to
+main menu crashes; quit from the game's menu instead. When the game has to
+rebuild its sound caches (`sound/sound.cache`) it stays on the loading poster;
+start it again and the menu appears.
 
 Tried another 32-bit game? Open a
 [compatibility report](https://github.com/mont127/AArchX/issues/new/choose)
