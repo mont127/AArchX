@@ -64,22 +64,68 @@ before running it: `xattr -dr com.apple.quarantine aarchx`.
 
 ## The AArchX app
 
-AArchX.app runs programs without Terminal. There are three ways to give it one:
-- drop an Intel app or command-line program on its window or its Dock icon;
-- right-click the program in Finder and choose **Open With → AArchX**;
-- click **Choose…**.
+AArchX.app is a window around `ocerz` for running programs without Terminal.
+It is separate from the terminal version: `ocerz` works the same with or without
+it, and the app only finds and starts it.
 
-Each program runs under `ocerz`, with its output in `~/Library/Logs/AArchX`.
-The window lists every run with how it ended:
-- double-click a run to open its log;
-- right-click a run to show its log, show the program in Finder, run it again
-  or stop it.
+The app keeps a **library** of your programs: Intel Mac apps and command-line
+programs, 32-bit Mac programs, and Windows `.exe` and `.msi` files. Each tile
+shows the program's icon and name, and says what it is or that it is running.
 
-How it picks the mode:
-- The **Native mode** box is `-native`.
+To add programs:
+- drop them on the window: one program dropped is added and run, several are
+  only added;
+- click **+**;
+- right-click a program in Finder and choose **Open With → AArchX**, or drop it
+  on the app's Dock icon, which adds it and runs it.
+
+To use a tile:
+- double-click it to run the program;
+- right-click it to run it in native mode, stop it, open its last log, show it
+  in Finder or remove it from the library.
+
+**Activity** lists every run, with how it ended and when it started. Its logs
+are in `~/Library/Logs/AArchX`.
+
+How the app picks the mode:
+- **Native mode**, in the bottom bar, is `-native`.
 - The app switches to native mode by itself for a 32-bit program, which only
   [m32](m32.md) runs, and when Rosetta's x86-64 cache is missing.
 - It refuses an Apple silicon app, which runs without AArchX.
+
+A Windows program runs through Wine, as `ocerz <wine> <program>`:
+- The **Windows programs** menu in the bottom bar lists the x86-64 Wine
+  builds the app finds:
+  - WineHQ's Stable, Staging and Devel apps, in `/Applications`,
+    `~/Applications` or MacNdCheese's own copies;
+  - Whisky's Wine;
+  - the Game Porting Toolkit;
+  - a `wine` in Homebrew's `bin`.
+- The program starts in its own folder, in cache mode.
+- It uses a prefix of the app's own, `~/Library/Application Support/AArchX/Wine`,
+  so no other Wine setup's prefix is touched. `WINEPREFIX`, or
+  `defaults write io.github.mont127.aarchx WinePrefix <dir>`, picks another.
+- An `.msi` is installed with `msiexec /i`.
+- **Stop** also stops the prefix's `wineserver`, which ends every Windows
+  program running in that prefix.
+
+With CrossOver installed, **CrossOver Bottles…** in the bottom bar lists its
+bottles, each with a box. A ticked bottle runs its Windows programs under
+AArchX instead of Rosetta, started from CrossOver's own window as usual.
+- **How it switches.** The box sets the bottle's `[Wine] "BinPath"`,
+  CrossOver's documented way to use another Wine. That puts two small scripts in
+  `~/Library/Application Support/AArchX/CrossOver/bin` ahead of CrossOver's own
+  `bin`. They run CrossOver's `wineloader` and `wineserver` under `ocerz`, or
+  directly if `ocerz` is gone.
+- **What stays the same.** Nothing inside CrossOver.app changes, so a CrossOver
+  update keeps both the setting and CrossOver's signature.
+- **Switching back.** Unticking the box removes the line.
+- **Before you switch.** Quit the bottle's programs; the change applies when the
+  bottle next starts.
+
+For games, [MacNdCheese](https://github.com/mont127/MacNdCheese) sets up a whole
+Wine environment, with DXMT, DXVK and Steam, and can run its bottles under
+AArchX too.
 
 It looks for `ocerz` in this order:
 1. inside its own bundle;

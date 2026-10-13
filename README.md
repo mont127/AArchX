@@ -58,7 +58,9 @@ This installs the latest release's prebuilt `ocerz` and its runtime files in
 `~/.aarchx`, adds `~/.aarchx/bin` to `PATH` in your shell profile, and puts
 AArchX.app in `~/Applications`. To run a program without Terminal, drop an
 Intel app on AArchX.app's window, or right-click the app in Finder and choose
-Open With → AArchX. In Terminal, open a new window, then:
+Open With → AArchX. With Wine installed, a Windows `.exe` works the same way.
+The app is only a wrapper around the terminal version, which works the same with
+or without it. In Terminal, open a new window, then:
 
 ```sh
 ocerz version                         # AArchX 0.7.1
