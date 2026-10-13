@@ -1,0 +1,5 @@
+type 10: ok 1 value -123456 guard 0x5a5a
+type 14: ok 1 value -123456 guard 0x5a5a
+type 15: ok 1 value -123456 guard 0x5a5a
+CGFloat: value 2.50 guard 0x5a5a
+exit 0

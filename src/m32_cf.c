@@ -498,6 +498,31 @@ static int sp_IOCreatePlugInInterfaceForService(struct OcerzVM *vm, OcerzCPU *cp
     return OCERZ_STEP_OK;
 }
 
+/* CFNumberCreate(alloc, type, valuePtr) and CFNumberGetValue(number, type, valuePtr): kCFNumberLongType, CFIndexType
+ * and NSIntegerType are 4 bytes on i386 and 8 on the host, kCFNumberCGFloatType a float there and a double here, so the
+ * host read 8 bytes from the guest's 4 and wrote 8 into them (Left 4 Dead 2 reads display modes this way).  They
+ * become the 4-byte types they are on i386. */
+static long number_type(long t)
+{
+    return t == 10 || t == 14 || t == 15 ? 3 /* kCFNumberSInt32Type */ : t == 16 ? 5 /* kCFNumberFloat32Type */ : t;
+}
+static int sp_CFNumberCreate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *(*f)(void *, long, const void *) = cf("CFNumberCreate");
+    uint32_t v = m32_arg(cpu, 2);
+    void *r = f ? f(m32_host(m32_arg(cpu, 0)), number_type((int32_t)m32_arg(cpu, 1)), v ? m32_h(v) : NULL) : NULL;
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_CFNumberGetValue(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    unsigned char (*f)(void *, long, void *) = cf("CFNumberGetValue");
+    uint32_t v = m32_arg(cpu, 2);
+    unsigned char r = f ? f(m32_host(m32_arg(cpu, 0)), number_type((int32_t)m32_arg(cpu, 1)), v ? m32_h(v) : NULL) : 0;
+    m32_ret(cpu, r, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 /* FSCatalogInfo: the i386 FSPermissionInfo ends in a 4-byte reserved word where the host's has an 8-byte FileSecRef,
  * so from the permissions on every field sits 4 bytes later on the host (i386 144 bytes, valence at 136; host 148, at
  * 140).  Handed through as is, a directory's valence came back 0 and a game sized its listing from it, then wrote
@@ -621,6 +646,7 @@ const M32SpecialEntry m32_cf_specials[] = {
     { "_CFUUIDGetConstantUUIDWithBytes", sp_CFUUIDGetConstantUUIDWithBytes },
     { "_CFUUIDCreateWithBytes", sp_CFUUIDCreateWithBytes },
     { "_IOCreatePlugInInterfaceForService", sp_IOCreatePlugInInterfaceForService },
+    { "_CFNumberCreate", sp_CFNumberCreate }, { "_CFNumberGetValue", sp_CFNumberGetValue },
     { "_CFDictionaryGetKeysAndValues", sp_CFDictionaryGetKeysAndValues }, { "_CFSetGetValues", sp_CFSetGetValues },
     { "_CFBagGetValues", sp_CFBagGetValues }, { "_CFArrayGetValues", sp_CFArrayGetValues },
     { "_GetProcessBundleLocation", sp_GetProcessBundleLocation }, { "_SecCodeCheckValidity", sp_SecCodeCheckValidity },
