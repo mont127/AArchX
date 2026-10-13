@@ -1,0 +1,4 @@
+defined 1 0
+address 1 calls 7
+library nssymbol
+exit 0

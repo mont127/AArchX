@@ -1045,6 +1045,33 @@ static int sp_dladdr(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* NSIsSymbolNameDefined and the rest of the NSSymbol calls, from the i386 images (Miles finds its own folder, and
+ * the decoders in osx32 beside it, through them): an NSSymbol is the symbol's address, an NSModule the base of the
+ * image holding it */
+static uint32_t ns_lookup(OcerzCPU *cpu)
+{
+    const char *sym = m32_h(m32_arg(cpu, 0));
+    uint32_t v = 0;
+    for (int i = 0; !v && i < m32_nimages; i++)
+        v = lookup_in(m32_images[i], sym, 0);
+    return v ? v : system_symbol(NULL, sym);
+}
+static int sp_NSIsSymbolNameDefined(struct OcerzVM *vm, OcerzCPU *cpu) { m32_ret(cpu, ns_lookup(cpu) != 0, 0, 0); return OCERZ_STEP_OK; }
+static int sp_NSLookupAndBindSymbol(struct OcerzVM *vm, OcerzCPU *cpu) { m32_ret(cpu, ns_lookup(cpu), 0, 0); return OCERZ_STEP_OK; }
+static int sp_NSAddressOfSymbol(struct OcerzVM *vm, OcerzCPU *cpu) { m32_ret(cpu, m32_arg(cpu, 0), 0, 0); return OCERZ_STEP_OK; }
+static int sp_NSModuleForSymbol(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    M32Image *img = image_at(m32_arg(cpu, 0));
+    m32_ret(cpu, img ? img->base : 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSLibraryNameForModule(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    M32Image *img = image_at(m32_arg(cpu, 0));
+    m32_ret(cpu, img ? m32_cstring(img->path) : 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 static int sp_image_count(struct OcerzVM *vm, OcerzCPU *cpu) { m32_ret(cpu, (uint32_t)m32_nimages, 0, 0); return OCERZ_STEP_OK; }
 static int sp_image_name(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -1132,6 +1159,9 @@ static int sp_getsectdatafromheader(struct OcerzVM *vm, OcerzCPU *cpu)
 const M32SpecialEntry m32_dyld_specials[] = {
     { "_dlopen", sp_dlopen }, { "_dlsym", sp_dlsym }, { "_dlclose", sp_dlclose }, { "_dlerror", sp_dlerror },
     { "_dladdr", sp_dladdr },
+    { "_NSIsSymbolNameDefined", sp_NSIsSymbolNameDefined }, { "_NSLookupAndBindSymbol", sp_NSLookupAndBindSymbol },
+    { "_NSAddressOfSymbol", sp_NSAddressOfSymbol }, { "_NSModuleForSymbol", sp_NSModuleForSymbol },
+    { "_NSLibraryNameForModule", sp_NSLibraryNameForModule },
     { "__dyld_image_count", sp_image_count }, { "__dyld_get_image_name", sp_image_name },
     { "__dyld_get_image_header", sp_image_header }, { "__dyld_get_image_vmaddr_slide", sp_image_slide },
     { "__dyld_register_func_for_add_image", sp_register_add_image },
