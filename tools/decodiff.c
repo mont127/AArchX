@@ -5,8 +5,9 @@
  * identical.  Two rejected i386 proposals both shipped silent 64-bit decode
  * regressions that the entire existing test suite missed, so this is the
  * acceptance gate for every future decode.c change.  It links against
- * src/decode.o ALONE (verified self-contained: it needs only libc), so it is
- * native arm64 -- no Rosetta, no wine, no i386 toolchain.
+ * src/decode.o ALONE, defining here the three arena bases that decode.c's
+ * NULL-code diagnostic prints, so it needs only libc and is native arm64 --
+ * no Rosetta, no wine, no i386 toolchain.
  *
  *   decodiff digest <out.bin>   -- sweep, write one u64 record hash per input
  *   decodiff line <hexbytes>    -- print the canonical record for one input
@@ -31,6 +32,8 @@
 #define SWEEP_BITS 24
 #define SWEEP_N    (1u << SWEEP_BITS)
 #define RIP        0x0000000140001000ull
+
+uint64_t ocerz_guest_base, ocerz_low_base, ocerz_top_base;
 
 static const uint8_t TAIL[13] = {
     0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd
