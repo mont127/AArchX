@@ -993,6 +993,8 @@ static int sp_dlsym(struct OcerzVM *vm, OcerzCPU *cpu)
     }
     if (!v)
         set_dlerror("dlsym: symbol %s not found", sym + 1);
+    if (!v && getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "dlsym"))   /* OCERZ_M32LOG=dlsym: lookups that found nothing */
+        fprintf(stderr, "ocerz: m32: dlsym found no %s (called from %#x)\n", sym + 1, m32_rd((uint32_t)cpu->gpr[OCERZ_RSP]));
     m32_ret(cpu, v, 0, 0);
     return OCERZ_STEP_OK;
 }

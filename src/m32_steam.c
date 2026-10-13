@@ -388,6 +388,8 @@ static int sp_BGetCallback(struct OcerzVM *vm, OcerzCPU *cpu)
         m32_wr(gm + 4, (uint32_t)m.id);
         m32_wr(gm + 8, buf);
         m32_wr(gm + 12, size);
+        if (steam_log())
+            fprintf(stderr, "ocerz: m32: steam: callback %d (%u bytes) for user %d\n", m.id, size, m.user);
     }
     m32_ret(cpu, (uint32_t)(r & 0xff), 0, 0);
     return OCERZ_STEP_OK;
