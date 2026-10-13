@@ -175,6 +175,45 @@ static int sp_CFRunLoopTimerCreate(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* CFRunLoopObserverCreate(allocator, activities, repeats, order, callout, ctx): the context as a timer's.  Passed
+ * through, the i386 context crashed the host on Left 4 Dead 2's threads. */
+static int sp_CFRunLoopObserverCreate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *(*f)(void *, unsigned long, unsigned char, long, void *, HostCtx *) = cf("CFRunLoopObserverCreate");
+    uint32_t callout = m32_arg(cpu, 4);
+    HostCtx ctx;
+    void *r = f ? f(m32_host(m32_arg(cpu, 0)), m32_arg(cpu, 1), (unsigned char)m32_arg(cpu, 2), (long)(int32_t)m32_arg(cpu, 3),
+                    callout ? m32_callback(callout, "v(pup)", "v(pLp)") : NULL, host_ctx(m32_arg(cpu, 5), &ctx))
+                : NULL;
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+
+/* CFRunLoopSourceCreate(allocator, order, ctx): a version 0 context is the timer's five fields and {equal, hash,
+ * schedule, cancel, perform}, ten 4-byte fields on i386.  ponytail: version 1 (Mach port sources) is refused. */
+typedef struct { HostCtx base; void *equal, *hash, *schedule, *cancel, *perform; } HostSourceCtx;
+static void *cb_or_null(uint32_t fn, const char *g, const char *h) { return fn ? m32_callback(fn, g, h) : NULL; }
+static int sp_CFRunLoopSourceCreate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    void *(*f)(void *, long, HostSourceCtx *) = cf("CFRunLoopSourceCreate");
+    uint32_t c = m32_arg(cpu, 2);
+    if (!f || !c || m32_rd(c) != 0) {
+        m32_log_once("only version 0 run loop source contexts cross:", "CFRunLoopSourceCreate");
+        m32_ret(cpu, 0, 0, 0);
+        return OCERZ_STEP_OK;
+    }
+    HostSourceCtx h;
+    host_ctx(c, &h.base);
+    h.equal = cb_or_null(m32_rd(c + 20), "B(pp)", "B(pp)");
+    h.hash = cb_or_null(m32_rd(c + 24), "u(p)", "L(p)");
+    h.schedule = cb_or_null(m32_rd(c + 28), "v(ppp)", "v(ppp)");
+    h.cancel = cb_or_null(m32_rd(c + 32), "v(ppp)", "v(ppp)");
+    h.perform = cb_or_null(m32_rd(c + 36), "v(p)", "v(p)");
+    void *r = f(m32_host(m32_arg(cpu, 0)), (long)(int32_t)m32_arg(cpu, 1), &h);
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 /* CFRunLoopTimerGetContext(timer, ctx): version and info back in the guest's layout.
  * ponytail: the callbacks come back NULL (the host holds slots, not the guest's functions); keep a map if a game
  * reads them back. */
@@ -653,6 +692,7 @@ const M32SpecialEntry m32_cf_specials[] = {
     { "_CFReadStreamSetClient", sp_CFReadStreamSetClient }, { "_CFWriteStreamSetClient", sp_CFWriteStreamSetClient },
     { "_CFRunLoopTimerGetContext", sp_CFRunLoopTimerGetContext },
     { "_CFRunLoopTimerCreate", sp_CFRunLoopTimerCreate },
+    { "_CFRunLoopObserverCreate", sp_CFRunLoopObserverCreate }, { "_CFRunLoopSourceCreate", sp_CFRunLoopSourceCreate },
     { "_CFDictionaryGetValueIfPresent", sp_CFDictionaryGetValueIfPresent },
     { "_CFBundleGetFunctionPointerForName", sp_CFBundleGetFunctionPointerForName },
     { "_CFBundleGetDataPointerForName", sp_CFBundleGetDataPointerForName },
