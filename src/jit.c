@@ -18987,10 +18987,15 @@ static void emit_slowcall(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             tc_imm64(b, 2, TCR_BLK, 0, (uint64_t)(uintptr_t)g_cur_blk);
             a64_mov_imm64(b, 3, (uint64_t)idx);
             tc_imm64(b, 16, TCR_SYM, TCS_EXEC_ONE_AT, (uint64_t)(uintptr_t)&ocerz_jit_exec_one_at);
+        } else if (idx >= 0) {
+            g_no_compact = 1;
+            tc_imm64(b, 2, TCR_BLK, 0, (uint64_t)(uintptr_t)g_cur_blk);
+            a64_mov_imm64(b, 3, (uint64_t)idx);
+            tc_imm64(b, 16, TCR_SYM, TCS_EXEC_ONE_AT, (uint64_t)(uintptr_t)&ocerz_jit_exec_one_at);
         } else {
             g_no_compact = 1;
-            if (idx >= 0) tc_imm64(b, 2, TCR_INSN, (uint64_t)idx, (uint64_t)(uintptr_t)insn);
-            else { g_tc_bad = 1; a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)insn); }
+            g_tc_bad = 1;
+            a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)insn);
             tc_imm64(b, 16, TCR_SYM, TCS_EXEC_ONE, (uint64_t)(uintptr_t)&ocerz_jit_exec_one);
         }
     }
@@ -21013,7 +21018,7 @@ static uint64_t ret_seam_live(const X86Insn *insns, int n)
 static int churn_blacklisted(uint64_t rip);
 static void churn_note_refusal(uint64_t rip);
 
-static void compact_block(JitBlock *blk)
+static void compact_block(JitBlock *blk, const X86Insn *borrowed)
 {
     int n = blk->n_insns;
     if (!blk->code || !blk->insns || g_no_compact || g_cur_blk != blk ||
@@ -21040,9 +21045,38 @@ static void compact_block(JitBlock *blk)
         if (g_keep[i]) { kept[k] = *in; ref[i].keep = (uint16_t)(k + 1); k++; }
     }
     blk->iref = ref; blk->kept = kept; blk->n_kept = (uint16_t)nk;
-    free(blk->insns); blk->insns = NULL;
+    if (blk->insns != borrowed) free(blk->insns);
+    blk->insns = NULL;
     g_pe_insns = NULL; g_cur_insns = NULL; g_cur_insns_n = 0;
     g_cur_blk = NULL;
+}
+
+/*
+ * translate decodes a block into its own scratch array and translates it from
+ * there: blk->insns is that array until the block is finished, and the
+ * X86Insn pointers taken from it while emitting (g_cur_insns, g_flag_producer,
+ * the tables) all agree with one another.  Most blocks are compacted, which
+ * copies the few instructions they keep and needs nothing more; a block kept
+ * whole (one that cannot be compacted, or one that ends in a failure return)
+ * gets its own copy here, once nothing is emitted any longer.  The array used
+ * to be malloc'd and copied for every block and freed again by compact_block.
+ */
+static void blk_insns_own(JitBlock *blk, const X86Insn *borrowed)
+{
+    if (blk->insns != borrowed)
+        return;
+    X86Insn *p = (X86Insn *)malloc((size_t)blk->n_insns * sizeof *p);
+    if (!p) {
+        fprintf(stderr, "ocerz: fatal: out of memory keeping the instructions of block %#llx\n",
+                (unsigned long long)blk_rip(blk));
+        abort();
+    }
+    memcpy(p, borrowed, (size_t)blk->n_insns * sizeof *p);
+    blk->insns = p;
+    if (g_cur_insns == borrowed) g_cur_insns = p;
+    if (g_pe_insns == borrowed) g_pe_insns = p;
+    if (g_nzcv_prod_of == borrowed) g_nzcv_prod_of = NULL;
+    if (g_du_of == borrowed) g_du_of = NULL;
 }
 
 static uint32_t g_tc_pool_off;
@@ -22209,13 +22243,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (ocerz_jitstat > 0) { js_xlat_fail++; js_fail_alloc++; js_note_fail(rip, JSR_ALLOC, n); }
         return NULL;
     }
-    blk->insns = (X86Insn *)malloc((size_t)n * sizeof(X86Insn));
-    if (!blk->insns) {
-        free(blk);
-        if (ocerz_jitstat > 0) { js_xlat_fail++; js_fail_alloc++; js_note_fail(rip, JSR_ALLOC, n); }
-        return NULL;
-    }
-    memcpy(blk->insns, scratch, (size_t)n * sizeof(X86Insn));
+    blk->insns = scratch;
     blk->n_insns = n;
     blk->key = jit_key(rip, mode32);
     if (g_keep_cap < n) {
@@ -23881,6 +23909,7 @@ promo_push_fallthrough:
         g_lowstack = 0;
         g_lowptr = 0;
         g_m32low = 0;
+        blk_insns_own(blk, scratch);
         cache_insert(jit, blk);
         return blk;
     }
@@ -23904,6 +23933,7 @@ promo_push_fallthrough:
         g_lowstack = 0;
         g_lowptr = 0;
         g_m32low = 0;
+        blk_insns_own(blk, scratch);
         cache_insert(jit, blk);
         return blk;
     }
@@ -24059,6 +24089,7 @@ promo_push_fallthrough:
         g_pin_hold = NULL;
         g_n_pinned = 0;
         g_pin_class = 0;
+        blk_insns_own(blk, scratch);
         cache_insert(jit, blk);
         return blk;
     }
@@ -24101,7 +24132,8 @@ promo_push_fallthrough:
         if (blk->lanerec) { memcpy(blk->lanerec, g_lanerec, (size_t)g_n_lanerec * sizeof *blk->lanerec); blk->n_lanerec = g_n_lanerec; }
     }
     g_n_lanerec = 0;
-    compact_block(blk);
+    compact_block(blk, scratch);
+    blk_insns_own(blk, scratch);
     cache_insert(jit, blk);
 
     if (tc_save) {
