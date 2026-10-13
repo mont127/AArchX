@@ -120,7 +120,9 @@
  * compares in order and stops at the first difference, or, when sixteen bytes
  * from the start lie inside one 4 KB page, the page byte 0 is in, compares
  * them at once.  The bytes are read before the slot is written, so a fault
- * never leaves a slot half filled.  OCERZ_NO_DECODE_MEMO=1 decodes afresh.
+ * never leaves a slot half filled.  A slot is 128 bytes and the table is
+ * aligned to 128, so a lookup touches one of Apple silicon's cache lines rather
+ * than straddling two.  OCERZ_NO_DECODE_MEMO=1 decodes afresh.
  * A static liveness pass and the emitters share the same predicates so they
  * cannot disagree about what is live.  The legality rules here are written in
  * blood: a gap may not write a register the producer read (a byte compare
@@ -1088,7 +1090,7 @@ static int g_tc_dbar;
 static int g_tc_rec;
 static int g_tc_learned;
 #define DEC_MEMO_SLOTS 4096
-static struct {
+static _Alignas(128) struct {
     uint64_t pc;
     uint8_t bytes[16];
     uint8_t mode32;
