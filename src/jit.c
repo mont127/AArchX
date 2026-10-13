@@ -7500,6 +7500,40 @@ static int nzcv_fuse_producer(const X86Insn *insns, int ci)
     }
     return k;
 }
+/*
+ * nzcv_fuse_producer of every instruction of the block being translated,
+ * worked out once before its liveness pass.  Its answer depends only on the
+ * instructions and on state translate sets before that pass (the pin layout,
+ * g_defer, the Wine layout's flags), so the liveness pass, nzcv_regen_scan,
+ * the emission loop's look for a consumer up to NZCV_GAP_MAX + 1 ahead and
+ * emit_cc_predicate read it here instead of asking again: the loop alone asked
+ * up to nine times an instruction, each a scan back through
+ * cc_consumer_inline_ok.  Any other array goes to nzcv_fuse_producer.
+ * OCERZ_NZCV_PROD_CHECK=1 asks again at every read and stops on a difference.
+ */
+static int16_t g_nzcv_prod[JIT_MAX_BLOCK_INSNS];
+static const X86Insn *g_nzcv_prod_of;
+static void nzcv_prod_fill(const X86Insn *insns, int n)
+{
+    g_nzcv_prod_of = NULL;
+    for (int j = 0; j < n; j++)
+        g_nzcv_prod[j] = (int16_t)nzcv_fuse_producer(insns, j);
+    g_nzcv_prod_of = insns;
+}
+static int nzcv_producer_of(const X86Insn *insns, int ci)
+{
+    if (insns != g_nzcv_prod_of)
+        return nzcv_fuse_producer(insns, ci);
+    if (ENV_ON("OCERZ_NZCV_PROD_CHECK")) {
+        int k = nzcv_fuse_producer(insns, ci);
+        if (k != g_nzcv_prod[ci]) {
+            fprintf(stderr, "ocerz: NZCV-PROD rip=%#llx insn %d: table %d, asked again %d\n",
+                    (unsigned long long)insns[ci].rip, ci, g_nzcv_prod[ci], k);
+            abort();
+        }
+    }
+    return g_nzcv_prod[ci];
+}
 static int16_t g_nzcv_regen[JIT_MAX_BLOCK_INSNS];
 /* Which loads sit in a window a consumer takes NZCV through, and from which producer. */
 static void nzcv_regen_scan(const X86Insn *insns, int n)
@@ -7509,7 +7543,7 @@ static void nzcv_regen_scan(const X86Insn *insns, int n)
         unsigned op = insns[ci].op;
         if (op != OCERZ_OP_SETCC && op != OCERZ_OP_CMOVCC && op != OCERZ_OP_ADC && op != OCERZ_OP_SBB && op != OCERZ_OP_JCC)
             continue;
-        int k = nzcv_fuse_producer(insns, ci);
+        int k = nzcv_producer_of(insns, ci);
         if (k < 0) continue;
         for (int m = k + 1; m < ci; m++)
             if (nzcv_gap_load(&insns[m])) g_nzcv_regen[m] = (int16_t)k;
@@ -7665,7 +7699,7 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
         fprintf(stderr, "ocerz: CCPRED cc=%u producer=%s\n", cc, tb);
     }
     if (g_nzcv_from >= 0 && g_cur_insns && g_nzcv_from < g_cur_insn_idx &&
-        nzcv_fuse_producer(g_cur_insns, g_cur_insn_idx) == g_nzcv_from) {
+        nzcv_producer_of(g_cur_insns, g_cur_insn_idx) == g_nzcv_from) {
         const X86Insn *c = &g_cur_insns[g_cur_insn_idx];
         unsigned want_cc = (c->op == OCERZ_OP_ADC || c->op == OCERZ_OP_SBB) ? OCERZ_CC_B : c->cc;
         if (want_cc == cc) {
@@ -22158,6 +22192,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_chain_epi = NULL;
     g_n_jcc_edges = 0;
     g_nzcv_want = 0; g_nzcv_from = -1;
+    g_nzcv_prod_of = NULL;
     g_jcc_edge[0].cond_site = NULL; g_jcc_edge[1].cond_site = NULL;
     g_n_oslow = 0;
     g_n_garm = 0;
@@ -22649,6 +22684,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         seam_seed = xlive_resolve(seam_seed, blk->insns, n - 1);
     }
 
+    nzcv_prod_fill(blk->insns, n);
     uint64_t fl_need[JIT_MAX_BLOCK_INSNS];
     uint64_t fl_live[JIT_MAX_BLOCK_INSNS];
     uint64_t jcc_fall_live[JIT_MAX_BLOCK_INSNS];
@@ -22682,7 +22718,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if ((blk->insns[i].op == OCERZ_OP_SETCC || blk->insns[i].op == OCERZ_OP_CMOVCC ||
                  blk->insns[i].op == OCERZ_OP_ADC || blk->insns[i].op == OCERZ_OP_SBB ||
                  blk->insns[i].op == OCERZ_OP_JCC)) {
-                int fk = nzcv_fuse_producer(blk->insns, i);
+                int fk = nzcv_producer_of(blk->insns, i);
                 if (fk >= 0 && !nzcv_window_has_load(blk->insns, fk, i))
                     use &= ~(uint64_t)JIT_ARITH_FLAGS;
             }
@@ -22971,7 +23007,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         ea_stepped = i;
         g_nzcv_want = 0;
         for (int j = i + 1; j < n && j <= i + 1 + NZCV_GAP_MAX; j++)
-            if (nzcv_fuse_producer(blk->insns, j) == i) { g_nzcv_want = 1; break; }
+            if (nzcv_producer_of(blk->insns, j) == i) { g_nzcv_want = 1; break; }
         if (g_callout_seq != l0_last_seq) { l0_flush_all(&b); l0_reset(); l0_last_seq = g_callout_seq; }
         l0_pre_insn(&b, insn);
         if (!(insn->op == OCERZ_OP_JCC && i < n - 1) &&
@@ -23140,7 +23176,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         }
         int pair_consumed = 0;
         for (int j = i + 2; j < n && j <= i + 2 + NZCV_GAP_MAX; j++)
-            if (nzcv_fuse_producer(blk->insns, j) == i + 1) { pair_consumed = 1; break; }
+            if (nzcv_producer_of(blk->insns, j) == i + 1) { pair_consumed = 1; break; }
         if (i + 1 < n && !pair_consumed) {
             uint32_t *logic_label = NULL;
             if (emit_mov_logic_pair(&b, insn, &blk->insns[i + 1],

@@ -154,6 +154,7 @@ bug is in what that switch controls.
 | `OCERZ_EXCLOG=1` | print every Objective-C and C++ exception with its throw site |
 | `OCERZ_WILDLOG=1` | report indirect branches whose target is outside the guest address space |
 | `OCERZ_JITLOCKLOG=1` | report JIT lock waits over three seconds, with the holder's state |
+| `OCERZ_NZCV_PROD_CHECK=1` | work out again, at every use, which instruction's flags each consumer takes, and stop with the difference if it disagrees with the table made before the block's liveness pass |
 | `OCERZ_SUSPLOG=1` | in native mode, log each `thread_suspend` and `thread_resume` a guest makes |
 | `OCERZ_XLATPAGES=1` | log each distinct 4 KB page the process translates |
 | `OCERZ_ALLMISS=1` | list every unresolved import rather than the first two dozen |
