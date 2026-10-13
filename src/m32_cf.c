@@ -482,6 +482,22 @@ static int sp_CFUUIDCreateWithBytes(struct OcerzVM *vm, OcerzCPU *cpu)
     return uuid_bytes(cpu, "CFUUIDCreateWithBytes");
 }
 
+/* IOCreatePlugInInterfaceForService(service, pluginType, interfaceType, theInterface**, theScore*): the interface is
+ * a COM-style table of host function pointers (IOCFPlugInInterface, then IOHIDDeviceInterface and the like), which
+ * i386 code reads as 4-byte slots; Left 4 Dead 2's input system called through one and reached NULL.  Until m32 hands
+ * out guest tables for them, the documented failure: the caller skips the device.
+ * ponytail: no COM plug-ins for i386 (old-style HID joysticks, ForceFeedback); proxy tables as the Steam bridge's would
+ * add them */
+static int sp_IOCreatePlugInInterfaceForService(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (m32_arg(cpu, 3))
+        m32_wr(m32_arg(cpu, 3), 0);
+    m32_log_once("COM plug-in interfaces are not available to i386 code (kIOReturnUnsupported):",
+                 "IOCreatePlugInInterfaceForService");
+    m32_ret(cpu, 0xe00002c7u, 0, 0);   /* kIOReturnUnsupported */
+    return OCERZ_STEP_OK;
+}
+
 /* FSCatalogInfo: the i386 FSPermissionInfo ends in a 4-byte reserved word where the host's has an 8-byte FileSecRef,
  * so from the permissions on every field sits 4 bytes later on the host (i386 144 bytes, valence at 136; host 148, at
  * 140).  Handed through as is, a directory's valence came back 0 and a game sized its listing from it, then wrote
@@ -604,6 +620,7 @@ const M32SpecialEntry m32_cf_specials[] = {
     { "_CFStringCreateWithFormatAndArguments", sp_CFStringCreateWithFormatAndArguments },
     { "_CFUUIDGetConstantUUIDWithBytes", sp_CFUUIDGetConstantUUIDWithBytes },
     { "_CFUUIDCreateWithBytes", sp_CFUUIDCreateWithBytes },
+    { "_IOCreatePlugInInterfaceForService", sp_IOCreatePlugInInterfaceForService },
     { "_CFDictionaryGetKeysAndValues", sp_CFDictionaryGetKeysAndValues }, { "_CFSetGetValues", sp_CFSetGetValues },
     { "_CFBagGetValues", sp_CFBagGetValues }, { "_CFArrayGetValues", sp_CFArrayGetValues },
     { "_GetProcessBundleLocation", sp_GetProcessBundleLocation }, { "_SecCodeCheckValidity", sp_SecCodeCheckValidity },
