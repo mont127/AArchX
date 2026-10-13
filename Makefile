@@ -100,6 +100,20 @@ $(APIS32_STAMP): $(APIS_INPUTS)
 steam32:
 	bash tools/steamgen.sh
 
+# `app` builds AArchX.app, a window that runs whatever Intel program is dropped
+# on it under the ocerz it finds: inside its own bundle, beside it, in ~/.aarchx
+# or in Homebrew's bin.  It is signed ad hoc, which seals the bundle.
+OCERZ_VER := $(shell sed -n 's/.*OCERZ_VERSION "\(.*\)".*/\1/p' include/ocerz/version.h)
+
+app: AArchX.app
+
+AArchX.app: app/AArchX.m app/Info.plist include/ocerz/version.h
+	rm -rf $@
+	mkdir -p $@/Contents/MacOS
+	$(CC) $(ARCHFLAGS) -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -framework AppKit -o $@/Contents/MacOS/AArchX app/AArchX.m
+	sed 's/@VERSION@/$(OCERZ_VER)/g' app/Info.plist > $@/Contents/Info.plist
+	codesign --force -s - $@
+
 check-m32: ocerz apis32
 	bash tests/run_m32_tests.sh
 	OCERZ_NO_HIGH8_ARITH=1 OCERZ_NO_SHIFT_MEM_IMM=1 bash tests/run_m32_tests.sh high8 shiftmem
@@ -143,9 +157,10 @@ i386diff:
 
 clean:
 	rm -f $(OBJS) $(DEPS) ocerz
+	rm -rf AArchX.app
 	rm -rf tests/unit/bin
 	$(MAKE) -C tests/guest clean
 
 -include $(DEPS)
 
-.PHONY: unit guest check apis apis32 steam32 check-m32 clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift
+.PHONY: unit guest check apis apis32 steam32 app check-m32 clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift
