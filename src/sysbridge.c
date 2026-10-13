@@ -134,11 +134,14 @@
  * fork and vfork are the fork syscall's body, so ocerz's fork handlers run and
  * the child keeps only the forking thread's cpu and starts without translations,
  * and vfork is a fork, as it is in cache mode.  The JIT never calls them from
- * inside a block (vdylib.h), because the child cannot return into a translation
- * it did not inherit, and for the same reason a fork inside a callback is
- * refused by name when a translated block's frame lies underneath the callback
- * on the host stack; a fork a native thread's callback makes with no translated
- * frame below it, or one made from the outermost level, is performed.  The
+ * inside a block (vdylib.h).  A fork inside a callback is performed too, though
+ * a translated block's frame may lie underneath the callback on the host stack:
+ * the child forgets the JIT without unmapping its code (ocerz_jit_forget) and
+ * translates into a fresh arena, so the code that frame returns into is still
+ * there, unchanged, and its exits come back to the child's own JIT.  It used to
+ * be refused by name, and Qt apps start every QProcess that way from an AppKit
+ * callback (ClipGrab running yt-dlp).  OCERZ_FORK_CALLBACK_REFUSE=1 refuses it
+ * again.  The
  * child is a working native-mode process: the bridge, the callback bank and the
  * API database are memory it inherits whole, their locks are put back to their
  * initial state, and a thread it creates is given a guest personality the way
@@ -1056,7 +1059,10 @@ static int sb_translated_frame_below(struct OcerzVM *vm)
 int ocerz_sys_fork(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     const struct OcerzBridgeFrame *cb = ocerz_bridge_callback_frame();
-    if (cb && sb_translated_frame_below(vm)) {
+    static int refuse = -1;
+    if (refuse < 0)
+        refuse = getenv("OCERZ_FORK_CALLBACK_REFUSE") ? 1 : 0;
+    if (refuse && cb && sb_translated_frame_below(vm)) {
         char why[256];
         snprintf(why, sizeof why,
                  "was called inside a callback %s made from translated code, and the child would return"

@@ -1298,15 +1298,16 @@
 # must agree on everything but that line, where Apple's own memmove is free to
 # use rbx.
 #
-# sys_jmp_refused and sys_fork_callback are the two refusals. The first longjmps
-# from a qsort comparator to a setjmp taken before the qsort, which would leave
-# qsort's native frames behind; both engines must refuse it by name with 72,
-# and cache mode, where qsort is translated x86 code, performs it. The second
-# forks inside the comparator. Under the JIT a translated block's frame lies
-# beneath the comparator on the host stack, and the child would return into it,
-# so the fork is refused by name with 72; the interpreter leaves no such frame,
-# so there the fork is performed and must print what cache mode and the arm64
-# build print.
+# sys_jmp_refused is a refusal: it longjmps from a qsort comparator to a setjmp
+# taken before the qsort, which would leave qsort's native frames behind; both
+# engines must refuse it by name with 72, and cache mode, where qsort is
+# translated x86 code, performs it. sys_fork_callback forks inside the
+# comparator twice: one child _exits, the other returns out through qsort and
+# main. Under the JIT a translated block's frame lies beneath the comparator on
+# the host stack, and the second child returns into it, which works because
+# the child keeps its parent's translated code mapped. Every engine must print
+# what the arm64 build prints, and with OCERZ_FORK_CALLBACK_REFUSE=1 the JIT
+# must refuse the fork by name with 72, as it used to.
 #
 # The cases that need a mappable shared cache are skipped, not failed, where
 # there is none. The native cases still run there -- not needing a cache is the
@@ -11746,21 +11747,30 @@ EOC
 
 #define TAG "sys_fork_callback"
 
-static int g_calls, g_status = -1;
+static int g_calls, g_status = -1, g_returned = -1, g_child;
 
 static int cmp_fork(const void *a, const void *b)
 {
-    if (++g_calls == 3) {
+    int call = ++g_calls;
+    if (!g_child && (call == 3 || call == 5)) {
         pid_t pid = fork();
         if (pid == 0) {
-            cb_len = 0;
-            cb_str(TAG " child");
-            cb_end();
-            _exit(8);
+            if (call == 3) {
+                cb_len = 0;
+                cb_str(TAG " child");
+                cb_end();
+                _exit(8);
+            }
+            g_child = 1; /* this one goes back out through qsort and main */
+            return *(const int *)a - *(const int *)b;
         }
         int st = 0;
-        if (pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st))
-            g_status = WEXITSTATUS(st);
+        if (pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st)) {
+            if (call == 3)
+                g_status = WEXITSTATUS(st);
+            else
+                g_returned = WEXITSTATUS(st);
+        }
     }
     return *(const int *)a - *(const int *)b;
 }
@@ -11776,8 +11786,15 @@ int main(void)
     for (int i = 0; i < 8; i++)
         sorted &= v[i] == i + 1;
     cb_len = 0;
+    if (g_child) {
+        cb_str(TAG " returned child");
+        sys_int("sorted", sorted);
+        cb_end();
+        return 3;
+    }
     cb_str(TAG " parent");
     sys_int("saw", g_status);
+    sys_int("returned", g_returned);
     sys_int("sorted", sorted);
     cb_end();
     return 0;
@@ -14954,14 +14971,21 @@ case_sys_fork_callback() {
     if [ -z "$reason" ]; then
         run_bounded "$ao" "$ae" "$SYS_FORKCB_ARM64"
         rc_arm=$?
-        if [ "$rc_arm" -ne 0 ] || ! grep -qx 'sys_fork_callback parent saw=8 sorted=1' "$ao"; then
+        if [ "$rc_arm" -ne 0 ] || ! grep -qx 'sys_fork_callback parent saw=8 returned=3 sorted=1' "$ao"; then
             reason="the arm64 build, run directly on the host, exited $rc_arm with '$(tr '\n' ' ' < "$ao")', so the fixture itself is broken"
         fi
     fi
     if [ -z "$reason" ]; then
         run_bounded "$jo" "$je" "$OCERZ" -native "$SYS_FORKCB_BIN"
         rc_jit=$?
-        reason="$(sys_refused_reason "$rc_jit" "$jo" "$je" "$SYS_FORKCB_MSG" " parent ")"
+        if [ "$rc_jit" -ne 0 ] || ! cmp -s "$jo" "$ao"; then
+            reason="the JIT, with a translated frame beneath the comparator, exited $rc_jit with '$(tr '\n' ' ' < "$jo")', want the forks performed and arm64's '$(tr '\n' ' ' < "$ao")'"
+        fi
+    fi
+    if [ -z "$reason" ]; then
+        run_bounded "$jo.refuse" "$je.refuse" env OCERZ_FORK_CALLBACK_REFUSE=1 "$OCERZ" -native "$SYS_FORKCB_BIN"
+        rc_refuse=$?
+        reason="$(sys_refused_reason "$rc_refuse" "$jo.refuse" "$je.refuse" "$SYS_FORKCB_MSG" " parent ")"
     fi
     if [ -z "$reason" ]; then
         run_bounded "$no" "$ne" "$OCERZ" -native -no-jit "$SYS_FORKCB_BIN"
