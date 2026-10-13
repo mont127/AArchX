@@ -105,6 +105,17 @@
  * an untranslated successor decoded it again, so answers are memoized by rip
  * and depth, and an entry counts only while no translation has been retired
  * since and the successor's first sixteen bytes are unchanged.
+ * The decodes themselves repeat as much: a translation decodes its block, its
+ * successors at each depth, its spliced callees and the fusion and
+ * if-conversion look-aheads, and a successor is decoded again when it is
+ * translated in turn.  jit_decode keeps the last decode at each of
+ * DEC_MEMO_SLOTS slots, by rip and mode, and returns it while the
+ * instruction's bytes are unchanged.  dec_memo_same reads no byte the decoder
+ * would not have read, so a fault comes where the decode's would have: it
+ * compares in order and stops at the first difference, or, when sixteen bytes
+ * from the start lie inside one 4 KB page, the page byte 0 is in, compares
+ * them at once.  The bytes are read before the slot is written, so a fault
+ * never leaves a slot half filled.  OCERZ_NO_DECODE_MEMO=1 decodes afresh.
  * A static liveness pass and the emitters share the same predicates so they
  * cannot disagree about what is live.  The legality rules here are written in
  * blood: a gap may not write a register the producer read (a byte compare
@@ -1071,10 +1082,63 @@ static uint32_t g_tc_nbytes;
 static int g_tc_dbar;
 static int g_tc_rec;
 static int g_tc_learned;
+#define DEC_MEMO_SLOTS 4096
+static struct {
+    uint64_t pc;
+    uint8_t bytes[16];
+    uint8_t mode32;
+    X86Insn insn;
+} g_dec_memo[DEC_MEMO_SLOTS];
+static unsigned long long g_dec_memo_hits, g_dec_memo_misses;
+static int dec_memo_same(const uint8_t *code, const uint8_t *bytes, int len)
+{
+    if (((uintptr_t)code & 4095) <= 4096 - 16) {
+        uint64_t c0, c1, b0, b1;
+        memcpy(&c0, code, 8);
+        memcpy(&c1, code + 8, 8);
+        memcpy(&b0, bytes, 8);
+        memcpy(&b1, bytes + 8, 8);
+        uint64_t m0 = len >= 8 ? ~0ull : (1ull << (8 * len)) - 1;
+        uint64_t m1 = len <= 8 ? 0 : (1ull << (8 * (len - 8))) - 1;
+        return (((c0 ^ b0) & m0) | ((c1 ^ b1) & m1)) == 0;
+    }
+    int i = 0;
+    while (i < len && code[i] == bytes[i])
+        i++;
+    return i == len;
+}
+static int dec_memo_decode(const uint8_t *code, uint64_t pc, X86Insn *out, int mode32)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_DECODE_MEMO") != NULL;
+    if (off || !code)
+        return ocerz_decode_mode(code, 15, pc, out, mode32);
+    unsigned slot = (unsigned)((pc * 0x9E3779B97F4A7C15ull) >> 52) & (DEC_MEMO_SLOTS - 1);
+    uint8_t m32 = mode32 != 0;
+    if (g_dec_memo[slot].insn.len && g_dec_memo[slot].pc == pc && g_dec_memo[slot].mode32 == m32 &&
+        dec_memo_same(code, g_dec_memo[slot].bytes, g_dec_memo[slot].insn.len)) {
+        *out = g_dec_memo[slot].insn;
+        g_dec_memo_hits++;
+        return OCERZ_OK;
+    }
+    g_dec_memo_misses++;
+    int rc = ocerz_decode_mode(code, 15, pc, out, mode32);
+    if (rc == OCERZ_OK) {
+        uint8_t bytes[15];
+        memcpy(bytes, code, out->len);
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        g_dec_memo[slot].pc = pc;
+        g_dec_memo[slot].mode32 = m32;
+        memcpy(g_dec_memo[slot].bytes, bytes, out->len);
+        g_dec_memo[slot].insn = *out;
+    }
+    return rc;
+}
 static int jit_decode(uint64_t pc, X86Insn *out, int mode32)
 {
     const uint8_t *code = (const uint8_t *)ocerz_g2h(pc);
-    int rc = ocerz_decode_mode(code, 15, pc, out, mode32);
+    int rc = dec_memo_decode(code, pc, out, mode32);
     if (rc == OCERZ_OK && g_tc_rec) {
         int last = g_tc_ndlog - 1;
         if (last >= g_tc_dbar && g_tc_dlog[last].pc + g_tc_dlog[last].len == pc &&
@@ -23971,9 +24035,9 @@ promo_push_fallthrough:
             g_xlat_sc_ns += ns;
         }
         if ((g_xlat_n & 0x3fff) == 0)
-            fprintf(stderr, "ocerz: XLAT[%d] blocks=%u xlat_total=%llums | shared-cache: blocks=%u xlat=%llums\n",
+            fprintf(stderr, "ocerz: XLAT[%d] blocks=%u xlat_total=%llums | shared-cache: blocks=%u xlat=%llums | decode memo: hits=%llu misses=%llu\n",
                     (int)getpid(), g_xlat_n, g_xlat_ns / 1000000ull,
-                    g_xlat_sc_n, g_xlat_sc_ns / 1000000ull);
+                    g_xlat_sc_n, g_xlat_sc_ns / 1000000ull, g_dec_memo_hits, g_dec_memo_misses);
     }
     return blk;
 }

@@ -109,6 +109,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_ADC_CINC=1` | set the carry in a register and add it for an adc or sbb of an immediate whose carry comes straight from a compare, instead of one csinc after at most one add or sub |
 | `OCERZ_NO_LEA32_GAP=1` | keep a lea of a 32-bit address (`lea edi, [ebx-8]`) in 64-bit code from sitting between a compare and the instructions taking its flags |
 | `OCERZ_NO_XLIVE_SELF=1` | follow a block's jump back to its own start as any other edge when working out which flags are live there, which gives up with every flag live, instead of the least fixed point over the loop |
+| `OCERZ_NO_DECODE_MEMO=1` | decode every instruction a translation looks at afresh, instead of reusing the last decode of the same address while its bytes are unchanged; `OCERZ_JITMEASURE=1` reports the reuses as decode memo hits |
 | `OCERZ_NO_LAZY_RSP=1` | move rsp's register at every push, pop, call and ret of a call spliced into its caller, instead of leaving it where it was before the call and giving each stack access a fixed offset from it |
 | `OCERZ_NO_FAST_LOW_GUARD=1` | in a Wine process, map every guest address with the general three-range check instead of the short form |
 | `OCERZ_NO_WINE_LIM=1` | in a Wine process, test each address against 12 GB with a shift and a compare again, instead of comparing it with x29 (which then holds 12 GB) and laying out the side it was on when translated |
@@ -152,6 +153,7 @@ bug is in what that switch controls.
 | `OCERZ_EXCLOG=1` | print every Objective-C and C++ exception with its throw site |
 | `OCERZ_WILDLOG=1` | report indirect branches whose target is outside the guest address space |
 | `OCERZ_JITLOCKLOG=1` | report JIT lock waits over three seconds, with the holder's state |
+| `OCERZ_JITMEASURE=1` | after every 16,384 blocks translated, print how many there were and the time translating them took, in all and for shared-cache code, with the decode memo's hits and misses |
 | `OCERZ_SUSPLOG=1` | in native mode, log each `thread_suspend` and `thread_resume` a guest makes |
 | `OCERZ_XLATPAGES=1` | log each distinct 4 KB page the process translates |
 | `OCERZ_ALLMISS=1` | list every unresolved import rather than the first two dozen |
