@@ -2070,6 +2070,15 @@ static int same_but_signedness(const char *x, const char *a)
 /* The guest (i386) class of one argument or result, given the arm64 type beside it */
 static const char *class32(CXType tx, CXType ta, int is_result, Buf *out, int host)
 {
+    /* GLhandleARB is void * on the Mac but holds an object name, a small integer: it crosses as one, 32 bits in i386
+     * code and zero-extended on the host (as a pointer it became an m32 handle, and glUseProgram got 0xe0001030) */
+    char *spelled = cx(clang_getTypeSpelling(tx));
+    int gl_handle = !strcmp(spelled, "GLhandleARB") || !strcmp(spelled, "const GLhandleARB");
+    free(spelled);
+    if (gl_handle) {
+        buf_addc(out, host ? 'L' : 'u');
+        return NULL;
+    }
     CXType x = canon(tx), a = canon(ta);
     if (x.kind == TK.Pointer && a.kind == TK.Pointer && !is_imp(tx)) {
         CXType pxs = clang_getPointeeType(x), pas = clang_getPointeeType(a);

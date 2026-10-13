@@ -26,6 +26,7 @@ libs = [  # stub path, install name, SDK tbd
     ("sdk/Frameworks/CoreGraphics.framework/CoreGraphics.tbd", "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics", "System/Library/Frameworks/CoreGraphics.framework/CoreGraphics.tbd"),
     ("sdk/Frameworks/CoreServices.framework/CoreServices.tbd", "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices", "System/Library/Frameworks/CoreServices.framework/CoreServices.tbd"),
     ("sdk/Frameworks/AudioToolbox.framework/AudioToolbox.tbd", "/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox", "System/Library/Frameworks/AudioToolbox.framework/AudioToolbox.tbd"),
+    ("sdk/Frameworks/OpenGL.framework/OpenGL.tbd", "/System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL", "System/Library/Frameworks/OpenGL.framework/OpenGL.tbd"),
 ]
 def lists(text, key):
     out = set()
