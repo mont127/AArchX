@@ -869,6 +869,34 @@ static void set_dlerror(const char *fmt, const char *what)
     t_dlerror = m32_cstring(buf);
 }
 
+/* a system library's path as its install name, which is what the bridge knows it by: a framework's short path
+ * (X.framework/X) is a chain of symlinks to X.framework/Versions/<v>/X, and the file itself lives only in the shared
+ * cache, so the links are followed one at a time instead of by realpath */
+static void install_name(const char *path, char *out, size_t n)
+{
+    char cur[1024], dir[1024], real[1024], link[1024];
+    snprintf(cur, sizeof cur, "%s", path);
+    for (int hop = 0; hop < 8; hop++) {
+        const char *slash = strrchr(cur, '/');
+        if (!slash || slash == cur)
+            break;
+        snprintf(dir, sizeof dir, "%.*s", (int)(slash - cur), cur);
+        if (!realpath(dir, real))
+            break;
+        snprintf(dir, sizeof dir, "%s%s", real, slash);   /* the directory resolved, the leaf as given */
+        ssize_t k = readlink(dir, link, sizeof link - 1);
+        snprintf(cur, sizeof cur, "%s", dir);
+        if (k <= 0)
+            break;
+        link[k] = 0;
+        if (link[0] == '/')
+            snprintf(cur, sizeof cur, "%s", link);
+        else
+            snprintf(cur, sizeof cur, "%s/%s", real, link);
+    }
+    snprintf(out, n, "%s", cur);
+}
+
 static uint32_t system_handle(const char *install)
 {
     for (int i = 0; i < g_nsyslibs; i++)
@@ -907,7 +935,8 @@ static int sp_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
     if (m32_resolve_path(m32_nimages ? m32_images[0] : NULL, name, path, sizeof path) != 0) {
         set_dlerror("dlopen(%s): image not found", name);
     } else if (!path[0]) {
-        handle = system_handle(name);
+        install_name(name, path, sizeof path);
+        handle = system_handle(path);
     } else if ((handle = m32_steam_dlopen(path)) != 0) {
         /* a steamclient.dylib with no i386 slice: the host's own, bridged (src/m32_steam.c) */
     } else {
