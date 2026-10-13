@@ -107,10 +107,14 @@ OCERZ_VER := $(shell sed -n 's/.*OCERZ_VERSION "\(.*\)".*/\1/p' include/ocerz/ve
 
 app: AArchX.app
 
-AArchX.app: app/AArchX.m app/Info.plist include/ocerz/version.h
-	rm -rf $@
-	mkdir -p $@/Contents/MacOS
+AArchX.app: app/AArchX.m app/Info.plist app/icon.m include/ocerz/version.h
+	rm -rf $@ app/AppIcon.iconset
+	mkdir -p $@/Contents/MacOS $@/Contents/Resources
 	$(CC) $(ARCHFLAGS) -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -framework AppKit -o $@/Contents/MacOS/AArchX app/AArchX.m
+	$(CC) -fobjc-arc -O2 -Wall -framework AppKit -o app/icon app/icon.m
+	app/icon app/AppIcon.iconset
+	iconutil -c icns -o $@/Contents/Resources/AppIcon.icns app/AppIcon.iconset
+	rm -rf app/icon app/AppIcon.iconset
 	sed 's/@VERSION@/$(OCERZ_VER)/g' app/Info.plist > $@/Contents/Info.plist
 	codesign --force -s - $@
 

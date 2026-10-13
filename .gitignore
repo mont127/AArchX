@@ -19,3 +19,5 @@ tests/m32/obj/
 tests/m32/sdk/
 runtime/apis32/
 runtime/guest32
+/app/icon
+/app/AppIcon.iconset/

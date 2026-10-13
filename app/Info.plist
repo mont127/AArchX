@@ -10,6 +10,8 @@
 	<string>io.github.mont127.aarchx</string>
 	<key>CFBundleExecutable</key>
 	<string>AArchX</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -39,6 +41,19 @@
 			<array>
 				<string>com.apple.application-bundle</string>
 				<string>public.unix-executable</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Windows program</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.microsoft.windows-executable</string>
+				<string>com.microsoft.windows-installer</string>
 			</array>
 		</dict>
 	</array>
