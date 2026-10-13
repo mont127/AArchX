@@ -1,0 +1,5 @@
+switches 1
+other thread: none at first 1, its own 1
+main still 1
+cleared 1
+exit 0

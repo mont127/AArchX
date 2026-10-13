@@ -2,7 +2,7 @@
  * i386 imports the JIT calls straight from an import stub's block (src/jit.c emit_bridge_fastcall32), with no
  * crossing: the small libc functions Batman: Arkham Asylum's threads call millions of times a second
  * (pthread_[gs]etspecific, wcscmp, memcpy, memcmp, strlen, bzero, the clock), the CGL context calls Feral's
- * IndirectX wraps every OpenGL call in, and OpenGL functions that take only integers, booleans and pointers.
+ * IndirectX wraps every OpenGL call in and Valve's ToGL asks before them, and OpenGL functions that take only integers, booleans and pointers.
  *
  * This file is built with -mgeneral-regs-only (Makefile): the guest's xmm registers stay pinned in vector registers
  * across the call, so nothing here may touch a SIMD register.  The libc functions called from here
@@ -104,6 +104,22 @@ static uint64_t leaf_tolower(uint32_t c) { return (uint32_t)__tolower((int)c); }
 CGL_LEAF(CGLSetCurrentContext)
 CGL_LEAF(CGLLockContext)
 CGL_LEAF(CGLUnlockContext)
+/* CGLGetCurrentContext, which Valve's ToGL asks before its OpenGL calls (about 500,000 times a second in Left 4 Dead
+ * 2): its handle, kept per thread, since the handle of a host pointer never changes (m32_handle) */
+static uint64_t leaf_CGLGetCurrentContext(void)
+{
+    static void *(*f)(void);
+    static __thread void *last;
+    static __thread uint32_t handle;
+    if (!f)
+        f = (void *(*)(void))ocerz_bridge_host_symbol(GL_LIB, "CGLGetCurrentContext");
+    void *ctx = f ? f() : NULL;
+    if (ctx != last) {
+        handle = m32_handle(ctx);
+        last = ctx;
+    }
+    return handle;
+}
 
 static uint64_t leaf_pthread_self(void) { return m32_handle(pthread_self()); }   /* m32_thread.c sp_pthread_self */
 /* the float's bits, as it sits on the guest stack */
@@ -117,6 +133,7 @@ static const M32Leaf g_leaves[] = {
     { "_CGLSetCurrentContext", (void *)leaf_CGLSetCurrentContext, 1, 0, M32_LEAF_I32, 1, 0, 0 },
     { "_CGLLockContext", (void *)leaf_CGLLockContext, 1, 0, M32_LEAF_I32, 1, 0, 0 },
     { "_CGLUnlockContext", (void *)leaf_CGLUnlockContext, 1, 0, M32_LEAF_I32, 1, 0, 0 },
+    { "_CGLGetCurrentContext", (void *)leaf_CGLGetCurrentContext, 0, 0, M32_LEAF_I32, 1, 0, 0 },
     { "_memcpy", (void *)leaf_memmove, 3, 3, M32_LEAF_ARG0, 0, 0, 0 },
     { "_memmove", (void *)leaf_memmove, 3, 3, M32_LEAF_ARG0, 0, 0, 0 },
     { "_memset", (void *)leaf_memset, 3, 1, M32_LEAF_ARG0, 0, 0, 0 },
