@@ -433,6 +433,23 @@ static int sp_gettimeofday(struct OcerzVM *vm, OcerzCPU *cpu)
     }
     RETV(r);
 }
+/* struct rusage: two 8-byte timevals, then fourteen 4-byte longs (72 bytes) */
+static int sp_getrusage(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    struct rusage ru;
+    int r = getrusage((int)m32_arg(cpu, 0), &ru);
+    uint32_t g = m32_arg(cpu, 1);
+    if (!r && g) {
+        const long *rest = &ru.ru_maxrss;
+        m32_wr(g, (uint32_t)ru.ru_utime.tv_sec);
+        m32_wr(g + 4, (uint32_t)ru.ru_utime.tv_usec);
+        m32_wr(g + 8, (uint32_t)ru.ru_stime.tv_sec);
+        m32_wr(g + 12, (uint32_t)ru.ru_stime.tv_usec);
+        for (int i = 0; i < 14; i++)
+            m32_wr(g + 16 + 4 * i, (uint32_t)rest[i]);
+    }
+    RETV(r);
+}
 static int sp_nanosleep(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t a = m32_arg(cpu, 0), b = m32_arg(cpu, 1);
@@ -1265,7 +1282,7 @@ static const M32SpecialEntry g_specials[] = {
     { "_gmtime_r", sp_gmtime_r }, { "_localtime_r", sp_localtime_r }, { "_gmtime", sp_gmtime },
     { "_localtime", sp_localtime }, { "_mktime", sp_mktime }, { "_timegm", sp_timegm },
     { "_strftime", sp_strftime }, { "_asctime", sp_asctime }, { "_ctime", sp_ctime },
-    { "_gettimeofday", sp_gettimeofday }, { "_nanosleep", sp_nanosleep }, { "_select", sp_select },
+    { "_getrusage", sp_getrusage }, { "_gettimeofday", sp_gettimeofday }, { "_nanosleep", sp_nanosleep }, { "_select", sp_select },
     { "_open", sp_open }, { "_openat", sp_openat }, { "_fcntl", sp_fcntl },
     { "_mmap", sp_mmap }, { "_munmap", sp_munmap }, { "_mprotect", sp_ok0 }, { "_madvise", sp_ok0 },
     { "_msync", sp_ok0 }, { "_vm_allocate", sp_vm_allocate }, { "_vm_deallocate", sp_vm_deallocate },
