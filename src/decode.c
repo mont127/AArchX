@@ -60,6 +60,18 @@
  * missing opcode is not academic - LDDQU is just an unaligned 16-byte load, but
  * Chromium's renderer uses it for SIMD UTF-8 scanning and failing to decode it
  * killed every renderer Steam launched.
+ *
+ * ---- cost ----
+ * The interpreter decodes every instruction it runs, and a translation decodes
+ * its block and then, for flag liveness, splicing and fusion, the blocks
+ * around it, so this runs several times for each instruction translated.  The
+ * shape follows from that.  One table lookup (prefix_kind) says whether a byte
+ * is a prefix, so an instruction without one leaves the prefix loop at its
+ * first test.  The prefixes are gathered in locals and DecState, all bytes, is
+ * built once after them.  The RIP-relative fixup runs only when decode_modrm
+ * produced a RIP-relative operand.  The one-byte map is a single switch, so a
+ * common opcode is one indirect branch away rather than at the end of a run of
+ * range tests.  None of it may change a decode, and decodiff is the gate.
  */
 #include <stdio.h>
 #include <unistd.h>
@@ -72,27 +84,23 @@ typedef struct DecState {
     const uint8_t *base;
     const uint8_t *p;
     const uint8_t *end;
-    size_t avail;
     uint64_t rip;
-    int has_66;
-    int has_67;
-    int has_f0;
-    int rep;
-    int mand;
-    int seg;
-    int rex;
-    int rex_present;
-    int rex_w;
-    int rex_r;
-    int rex_x;
-    int rex_b;
-    int mode32;
-    int addr16;
-    int vex;
-    int vex_l;
-    int vex_w;
-    int vex_vvvv;
     X86Insn *out;
+    uint8_t has_66;
+    uint8_t rep;
+    uint8_t mand;
+    uint8_t rex_present;
+    uint8_t rex_w;
+    uint8_t rex_r;
+    uint8_t rex_x;
+    uint8_t rex_b;
+    uint8_t mode32;
+    uint8_t addr16;
+    uint8_t vex;
+    uint8_t vex_l;
+    uint8_t vex_w;
+    uint8_t vex_vvvv;
+    uint8_t riprel;
 } DecState;
 
 enum {
@@ -408,6 +416,7 @@ static int decode_modrm(DecState *s, ModRM *m, int mem_size)
     }
 
     if (riprel) {
+        s->riprel = 1;
         mo->riprel = 1;
         mo->base = OCERZ_REG_NONE;
         mo->index = OCERZ_REG_NONE;
@@ -777,6 +786,21 @@ static int vex_finish(DecState *s)
     return OCERZ_OK;
 }
 
+enum {
+    PFX_LEGACY = 1,
+    PFX_REX = 2,
+};
+
+static const uint8_t prefix_kind[256] = {
+    [0x26] = PFX_LEGACY, [0x2e] = PFX_LEGACY, [0x36] = PFX_LEGACY, [0x3e] = PFX_LEGACY,
+    [0x40] = PFX_REX, [0x41] = PFX_REX, [0x42] = PFX_REX, [0x43] = PFX_REX,
+    [0x44] = PFX_REX, [0x45] = PFX_REX, [0x46] = PFX_REX, [0x47] = PFX_REX,
+    [0x48] = PFX_REX, [0x49] = PFX_REX, [0x4a] = PFX_REX, [0x4b] = PFX_REX,
+    [0x4c] = PFX_REX, [0x4d] = PFX_REX, [0x4e] = PFX_REX, [0x4f] = PFX_REX,
+    [0x64] = PFX_LEGACY, [0x65] = PFX_LEGACY, [0x66] = PFX_LEGACY, [0x67] = PFX_LEGACY,
+    [0xf0] = PFX_LEGACY, [0xf2] = PFX_LEGACY, [0xf3] = PFX_LEGACY,
+};
+
 int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
                       X86Insn *out, int mode32)
 {
@@ -791,107 +815,90 @@ int ocerz_decode_mode(const uint8_t *code, size_t avail, uint64_t rip,
         }
         return OCERZ_ETRUNC;
     }
-    DecState s;
-    s.mode32 = mode32 ? 1 : 0;
-    s.addr16 = 0;
-    s.base = code;
-    s.p = code;
-    s.avail = avail;
-    s.end = code + (avail > 16 ? 16 : avail);
-    s.rip = rip;
-    s.has_66 = 0;
-    s.has_67 = 0;
-    s.has_f0 = 0;
-    s.rep = OCERZ_REP_NONE;
-    s.mand = MAND_NONE;
-    s.seg = OCERZ_SEG_NONE;
-    s.rex = 0;
-    s.rex_present = 0;
-    s.rex_w = 0;
-    s.rex_r = 0;
-    s.rex_x = 0;
-    s.rex_b = 0;
-    s.vex = 0;
-    s.vex_l = 0;
-    s.vex_w = 0;
-    s.vex_vvvv = 0;
-    s.out = out;
-
     memset(out, 0, sizeof(*out));
     out->rip = rip;
-    out->mode32 = (uint8_t)s.mode32;
+    out->mode32 = (uint8_t)(mode32 ? 1 : 0);
     for (int i = 0; i < 3; i++) {
         out->ops[i].base = OCERZ_REG_NONE;
         out->ops[i].index = OCERZ_REG_NONE;
     }
 
-    int last_f23 = 0;
+    const uint8_t *p = code;
+    const uint8_t *end = code + (avail > 16 ? 16 : avail);
+    unsigned kinds = mode32 ? PFX_LEGACY : PFX_LEGACY | PFX_REX;
+    int has_66 = 0, has_67 = 0, has_f0 = 0, last_f23 = 0;
+    int rep = OCERZ_REP_NONE, mand = MAND_NONE, seg = OCERZ_SEG_NONE;
+    int rex = 0;
     for (;;) {
-        if (s.p >= s.end)
+        if (p >= end)
             return avail >= 16 ? OCERZ_ETOOLONG : OCERZ_ETRUNC;
-        uint8_t b = *s.p;
-        if (!s.mode32 && b >= 0x40 && b <= 0x4f) {
-            s.rex_present = 1;
-            s.rex = b;
-            s.rex_w = (b >> 3) & 1;
-            s.rex_r = (b >> 2) & 1;
-            s.rex_x = (b >> 1) & 1;
-            s.rex_b = b & 1;
-            s.p++;
+        uint8_t b = *p;
+        unsigned kind = prefix_kind[b] & kinds;
+        if (!kind)
+            break;
+        p++;
+        if (kind == PFX_REX) {
+            rex = b;
             continue;
         }
+        rex = 0;
         switch (b) {
         case 0x66:
-            s.has_66 = 1;
+            has_66 = 1;
             if (last_f23 == 0)
-                s.mand = MAND_66;
+                mand = MAND_66;
             break;
         case 0x67:
-            s.has_67 = 1;
+            has_67 = 1;
             break;
         case 0xf0:
-            s.has_f0 = 1;
+            has_f0 = 1;
             break;
         case 0xf2:
-            s.rep = OCERZ_REP_REPNE;
-            s.mand = MAND_F2;
+            rep = OCERZ_REP_REPNE;
+            mand = MAND_F2;
             last_f23 = 1;
             break;
         case 0xf3:
-            s.rep = OCERZ_REP_REP;
-            s.mand = MAND_F3;
+            rep = OCERZ_REP_REP;
+            mand = MAND_F3;
             last_f23 = 1;
             break;
-        case 0x2e:
-            s.seg = OCERZ_SEG_NONE;
-            break;
-        case 0x36:
-            s.seg = OCERZ_SEG_NONE;
-            break;
-        case 0x3e:
-            s.seg = OCERZ_SEG_NONE;
-            break;
-        case 0x26:
-            s.seg = OCERZ_SEG_NONE;
-            break;
         case 0x64:
-            s.seg = OCERZ_SEG_FS;
+            seg = OCERZ_SEG_FS;
             break;
         case 0x65:
-            s.seg = OCERZ_SEG_GS;
+            seg = OCERZ_SEG_GS;
             break;
-        default:
-            goto prefixes_done;
+        case 0x26:
+        case 0x2e:
+        case 0x36:
+        case 0x3e:
+            seg = OCERZ_SEG_NONE;
+            break;
         }
-        s.rex_present = 0;
-        s.rex_w = s.rex_r = s.rex_x = s.rex_b = 0;
-        s.p++;
     }
-prefixes_done:
-    out->addrsize = s.mode32 ? (s.has_67 ? 2 : 4) : (s.has_67 ? 4 : 8);
+
+    DecState s = {
+        .base = code,
+        .p = p,
+        .end = end,
+        .rip = rip,
+        .has_66 = has_66,
+        .rep = rep,
+        .mand = mand,
+        .rex_present = rex != 0,
+        .rex_w = (rex >> 3) & 1,
+        .rex_r = (rex >> 2) & 1,
+        .rex_x = (rex >> 1) & 1,
+        .rex_b = rex & 1,
+        .mode32 = mode32 ? 1 : 0,
+        .out = out,
+    };
+    out->addrsize = s.mode32 ? (has_67 ? 2 : 4) : (has_67 ? 4 : 8);
     s.addr16 = (out->addrsize == 2);
-    out->seg = (uint8_t)s.seg;
-    out->lock = (uint8_t)(s.has_f0 ? 1 : 0);
+    out->seg = (uint8_t)seg;
+    out->lock = (uint8_t)(has_f0 ? 1 : 0);
     out->rep = (uint8_t)OCERZ_REP_NONE;
 
     uint8_t op;
@@ -923,7 +930,8 @@ prefixes_done:
     if (r != OCERZ_OK)
         return r;
 
-    fixup_riprel(&s);
+    if (s.riprel)
+        fixup_riprel(&s);
 
     int len = cur_len(&s);
     if (len > 15)
@@ -1262,29 +1270,32 @@ static int decode_one_byte(DecState *s, uint8_t op)
             return e;
     }
 
-    if (op <= 0x3d) {
+    switch (op) {
+    case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05:
+    case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d:
+    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
+    case 0x18: case 0x19: case 0x1a: case 0x1b: case 0x1c: case 0x1d:
+    case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:
+    case 0x28: case 0x29: case 0x2a: case 0x2b: case 0x2c: case 0x2d:
+    case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35:
+    case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c: case 0x3d: {
         int hi = op >> 3;
-        int lo = op & 7;
-        if (hi <= 7 && lo <= 5) {
-            switch (lo) {
-            case 0:
-                return alu_rm_r(s, hi, 1, 0);
-            case 1:
-                return alu_rm_r(s, hi, 0, 0);
-            case 2:
-                return alu_rm_r(s, hi, 1, 1);
-            case 3:
-                return alu_rm_r(s, hi, 0, 1);
-            case 4:
-                return alu_acc_imm(s, hi, 1);
-            default:
-                return alu_acc_imm(s, hi, 0);
-            }
+        switch (op & 7) {
+        case 0:
+            return alu_rm_r(s, hi, 1, 0);
+        case 1:
+            return alu_rm_r(s, hi, 0, 0);
+        case 2:
+            return alu_rm_r(s, hi, 1, 1);
+        case 3:
+            return alu_rm_r(s, hi, 0, 1);
+        case 4:
+            return alu_acc_imm(s, hi, 1);
+        default:
+            return alu_acc_imm(s, hi, 0);
         }
-        return OCERZ_EUNDEF;
     }
-
-    if (op >= 0x50 && op <= 0x57) {
+    case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: {
         int reg = (op - 0x50) | (s->rex_b ? 8 : 0);
         int size = opsize_stack(s);
         set_op(s, OCERZ_OP_PUSH);
@@ -1293,7 +1304,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
         set_reg(&s->out->ops[0], reg, size);
         return OCERZ_OK;
     }
-    if (op >= 0x58 && op <= 0x5f) {
+    case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f: {
         int reg = (op - 0x58) | (s->rex_b ? 8 : 0);
         int size = opsize_stack(s);
         set_op(s, OCERZ_OP_POP);
@@ -1302,8 +1313,6 @@ static int decode_one_byte(DecState *s, uint8_t op)
         set_reg(&s->out->ops[0], reg, size);
         return OCERZ_OK;
     }
-
-    switch (op) {
     case 0x63: {
         ModRM m;
         int dsize = s->rex_w ? 8 : 4;
@@ -1347,12 +1356,9 @@ static int decode_one_byte(DecState *s, uint8_t op)
             return read_imm8s(s, &s->out->ops[2], size);
         return read_imm_sized(s, &s->out->ops[2], size);
     }
-    }
-
-    if (op >= 0x70 && op <= 0x7f)
+    case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
+    case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f:
         return branch_rel(s, OCERZ_OP_JCC, 1, op & 0xf);
-
-    switch (op) {
     case 0x80:
     case 0x81:
     case 0x83:
@@ -1663,9 +1669,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
         s->out->nops = 0;
         return OCERZ_OK;
     }
-    }
-
-    if (op >= 0xb0 && op <= 0xb7) {
+    case 0xb0: case 0xb1: case 0xb2: case 0xb3: case 0xb4: case 0xb5: case 0xb6: case 0xb7: {
         int reg = (op - 0xb0) | (s->rex_b ? 8 : 0);
         set_op(s, OCERZ_OP_MOV);
         s->out->opsize = 1;
@@ -1676,7 +1680,7 @@ static int decode_one_byte(DecState *s, uint8_t op)
             set_reg8(s, &s->out->ops[0], op - 0xb0);
         return read_imm8s(s, &s->out->ops[1], 1);
     }
-    if (op >= 0xb8 && op <= 0xbf) {
+    case 0xb8: case 0xb9: case 0xba: case 0xbb: case 0xbc: case 0xbd: case 0xbe: case 0xbf: {
         int reg = (op - 0xb8) | (s->rex_b ? 8 : 0);
         int size = opsize_default(s);
         set_op(s, OCERZ_OP_MOV);
@@ -1694,8 +1698,6 @@ static int decode_one_byte(DecState *s, uint8_t op)
         set_imm(&s->out->ops[1], d, 4);
         return OCERZ_OK;
     }
-
-    switch (op) {
     case 0xc0:
     case 0xc1:
         return group2(s, op);
