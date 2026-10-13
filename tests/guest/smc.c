@@ -9,7 +9,9 @@
  * loop whose callee is rewritten while the loop is chained; a partial rewrite in
  * the middle of a longer function (patching an immediate in place); and a
  * rewrite of the first bytes of a function already executed from a chained loop,
- * with a longer new body.
+ * with a longer new body.  A fifth rewrites only byte 9 of a 10-byte
+ * mov rax, imm64, past the instruction's first eight bytes, so anything that
+ * compares only the start of an instruction keeps the old immediate.
  */
 #include "gsys.h"
 
@@ -18,6 +20,7 @@ static void emit_ret_imm(unsigned char *p, unsigned v)
     p[0] = 0xb8; p[1] = (unsigned char)v; p[2] = (unsigned char)(v >> 8); p[3] = (unsigned char)(v >> 16); p[4] = (unsigned char)(v >> 24); p[5] = 0xc3;
 }
 typedef unsigned (*fn_t)(void);
+typedef g_u64 (*fn64_t)(void);
 
 int main(int argc, char **argv, char **envp)
 {
@@ -52,5 +55,12 @@ int main(int argc, char **argv, char **envp)
     k[10] = 0xc3;
     for (int i = 0; i < 300; i++) sum += kf();
     g_putu64(sum);
+    unsigned char *q = code + 192;
+    q[0] = 0x48; q[1] = 0xb8; q[2] = 7; q[3] = 0; q[4] = 0; q[5] = 0;
+    q[6] = 0; q[7] = 0; q[8] = 0; q[9] = 0; q[10] = 0xc3;
+    fn64_t qf = (fn64_t)(void *)q;
+    g_putu64(qf());
+    q[9] = 1;
+    g_putu64(qf());
     return 0;
 }
