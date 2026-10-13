@@ -7219,6 +7219,38 @@ static int cc_consumer_inline_ok(const X86Insn *c)
         return 0;
     }
 }
+/*
+ * ocerz_flags_defuse of every instruction of the block being translated, made
+ * once after translate's per-block resets.  The answer depends on nothing but
+ * the instruction (and a switch read once), and the block's instructions do
+ * not change while it is translated, so the liveness pass and the scans back
+ * for the last flag writer (value_cond_fuse_producer, comis_fuse_producer,
+ * ptest_fuse_producer, xlive_resolve, ret_seam_live), which every consumer and
+ * every jcc ran again over the instructions before it, read it here.  Any
+ * other array, a look-ahead's own among them, is worked out as before.
+ */
+static uint16_t g_du_def[JIT_MAX_BLOCK_INSNS], g_du_use[JIT_MAX_BLOCK_INSNS];
+static const X86Insn *g_du_of;
+static void du_fill(const X86Insn *insns, int n)
+{
+    g_du_of = NULL;
+    for (int i = 0; i < n; i++) {
+        uint64_t def, use;
+        ocerz_flags_defuse(&insns[i], &def, &use);
+        g_du_def[i] = (uint16_t)def;
+        g_du_use[i] = (uint16_t)use;
+    }
+    g_du_of = insns;
+}
+static void du_get(const X86Insn *insns, int i, uint64_t *def, uint64_t *use)
+{
+    if (insns == g_du_of) {
+        *def = g_du_def[i];
+        *use = g_du_use[i];
+        return;
+    }
+    ocerz_flags_defuse(&insns[i], def, use);
+}
 static int comis_fuse_producer(const X86Insn *insns, int ci)
 {
     if (!cc_consumer_inline_ok(&insns[ci])) return -1;
@@ -7229,7 +7261,7 @@ static int comis_fuse_producer(const X86Insn *insns, int ci)
     int pi = -1;
     for (int k = ci - 1; k >= 0; k--) {
         uint64_t def, use;
-        ocerz_flags_defuse(&insns[k], &def, &use);
+        du_get(insns, k, &def, &use);
         if (def & JIT_ARITH_FLAGS) { pi = k; break; }
     }
     if (pi < 0) return -1;
@@ -7269,7 +7301,7 @@ static int ptest_fuse_producer(const X86Insn *insns, int ci)
     int pi = -1;
     for (int k = ci - 1; k >= 0; k--) {
         uint64_t def, use;
-        ocerz_flags_defuse(&insns[k], &def, &use);
+        du_get(insns, k, &def, &use);
         if (def & JIT_ARITH_FLAGS) { pi = k; break; }
     }
     if (pi < 0) return -1;
@@ -7303,7 +7335,7 @@ static int value_cond_fuse_producer(const X86Insn *insns, int ci)
     int pi = -1;
     for (int k = ci - 1; k >= 0; k--) {
         uint64_t def, use;
-        ocerz_flags_defuse(&insns[k], &def, &use);
+        du_get(insns, k, &def, &use);
         if (def & JIT_ARITH_FLAGS) { pi = k; break; }
     }
     if (pi < 0) return -1;
@@ -20953,7 +20985,7 @@ static uint64_t xlive_resolve(uint64_t live, const X86Insn *insns, int upto)
         return live;
     for (int k = upto - 1; k >= 0; k--) {
         uint64_t def, use;
-        ocerz_flags_defuse(&insns[k], &def, &use);
+        du_get(insns, k, &def, &use);
         if (def & JIT_ARITH_FLAGS)
             return (live & ~(uint64_t)XLIVE_RETDEP) | (ret_flag_producer(insns[k].op) ? OCERZ_FL_ALL : 0);
     }
@@ -20964,7 +20996,7 @@ static uint64_t ret_seam_live(const X86Insn *insns, int n)
 {
     for (int i = n - 2; i >= 0; i--) {
         uint64_t def, use;
-        ocerz_flags_defuse(&insns[i], &def, &use);
+        du_get(insns, i, &def, &use);
         if (!(def & JIT_ARITH_FLAGS)) continue;
         switch (insns[i].op) {
         case OCERZ_OP_CMP: case OCERZ_OP_TEST:
@@ -22219,6 +22251,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_jcc_edges = 0;
     g_nzcv_want = 0; g_nzcv_from = -1;
     g_nzcv_prod_of = NULL;
+    du_fill(blk->insns, n);
     g_jcc_edge[0].cond_site = NULL; g_jcc_edge[1].cond_site = NULL;
     g_n_oslow = 0;
     g_n_garm = 0;
@@ -22734,7 +22767,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             if (blk->fault_flags && blk->fault_flags[i].kind != JFF_NONE)
                 ocerz_flags_defuse_nofault(&blk->insns[i], &def, &use);
             else
-                ocerz_flags_defuse(&blk->insns[i], &def, &use);
+                du_get(blk->insns, i, &def, &use);
             if ((blk->insns[i].op == OCERZ_OP_JCC || blk->insns[i].op == OCERZ_OP_SETCC ||
                  blk->insns[i].op == OCERZ_OP_CMOVCC) &&
                 ((sse_enabled() && comis_fuse_producer(blk->insns, i) >= 0) ||
