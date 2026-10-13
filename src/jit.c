@@ -19467,6 +19467,17 @@ static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
     case OCERZ_OP_CMPXCHG: case OCERZ_OP_CMPXCHGXB:
         if (reg == OCERZ_RAX || reg == OCERZ_RDX || reg == OCERZ_RBX || reg == OCERZ_RCX) return 1;
         break;
+    case OCERZ_OP_LAHF: case OCERZ_OP_SALC:
+    case OCERZ_OP_DAA: case OCERZ_OP_DAS: case OCERZ_OP_AAA: case OCERZ_OP_AAS: case OCERZ_OP_AAM: case OCERZ_OP_AAD:
+        return reg == OCERZ_RAX;
+    case OCERZ_OP_LOOP: case OCERZ_OP_LOOPE: case OCERZ_OP_LOOPNE:
+    case OCERZ_OP_PCMPESTRI: case OCERZ_OP_PCMPISTRI:
+        return reg == OCERZ_RCX;
+    case OCERZ_OP_POPA:
+        return 1;
+    case OCERZ_OP_MULX:
+        if (in->nops > 1 && in->ops[1].kind == OCERZ_OPK_REG && (in->ops[1].reg & 15) == reg) return 1;
+        break;
     default:
         break;
     }
