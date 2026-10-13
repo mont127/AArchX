@@ -28,10 +28,15 @@ shim_tu="$source_dir/libcxxabi/src/stdlib_new_delete.cpp"
 grep -q 'vendor/apple/shims.cpp' "$shim_tu" || printf '\n#include "vendor/apple/shims.cpp"\n' >> "$shim_tu"
 shim_exp="$source_dir/libcxxabi/lib/new-delete.exp"
 grep -q '__type_descriptor_t' "$shim_exp" || cat "$repo/tools/cxx/apple-shims.exp" >> "$shim_exp"
+# The libraries ship in release archives, so the paths they were built at are
+# mapped away: assertion messages name llvm-project/..., not this machine's
+# directories.
+prefix_map="\"-ffile-prefix-map=$source_dir=llvm-project\" \"-ffile-prefix-map=$build=build\""
 cmake -S "$source_dir/runtimes" -B "$build/runtime" -G 'Unix Makefiles' \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
     -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
-    "-DCMAKE_CXX_FLAGS=-I\"$source_dir/libc\"" \
+    "-DCMAKE_C_FLAGS=$prefix_map" \
+    "-DCMAKE_CXX_FLAGS=-I\"$source_dir/libc\" $prefix_map" \
     '-DLLVM_ENABLE_RUNTIMES=libunwind;libcxxabi;libcxx' \
     -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF -DLIBUNWIND_INCLUDE_TESTS=OFF \
     -DLIBCXX_ENABLE_STATIC=OFF -DLIBCXXABI_ENABLE_STATIC=OFF -DLIBUNWIND_ENABLE_STATIC=OFF \
@@ -46,6 +51,12 @@ install_name_tool -id /usr/lib/libc++.1.dylib \
 install_name_tool -id /usr/lib/libc++abi.dylib \
     -change @rpath/libunwind.1.dylib /usr/lib/libunwind.1.dylib "$dest/usr/lib/libc++abi.dylib"
 install_name_tool -id /usr/lib/libunwind.1.dylib "$dest/usr/lib/libunwind.1.dylib"
+# CMake leaves its build directory as an LC_RPATH; nothing is loaded through
+# @rpath any more, and the path would name this machine.
+for lib in "$dest/usr/lib/"*.dylib; do
+    otool -l "$lib" | awk '$1 == "cmd" { rp = ($2 == "LC_RPATH") } rp && $1 == "path" { print $2 }' |
+        while read -r rpath; do install_name_tool -delete_rpath "$rpath" "$lib"; done
+done
 for component in libcxx libcxxabi libunwind; do
     cp "$source_dir/$component/LICENSE.TXT" "$dest/LICENSE.$component.txt"
 done

@@ -1,7 +1,8 @@
 #!/bin/sh
-# Installs the prebuilt AArchX from GitHub releases into ~/.aarchx and puts
-# ocerz on PATH.  Nothing outside ~/.aarchx is touched except one line in the
-# shell profile (~/.zprofile or ~/.bash_profile), and no password is asked for.
+# Installs the prebuilt AArchX from GitHub releases into ~/.aarchx, puts ocerz
+# on PATH and AArchX.app in ~/Applications.  Nothing else is touched except one
+# line in the shell profile (~/.zprofile or ~/.bash_profile), and no password
+# is asked for.
 #
 #   curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
 #   curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall
@@ -9,6 +10,7 @@
 # AARCHX_HOME           where to install (default ~/.aarchx)
 # AARCHX_VERSION        a release tag such as v0.7 (default: the latest release)
 # AARCHX_NO_MODIFY_PATH set to 1 to leave the shell profile alone
+# AARCHX_NO_APP         set to 1 to leave AArchX.app out of ~/Applications
 # AARCHX_URL            the archive to install instead of the release's
 #
 # The archive is fetched with curl, so macOS does not quarantine it and
@@ -19,6 +21,8 @@ set -eu
 REPO=mont127/AArchX
 ASSET=aarchx-macos-arm64.tar.gz
 MARK='# added by the AArchX installer'
+APP_ID=io.github.mont127.aarchx
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'aarchx install: %s\n' "$*" >&2; exit 1; }
@@ -31,8 +35,18 @@ profile_file() {
     esac
 }
 
+is_our_app() {
+    [ "$(plutil -extract CFBundleIdentifier raw "$1/Contents/Info.plist" 2>/dev/null)" = "$APP_ID" ]
+}
+
 uninstall() {
     home=${AARCHX_HOME:-$HOME/.aarchx}
+    app=$HOME/Applications/AArchX.app
+    if [ -d "$app" ] && is_our_app "$app"; then
+        "$LSREGISTER" -u "$app" 2>/dev/null || true
+        rm -rf "$app"
+        say "removed $app"
+    fi
     if [ -x "$home/ocerz" ]; then
         rm -rf "$home"
         say "removed $home"
@@ -96,6 +110,24 @@ install() {
     fi
     mv "$tmp/x/aarchx" "$home"
     say "installed $("$home/ocerz" version) in $home"
+
+    if [ -d "$home/AArchX.app" ]; then
+        app=$HOME/Applications/AArchX.app
+        if [ "${AARCHX_NO_APP:-0}" = 1 ]; then
+            :
+        elif [ -e "$app" ] && ! is_our_app "$app"; then
+            say "$app exists and is not AArchX's, so the app stays in $home"
+        else
+            mkdir -p "$HOME/Applications"
+            rm -rf "$app"
+            mv "$home/AArchX.app" "$app"
+            if [ "$home" != "$HOME/.aarchx" ]; then
+                defaults write "$APP_ID" OcerzPath "$home/ocerz"
+            fi
+            "$LSREGISTER" -f "$app" 2>/dev/null || true
+            say "installed AArchX.app in ~/Applications: drop an Intel app on it, or use Open With in Finder"
+        fi
+    fi
 
     case "$home" in
         "$HOME"/*) dir="\$HOME${home#"$HOME"}/bin" ;;

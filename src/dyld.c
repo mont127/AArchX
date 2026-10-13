@@ -157,6 +157,20 @@
  * dlopen_caller_rpath pins it; OCERZ_NO_DLOPEN_CALLER_RPATH=1 restores the old
  * behaviour.
  *
+ * The same chain finds a dlopened image's own @rpath dependencies: its
+ * LC_RPATHs first, then the caller's, then the main executable's, as dyld's
+ * load chain runs from the image back to the main executable.  Cache mode used
+ * only the image's own, so a plugin with no LC_RPATH that links a library from
+ * its loader's directory had those imports left unbound: CrossOver's
+ * cxcompatdb.so, dlopened by ntdll.so, links @rpath/libgnutls.30.dylib, which
+ * only ntdll's @loader_path/../../../lib64 reaches, and every CrossOver bottle
+ * crashed at startup.  Native mode already passed the chain.  A leaf name
+ * goes through the same rpaths, after DYLD_LIBRARY_PATH and before the working
+ * directory: cache mode skipped them, and CrossOver's win32u.so, which dlopens
+ * libfreetype.6.dylib, found no FreeType and drew no text.  The dynamic test
+ * dlopen_chain_rpath pins both, and OCERZ_NO_DLOPEN_CALLER_RPATH=1 turns them
+ * off too.
+ *
  * ---- thread-local variables ----
  * Two descriptor layouts share the same 24 bytes.  A static linker emits the
  * classic tlv_descriptor { thunk, key:u64, offset:u64 }, so the offset is at
@@ -4039,7 +4053,10 @@ static void dlerror_set(const char *fmt, const char *arg)
     }
 }
 
-static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
+static RpathList *ndl_rpaths(DynImage *caller);
+static void rpaths_append(RpathList *dst, const RpathList *src);
+
+static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path, uint64_t caller)
 {
     if (dep_find(cache, install_path) != 0)
         return NULL;
@@ -4082,6 +4099,11 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path)
         return NULL;
     }
     collect_rpaths(d, NULL, merged);
+    if (!getenv("OCERZ_NO_DLOPEN_CALLER_RPATH")) {
+        RpathList *chain = ndl_rpaths(dimg_containing(caller));
+        rpaths_append(merged, chain);
+        free(chain);
+    }
     load_disk_deps(cache, d, merged);
     free(merged);
     if (apply_fixups(d, cache) != OCERZ_OK) {
@@ -4281,6 +4303,20 @@ static int resolve_bare_soname(const char *name, char *out, size_t n)
 
 static RpathList *ndl_rpaths(DynImage *caller);
 
+/* A leaf name in the LC_RPATHs of the image that called dlopen and then the
+ * main executable, which dyld tries after DYLD_LIBRARY_PATH and before the
+ * working directory. */
+static int bare_in_caller_rpaths(const char *name, uint64_t caller, char *out, size_t n)
+{
+    RpathList *rp = ndl_rpaths(dimg_containing(caller));
+    int ok = 0;
+    for (int i = 0; rp && i < rp->n && !ok; i++)
+        if (snprintf(out, n, "%s/%s", rp->entry[i], name) < (int)n)
+            ok = rpath_supplied(g_run_cache, out) || dimg_find_by_path(out) != NULL;
+    free(rp);
+    return ok;
+}
+
 static const char *dlopen_expand_at(const char *p, uint64_t caller, char *out, size_t n)
 {
     DynImage *c = dimg_containing(caller);
@@ -4348,8 +4384,11 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
     }
 
     char sopath[PATH_MAX];
-    if (!strchr(loadpath, '/') && loadpath[0] != '@' && access(loadpath, F_OK) != 0 &&
-        resolve_bare_soname(loadpath, sopath, sizeof sopath)) {
+    if (!strchr(loadpath, '/') && loadpath[0] != '@' &&
+        (try_soname_in_pathlist(getenv("DYLD_LIBRARY_PATH"), loadpath, sopath, sizeof sopath) ||
+         (!getenv("OCERZ_NO_DLOPEN_CALLER_RPATH") &&
+          bare_in_caller_rpaths(loadpath, caller, sopath, sizeof sopath)) ||
+         (access(loadpath, F_OK) != 0 && resolve_bare_soname(loadpath, sopath, sizeof sopath)))) {
         already = dimg_find_by_path(sopath);
         if (already) {
             if (g_dlerror_g)
@@ -4391,7 +4430,7 @@ static uint64_t ocerz_dlopen_inner(struct OcerzVM *vm, const char *hostpath, int
         }
     }
     int before = g_dimgs_n;
-    DynImage *d = dlopen_load_image(g_run_cache, loadpath);
+    DynImage *d = dlopen_load_image(g_run_cache, loadpath, caller);
     if (!d)
         return 0;
     if (!g_run_init_ready && g_run_vm && !vm->exited &&

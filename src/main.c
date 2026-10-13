@@ -22,6 +22,12 @@
  * way: "cs2.exe:OCERZ_NO_SUPERBLOCK=1,OCERZ_TSO_STRICT=1;other.exe:..." gives
  * each listed process its own JIT knobs before any of them is read.  A process whose loader is named wine is
  * marked as one of Wine's, which fixes the base of its memory arena (see mem.c).
+ * So is one whose program carries a WINE_RESERVE segment, the range Wine's
+ * preloader keeps for Windows: CrossOver starts each process through a link
+ * named after the program, and for a hard link realpath keeps that name, so its
+ * cmd.exe started with the ordinary layout and died reserving the low-shadow
+ * base its Wine parent handed down.  OCERZ_NO_WINE_SEGMENT_DETECT=1 goes back
+ * to the name alone.
  * OCERZ_STDERR_FILE appends every process's standard error to one file before
  * anything else runs: Chromium and others start their children with standard
  * error closed or pointed at nothing, and a child that dies early under ocerz
@@ -85,6 +91,8 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <mach-o/fat.h>
+#include <mach-o/loader.h>
 
 static char **env_snapshot(char **env)
 {
@@ -110,6 +118,45 @@ static void usage(void)
                     "       ocerz version\n");
 }
 
+/* Whether the x86_64 image in a Mach-O file has a WINE_RESERVE segment. */
+static int has_wine_reserve(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    static uint8_t buf[1 << 16];
+    ssize_t got = pread(fd, buf, sizeof buf, 0);
+    uint32_t magic = got >= 8 ? *(const uint32_t *)buf : 0;
+    if (magic == FAT_CIGAM) {
+        uint32_t n = __builtin_bswap32(*(const uint32_t *)(buf + 4));
+        off_t at = -1;
+        for (uint32_t i = 0; i < n && 8 + (i + 1) * sizeof(struct fat_arch) <= (size_t)got; i++) {
+            const struct fat_arch *fa = (const struct fat_arch *)(buf + 8) + i;
+            if ((int32_t)__builtin_bswap32((uint32_t)fa->cputype) == CPU_TYPE_X86_64)
+                at = (off_t)__builtin_bswap32(fa->offset);
+        }
+        got = at >= 0 ? pread(fd, buf, sizeof buf, at) : 0;
+        magic = got >= 8 ? *(const uint32_t *)buf : 0;
+    }
+    close(fd);
+    if (magic != MH_MAGIC_64 || (size_t)got < sizeof(struct mach_header_64))
+        return 0;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)buf;
+    if (mh->cputype != CPU_TYPE_X86_64)
+        return 0;
+    size_t off = sizeof *mh;
+    for (uint32_t i = 0; i < mh->ncmds && off + sizeof(struct load_command) <= (size_t)got; i++) {
+        const struct load_command *lc = (const struct load_command *)(buf + off);
+        if (lc->cmdsize < sizeof *lc || off + lc->cmdsize > (size_t)got)
+            break;
+        if (lc->cmd == LC_SEGMENT_64 &&
+            strncmp(((const struct segment_command_64 *)lc)->segname, "WINE_RESERVE", 16) == 0)
+            return 1;
+        off += lc->cmdsize;
+    }
+    return 0;
+}
+
 static int is_wine_loader(const char *path)
 {
     char resolved[PATH_MAX];
@@ -117,7 +164,9 @@ static int is_wine_loader(const char *path)
         path = resolved;
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
-    return strcmp(base, "wine") == 0 || strcmp(base, "wine64") == 0;
+    if (strcmp(base, "wine") == 0 || strcmp(base, "wine64") == 0)
+        return 1;
+    return !getenv("OCERZ_NO_WINE_SEGMENT_DETECT") && has_wine_reserve(path);
 }
 
 static void apply_wine_defaults(const char *path)

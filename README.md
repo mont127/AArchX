@@ -14,7 +14,7 @@
   <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
-  <img alt="version" src="https://img.shields.io/badge/version-0.7-green.svg">
+  <img alt="version" src="https://img.shields.io/badge/version-0.7.1-green.svg">
 </p>
 
 > [!WARNING]
@@ -55,16 +55,24 @@ curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
 ```
 
 This installs the latest release's prebuilt `ocerz` and its runtime files in
-`~/.aarchx`, and adds `~/.aarchx/bin` to `PATH` in your shell profile. Open a
-new terminal window, then:
+`~/.aarchx`, adds `~/.aarchx/bin` to `PATH` in your shell profile, and puts
+AArchX.app in `~/Applications`. To run a program without Terminal, drop an
+Intel app on AArchX.app's window, or right-click the app in Finder and choose
+Open With → AArchX. With Wine installed, a Windows `.exe` works the same way.
+The app is only a wrapper around the terminal version, which works the same with
+or without it. In Terminal, open a new window, then:
 
 ```sh
-ocerz version                         # AArchX 0.7
+ocerz version                         # AArchX 0.7.1
 ocerz /Applications/Some.app          # a bundle runs the executable its Info.plist names
 ```
 
 With Homebrew, `brew install --cask mont127/aarchx/aarchx` installs the same
-prebuilt. Running the same curl command with `sh -s -- --uninstall` instead of
+prebuilt. Without Terminal at all, download `AArchX.zip` from the
+[latest release](https://github.com/mont127/AArchX/releases/latest), unzip it
+and move AArchX.app to Applications. It is not notarized, so the first time
+macOS refuses to open it; click **Open Anyway** in System Settings → Privacy &
+Security. Running the same curl command with `sh -s -- --uninstall` instead of
 `sh` removes it.
 Cache mode also needs Rosetta installed (see below). 32-bit Steam games need a
 build from source; see [32-bit Mac games from Steam](docs/32-bit-steam-games.md).
@@ -81,7 +89,7 @@ You need:
 
 ```sh
 make -j
-./ocerz version                       # AArchX 0.7
+./ocerz version                       # AArchX 0.7.1
 ./ocerz tests/guest/bin/hello         # a test program from this repository
 ./ocerz /Applications/Some.app       # a bundle runs the executable its Info.plist names
 ```

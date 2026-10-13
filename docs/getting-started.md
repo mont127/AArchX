@@ -28,7 +28,8 @@ curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
 The script downloads the latest release's `aarchx-macos-arm64.tar.gz`, checks
 its SHA-256 and unpacks it into `~/.aarchx`: `ocerz`, the API databases native
 mode reads (`runtime/apis`, `runtime/apis32`) and the guest C++ runtime
-(`runtime/guest`). It then adds `~/.aarchx/bin` to `PATH` in `~/.zprofile` or
+(`runtime/guest`). It moves [AArchX.app](#the-aarchx-app) into
+`~/Applications`, and adds `~/.aarchx/bin` to `PATH` in `~/.zprofile` or
 `~/.bash_profile`. It asks for no password and touches nothing else. Because
 curl does not quarantine what it downloads, Gatekeeper does not stop the
 unsigned binary.
@@ -38,6 +39,7 @@ unsigned binary.
 | `AARCHX_HOME=<dir>` | install there instead of `~/.aarchx` |
 | `AARCHX_VERSION=v0.7` | install that release instead of the latest |
 | `AARCHX_NO_MODIFY_PATH=1` | leave the shell profile alone |
+| `AARCHX_NO_APP=1` | leave AArchX.app in the install directory instead of `~/Applications` |
 
 Pass them to the `sh` side of the pipe: `curl -fsSL ... | AARCHX_HOME=/opt/aarchx sh`.
 Running the script again updates the install, and
@@ -51,8 +53,8 @@ With Homebrew, the same prebuilt is a cask in the `mont127/aarchx` tap:
 brew install --cask mont127/aarchx/aarchx
 ```
 
-It links `ocerz` into Homebrew's `bin`. The cask removes the quarantine flag
-Homebrew puts on its downloads. `brew upgrade --cask aarchx` updates it, and
+It links `ocerz` into Homebrew's `bin` and puts AArchX.app in `/Applications`.
+The cask removes the quarantine flag Homebrew puts on its downloads. `brew upgrade --cask aarchx` updates it, and
 `brew uninstall --zap --cask aarchx` removes it along with the translation cache.
 
 The prebuilt has no Steam bridge database and no 32-bit GNU C++ runtime, so
@@ -60,11 +62,96 @@ The prebuilt has no Steam bridge database and no 32-bit GNU C++ runtime, so
 If you download the archive with a browser instead, remove the quarantine flag
 before running it: `xattr -dr com.apple.quarantine aarchx`.
 
+## The AArchX app
+
+AArchX.app is a window around `ocerz` for running programs without Terminal.
+It is separate from the terminal version: `ocerz` works the same with or without
+it, and the app only finds and starts it.
+
+The app keeps a **library** of your programs: Intel Mac apps and command-line
+programs, 32-bit Mac programs, and Windows `.exe` and `.msi` files. Each tile
+shows the program's icon and name, and says what it is or that it is running.
+
+To add programs:
+- drop them on the window: one program dropped is added and run, several are
+  only added;
+- click **+**;
+- right-click a program in Finder and choose **Open With → AArchX**, or drop it
+  on the app's Dock icon, which adds it and runs it.
+
+To use a tile:
+- double-click it to run the program;
+- right-click it to run it in native mode, stop it, open its last log, show it
+  in Finder or remove it from the library.
+
+**Activity** lists every run, with how it ended and when it started. Its logs
+are in `~/Library/Logs/AArchX`.
+
+How the app picks the mode:
+- **Native mode**, in the bottom bar, is `-native`.
+- The app switches to native mode by itself for a 32-bit program, which only
+  [m32](m32.md) runs, and when Rosetta's x86-64 cache is missing.
+- It refuses an Apple silicon app, which runs without AArchX.
+
+A Windows program runs through Wine, as `ocerz <wine> <program>`:
+- The **Windows programs** menu in the bottom bar lists the x86-64 Wine
+  builds the app finds:
+  - WineHQ's Stable, Staging and Devel apps, in `/Applications`,
+    `~/Applications` or MacNdCheese's own copies;
+  - Whisky's Wine;
+  - the Game Porting Toolkit;
+  - a `wine` in Homebrew's `bin`.
+- The program starts in its own folder, in cache mode.
+- It uses a prefix of the app's own, `~/Library/Application Support/AArchX/Wine`,
+  so no other Wine setup's prefix is touched. `WINEPREFIX`, or
+  `defaults write io.github.mont127.aarchx WinePrefix <dir>`, picks another.
+- An `.msi` is installed with `msiexec /i`.
+- **Stop** also stops the prefix's `wineserver`, which ends every Windows
+  program running in that prefix.
+
+With CrossOver installed, **CrossOver Bottles…** in the bottom bar lists its
+bottles, each with a box. A ticked bottle runs its Windows programs under
+AArchX instead of Rosetta, started from CrossOver's own window as usual.
+- **How it switches.** The box sets the bottle's `[Wine] "BinPath"`,
+  CrossOver's documented way to use another Wine. That puts two small scripts in
+  `~/Library/Application Support/AArchX/CrossOver/bin` ahead of CrossOver's own
+  `bin`. They run CrossOver's `wineloader` and `wineserver` under `ocerz`, or
+  directly if `ocerz` is gone.
+- **What stays the same.** Nothing inside CrossOver.app changes, so a CrossOver
+  update keeps both the setting and CrossOver's signature.
+- **Switching back.** Unticking the box removes the line.
+- **Before you switch.** Quit the bottle's programs; the change applies when the
+  bottle next starts.
+
+For games, [MacNdCheese](https://github.com/mont127/MacNdCheese) sets up a whole
+Wine environment, with DXMT, DXVK and Steam, and can run its bottles under
+AArchX too.
+
+It looks for `ocerz` in this order:
+1. inside its own bundle;
+2. beside itself;
+3. in `~/.aarchx`;
+4. in Homebrew's `bin`.
+
+To point it at another `ocerz`, run
+`defaults write io.github.mont127.aarchx OcerzPath /path/to/ocerz`.
+
+How to get it:
+- **The one-line installer** puts it in `~/Applications`.
+- **The Homebrew cask** puts it in `/Applications`.
+- **`AArchX.zip`** on each release is the app with `ocerz` and its runtime
+  inside, for anyone who would rather not use Terminal at all. It is not
+  notarized, so macOS refuses to open it the first time:
+  1. Move it to Applications.
+  2. Try to open it.
+  3. Click **Open Anyway** in System Settings → Privacy & Security.
+- **`make app`** builds it from source.
+
 ## Build
 
 ```sh
 make -j
-./ocerz version        # AArchX 0.7
+./ocerz version        # AArchX 0.7.1
 ```
 
 The build is C11 with `-arch arm64 -O2`, takes well under a minute, and has no
