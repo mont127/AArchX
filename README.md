@@ -46,7 +46,28 @@ Mac's own arm64 frameworks, so they need no x86 system libraries at all.
   runs both interpreted and translated and the two must match byte for byte,
   and 20,033 i386 cases are compared register by register.
 
-## Quick start
+## Install
+
+On an Apple silicon Mac with macOS 26 or 27, without Xcode:
+
+```sh
+curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
+```
+
+This installs the latest release's prebuilt `ocerz` and its runtime files in
+`~/.aarchx`, and adds `~/.aarchx/bin` to `PATH` in your shell profile. Open a
+new terminal window, then:
+
+```sh
+ocerz version                         # AArchX 0.7
+ocerz /Applications/Some.app          # a bundle runs the executable its Info.plist names
+```
+
+Running the same command with `sh -s -- --uninstall` instead of `sh` removes it.
+Cache mode also needs Rosetta installed (see below). 32-bit Steam games need a
+build from source; see [32-bit Mac games from Steam](docs/32-bit-steam-games.md).
+
+## Build from source
 
 You need:
 
