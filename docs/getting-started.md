@@ -45,6 +45,16 @@ Running the script again updates the install, and
 removes it and the `PATH` line. The translation cache in
 `~/Library/Caches/ocerz` is left behind; delete it too if you want the space back.
 
+With Homebrew, the same prebuilt is a cask in the `mont127/aarchx` tap:
+
+```sh
+brew install --cask mont127/aarchx/aarchx
+```
+
+It links `ocerz` into Homebrew's `bin`. The cask removes the quarantine flag
+Homebrew puts on its downloads. `brew upgrade --cask aarchx` updates it, and
+`brew uninstall --zap --cask aarchx` removes it along with the translation cache.
+
 The prebuilt has no Steam bridge database and no 32-bit GNU C++ runtime, so
 [32-bit Mac games from Steam](32-bit-steam-games.md) still need the build below.
 If you download the archive with a browser instead, remove the quarantine flag

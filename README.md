@@ -63,7 +63,9 @@ ocerz version                         # AArchX 0.7
 ocerz /Applications/Some.app          # a bundle runs the executable its Info.plist names
 ```
 
-Running the same command with `sh -s -- --uninstall` instead of `sh` removes it.
+With Homebrew, `brew install --cask mont127/aarchx/aarchx` installs the same
+prebuilt. Running the same curl command with `sh -s -- --uninstall` instead of
+`sh` removes it.
 Cache mode also needs Rosetta installed (see below). 32-bit Steam games need a
 build from source; see [32-bit Mac games from Steam](docs/32-bit-steam-games.md).
 
