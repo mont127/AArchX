@@ -1,0 +1,5 @@
+fopen 1 1 flock 1
+written 13
+reused 1
+fdopen 1 tmpfile 1
+exit 0

@@ -867,7 +867,7 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
     uint64_t raw = (hr->cls == 'f' || hr->cls == 'd') ? out_v[0] : out_x[0];
     if (hr->cls == 'f')
         raw = (uint32_t)raw;
-    uint64_t v = m32_scalar_out(gr->cls, hr->cls, raw);
+    uint64_t v = e->file_ret && raw ? m32_file((void *)(uintptr_t)raw) : m32_scalar_out(gr->cls, hr->cls, raw);
     switch (gr->cls) {
     case 'f': m32_ret_st0(cpu, fbits((uint32_t)v)); break;
     case 'd': m32_ret_st0(cpu, dbits(v)); break;

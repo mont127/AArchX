@@ -87,6 +87,7 @@ typedef struct M32Export {
     uint32_t data;            /* data imports: the guest variable */
     int gsize, hsize;
     char *data_kind;
+    int file_ret;             /* returns a FILE *: the guest gets m32_file's twin */
 } M32Export;
 enum { M32_EX_UNRESOLVED, M32_EX_SPECIAL, M32_EX_FN, M32_EX_BAD, M32_EX_DATA };
 
@@ -113,6 +114,7 @@ void m32_alias(uint32_t g, void *host);   /* guest-resident object g stands for 
 uint32_t m32_handle_count(void);
 uint32_t m32_cstring(const char *host);   /* guest copy of a host C string (in-window strings stay put) */
 uint32_t m32_handle_twin_lookup(void *host);   /* the guest object aliased to host, or 0 */
+uint32_t m32_file(void *host_file);   /* src/m32_stdio.c: the guest FILE standing for a host one */
 uint32_t m32_export_hostfn(void *fn, const char *gnote, const char *hnote);   /* host function as guest address */
 
 int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e);          /* src/m32_cross.c */

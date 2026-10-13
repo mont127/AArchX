@@ -702,6 +702,21 @@ static int sp_getcwd(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(out);
 }
 
+/* The guest's FILE for a host stream.  i386 code reads struct __sFILE's fields inline: Valve's file system flocks
+ * fp->_file (offset 14) of a file it opened for writing, and on a handle (fd 0) gave up with the file already
+ * truncated.  The twin is an i386 __sFILE (88 bytes) aliased to the host stream with only _file kept current; the rest
+ * reads 0, so the getc/putc macros fall through to __srget/__swbuf.  libc reuses closed FILEs, and their twins. */
+uint32_t m32_file(void *host_file)
+{
+    uint32_t g = m32_handle_twin_lookup(host_file);
+    if (!g) {
+        g = m32_static_alloc(88, 4);
+        m32_alias(g, host_file);
+    }
+    *(int16_t *)m32_h(g + 14) = (int16_t)fileno((FILE *)host_file);
+    return g;
+}
+
 const M32SpecialEntry m32_stdio_specials[] = {
     { "___error", sp___error },
     { "_printf", sp_printf }, { "_vprintf", sp_vprintf }, { "_fprintf", sp_fprintf }, { "_vfprintf", sp_vfprintf },
