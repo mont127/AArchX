@@ -1,0 +1,10 @@
+frame 0 flushed range 1
+frame 1 flushed range 1
+frame 2 flushed range 1
+data then map reads it 1
+partial write kept the rest 1
+sub data seen through a map 1
+read only map changed nothing 1
+new buffer's contents 1
+errors 0
+exit 0

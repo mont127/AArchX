@@ -3,13 +3,20 @@
  *
  * glMapBuffer hands back driver memory far outside the guest's 4 GB window, so a guest could never write its vertices
  * there (handed a handle instead, the writes went nowhere and every 3D draw came out empty).  A mapping gets a shadow
- * in the guest heap instead: the buffer's bytes are copied in when it is mapped, flushed ranges
- * (glFlushMappedBufferRange[APPLE]) are copied out as they are flushed, and at unmap the whole shadow is copied out
- * unless the guest flushed ranges itself (it is then in explicit-flush mode and has said what it wrote).  A shadow is
- * kept per (context, buffer) for the next mapping.
+ * in the guest heap instead: flushed ranges (glFlushMappedBufferRange[APPLE]) are copied out as they are flushed, and
+ * at unmap the whole shadow is copied out unless the guest flushed ranges itself (it is then in explicit-flush mode and
+ * has said what it wrote).  A shadow is kept per (share group, buffer) for the next mapping.
  *
- * ponytail: 256 shadows, a linear scan under one lock, and a full copy in at every map; track written ranges when
- * the copies show up in a profile.
+ * A shadow is the buffer's mirror once it has been mapped through it: what the buffer holds is what the guest last
+ * wrote there, or undefined after glBufferData without data (the orphaning a game does before refilling a dynamic
+ * buffer).  Mapping it again copies nothing in, and maps ask the driver nothing either: the buffer's size is the
+ * shadow's.  Both cost Left 4 Dead 2's render thread about half its time: the copy of the whole buffer in at each map,
+ * and glGetBufferParameteriv, which on Apple's multithreaded engine waits for every queued command to run first.
+ * glBufferData with data and glBufferSubData keep the mirror true; anything else that writes a buffer (a pixel pack,
+ * transform feedback, glCopyBufferSubData) does not go through m32, so only array and element array buffers are
+ * mirrored and a buffer bound elsewhere is copied in at every map.
+ *
+ * ponytail: 256 shadows, a linear scan under one lock.
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -23,16 +30,21 @@
 #define GL_LIB "/System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL"
 
 typedef struct Shadow {
-    void *ctx;
+    void *group;
     uint32_t buffer, guest, cap;   /* the guest copy and its capacity */
     uint8_t *host;                 /* while mapped: the driver's pointer to the mapped range */
     uint32_t size, flushed;        /* the mapped range's size; whether the guest flushed any part of it */
+    uint32_t bufsize, mirror;      /* the buffer's size (0: not known); whether the copy is the buffer's mirror */
 } Shadow;
 static Shadow g_shadows[256];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct {
     void *(*current)(void);
+    void *(*share_group)(void *);
+    void (*buffer_data)(unsigned, intptr_t, const void *, unsigned);
+    void (*buffer_sub_data)(unsigned, intptr_t, intptr_t, const void *);
+    void (*delete_buffers)(int, const uint32_t *);
     void (*getiv)(unsigned, int *);
     void (*buffer_iv)(unsigned, unsigned, int *);
     void *(*map)(unsigned, unsigned);
@@ -53,8 +65,25 @@ static void gl_init(void)
     gl.unmap = (unsigned char (*)(unsigned))ocerz_bridge_host_symbol(GL_LIB, "glUnmapBuffer");
     gl.flush_apple = (void (*)(unsigned, intptr_t, intptr_t))ocerz_bridge_host_symbol(GL_LIB, "glFlushMappedBufferRangeAPPLE");
     gl.flush_range = (void (*)(unsigned, intptr_t, intptr_t))ocerz_bridge_host_symbol(GL_LIB, "glFlushMappedBufferRange");
-    gl.map = (void *(*)(unsigned, unsigned))ocerz_bridge_host_symbol(GL_LIB, "glMapBuffer");
+    gl.share_group = (void *(*)(void *))ocerz_bridge_host_symbol(GL_LIB, "CGLGetShareGroup");
+    gl.buffer_data = (void (*)(unsigned, intptr_t, const void *, unsigned))ocerz_bridge_host_symbol(GL_LIB, "glBufferData");
+    gl.buffer_sub_data =
+        (void (*)(unsigned, intptr_t, intptr_t, const void *))ocerz_bridge_host_symbol(GL_LIB, "glBufferSubData");
+    gl.delete_buffers = (void (*)(int, const uint32_t *))ocerz_bridge_host_symbol(GL_LIB, "glDeleteBuffers");
+    __atomic_store_n(&gl.map, (void *(*)(unsigned, unsigned))ocerz_bridge_host_symbol(GL_LIB, "glMapBuffer"),
+                     __ATOMIC_RELEASE);
 }
+
+/* buffers are shared by the contexts of a share group, so their shadows are too */
+static void *share_group(void)
+{
+    void *ctx = gl.current();
+    void *g = ctx && gl.share_group ? gl.share_group(ctx) : NULL;
+    return g ? g : ctx;
+}
+
+/* only these are mirrored: the guest's own calls are the only writers m32 sees */
+static int mirrored(unsigned target) { return target == 0x8892 || target == 0x8893; }   /* GL_[ELEMENT_]ARRAY_BUFFER */
 
 /* the buffer bound to target (the binding query of each buffer target) */
 static uint32_t bound(unsigned target)
@@ -74,27 +103,36 @@ static uint32_t bound(unsigned target)
     return (uint32_t)b;
 }
 
-/* the shadow of (current context, buffer), made or grown to size; NULL when there is no room */
-static Shadow *shadow_for(uint32_t buffer, uint32_t size)
+/* the shadow of (group, buffer), or NULL; with g_lock held */
+static Shadow *find(void *group, uint32_t buffer)
 {
-    void *ctx = gl.current();
+    for (int i = 0; i < 256; i++)
+        if (g_shadows[i].group == group && g_shadows[i].buffer == buffer && g_shadows[i].guest)
+            return &g_shadows[i];
+    return NULL;
+}
+
+/* the shadow of (group, buffer), made or grown to size (a grown one mirrors nothing yet); NULL when there is no room */
+static Shadow *shadow_for(void *group, uint32_t buffer, uint32_t size)
+{
     Shadow *s = NULL, *spare = NULL;
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < 256 && !s; i++) {
-        if (g_shadows[i].ctx == ctx && g_shadows[i].buffer == buffer)
+        if (g_shadows[i].group == group && g_shadows[i].buffer == buffer)
             s = &g_shadows[i];
         else if (!spare && !g_shadows[i].host)
             spare = &g_shadows[i];   /* empty, or an unmapped one to recycle */
     }
     if (!s && spare) {
         m32_free(spare->guest);
-        *spare = (Shadow){ ctx, buffer, 0, 0, NULL, 0, 0 };
+        *spare = (Shadow){ group, buffer, 0, 0, NULL, 0, 0, 0, 0 };
         s = spare;
     }
     if (s && s->cap < size) {
         m32_free(s->guest);
         s->guest = m32_malloc(size);
         s->cap = s->guest ? size : 0;
+        s->mirror = 0;
     }
     pthread_mutex_unlock(&g_lock);
     return s && s->guest ? s : NULL;
@@ -102,27 +140,34 @@ static Shadow *shadow_for(uint32_t buffer, uint32_t size)
 
 static Shadow *mapped(unsigned target)
 {
-    void *ctx = gl.current();
+    void *group = share_group();
     uint32_t buffer = bound(target);
     for (int i = 0; i < 256; i++)
-        if (g_shadows[i].ctx == ctx && g_shadows[i].buffer == buffer && g_shadows[i].host)
+        if (g_shadows[i].group == group && g_shadows[i].buffer == buffer && g_shadows[i].host)
             return &g_shadows[i];
     return NULL;
 }
 
 #define RET(v) do { m32_ret(cpu, (uint32_t)(v), 0, 0); return OCERZ_STEP_OK; } while (0)
 
-static int map_common(OcerzCPU *cpu, unsigned target, uint8_t *host, uint32_t size)
+/* whole: the mapping is the whole buffer, of size bytes, and the shadow may be (or become) its mirror */
+static int map_common(OcerzCPU *cpu, unsigned target, uint32_t buffer, void *group, uint8_t *host, uint32_t size,
+                      int whole)
 {
     if (!host)
         RET(0);
-    Shadow *s = shadow_for(bound(target), size ? size : 1);
+    Shadow *s = shadow_for(group, buffer, size ? size : 1);
     if (!s) {
         fprintf(stderr, "ocerz: m32: glMapBuffer: no guest shadow for %u bytes\n", (unsigned)size);
         gl.unmap(target);
         RET(0);
     }
-    memcpy(m32_h(s->guest), host, size);
+    int keep = whole && mirrored(target);
+    if (!(keep && s->mirror))
+        memcpy(m32_h(s->guest), host, size);
+    if (whole)
+        s->bufsize = size;
+    s->mirror = keep;
     s->host = host;
     s->size = size;
     s->flushed = 0;
@@ -134,17 +179,102 @@ static int sp_glMapBuffer(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     gl_init();
     unsigned target = m32_arg(cpu, 0);
-    int size = 0;
-    gl.buffer_iv(target, 0x8764, &size);   /* GL_BUFFER_SIZE */
-    return map_common(cpu, target, gl.map(target, m32_arg(cpu, 1)), (uint32_t)size);
+    uint32_t buffer = bound(target), size = 0;
+    void *group = share_group();
+    pthread_mutex_lock(&g_lock);
+    Shadow *s = mirrored(target) ? find(group, buffer) : NULL;
+    if (s)
+        size = s->bufsize;
+    pthread_mutex_unlock(&g_lock);
+    if (!size) {
+        int q = 0;
+        gl.buffer_iv(target, 0x8764, &q);   /* GL_BUFFER_SIZE */
+        size = (uint32_t)q;
+    }
+    return map_common(cpu, target, buffer, group, gl.map(target, m32_arg(cpu, 1)), size, 1);
 }
-/* glMapBufferRange(target, offset, length, access): the shadow holds just the range */
+/* glMapBufferRange(target, offset, length, access): the shadow holds just the range, and mirrors nothing */
 static int sp_glMapBufferRange(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     gl_init();
     unsigned target = m32_arg(cpu, 0);
     uint32_t len = m32_arg(cpu, 2);
-    return map_common(cpu, target, gl.map_range(target, (int32_t)m32_arg(cpu, 1), len, m32_arg(cpu, 3)), len);
+    return map_common(cpu, target, bound(target), share_group(),
+                      gl.map_range(target, (int32_t)m32_arg(cpu, 1), len, m32_arg(cpu, 3)), len, 0);
+}
+
+/* glBufferData(target, size, data, usage): the buffer's new size; without data its contents are undefined, which any
+ * shadow mirrors, and with data the shadow takes them too */
+static int sp_glBufferData(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    gl_init();
+    unsigned target = m32_arg(cpu, 0);
+    int32_t size = (int32_t)m32_arg(cpu, 1);
+    uint32_t data = m32_arg(cpu, 2);
+    gl.buffer_data(target, size, data ? m32_host(data) : NULL, m32_arg(cpu, 3));
+    if (mirrored(target)) {
+        void *group = share_group();
+        uint32_t buffer = bound(target);
+        pthread_mutex_lock(&g_lock);
+        Shadow *s = find(group, buffer);
+        if (s) {
+            s->bufsize = size > 0 ? (uint32_t)size : 0;
+            if (!data)
+                s->mirror = 1;   /* undefined contents: whatever the shadow holds will do */
+            else if (s->cap >= (uint32_t)size && size > 0)
+                memcpy(m32_h(s->guest), m32_host(data), (size_t)size), s->mirror = 1;
+            else
+                s->mirror = 0;
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
+    RET(0);
+}
+/* glBufferSubData(target, offset, size, data): written into the mirror too */
+static int sp_glBufferSubData(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    gl_init();
+    unsigned target = m32_arg(cpu, 0);
+    int32_t off = (int32_t)m32_arg(cpu, 1), size = (int32_t)m32_arg(cpu, 2);
+    uint32_t data = m32_arg(cpu, 3);
+    gl.buffer_sub_data(target, off, size, data ? m32_host(data) : NULL);
+    if (mirrored(target)) {
+        void *group = share_group();
+        uint32_t buffer = bound(target);
+        pthread_mutex_lock(&g_lock);
+        Shadow *s = find(group, buffer);
+        if (s && s->mirror) {
+            if (data && off >= 0 && size >= 0 && (uint64_t)off + (uint64_t)size <= s->cap)
+                memcpy(m32_h(s->guest + (uint32_t)off), m32_host(data), (size_t)size);
+            else
+                s->mirror = 0;
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
+    RET(0);
+}
+/* glDeleteBuffers(n, buffers): their shadows go, so a name made again starts with none */
+static int sp_glDeleteBuffers(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    gl_init();
+    int32_t n = (int32_t)m32_arg(cpu, 0);
+    uint32_t names = m32_arg(cpu, 1);
+    void *group = share_group();
+    pthread_mutex_lock(&g_lock);
+    for (int32_t i = 0; names && i < n; i++) {
+        Shadow *s = find(group, m32_rd(names + 4 * (uint32_t)i));
+        if (s) {
+            m32_free(s->guest);
+            *s = (Shadow){ 0 };
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (n >= 0)
+        gl.delete_buffers(n, names ? (const uint32_t *)m32_h(names) : NULL);
+    RET(0);
 }
 /* glFlushMappedBufferRange[APPLE](target, offset, size): the offset is within the mapped range */
 static int flush_common(OcerzCPU *cpu, void (*flush)(unsigned, intptr_t, intptr_t))
@@ -261,5 +391,8 @@ const M32SpecialEntry m32_gl_specials[] = {
     { "_glFlushMappedBufferRange", sp_glFlushMappedBufferRange },
     { "_glFlushMappedBufferRangeAPPLE", sp_glFlushMappedBufferRangeAPPLE },
     { "_glUnmapBuffer", sp_glUnmapBuffer }, { "_glUnmapBufferARB", sp_glUnmapBuffer },
+    { "_glBufferData", sp_glBufferData }, { "_glBufferDataARB", sp_glBufferData },
+    { "_glBufferSubData", sp_glBufferSubData }, { "_glBufferSubDataARB", sp_glBufferSubData },
+    { "_glDeleteBuffers", sp_glDeleteBuffers }, { "_glDeleteBuffersARB", sp_glDeleteBuffers },
     { NULL, NULL }
 };
