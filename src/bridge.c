@@ -2999,6 +2999,7 @@ static const BrHandler g_br_handlers[] = {
     { "pthread_getspecific", ocerz_sys_pthread_getspecific },
     { "pthread_create",      ocerz_sys_pthread_create },
     { "pthread_exit",        ocerz_sys_pthread_exit },
+    { "pthread_testcancel",  ocerz_sys_pthread_testcancel },
     { "Block_copy",                ocerz_block_special_copy },
     { "Block_object_assign",       ocerz_block_special_object_assign },
 };

@@ -448,6 +448,12 @@
  * filed under.  A file with no x86_64 slice and a host library no database
  * describes are both refused as a native library without an API database, since
  * native mode runs x86 code only and reaches native code only through one.
+ * As a dependency of something being dlopened, such a library is passed over
+ * instead, and only an import from it fails the load, as Symbol not found:
+ * Qt's Cocoa platform plugin links AGL.framework, which the SDK no longer
+ * describes, and imports nothing from it, so every Qt app (ClipGrab) aborted
+ * with "Could not load the Qt platform plugin". OCERZ_NO_HOST_ONLY_DEP=1 goes
+ * back to refusing it.
  *
  * A load binds its whole closure before anything in it runs.  The loader's
  * usual path defines an image's Objective-C as soon as that image's fixups are
@@ -3788,6 +3794,7 @@ static void canonicalize_objc_selrefs(DynImage *img)
 
 typedef struct NativeDlLoad {
     int active;
+    int host_only; /* the last dependency refused exists natively, just not for x86 */
     char missing[1024];
     char missing_from[1024];
     char reason[256];
@@ -3855,6 +3862,7 @@ static uint64_t virt_slot_of(void *ctx, const char *export_name)
 static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, DynImage *loader,
                                  const RpathList *rpaths)
 {
+    g_ndl.host_only = 0;
     DynImage *by_name = dimg_find_by_install_name(install_name);
     if (by_name)
         return by_name;
@@ -3947,6 +3955,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
                 native_dl_reason("%s is a native library without an API database", real);
             else
                 native_dl_reason("no such file", NULL);
+            g_ndl.host_only = real != NULL;
         }
         return NULL;
     }
@@ -3957,6 +3966,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         else
             OCERZ_FATAL("incompatible architecture: %s has no x86_64 slice\n", resolved);
         native_dl_reason("%s has no x86_64 slice, so it is a native library without an API database", resolved);
+        g_ndl.host_only = 1;
         free(buf);
         return NULL;
     }
@@ -4022,7 +4032,14 @@ static void load_disk_deps(OcerzCache *cache, DynImage *loader, const RpathList 
             if (noff < rd32(lc + 4)) {
                 const char *name = (const char *)(lc + noff);
                 DynImage *dep = load_disk_dylib(cache, name, loader, rpaths);
-                if (!dep && g_ndl.active && cmd != LC_LOAD_WEAK_DYLIB && !g_ndl.missing[0]) {
+                /* A library the host has but no database describes stops the
+                   dlopen only if something is imported from it: the binds
+                   count those as misses, Symbol not found, so one nothing
+                   uses is passed over the way dyld would load it unused. */
+                int unused_host = !dep && g_ndl.host_only && !getenv("OCERZ_NO_HOST_ONLY_DEP");
+                if (unused_host)
+                    OCERZ_LOG("dynamic: %s has no API database; %s loads without it\n", name, loader->path);
+                if (!dep && !unused_host && g_ndl.active && cmd != LC_LOAD_WEAK_DYLIB && !g_ndl.missing[0]) {
                     snprintf(g_ndl.missing, sizeof g_ndl.missing, "%s", name);
                     snprintf(g_ndl.missing_from, sizeof g_ndl.missing_from, "%s", loader->path);
                     if (!g_ndl.reason[0])

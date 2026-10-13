@@ -100,8 +100,10 @@
 # daemon and wordexp, which runs a shell, would start an x86 image with no
 # translator under it.  ocerz has to launch those through itself.
 #
-# Thread cancellation: pthread_cancel and pthread_testcancel unwind a host
-# thread through ocerz's own frames.  dispatch_main is special instead: the real
+# Thread cancellation: pthread_cancel unwinds a host thread through ocerz's own
+# frames, so it is refused, and with no way to ask for a cancellation
+# pthread_testcancel never has one to act on: it is special and returns.  Qt's
+# threads call it, and the stub stopped ClipGrab in native mode.  dispatch_main is special instead: the real
 # one ends the main thread and hands the main queue to the thread pool, and in
 # ocerz the main thread is the one the process belongs to, so the handler runs
 # the native main run loop there for good, which drains the main queue the way
@@ -712,7 +714,7 @@ special _pthread_key_init_np pthread_key_init_np
 special _pthread_setspecific pthread_setspecific
 special _pthread_getspecific pthread_getspecific
 stub _pthread_cancel override
-stub _pthread_testcancel override
+special _pthread_testcancel pthread_testcancel
 special _dispatch_main dispatch_main
 special _glob glob
 special _glob$INODE64 glob

@@ -103,6 +103,7 @@ int ocerz_sys_pthread_setspecific(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_getspecific(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_testcancel(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_mach_vm_map(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_mach_vm_remap(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_get_stackaddr_np(struct OcerzVM *vm, OcerzCPU *cpu);

@@ -303,6 +303,128 @@ static BOOL set_bottle_aarchx(NSString *conf, BOOL on)
     return [[lines componentsJoinedByString:@"\n"] writeToFile:conf atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+/* Where CrossOver lives, for the launcher scripts: never a translocated copy,
+ * whose path is gone once that copy quits. */
+static NSString *crossover_home(void)
+{
+    NSMutableArray *candidates = [NSMutableArray array];
+    for (NSURL *u in [[NSWorkspace sharedWorkspace] URLsForApplicationsWithBundleIdentifier:@"com.codeweavers.CrossOver"])
+        [candidates addObject:u.path];
+    [candidates addObjectsFromArray:@[
+        @"/Applications/CrossOver.app", [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/CrossOver.app"],
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Downloads/CrossOver.app"]
+    ]];
+    for (NSString *c in candidates)
+        if ([c rangeOfString:@"/AppTranslocation/"].location == NSNotFound &&
+            [[NSFileManager defaultManager]
+                isExecutableFileAtPath:[c stringByAppendingPathComponent:@"Contents/SharedSupport/CrossOver/bin/wine"]])
+            return c;
+    return nil;
+}
+
+/* The launchers CrossOver wrote for a bottle into ~/Applications/CrossOver,
+ * each naming its bottle in its Info.plist. */
+static NSArray<NSString *> *crossover_launchers(NSString *bottle)
+{
+    NSString *root = [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/CrossOver"];
+    NSMutableArray *found = [NSMutableArray array];
+    NSDirectoryEnumerator *e = [[NSFileManager defaultManager] enumeratorAtPath:root];
+    for (NSString *rel in e) {
+        if (![rel.pathExtension isEqualToString:@"app"])
+            continue;
+        [e skipDescendants];
+        NSString *app = [root stringByAppendingPathComponent:rel];
+        NSDictionary *info =
+            [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Contents/Info.plist"]];
+        if ([info[@"CXHelperAppBottleName"] isEqual:bottle] && [info[@"CFBundleExecutable"] length])
+            [found addObject:app];
+    }
+    return found;
+}
+
+static NSString *const kLauncherMark = @"# Written by AArchX.app";
+
+/* What a switched launcher runs.  Opened from Finder, the Dock or CrossOver,
+ * with no arguments, it runs the command CrossOver wrote for the program (its
+ * CrossOverHelperCommand, a script that calls CrossOver's wine with the bottle
+ * and the program) as it is: the launcher itself would add
+ * --enable-alt-loader, whose processes do not run under ocerz yet.  With
+ * arguments it is CrossOver asking for the launcher itself, and the original
+ * gets them.  The script becomes that command, so the launcher stays running
+ * while the program does, as CrossOver's own launcher would. */
+static NSString *launcher_script(NSString *exe, NSString *crossover)
+{
+    return [NSString stringWithFormat:
+        @"#!/bin/sh\n"
+        @"%@: starts this program through CrossOver's own wine without its\n"
+        @"# alternate loader, so it runs under AArchX instead of Rosetta.  Switching the\n"
+        @"# bottle off in AArchX puts the original launcher back.\n"
+        @"here=$(cd \"$(dirname \"$0\")\" && pwd)\n"
+        @"orig=\"$here/%@.cx-original\"\n"
+        @"case \"$1\" in ''|-psn_*) ;; *) exec \"$orig\" \"$@\" ;; esac\n"
+        @"info=\"$here/../Info.plist\"\n"
+        @"bottle=$(/usr/bin/plutil -extract CXHelperAppBottleName raw \"$info\" 2>/dev/null)\n"
+        @"target=$(/usr/bin/plutil -extract CrossOverHelperCommand raw \"$info\" 2>/dev/null | /usr/bin/sed 's/^\"//; s/\"$//')\n"
+        @"[ -f \"$target\" ] && [ -x \"$target\" ] && exec \"$target\"\n"
+        @"for app in %@ /Applications/CrossOver.app \"$HOME/Applications/CrossOver.app\"; do\n"
+        @"    wine=\"$app/Contents/SharedSupport/CrossOver/bin/wine\"\n"
+        @"    if [ -x \"$wine\" ] && [ -n \"$bottle\" ] && [ -n \"$target\" ]; then\n"
+        @"        exec \"$wine\" --bottle \"$bottle\" --wait-children --start \"$target\"\n"
+        @"    fi\n"
+        @"done\n"
+        @"exec \"$orig\" \"$@\"\n",
+        kLauncherMark, exe, shell_quote(crossover ? crossover : @"/Applications/CrossOver.app")];
+}
+
+/* Points one launcher at that script, keeping its own executable beside it as
+ * <name>.cx-original, or puts the original back.  A launcher CrossOver has
+ * written again since is left as CrossOver wrote it. */
+static BOOL set_launcher_aarchx(NSString *app, BOOL on, NSString *crossover)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Contents/Info.plist"]];
+    NSString *exe = info[@"CFBundleExecutable"];
+    if (!exe.length)
+        return NO;
+    NSString *path = [[app stringByAppendingPathComponent:@"Contents/MacOS"] stringByAppendingPathComponent:exe];
+    NSString *orig = [path stringByAppendingString:@".cx-original"];
+    NSString *current = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    BOOL ours = [current rangeOfString:kLauncherMark].location != NSNotFound;
+    BOOL wrapped = [fm fileExistsAtPath:orig];
+    if (!on) {
+        if (!wrapped || !ours)
+            return YES;
+        return [fm removeItemAtPath:path error:nil] && [fm moveItemAtPath:orig toPath:path error:nil];
+    }
+    BOOL moved = NO;
+    if (!wrapped) {
+        if (![fm moveItemAtPath:path toPath:orig error:nil])
+            return NO;
+        moved = YES;
+    } else if (!ours && [fm fileExistsAtPath:path]) {
+        return NO;
+    }
+    if (![launcher_script(exe, crossover) writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil] ||
+        ![fm setAttributes:@{ NSFilePosixPermissions : @0755 } ofItemAtPath:path error:nil]) {
+        if (moved) {
+            [fm removeItemAtPath:path error:nil];
+            [fm moveItemAtPath:orig toPath:path error:nil];
+        }
+        return NO;
+    }
+    return YES;
+}
+
+/* Every launcher of a bottle; NO if any of them could not be changed. */
+static BOOL set_launchers_aarchx(NSString *bottle, BOOL on)
+{
+    NSString *crossover = crossover_home();
+    BOOL ok = YES;
+    for (NSString *app in crossover_launchers(bottle))
+        ok = set_launcher_aarchx(app, on, crossover) && ok;
+    return ok;
+}
+
 /* A copy downloaded with a browser carries the quarantine flag on every file;
  * once the user has let the app open, ocerz inside it must not be stopped
  * again on its own. */
@@ -1104,8 +1226,9 @@ static int program_kind(NSString *path, NSString **why)
     NSTextField *title = [NSTextField labelWithString:@"CrossOver Bottles"];
     title.font = [NSFont boldSystemFontOfSize:13];
     NSTextField *intro = [NSTextField wrappingLabelWithString:
-        @"Ticked bottles run their Windows programs under AArchX instead of Rosetta. A change takes effect the "
-        @"next time the bottle starts, so quit its programs first. CrossOver's own files are not changed."];
+        @"Ticked bottles run their Windows programs under AArchX instead of Rosetta, started from CrossOver or "
+        @"from their launchers in ~/Applications/CrossOver as usual. A change takes effect the next time the "
+        @"bottle starts, so quit its programs first. Unticking puts every file back as CrossOver wrote it."];
     NSStackView *boxes = [NSStackView new];
     boxes.orientation = NSUserInterfaceLayoutOrientationVertical;
     boxes.alignment = NSLayoutAttributeLeading;
@@ -1113,6 +1236,8 @@ static int program_kind(NSString *path, NSString **why)
         NSButton *box = [NSButton checkboxWithTitle:b target:self action:@selector(bottleToggled:)];
         box.identifier = [[dir stringByAppendingPathComponent:b] stringByAppendingPathComponent:@"cxbottle.conf"];
         box.state = bottle_uses_aarchx(box.identifier) ? NSControlStateValueOn : NSControlStateValueOff;
+        if (box.state == NSControlStateValueOn)
+            set_launchers_aarchx(b, YES);
         [boxes addArrangedSubview:box];
     }
     NSScrollView *scroll = [NSScrollView new];
@@ -1148,11 +1273,19 @@ static int program_kind(NSString *path, NSString **why)
 - (void)bottleToggled:(NSButton *)box
 {
     BOOL on = box.state == NSControlStateValueOn;
+    NSString *why = nil;
     if (!set_bottle_aarchx(box.identifier, on)) {
         box.state = on ? NSControlStateValueOff : NSControlStateValueOn;
+        why = @"Its cxbottle.conf already sets [Wine] BinPath to something else, or could not be written.";
+    } else if (!set_launchers_aarchx(box.title, on)) {
+        why = on ? @"The bottle runs under AArchX, but some of its launchers in ~/Applications/CrossOver could not be "
+                   @"changed, so they still start it under Rosetta."
+                 : @"Some of its launchers in ~/Applications/CrossOver could not be put back.";
+    }
+    if (why) {
         NSAlert *a = [NSAlert new];
-        a.messageText = [NSString stringWithFormat:@"%@ could not be changed", box.title];
-        a.informativeText = @"Its cxbottle.conf already sets [Wine] BinPath to something else, or could not be written.";
+        a.messageText = [NSString stringWithFormat:@"%@ was not fully changed", box.title];
+        a.informativeText = why;
         [a beginSheetModalForWindow:box.window completionHandler:nil];
     }
 }
