@@ -61,3 +61,5 @@ for f in *.c *.cpp *.m; do [ -e "$f" ] || continue; n=${f%.*}; case $n in lib*) 
   extra=(); [ -f "$n.link" ] && read -ra extra < "$n.link"
   xcrun clang "${LD[@]}" "obj/$n.o" "${OBJC[@]}" -Wl,-dead_strip_dylibs ${extra[@]+"${extra[@]}"} -o "bin/$n" 2>&1 | grep -vE "ld_classic is deprecated|i386 architecture is deprecated" || true
   [ -f "bin/$n" ] || { echo "build.sh: link failed for $n" >&2; exit 1; }; done
+# the arm64 stand-in for Steam's client that steambridge loads through the i386 Steam bridge
+xcrun clang -arch arm64 -O1 -dynamiclib -install_name @rpath/steamclient.dylib steamfake/steamclient.c -o bin/steamclient.dylib

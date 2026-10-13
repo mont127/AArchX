@@ -69,6 +69,14 @@ static void choose_dir(void)
         snprintf(g_dir, sizeof g_dir, "%s/%s", macos, best);
 }
 
+const char *m32_db_dir(void)
+{
+    pthread_mutex_lock(&g_lock);
+    choose_dir();
+    pthread_mutex_unlock(&g_lock);
+    return g_dir[0] ? g_dir : NULL;
+}
+
 static int cmp_rec(const void *a, const void *b)
 {
     return strcmp(((const M32DbRec *)a)->name, ((const M32DbRec *)b)->name);

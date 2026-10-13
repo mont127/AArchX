@@ -88,7 +88,7 @@ APIS32_LIBS := libSystem CoreFoundation libobjc Foundation CoreGraphics AppKit l
 	OpenGL libGL Accelerate ApplicationServices CoreText OpenAL AudioUnit libcurl ImageIO
 APIS32_STAMP := runtime/apis32/.generated-$(APIS_VER)
 
-apis32: $(APIS32_STAMP)
+apis32: apis $(APIS32_STAMP)
 
 $(APIS32_STAMP): $(APIS_INPUTS)
 	@echo "generating i386 API databases from the macOS $(APIS_VER) SDK"
@@ -97,8 +97,12 @@ $(APIS32_STAMP): $(APIS_INPUTS)
 	done
 	@touch $@
 
+steam32:
+	bash tools/steamgen.sh
+
 check-m32: ocerz apis32
 	bash tests/run_m32_tests.sh
+	OCERZ_NO_HIGH8_ARITH=1 OCERZ_NO_SHIFT_MEM_IMM=1 bash tests/run_m32_tests.sh high8 shiftmem
 
 check: ocerz unit guest apis
 	bash tests/run_guest_tests.sh --no-jit
@@ -144,4 +148,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: unit guest check apis apis32 check-m32 clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift
+.PHONY: unit guest check apis apis32 steam32 check-m32 clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift

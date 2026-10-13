@@ -17,6 +17,7 @@ These pages describe what it does, how to run it, and how it works.
 | [Modes](modes.md) | Cache mode and native mode: what each binds against, what each needs, which to pick |
 | [Native mode in depth](native-mode.md) | How native mode crosses into the Mac's own frameworks, what it costs, and what it cannot run yet |
 | [32-bit Mac programs](m32.md) | m32: running i386 Mach-O programs, which macOS dropped, against the Mac's arm64 frameworks |
+| [32-bit Mac games from Steam](32-bit-steam-games.md) | Setting up, launching a 32-bit Mac game from Steam, the games tried so far, and what to do when one fails |
 | [Reference](reference.md) | Every command-line option and every environment variable that is meant to be used |
 | [Architecture](architecture.md) | How a guest program is loaded, decoded, translated and run |
 | [Performance](performance.md) | Measured results against Rosetta, how to reproduce them, and where the remaining costs are |
@@ -38,7 +39,7 @@ engine that moves arguments between the two calling conventions.
 
 ## Status
 
-AArchX is experimental and version 0.6. It runs real applications, the
+AArchX is experimental and version 0.7. It runs real applications, the
 x86-64 Steam client among them, and it passes a gate of roughly twenty thousand
 differential cases plus several hundred behavioural ones on every commit. It is
 not a supported product, it has no stability guarantees, and it should not be

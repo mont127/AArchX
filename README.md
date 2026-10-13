@@ -14,7 +14,7 @@
   <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
-  <img alt="version" src="https://img.shields.io/badge/version-0.6-green.svg">
+  <img alt="version" src="https://img.shields.io/badge/version-0.7-green.svg">
 </p>
 
 > [!WARNING]
@@ -46,7 +46,30 @@ Mac's own arm64 frameworks, so they need no x86 system libraries at all.
   runs both interpreted and translated and the two must match byte for byte,
   and 20,033 i386 cases are compared register by register.
 
-## Quick start
+## Install
+
+On an Apple silicon Mac with macOS 26 or 27, without Xcode:
+
+```sh
+curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
+```
+
+This installs the latest release's prebuilt `ocerz` and its runtime files in
+`~/.aarchx`, and adds `~/.aarchx/bin` to `PATH` in your shell profile. Open a
+new terminal window, then:
+
+```sh
+ocerz version                         # AArchX 0.7
+ocerz /Applications/Some.app          # a bundle runs the executable its Info.plist names
+```
+
+With Homebrew, `brew install --cask mont127/aarchx/aarchx` installs the same
+prebuilt. Running the same curl command with `sh -s -- --uninstall` instead of
+`sh` removes it.
+Cache mode also needs Rosetta installed (see below). 32-bit Steam games need a
+build from source; see [32-bit Mac games from Steam](docs/32-bit-steam-games.md).
+
+## Build from source
 
 You need:
 
@@ -58,7 +81,7 @@ You need:
 
 ```sh
 make -j
-./ocerz version                       # AArchX 0.6
+./ocerz version                       # AArchX 0.7
 ./ocerz tests/guest/bin/hello         # a test program from this repository
 ./ocerz /Applications/Some.app       # a bundle runs the executable its Info.plist names
 ```
@@ -86,7 +109,7 @@ make apis
 | Ollama | command line and server work, and the menu-bar app runs |
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
 | Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window |
-| Batman: Arkham Asylum, a 32-bit Mac game | gameplay runs through m32 at about 61 fps (October 2026) |
+| Batman: Arkham Asylum, a 32-bit Mac game | plays through m32 at about 61 fps, launched from Steam and signed in to it (October 2026) |
 | Counter-Strike 2, under Wine with D3DMetal | reaches its window, then stops on an error Rosetta does not hit |
 | Photoshop | stops during startup |
 
@@ -182,6 +205,7 @@ The full list is in [Compatibility](docs/compatibility.md#known-limitations) and
 | [Modes](docs/modes.md) | cache mode and native mode, and which to pick |
 | [Native mode in depth](docs/native-mode.md) | how native mode crosses into the Mac's frameworks, and its limits |
 | [32-bit Mac programs](docs/m32.md) | m32: i386 Mach-O programs, such as Feral's Batman: Arkham Asylum |
+| [32-bit Mac games from Steam](docs/32-bit-steam-games.md) | playing a 32-bit Mac game from your Steam library, step by step (experimental) |
 | [Reference](docs/reference.md) | every command-line option, environment variable and exit code |
 | [Architecture](docs/architecture.md) | how a program is loaded, translated and run |
 | [Performance](docs/performance.md) | results against Rosetta and how to reproduce them |

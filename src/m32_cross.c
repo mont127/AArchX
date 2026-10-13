@@ -739,7 +739,7 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
                 uint32_t cur = m32_rd((uint32_t)raw);
                 *cell = ga->cls == 'P' ? (uint64_t)(uintptr_t)m32_host(cur)
                       : ga->cls == 'W' ? (uint64_t)(int64_t)(int32_t)cur : cur;
-                wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell };
+                wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell, NULL, NULL };
             }
             put_int(&hc, (uint64_t)(uintptr_t)cell, 8);
             continue;

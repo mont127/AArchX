@@ -6,8 +6,9 @@
   directly; it does not run on an Intel Mac.
 - **macOS 26 or 27.** Those are the releases it is developed and tested on.
   Earlier releases are untried rather than known-broken.
-- **The Xcode Command Line Tools**, for `clang` and `make`. `xcode-select
-  --install` installs them.
+- **The Xcode Command Line Tools**, for `clang` and `make`, if you build
+  AArchX yourself. `xcode-select --install` installs them. The prebuilt below
+  does not need them.
 - **Rosetta installed, for cache mode only.** Cache mode binds guest programs
   against Apple's x86-64 shared cache, and the Rosetta package is what ships
   that cache. AArchX maps and fixes up the cache itself and never calls
@@ -18,11 +19,52 @@ Two more things are needed only to run the full test suite: the Python
 `capstone` package for the i386 differential gate, and a working `clang -arch
 x86_64` for the fixtures the dynamic and native gates build.
 
+## Install the prebuilt
+
+```sh
+curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
+```
+
+The script downloads the latest release's `aarchx-macos-arm64.tar.gz`, checks
+its SHA-256 and unpacks it into `~/.aarchx`: `ocerz`, the API databases native
+mode reads (`runtime/apis`, `runtime/apis32`) and the guest C++ runtime
+(`runtime/guest`). It then adds `~/.aarchx/bin` to `PATH` in `~/.zprofile` or
+`~/.bash_profile`. It asks for no password and touches nothing else. Because
+curl does not quarantine what it downloads, Gatekeeper does not stop the
+unsigned binary.
+
+| Variable | Effect |
+| --- | --- |
+| `AARCHX_HOME=<dir>` | install there instead of `~/.aarchx` |
+| `AARCHX_VERSION=v0.7` | install that release instead of the latest |
+| `AARCHX_NO_MODIFY_PATH=1` | leave the shell profile alone |
+
+Pass them to the `sh` side of the pipe: `curl -fsSL ... | AARCHX_HOME=/opt/aarchx sh`.
+Running the script again updates the install, and
+`curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall`
+removes it and the `PATH` line. The translation cache in
+`~/Library/Caches/ocerz` is left behind; delete it too if you want the space back.
+
+With Homebrew, the same prebuilt is a cask in the `mont127/aarchx` tap:
+
+```sh
+brew install --cask mont127/aarchx/aarchx
+```
+
+It links `ocerz` into Homebrew's `bin`. The cask removes the quarantine flag
+Homebrew puts on its downloads. `brew upgrade --cask aarchx` updates it, and
+`brew uninstall --zap --cask aarchx` removes it along with the translation cache.
+
+The prebuilt has no Steam bridge database and no 32-bit GNU C++ runtime, so
+[32-bit Mac games from Steam](32-bit-steam-games.md) still need the build below.
+If you download the archive with a browser instead, remove the quarantine flag
+before running it: `xattr -dr com.apple.quarantine aarchx`.
+
 ## Build
 
 ```sh
 make -j
-./ocerz version        # AArchX 0.6
+./ocerz version        # AArchX 0.7
 ```
 
 The build is C11 with `-arch arm64 -O2`, takes well under a minute, and has no

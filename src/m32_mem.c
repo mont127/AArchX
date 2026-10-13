@@ -18,6 +18,18 @@ static pthread_mutex_t g_static_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct Pool { uint32_t next, end; } Pool;
 static Pool g_data, g_code;
 
+/* a fresh read-write mapping of n bytes anywhere below the handle cells, or 0; one that reaches past them is given
+ * back (m32_run reserves the cells and the top first, so none should) */
+uint32_t m32_map(uint64_t n)
+{
+    uint64_t g = ocerz_map_anywhere(n, PROT_READ | PROT_WRITE);
+    if (g && g + n > M32_HANDLE_LO) {
+        ocerz_unmap(g, n);
+        g = 0;
+    }
+    return (uint32_t)g;
+}
+
 static uint32_t pool_alloc(Pool *p, uint32_t size, uint32_t align)
 {
     if (align < 4)
@@ -26,14 +38,14 @@ static uint32_t pool_alloc(Pool *p, uint32_t size, uint32_t align)
     uint32_t at = (p->next + align - 1) & ~(align - 1);
     if (!p->next || at + size > p->end) {
         uint32_t chunk = size + align > (1u << 20) ? (size + align + 0x3fff) & ~0x3fffu : 1u << 20;
-        uint64_t base = ocerz_map_anywhere(chunk, PROT_READ | PROT_WRITE);
-        if (!base || base + chunk > M32_HANDLE_LO) {
+        uint32_t base = m32_map(chunk);
+        if (!base) {
             pthread_mutex_unlock(&g_static_lock);
             fprintf(stderr, "ocerz: m32: window full (static allocation of %u bytes)\n", (unsigned)size);
             return 0;
         }
-        p->next = (uint32_t)base;
-        p->end = (uint32_t)base + chunk;
+        p->next = base;
+        p->end = base + chunk;
         at = (p->next + align - 1) & ~(align - 1);
     }
     p->next = at + size;
@@ -67,11 +79,11 @@ static void heap_mark(uint32_t g, size_t n, int on)
 }
 static void *heap_mmap(size_t n)
 {
-    uint64_t g = ocerz_map_anywhere(n, PROT_READ | PROT_WRITE);
-    if (!g || g + n > M32_HANDLE_LO)
+    uint32_t g = m32_map(n);
+    if (!g)
         return (void *)~(size_t)0;
-    heap_mark((uint32_t)g, n, 1);
-    return m32_h((uint32_t)g);
+    heap_mark(g, n, 1);
+    return m32_h(g);
 }
 static int heap_munmap(void *p, size_t n)
 {
