@@ -3,6 +3,7 @@
  * forms differ in layout, that allocate for the caller, that take variadic arguments, or that exist only on i386.
  */
 #include <dirent.h>
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <servers/bootstrap.h>
@@ -65,6 +66,27 @@ static int sp__exit(struct OcerzVM *vm, OcerzCPU *cpu)
     log_exit(cpu, "_exit");
     fflush(NULL);
     _exit((int)(m32_arg(cpu, 0) & 0xff));
+}
+
+/* SetFrontProcess(&psn) is how a game started by a script (Left 4 Dead 2 from Steam, through hl2.sh) came to the
+ * front.  Today's cooperative activation ignores it while another app is active, so the game started unfocused:
+ * throttled by engine_no_focus_sleep and without the mouse until the user switched away and back.  For the current
+ * process the call still goes through, and the app also asks to activate once its run loop turns, which is honored. */
+static int sp_SetFrontProcess(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static short (*set_front)(const void *), (*same)(const void *, const void *, unsigned char *);
+    if (!set_front) {
+        same = (short (*)(const void *, const void *, unsigned char *))dlsym(RTLD_DEFAULT, "SameProcess");
+        set_front = (short (*)(const void *))dlsym(RTLD_DEFAULT, "SetFrontProcess");
+    }
+    const uint32_t *psn = m32_h(m32_arg(cpu, 0)), current[2] = { 0, 2 };   /* kCurrentProcess */
+    unsigned char self = psn[0] == 0 && psn[1] == 2;
+    if (!self && same && same(psn, current, &self) != 0)
+        self = 0;
+    if (self)
+        m32_activate_soon();
+    m32_ret(cpu, (uint32_t)(int32_t)(set_front ? set_front(psn) : 0), 0, 0);
+    return OCERZ_STEP_OK;
 }
 
 static int sp_ok0(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -1328,6 +1350,7 @@ static const M32SpecialEntry g_specials[] = {
     { "_signal", sp_signal }, { "_sigaction", sp_sigaction }, { "_sigaltstack", sp_ok0 },
     { "___bzero", sp_bzero }, { "_bzero", sp_bzero }, { "___stack_chk_fail", sp_stack_chk_fail },
     { "_exit", sp_exit },
+    { "_SetFrontProcess", sp_SetFrontProcess },
     { "__exit", sp__exit },
     { "__Exit", sp__exit },
     { "___cxa_atexit", sp_ok0 },   /* ponytail: C++ static destructors do not run at exit */

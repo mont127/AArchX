@@ -116,6 +116,7 @@ uint32_t m32_cstring(const char *host);   /* guest copy of a host C string (in-w
 uint32_t m32_handle_twin_lookup(void *host);   /* the guest object aliased to host, or 0 */
 uint32_t m32_file(void *host_file);   /* src/m32_stdio.c: the guest FILE standing for a host one */
 void m32_hud_start(void);             /* src/m32_bridge.c: OCERZ_M32_HUD's overlay */
+void m32_activate_soon(void);         /* src/m32.c: the game's app comes to the front */
 uint32_t m32_export_hostfn(void *fn, const char *gnote, const char *hnote);   /* host function as guest address */
 
 int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e);          /* src/m32_cross.c */

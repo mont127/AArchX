@@ -82,7 +82,8 @@ static uint32_t build_frame(uint32_t top, const char *path, int argc, char **arg
 
 /* OCERZ_M32_ACTIVATE=1 (measurement runs): bring the game's app to the front 5 s after launch, as a Finder launch
  * would.  Launched from a shell it stays behind the active app, and macOS then runs a background app on the
- * efficiency cores (always in Low Power Mode, after a while otherwise), which makes frame rates meaningless. */
+ * efficiency cores (always in Low Power Mode, after a while otherwise), which makes frame rates meaningless.
+ * m32_activate_soon does the same at once for a game that asks to be in front (SetFrontProcess). */
 static void activate_now(void *unused)
 {
     void *(*send)(void *, void *) = (void *(*)(void *, void *))dlsym(RTLD_DEFAULT, "objc_msgSend");
@@ -94,6 +95,11 @@ static void activate_now(void *unused)
     void *app = send(cls("NSApplication"), sel("sharedApplication"));
     if (app)
         send_b(app, sel("activateIgnoringOtherApps:"), 1);
+}
+
+void m32_activate_soon(void)
+{
+    dispatch_async_f(dispatch_get_main_queue(), NULL, activate_now);   /* runs once the game's run loop turns */
 }
 
 int m32_active;
