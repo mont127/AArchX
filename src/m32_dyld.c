@@ -92,7 +92,8 @@ static uint8_t *read_all(const char *path, size_t *len)
     return buf;
 }
 
-int m32_is_i386(const char *path)
+/* which of i386 (bit 0) and x86_64 (bit 1) the Mach-O file at path holds */
+static int slices(const char *path)
 {
     uint8_t head[4096];
     int fd = open(path, O_RDONLY);
@@ -105,17 +106,19 @@ int m32_is_i386(const char *path)
     /* a fat file's slices can lie beyond the first page; its arch table cannot */
     if (le32(head) == MH_MAGIC)
         return le32(head + 4) == CPU_TYPE_I386;
+    int found = 0;
     if (be32(head) == FAT_MAGIC || be32(head) == FAT_MAGIC_64) {
-        int wide = be32(head) == FAT_MAGIC_64, i386 = 0, x64 = 0;
+        int wide = be32(head) == FAT_MAGIC_64;
         for (uint32_t i = 0; i < be32(head + 4) && 8 + (i + 1) * (wide ? 32u : 20u) <= (uint32_t)n; i++) {
             uint32_t cpu = be32(head + 8 + i * (wide ? 32 : 20));
-            i386 |= cpu == CPU_TYPE_I386;
-            x64 |= cpu == CPU_TYPE_X86_64;
+            found |= (cpu == CPU_TYPE_I386) | (cpu == CPU_TYPE_X86_64) << 1;
         }
-        return i386 && !x64;
     }
-    return 0;
+    return found;
 }
+
+/* an i386-only program: one with an x86_64 slice runs through the x86_64 path */
+int m32_is_i386(const char *path) { return slices(path) == 1; }
 
 static uint64_t uleb(const uint8_t **p, const uint8_t *end)
 {
@@ -617,6 +620,16 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
 {
     out[0] = 0;
     char buf[2048];
+    /* as dyld does, a library's leaf name in the DYLD_LIBRARY_PATH directories first (Valve's hl2.sh points it at the
+     * game's bin); only an i386 image counts, so the host's own libraries on that path are passed over */
+    const char *dl = getenv("DYLD_LIBRARY_PATH"), *leaf = strrchr(name, '/');
+    for (const char *d = dl; d && *d && leaf; d = strchr(d, ':') ? strchr(d, ':') + 1 : NULL) {
+        size_t n = strcspn(d, ":");
+        snprintf(buf, sizeof buf, "%.*s%s", (int)n, d, leaf);
+        if (n && file_exists(buf) && (slices(buf) & 1) && realpath(buf, out))
+            return 0;
+    }
+    out[0] = 0;
     if (!strncmp(name, "@executable_path/", 17))
         snprintf(buf, sizeof buf, "%s/%s", g_exe_dir, name + 17);
     else if (!strncmp(name, "@loader_path/", 13) && loader) {
