@@ -2359,15 +2359,6 @@ static void gran_clear_all(void)
     g_gblk_off = getenv("OCERZ_INV_SCAN") ? 1 : 0;
 }
 
-static void shrink_edges(JitBlock *b)
-{
-    unsigned n = b->n_edges ? b->n_edges : 1;
-    if (b->edges && n < JIT_MAX_EDGES) {
-        void *p = realloc(b->edges, n * sizeof *b->edges);
-        if (p) b->edges = p;
-    }
-}
-
 /*
  * The least and the end of the greatest guest address b's instructions cover.  A
  * callee spliced into its caller (splice_callee) lies anywhere, not between the
@@ -2391,7 +2382,6 @@ static void block_gspan(JitBlock *b)
 
 static void cache_insert(OcerzJit *jit, JitBlock *b)
 {
-    shrink_edges(b);
     unsigned h = hash_key(b->key);
     b->hnext = jit->buckets[h];
     __atomic_store_n(&jit->buckets[h], b, __ATOMIC_RELEASE);
@@ -19283,6 +19273,27 @@ typedef struct PendingChain {
 #define PEND_SIZE (1u << PEND_BITS)
 #define PEND_MASK (PEND_SIZE - 1)
 static PendingChain *g_pending[PEND_SIZE];
+/*
+ * A pending chain lives from the translation that finds its target missing to
+ * the one that translates the target, and most new blocks drain at least one,
+ * so drained entries go on a free list for the next pending_add instead of
+ * back to malloc: under jit_lock, as every list here is.
+ */
+static PendingChain *g_pending_free;
+static PendingChain *pending_new(void)
+{
+    PendingChain *e = g_pending_free;
+    if (e) {
+        g_pending_free = e->next;
+        return e;
+    }
+    return (PendingChain *)malloc(sizeof *e);
+}
+static void pending_release(PendingChain *e)
+{
+    e->next = g_pending_free;
+    g_pending_free = e;
+}
 
 static void pred_add(JitBlock *target, JitBlock *src, int e)
 {
@@ -19305,7 +19316,7 @@ static void pending_add(uint64_t target_key, uint32_t *patch_b, uint8_t kind,
                         uint8_t pin_class, uint32_t *cond_site, uint64_t src_sig,
                         JitBlock *src, int edge)
 {
-    PendingChain *e = (PendingChain *)malloc(sizeof *e);
+    PendingChain *e = pending_new();
     if (!e)
         return;
     unsigned h = (unsigned)(hash_key(target_key) & PEND_MASK);
@@ -19347,7 +19358,7 @@ static void **ras_slot_alloc(void)
 
 static void pending_add_ras(uint64_t target_key, void **ras_slot)
 {
-    PendingChain *e = (PendingChain *)malloc(sizeof *e);
+    PendingChain *e = pending_new();
     if (!e)
         return;
     unsigned h = (unsigned)(hash_key(target_key) & PEND_MASK);
@@ -19396,7 +19407,7 @@ static void pending_drain(uint64_t key, JitBlock *target)
                 pred_add(target, e->src, e->edge);
             }
             *pp = e->next;
-            free(e);
+            pending_release(e);
         } else {
             pp = &e->next;
         }
@@ -21788,8 +21799,8 @@ static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, i
         return NULL;
     blk->key = jit_key(rip, mode32);
     blk->n_insns = (int)n;
-    blk->edges = calloc(JIT_MAX_EDGES, sizeof *blk->edges);
-    if (!blk->edges) fail = 1;
+    blk->edges = r->n_edges ? calloc(r->n_edges, sizeof *blk->edges) : NULL;
+    if (r->n_edges && !blk->edges) fail = 1;
     blk->insn_off = (uint32_t *)tc_dup(v.insn_off, n * sizeof(uint32_t), &fail);
     if (r->flags & TCF_COMPACT) {
         blk->iref = (JitInsnRef *)tc_dup(v.iref, n * sizeof(JitInsnRef), &fail);
@@ -22175,13 +22186,6 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     memcpy(blk->insns, scratch, (size_t)n * sizeof(X86Insn));
     blk->n_insns = n;
     blk->key = jit_key(rip, mode32);
-    blk->edges = calloc(JIT_MAX_EDGES, sizeof *blk->edges);
-    if (!blk->edges) {
-        free(blk->insns);
-        free(blk);
-        if (ocerz_jitstat > 0) { js_xlat_fail++; js_fail_alloc++; js_note_fail(rip, JSR_ALLOC, n); }
-        return NULL;
-    }
     if (g_keep_cap < n) {
         free(g_keep);
         g_keep = (uint8_t *)malloc((size_t)n);
@@ -23888,43 +23892,51 @@ promo_push_fallthrough:
            "block cannot mix legacy CALL, canonical CALL, and Jcc edges");
     assert(!(g_n_jcc_edges && g_n_call_edges) &&
            "block cannot have both canonical CALL and Jcc edges");
-    if (g_n_call_edges) {
-        for (int i = 0; i < g_n_call_edges; i++) {
-            blk->edges[i].target_rip = g_call_edge[i].target_rip;
-            blk->edges[i].patch_b = g_call_edge[i].patch_b;
-            blk->edges[i].cond_site = NULL;
-            blk->edges[i].kind = g_call_edge[i].kind;
-            blk->edges[i].pin_class = g_call_edge[i].pin_class;
-        }
-        blk->n_edges = (uint8_t)g_n_call_edges;
-    } else if (chain_patch_b) {
-        blk->edges[0].target_rip = g_chain_target;
-        blk->edges[0].patch_b = chain_patch_b;
-        blk->edges[0].cond_site = NULL;
-        blk->edges[0].kind = chain_is_body ? EDGE_BODY : EDGE_XBLOCK;
-        blk->edges[0].pin_class = chain_is_body ? 3 : 0;
-        blk->n_edges = 1;
-    } else if (g_n_jcc_edges) {
-        for (int i = 0; i < g_n_jcc_edges; i++) {
-            blk->edges[i].target_rip = g_jcc_edge[i].target_rip;
-            blk->edges[i].patch_b = g_jcc_edge[i].patch_b;
-            blk->edges[i].cond_site = g_jcc_edge[i].cond_site;
-            blk->edges[i].kind = g_jcc_edge[i].kind;
-            blk->edges[i].pin_class = g_jcc_edge[i].pin_class;
-        }
-        blk->n_edges = (uint8_t)g_n_jcc_edges;
+    {
+        int ne = g_n_call_edges ? g_n_call_edges : chain_patch_b ? 1 : g_n_jcc_edges;
+        for (int k = 0; k < g_n_side && ne < 8; k++)
+            if (g_side[k].patch_b) ne++;
+        blk->edges = ne ? calloc((size_t)ne, sizeof *blk->edges) : NULL;
     }
-    for (int k = 0; k < g_n_side && blk->n_edges < 8; k++) {
-        if (!g_side[k].patch_b) continue;
-        int e = blk->n_edges++;
-        blk->edges[e].target_rip = g_side[k].taken;
-        blk->edges[e].patch_b = g_side[k].patch_b;
-        blk->edges[e].cond_site = side_stub_has_work(k) ? NULL : g_side[k].site;
-        blk->edges[e].kind = body_edge_pin_class() >= 0 ? EDGE_BODY : EDGE_XBLOCK;
-        blk->edges[e].pin_class = body_edge_pin_class() >= 0 ? (uint8_t)body_edge_pin_class() : 0;
-        blk->edges[e].side = (uint8_t)(k + 1);
-        blk->edges[e].jcc_rip = g_side[k].jcc_rip;
-        blk->edges[e].probing = (uint8_t)(g_side[k].probe && blk->prof != NULL);
+    if (blk->edges) {
+        if (g_n_call_edges) {
+            for (int i = 0; i < g_n_call_edges; i++) {
+                blk->edges[i].target_rip = g_call_edge[i].target_rip;
+                blk->edges[i].patch_b = g_call_edge[i].patch_b;
+                blk->edges[i].cond_site = NULL;
+                blk->edges[i].kind = g_call_edge[i].kind;
+                blk->edges[i].pin_class = g_call_edge[i].pin_class;
+            }
+            blk->n_edges = (uint8_t)g_n_call_edges;
+        } else if (chain_patch_b) {
+            blk->edges[0].target_rip = g_chain_target;
+            blk->edges[0].patch_b = chain_patch_b;
+            blk->edges[0].cond_site = NULL;
+            blk->edges[0].kind = chain_is_body ? EDGE_BODY : EDGE_XBLOCK;
+            blk->edges[0].pin_class = chain_is_body ? 3 : 0;
+            blk->n_edges = 1;
+        } else if (g_n_jcc_edges) {
+            for (int i = 0; i < g_n_jcc_edges; i++) {
+                blk->edges[i].target_rip = g_jcc_edge[i].target_rip;
+                blk->edges[i].patch_b = g_jcc_edge[i].patch_b;
+                blk->edges[i].cond_site = g_jcc_edge[i].cond_site;
+                blk->edges[i].kind = g_jcc_edge[i].kind;
+                blk->edges[i].pin_class = g_jcc_edge[i].pin_class;
+            }
+            blk->n_edges = (uint8_t)g_n_jcc_edges;
+        }
+        for (int k = 0; k < g_n_side && blk->n_edges < 8; k++) {
+            if (!g_side[k].patch_b) continue;
+            int e = blk->n_edges++;
+            blk->edges[e].target_rip = g_side[k].taken;
+            blk->edges[e].patch_b = g_side[k].patch_b;
+            blk->edges[e].cond_site = side_stub_has_work(k) ? NULL : g_side[k].site;
+            blk->edges[e].kind = body_edge_pin_class() >= 0 ? EDGE_BODY : EDGE_XBLOCK;
+            blk->edges[e].pin_class = body_edge_pin_class() >= 0 ? (uint8_t)body_edge_pin_class() : 0;
+            blk->edges[e].side = (uint8_t)(k + 1);
+            blk->edges[e].jcc_rip = g_side[k].jcc_rip;
+            blk->edges[e].probing = (uint8_t)(g_side[k].probe && blk->prof != NULL);
+        }
     }
     for (int i = 0; i < blk->n_edges; i++) {
         blk->edges[i].fallback_insn = *blk->edges[i].patch_b;
@@ -24620,6 +24632,7 @@ void ocerz_jit_forget(struct OcerzVM *vm)
     g_n_ras_cells = 0;
     g_ras_slot_n = 0;
     memset(g_pending, 0, sizeof g_pending);
+    g_pending_free = NULL;
     if (vm)
         vm->jit = NULL;
 }
