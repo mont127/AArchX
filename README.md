@@ -55,8 +55,10 @@ curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
 ```
 
 This installs the latest release's prebuilt `ocerz` and its runtime files in
-`~/.aarchx`, and adds `~/.aarchx/bin` to `PATH` in your shell profile. Open a
-new terminal window, then:
+`~/.aarchx`, adds `~/.aarchx/bin` to `PATH` in your shell profile, and puts
+AArchX.app in `~/Applications`. To run a program without Terminal, drop an
+Intel app on AArchX.app's window, or right-click the app in Finder and choose
+Open With → AArchX. In Terminal, open a new window, then:
 
 ```sh
 ocerz version                         # AArchX 0.7
@@ -64,7 +66,11 @@ ocerz /Applications/Some.app          # a bundle runs the executable its Info.pl
 ```
 
 With Homebrew, `brew install --cask mont127/aarchx/aarchx` installs the same
-prebuilt. Running the same curl command with `sh -s -- --uninstall` instead of
+prebuilt. Without Terminal at all, download `AArchX.zip` from the
+[latest release](https://github.com/mont127/AArchX/releases/latest), unzip it
+and move AArchX.app to Applications. It is not notarized, so the first time
+macOS refuses to open it; click **Open Anyway** in System Settings → Privacy &
+Security. Running the same curl command with `sh -s -- --uninstall` instead of
 `sh` removes it.
 Cache mode also needs Rosetta installed (see below). 32-bit Steam games need a
 build from source; see [32-bit Mac games from Steam](docs/32-bit-steam-games.md).

@@ -28,7 +28,8 @@ curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
 The script downloads the latest release's `aarchx-macos-arm64.tar.gz`, checks
 its SHA-256 and unpacks it into `~/.aarchx`: `ocerz`, the API databases native
 mode reads (`runtime/apis`, `runtime/apis32`) and the guest C++ runtime
-(`runtime/guest`). It then adds `~/.aarchx/bin` to `PATH` in `~/.zprofile` or
+(`runtime/guest`). It moves [AArchX.app](#the-aarchx-app) into
+`~/Applications`, and adds `~/.aarchx/bin` to `PATH` in `~/.zprofile` or
 `~/.bash_profile`. It asks for no password and touches nothing else. Because
 curl does not quarantine what it downloads, Gatekeeper does not stop the
 unsigned binary.
@@ -38,6 +39,7 @@ unsigned binary.
 | `AARCHX_HOME=<dir>` | install there instead of `~/.aarchx` |
 | `AARCHX_VERSION=v0.7` | install that release instead of the latest |
 | `AARCHX_NO_MODIFY_PATH=1` | leave the shell profile alone |
+| `AARCHX_NO_APP=1` | leave AArchX.app in the install directory instead of `~/Applications` |
 
 Pass them to the `sh` side of the pipe: `curl -fsSL ... | AARCHX_HOME=/opt/aarchx sh`.
 Running the script again updates the install, and
@@ -51,14 +53,53 @@ With Homebrew, the same prebuilt is a cask in the `mont127/aarchx` tap:
 brew install --cask mont127/aarchx/aarchx
 ```
 
-It links `ocerz` into Homebrew's `bin`. The cask removes the quarantine flag
-Homebrew puts on its downloads. `brew upgrade --cask aarchx` updates it, and
+It links `ocerz` into Homebrew's `bin` and puts AArchX.app in `/Applications`.
+The cask removes the quarantine flag Homebrew puts on its downloads. `brew upgrade --cask aarchx` updates it, and
 `brew uninstall --zap --cask aarchx` removes it along with the translation cache.
 
 The prebuilt has no Steam bridge database and no 32-bit GNU C++ runtime, so
 [32-bit Mac games from Steam](32-bit-steam-games.md) still need the build below.
 If you download the archive with a browser instead, remove the quarantine flag
 before running it: `xattr -dr com.apple.quarantine aarchx`.
+
+## The AArchX app
+
+AArchX.app runs programs without Terminal. There are three ways to give it one:
+- drop an Intel app or command-line program on its window or its Dock icon;
+- right-click the program in Finder and choose **Open With → AArchX**;
+- click **Choose…**.
+
+Each program runs under `ocerz`, with its output in `~/Library/Logs/AArchX`.
+The window lists every run with how it ended:
+- double-click a run to open its log;
+- right-click a run to show its log, show the program in Finder, run it again
+  or stop it.
+
+How it picks the mode:
+- The **Native mode** box is `-native`.
+- The app switches to native mode by itself for a 32-bit program, which only
+  [m32](m32.md) runs, and when Rosetta's x86-64 cache is missing.
+- It refuses an Apple silicon app, which runs without AArchX.
+
+It looks for `ocerz` in this order:
+1. inside its own bundle;
+2. beside itself;
+3. in `~/.aarchx`;
+4. in Homebrew's `bin`.
+
+To point it at another `ocerz`, run
+`defaults write io.github.mont127.aarchx OcerzPath /path/to/ocerz`.
+
+How to get it:
+- **The one-line installer** puts it in `~/Applications`.
+- **The Homebrew cask** puts it in `/Applications`.
+- **`AArchX.zip`** on each release is the app with `ocerz` and its runtime
+  inside, for anyone who would rather not use Terminal at all. It is not
+  notarized, so macOS refuses to open it the first time:
+  1. Move it to Applications.
+  2. Try to open it.
+  3. Click **Open Anyway** in System Settings → Privacy & Security.
+- **`make app`** builds it from source.
 
 ## Build
 
