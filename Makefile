@@ -59,9 +59,12 @@ src/%.o: src/%.m
 src/%.o: src/%.s
 	$(CC) $(ARCHFLAGS) -g -c -o $@ $<
 
+# The unit binaries are committed, so they are linked with no debug map: it
+# would name the absolute path of every object they were linked from, and with
+# it the build machine's home directory.
 tests/unit/bin/%: tests/unit/%.c $(CORE_OBJS)
 	@mkdir -p tests/unit/bin
-	$(CC) $(CFLAGS) -o $@ $< $(CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -Wl,-S -o $@ $< $(CORE_OBJS) $(LDLIBS)
 
 unit: $(UNIT_BINS)
 	@for t in $(UNIT_BINS); do echo "== $$t"; OCERZ_NO_ARM_EXEC=1 $$t || exit 1; done
