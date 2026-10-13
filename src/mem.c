@@ -191,6 +191,7 @@ uint64_t ocerz_arena_lo;
 uint64_t ocerz_arena_hi;
 uint64_t ocerz_low_base;
 uint64_t ocerz_top_base;
+int ocerz_low_margin;
 uint8_t *ocerz_commpage;
 
 static uint64_t bump_next;
@@ -1626,24 +1627,49 @@ void ocerz_mem_pin_host_low(void)
               (unsigned long long)lost, failed);
 }
 
+/*
+ * The low window at `want`, with the top strip past the upper margin.  With
+ * margins it is one block from the lower margin to the strip's end, all of it
+ * inaccessible until the window and the strip are mapped into; without, the
+ * window and the strip alone, in the same places.
+ */
+static uint64_t reserve_low_block(uint64_t want, int margins)
+{
+    uint64_t topsz = OCERZ_TOP_HI - OCERZ_TOP_LO, top = want + OCERZ_LOW_LIMIT + OCERZ_LOW_MARGIN_HI;
+    if (margins) {
+        uint64_t lo = want - OCERZ_LOW_MARGIN_LO;
+        return want > OCERZ_LOW_MARGIN_LO && reserve_host_fixed(lo, top + topsz - lo) == lo ? want : 0;
+    }
+    if (reserve_host_fixed(want, OCERZ_LOW_LIMIT) != want)
+        return 0;
+    if (reserve_host_fixed(top, topsz) != top) {
+        mach_vm_deallocate(mach_task_self(), want, OCERZ_LOW_LIMIT);
+        return 0;
+    }
+    return want;
+}
+
 int ocerz_mem_init_low_shadow(void)
 {
-
+    /* 1 TB first: host allocations start near 450 GB and reach the margin below 512 GB in some processes. */
     static const uint64_t candidates[] = {
-        0x8000000000ull, 0x10000000000ull, 0x500000000ull, 0x600000000000ull,
+        0x10000000000ull, 0x8000000000ull, 0x500000000ull, 0x600000000000ull,
     };
-    uint64_t topsz = OCERZ_TOP_HI - OCERZ_TOP_LO;
-    uint64_t blocksz = OCERZ_LOW_LIMIT + topsz;
     map_lock_acquire();
     if (ocerz_low_base) {
         map_lock_release();
         return OCERZ_OK;
     }
     uint64_t base = 0;
+    int margin = getenv("OCERZ_NO_LOW_MARGIN") ? 0 : 1;
     const char *env = getenv("OCERZ_LOWBASE");
     if (env && env[0]) {
         uint64_t want = strtoull(env, NULL, 0);
-        base = reserve_host_fixed(want, blocksz);
+        base = margin ? reserve_low_block(want, 1) : 0;
+        if (!base) {
+            margin = 0;
+            base = reserve_low_block(want, 0);
+        }
         if (base != want) {
             map_lock_release();
             OCERZ_FATAL("cannot reserve inherited low-shadow base %#llx\n",
@@ -1651,12 +1677,13 @@ int ocerz_mem_init_low_shadow(void)
             return OCERZ_ENOMEM;
         }
     } else {
-        for (size_t k = 0; k < sizeof candidates / sizeof candidates[0] && !base; k++)
-            base = reserve_host_fixed(candidates[k], blocksz);
+        for (; margin >= 0 && !base; margin -= !base)
+            for (size_t k = 0; k < sizeof candidates / sizeof candidates[0] && !base; k++)
+                base = reserve_low_block(candidates[k], margin);
         if (!base) {
             map_lock_release();
-            OCERZ_FATAL("no host base accepts the %#llx-byte shadow block\n",
-                        (unsigned long long)blocksz);
+            OCERZ_FATAL("no host base accepts the %#llx-byte shadow window\n",
+                        (unsigned long long)OCERZ_LOW_LIMIT);
             return OCERZ_ENOMEM;
         }
         char buf[24];
@@ -1667,14 +1694,15 @@ int ocerz_mem_init_low_shadow(void)
         map_lock_release();
         return OCERZ_ENOMEM;
     }
-    ocerz_top_base = base + OCERZ_LOW_LIMIT;
+    ocerz_top_base = base + OCERZ_LOW_LIMIT + OCERZ_LOW_MARGIN_HI;
+    ocerz_low_margin = margin;
     ocerz_low_base = base;
     map_lock_release();
     ocerz_low_fill_host_holes();
-    OCERZ_LOG("low shadow window guest [0, %#llx) -> host %#llx; top strip [%#llx, %#llx) -> host %#llx\n",
+    OCERZ_LOG("low shadow window guest [0, %#llx) -> host %#llx; top strip [%#llx, %#llx) -> host %#llx; margins %s\n",
               (unsigned long long)OCERZ_LOW_LIMIT, (unsigned long long)base,
               (unsigned long long)OCERZ_TOP_LO, (unsigned long long)OCERZ_TOP_HI,
-              (unsigned long long)ocerz_top_base);
+              (unsigned long long)ocerz_top_base, margin ? "reserved" : "not reserved");
     return OCERZ_OK;
 }
 

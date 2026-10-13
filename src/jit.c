@@ -1672,6 +1672,23 @@ static int wlim_on(void);
  * index of either sign, with JMEMAUX holding how far below the bases the
  * index may reach.  When that fails too, it is translated without a hoist.
  *
+ * Where the low window has its margins (ocerz_low_margin, mem.h), the narrow
+ * form leans on them.  Its base is then only asked to be below 12 GB, with no
+ * span: whatever the block adds to it, a displacement, an index the block or
+ * the operand has checked, lands in the window or in a margin, where it
+ * faults and the interpreter takes the instruction (four instructions for
+ * any base, so a block that meets bases on both sides of 8 GB stays in this
+ * form).  And an index needs no
+ * check at all when its size is known: one the block itself wrote with a
+ * 32-bit result, a sign or zero extension or sums and shifts of those
+ * (llh_range), and in a block that loops on itself one that is only stepped
+ * by constants, which is checked to fit 32 bits once, before the loop.  Each
+ * time round it has moved by the steps, every operand on it has been read or
+ * written where the last round left it, and one that walks off the window
+ * reaches the margin before anything else.  A register the loop writes with
+ * nothing but 32-bit results, the counter of inc eax, is checked to be one
+ * where the loop starts and is one from then on.
+ *
  * Which operands are covered is decided once, in select_low_hoist, and kept
  * per instruction in g_llh_cov.  Code emitted later asks by the operand's
  * address (llh_slot), so it cannot disagree with what the checks were sized
@@ -1697,7 +1714,9 @@ static struct {
     int8_t acc_size, acc_reg, acc_store;     /* an access the arm makes itself (llh_regoff_access), size 0 if none */
 } g_larm[LLH_ARMS_MAX];
 static int g_n_larm;
-static uint32_t *g_llh_bail_tb[3 * LLH_MAX], *g_llh_bail_cb[2 * LLH_MAX + 1];
+static int g_llh_margin;                            /* the block relies on the low window's margins */
+static uint32_t g_llh_prex, g_llh_prez;             /* index registers a loop checks once, before it: 32 bits signed, unsigned */
+static uint32_t *g_llh_bail_tb[3 * LLH_MAX], *g_llh_bail_cb[2 * LLH_MAX + 1 + 16];
 static int g_n_llh_bail_tb, g_n_llh_bail_cb;
 /* The hoist's slot for an operand it covers, or -1; *loose says the operand checks its own index. */
 static int llh_slot_ex(const X86Insn *insn, const X86Operand *op, int *loose)
@@ -19527,7 +19546,7 @@ static void mark_add(MarkSet *m, uint64_t key)
     }
     m->full = 1;
 }
-static MarkSet g_lowhoist_marks, g_llhwide_marks, g_x87spec_marks;
+static MarkSet g_lowhoist_marks, g_llhwide_marks, g_llhexact_marks, g_x87spec_marks;
 static int lowhoist_marked(uint64_t key) { return mark_has(&g_lowhoist_marks, key); }
 static void lowhoist_mark(uint64_t key) { mark_add(&g_lowhoist_marks, key); }
 /* add, sub, inc or dec of the 64-bit register r by a constant: how far it steps. */
@@ -19544,6 +19563,109 @@ static int llh_step(const X86Insn *in, unsigned r, int64_t *by)
         return *by > -(1 << 20) && *by < (1 << 20);
     default: return 0;
     }
+}
+static int llh_bitlen(uint64_t v) { return v ? 64 - __builtin_clzll(v) : 0; }
+static int llh_sum(int a, int b) { return a == 0 ? b : b == 0 ? a : (a > b ? a : b) + 1; }
+/*
+ * What an instruction leaves known about the size of the registers it writes:
+ * a value v has -2^nb <= v < 2^pb, with nb 0 for one that is never negative
+ * and 64 in either for no bound.  Only writes whose result
+ * is bounded whatever was there before: a full 32-bit result, which zero
+ * extends, the extensions, constants, and copies, constant steps, sums, lea
+ * and shifts of values already bounded.  dep says which registers' bounds at
+ * the block's start a bound was derived from.
+ */
+static void llh_range(const X86Insn *in, uint8_t *nb, uint8_t *pb, uint16_t *dep)
+{
+    uint8_t n0[16], p0[16];
+    uint16_t d0[16];
+    memcpy(n0, nb, 16);
+    memcpy(p0, pb, 16);
+    memcpy(d0, dep, sizeof d0);
+    for (unsigned r = 0; r < 16; r++)
+        if (insn_may_write_gpr(in, r)) { nb[r] = pb[r] = 64; dep[r] = 0; }
+    const X86Operand *d = &in->ops[0], *s = &in->ops[1];
+    if (in->nops < 1 || d->kind != OCERZ_OPK_REG || d->reg > 15 || d->high8) return;
+    int n = 64, p = 64, two = in->nops == 2;
+    uint16_t dp = 0;
+    int sreg = two && s->kind == OCERZ_OPK_REG && s->reg <= 15 && !s->high8 && s->size == 8 ? s->reg : -1;
+    int64_t by;
+    switch (in->op) {
+    case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD: case OCERZ_OP_LEA:
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+    case OCERZ_OP_INC: case OCERZ_OP_DEC: case OCERZ_OP_NEG: case OCERZ_OP_NOT:
+        if (d->size == 4) {
+            n = 0;
+            p = in->op == OCERZ_OP_MOVZX && two && s->size < 4 ? 8 * s->size : 32;
+        }
+        break;
+    case OCERZ_OP_SHL:
+        break;
+    default:
+        return;
+    }
+    if (d->size == 8) switch (in->op) {
+    case OCERZ_OP_MOV:
+        if (sreg >= 0) { n = n0[sreg]; p = p0[sreg]; dp = d0[sreg]; }
+        else if (two && s->kind == OCERZ_OPK_IMM) {
+            int64_t v = (int64_t)s->imm;
+            n = v < 0 ? llh_bitlen((uint64_t)-v) : 0;
+            p = v > 0 ? llh_bitlen((uint64_t)v) : 0;
+        }
+        break;
+    case OCERZ_OP_MOVZX:
+        if (two && s->size < 4) { n = 0; p = 8 * s->size; }
+        break;
+    case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD:
+        if (two && s->size <= 4) { n = p = 8 * s->size - 1; }
+        break;
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_INC: case OCERZ_OP_DEC:
+        if (n0[d->reg] >= 64) break;
+        if (llh_step(in, d->reg, &by)) {
+            n = by < 0 ? llh_sum(n0[d->reg], llh_bitlen((uint64_t)-by)) : n0[d->reg];
+            p = by > 0 ? llh_sum(p0[d->reg], llh_bitlen((uint64_t)by)) : p0[d->reg];
+            dp = d0[d->reg];
+        } else if (sreg >= 0 && n0[sreg] < 64 && (in->op == OCERZ_OP_ADD || in->op == OCERZ_OP_SUB)) {
+            int add = in->op == OCERZ_OP_ADD;
+            n = llh_sum(n0[d->reg], add ? n0[sreg] : p0[sreg]);
+            p = llh_sum(p0[d->reg], add ? p0[sreg] : n0[sreg] ? n0[sreg] + 1 : 0);
+            dp = d0[d->reg] | d0[sreg];
+        }
+        break;
+    case OCERZ_OP_AND:
+        if (two && s->kind == OCERZ_OPK_IMM && (int64_t)s->imm >= 0) { n = 0; p = llh_bitlen(s->imm); }
+        break;
+    case OCERZ_OP_SHL:
+        if (two && s->kind == OCERZ_OPK_IMM && n0[d->reg] < 64) {
+            int c = (int)(s->imm & 63);
+            n = n0[d->reg] ? n0[d->reg] + c : 0;
+            p = p0[d->reg] ? p0[d->reg] + c : 0;
+            dp = d0[d->reg];
+        }
+        break;
+    case OCERZ_OP_LEA:
+        if (two && s->kind == OCERZ_OPK_MEM && !s->riprel && in->seg == OCERZ_SEG_NONE && in->addrsize == 8 &&
+            (s->base == OCERZ_REG_NONE || (s->base <= 15 && n0[s->base] < 64)) &&
+            (s->index == OCERZ_REG_NONE || (s->index <= 15 && n0[s->index] < 64))) {
+            int sc = s->scale & 3;
+            n = s->disp < 0 ? llh_bitlen((uint64_t)-s->disp) : 0;
+            p = s->disp > 0 ? llh_bitlen((uint64_t)s->disp) : 0;
+            if (s->base != OCERZ_REG_NONE) { n = llh_sum(n, n0[s->base]); p = llh_sum(p, p0[s->base]); dp |= d0[s->base]; }
+            if (s->index != OCERZ_REG_NONE) {
+                n = llh_sum(n, n0[s->index] ? n0[s->index] + sc : 0);
+                p = llh_sum(p, p0[s->index] ? p0[s->index] + sc : 0);
+                dp |= d0[s->index];
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    if (d->size != 4 && d->size != 8) return;
+    if (n > 62 || p > 62) n = p = 64;
+    nb[d->reg] = (uint8_t)n;
+    pb[d->reg] = (uint8_t)p;
+    dep[d->reg] = n < 64 ? dp : 0;
 }
 /*
  * The registers a memory operand the hoist may cover is based on (*rb) and
@@ -19595,17 +19717,40 @@ static void select_low_hoist(const X86Insn *insns, int n, uint64_t rip)
     int no_ix = ENV_ON("OCERZ_NO_LOW_HOIST_INDEX") || (g_llh_wide && wlim_on()), no_loose = ENV_ON("OCERZ_NO_LOW_HOIST_LOOSE");
 restart_wide:;
     /* firstw: the first instruction to write a register; stepend: the first to write it other than by a constant step */
-    int firstw[16], stepend[16], cnt[16] = {0}, ixn[16][4] = {{0}};
+    int firstw[16], stepend[16], cnt[16] = {0}, ixn[16][4] = {{0}}, nfree[16] = {0};
     int64_t lo[16] = {0}, hi[16] = {0};
-    uint8_t ix[16] = {0}, role[JIT_MAX_BLOCK_INSNS][3], lse[JIT_MAX_BLOCK_INSNS];
+    uint8_t ix[16] = {0}, role[JIT_MAX_BLOCK_INSNS][3], lse[JIT_MAX_BLOCK_INSNS], fre[JIT_MAX_BLOCK_INSNS][3];
+    uint16_t fdep[JIT_MAX_BLOCK_INSNS][3];
+    /*
+     * With the margins: an index of known size is free (1), one a loop only steps is free after a check
+     * before the loop (2).  A block that has met an address in a margin keeps the checks of its own.
+     */
+    int margin = ocerz_low_margin && !g_llh_wide, any_free = 0;
+    if (margin && mark_has(&g_llhexact_marks, jit_key(rip, 0))) {
+        g_tc_learned = 1;
+        margin = 0;
+    }
+    /* lsteady: only stepped by constants all the way round; l32: only ever written with a 32-bit result */
+    uint32_t lsteady = 0, l32 = 0;
     for (unsigned r = 0; r < 16; r++) {
+        int64_t drift = 0;
+        int all32 = 1;
         firstw[r] = stepend[r] = n;
         for (int i = n - 1; i >= 0; i--) {
             int64_t by;
             if (!insn_may_write_gpr(&insns[i], r)) continue;
             firstw[r] = i;
             if (!llh_step(&insns[i], r, &by)) stepend[r] = i;
+            else drift += by < 0 ? -by : by;
+            uint8_t tn[16], tp[16];
+            uint16_t td[16] = {0};
+            memset(tn, 64, sizeof tn);
+            memset(tp, 64, sizeof tp);
+            llh_range(&insns[i], tn, tp, td);
+            if (tn[r] != 0 || tp[r] > 32) all32 = 0;
         }
+        if (margin && loops && stepend[r] == n && drift < (1 << 27)) lsteady |= 1u << r;
+        if (margin && loops && firstw[r] != n && all32) l32 |= 1u << r;
     }
     /*
      * Two passes: the index and scale most operands share, which the block
@@ -19615,16 +19760,34 @@ restart_wide:;
     int bx = -1, bs = 0;
     for (int pass = 0; pass < 2; pass++) {
         int64_t stepped = 0;
+        uint8_t nb[16], pb[16];
+        uint16_t dep[16] = {0};
+        memset(nb, 64, sizeof nb);
+        memset(pb, 64, sizeof pb);
+        for (unsigned r = 0; r < 16; r++)
+            if (l32 >> r & 1) { nb[r] = 0; pb[r] = 32; dep[r] = (uint16_t)(1u << r); }
         for (int i = 0; i < n; i++) {
             const X86Insn *in = &insns[i];
             if (pass) lse[i] = 0;
             for (int k = 0; k < in->nops && k < 3; k++) {
                 const X86Operand *m = &in->ops[k];
                 int rb, rx, steady;
-                if (pass) role[i][k] = 0;
+                if (pass) role[i][k] = fre[i][k] = 0;
                 if (!llh_roles(insns, n, i, m, firstw, stepend, &rb, &rx, &steady) || (rx >= 0 && no_ix)) continue;
+                int sc = m->scale & 3;
+                int fr = rx < 0 || !margin ? 0 : pb[rx] + sc <= 35 && nb[rx] + sc <= 34 ? 1 : lsteady >> rx & 1 ? 2 : 0;
+                if (fr == 1 && dep[rx]) fr = 3;                 /* known by the checks before the loop */
                 if (!pass) {
-                    if (rx >= 0 && steady) ixn[rx][m->scale & 3]++;
+                    if (rx >= 0 && steady && !fr) ixn[rx][sc]++;
+                    continue;
+                }
+                if (fr) {
+                    cnt[rb]++;
+                    nfree[rb]++;
+                    role[i][k] = (uint8_t)(rb + 1);
+                    fre[i][k] = (uint8_t)fr;
+                    fdep[i][k] = dep[rx];
+                    any_free = 1;
                     continue;
                 }
                 int tight = rx >= 0 && steady && rx == bx && (m->scale & 3) == bs;
@@ -19641,6 +19804,7 @@ restart_wide:;
             }
             int64_t by;
             if (pass && bx >= 0 && llh_step(in, (unsigned)bx, &by)) stepped += by;
+            llh_range(in, nb, pb, dep);
         }
         if (!pass) {
             /*
@@ -19676,12 +19840,15 @@ restart_wide:;
     for (;;) {
         g_llh_n = 0;
         g_llh_index = -1;
+        g_llh_prex = g_llh_prez = 0;
         for (int r = 0; r < 16; r++) slot_of[r] = -1;
         for (; g_llh_n < LLH_MAX; g_llh_n++) {
             int best = -1;
             for (int r = 0; r < 16; r++) {
                 int pre = loops && firstw[r] == n;
                 int least = g_llh_wide ? (pre ? 2 : 6) : pre ? (total >= 2 || quick[r] ? 1 : 2) : quick[r] ? 2 : 3;
+                /* With the margins the check is four instructions, and an operand with a free index saves that many. */
+                if (margin && !g_llh_wide) least = pre || nfree[r] ? 1 : 3;
                 if (slot_of[r] < 0 && cnt[r] >= least && (best < 0 || cnt[r] > cnt[best])) best = r;
             }
             if (best < 0) break;
@@ -19699,20 +19866,34 @@ restart_wide:;
          * the narrow form's checks would fail on that, start in the wide one
          * instead of translating twice to find out.
          */
+        for (int i = 0; i < n; i++)
+            for (int k = 0; k < insns[i].nops && k < 3; k++)
+                if (fre[i][k] >= 2 && slot_of[role[i][k] - 1] >= 0) {
+                    if (fre[i][k] == 2) g_llh_prex |= 1u << llh_other(&insns[i].ops[k], slot_of[role[i][k] - 1]);
+                    else                g_llh_prez |= fdep[i][k];
+                }
         int fits = 1;
         for (int k = 0; k < g_llh_n && !g_llh_wide && g_xlat_cpu; k++) {
             uint64_t v = g_xlat_cpu->gpr[g_llh_greg[k]];
             uint64_t end = v + (uint64_t)g_llh_hi[k] + (g_llh_ix[k] ? LLH_REACH : 0);
-            if ((int64_t)(v + (uint64_t)g_llh_lo[k]) < 0 || ((v | end) >> 32) >= (OCERZ_LOW_LIMIT >> 32)) fits = 0;
+            if (margin ? v >= OCERZ_LOW_LIMIT
+                       : (int64_t)(v + (uint64_t)g_llh_lo[k]) < 0 || ((v | end) >> 32) >= (OCERZ_LOW_LIMIT >> 32)) fits = 0;
             if ((g_llh_ix[k] & 1) && g_xlat_cpu->gpr[g_llh_index] >> (31 - g_llh_scale)) fits = 0;
+        }
+        for (unsigned r = 0; r < 16 && !g_llh_wide && g_xlat_cpu; r++) {
+            if ((g_llh_prex >> r & 1) && (int64_t)g_xlat_cpu->gpr[r] != (int32_t)g_xlat_cpu->gpr[r]) fits = 0;
+            if ((g_llh_prez >> r & 1) && g_xlat_cpu->gpr[r] >> 32) fits = 0;
         }
         if (fits) break;
         g_llh_wide = 1;
-        if (wlim_on() && !no_ix) {
-            no_ix = 1;
+        /* The wide form takes no free index, and with x29 holding 12 GB no index at all. */
+        if ((wlim_on() && !no_ix) || any_free) {
+            no_ix |= wlim_on();
             goto restart_wide;
         }
     }
+    g_llh_margin = margin && !g_llh_wide;
+    if (!g_llh_margin) g_llh_prex = g_llh_prez = 0;
     if (!g_llh_n) return;
     /* The wide form's reach below the bases is one value for them all, so they are settled together. */
     for (int k = 0; g_llh_wide && k < g_llh_n; k++)
@@ -19728,8 +19909,9 @@ restart_wide:;
     }
     if (g_llh_wide) g_tc_learned = 1;
     if (ENV_ON("OCERZ_LOW_HOIST_LOG"))
-        fprintf(stderr, "ocerz: LOWHOIST take %#llx bases=%d index=%d%s%s\n", (unsigned long long)rip, g_llh_n,
-                g_llh_index, loops ? " loop" : "", g_llh_wide ? " wide" : "");
+        fprintf(stderr, "ocerz: LOWHOIST take %#llx bases=%d index=%d%s%s%s prex=%#x prez=%#x\n", (unsigned long long)rip,
+                g_llh_n, g_llh_index, loops ? " loop" : "", g_llh_wide ? " wide" : "", g_llh_margin ? " margin" : "",
+                g_llh_prex, g_llh_prez);
 }
 /*
  * JMEMBASEn from its base, without touching the flags: the base with low_base
@@ -19777,6 +19959,20 @@ static void emit_low_hoist_setup(A64Buf *b, int pre)
         int hb = pin_hreg(pin_slot((unsigned)g_llh_greg[k])), hr = g_llh_hreg[k], t = hb;
         uint64_t reach = g_llh_ix[k] ? LLH_REACH : 0;
         if (zero) { a64_movz(b, JMEMAUX, 0x4000, 1); zero = 0; }
+        if (g_llh_margin) {
+            /*
+             * Below 12 GB is all that is asked: the margins take whatever the
+             * block adds to it.  One form for every base, where the short
+             * check for one below 8 GB sent a block that later met one above
+             * it to the wide form.
+             */
+            a64_lsr_imm(b, 1, JTU, hb, 32);
+            a64_sub_imm(b, 1, JTU, JTU, (uint32_t)(OCERZ_LOW_LIMIT >> 32));
+            g_llh_bail_tb[g_n_llh_bail_tb++] = a64_label(b);
+            a64_tbz(b, JTU, 63, 0);
+            emit_llh_base(b, k);
+            continue;
+        }
         if (g_llh_lo[k] < 0) {
             t = JTT;
             a64_mov_imm64(b, JTT, (uint64_t)-g_llh_lo[k]);
@@ -19835,6 +20031,19 @@ static void emit_low_hoist_setup(A64Buf *b, int pre)
         a64_asr_imm(b, 1, JT0, JTA, 63);
         a64_and_reg(b, 1, JTA, JTA, JT0, 0);
         a64_add_reg(b, 1, JMEMAUX, JMEMAUX, JTA, 0);
+    }
+    /* Where the loop starts, an index it only steps fits 32 bits, signed, and one it only writes 32-bit results to is one. */
+    for (unsigned r = 0; pre && r < 16; r++) {
+        if (!((g_llh_prex | g_llh_prez) >> r & 1)) continue;
+        int hx = pin_hreg(pin_slot(r));
+        if (g_llh_prex >> r & 1) {
+            a64_sxtw(b, JTU, hx);
+            a64_eor_reg(b, 1, JTU, JTU, hx, 0);
+        } else {
+            a64_lsr_imm(b, 1, JTU, hx, 32);
+        }
+        g_llh_bail_cb[g_n_llh_bail_cb++] = a64_label(b);
+        a64_cbnz(b, 1, JTU, 0);
     }
     if (pre) g_llh_live = 1;
 }
@@ -22259,7 +22468,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_stop_target = NULL;
     g_mem_hoist_greg = -1;
     g_n_llh_bail_tb = g_n_llh_bail_cb = g_n_larm = 0;
-    g_llh_n = g_llh_live = g_llh_wide = 0;
+    g_llh_n = g_llh_live = g_llh_wide = g_llh_margin = 0;
+    g_llh_prex = g_llh_prez = 0;
     g_llh_index = -1;
     g_mem_hoist_greg2 = -1;
     g_mem_hoist_greg3 = -1;
@@ -24346,6 +24556,24 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     ocerz_jit_invalidate_range(vm, block_rip, 1);
     if (fault_rip != block_rip) ocerz_jit_invalidate_range(vm, fault_rip, 1);
     g_churn_suppress = prev;
+    return 1;
+}
+
+/*
+ * A fault in one of the low window's margins: the block's hoist left an offset
+ * unchecked that took an address out of the window.  It is translated again
+ * with the hoist's own checks, so that one whose addresses do cross 12 GB
+ * faults once and not on every access.
+ */
+int ocerz_jit_note_margin_fault(struct OcerzVM *vm, const void *host_pc, uint64_t fault_rip)
+{
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    const JitBlock *b = fault_block(jit, (const uint32_t *)host_pc);
+    if (!b) return 0;
+    if (!mark_has(&g_llhexact_marks, b->key)) {
+        mark_add(&g_llhexact_marks, b->key);
+        retire_fault_blocks(vm, jit, blk_rip(b), fault_rip, blk_mode32(b));
+    }
     return 1;
 }
 

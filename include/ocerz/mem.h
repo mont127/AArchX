@@ -34,6 +34,21 @@ extern uint8_t *ocerz_pin_map;
 #define OCERZ_GUEST_PAGE_SIZE 0x1000ull
 #define OCERZ_HOST_PAGE_SIZE  0x4000ull
 
+/*
+ * The low window's margins: host address space on both sides of it that
+ * nothing is ever mapped in, 32 GB below low_base and 64 GB from the window's
+ * end to the top strip.  A guest address below 12 GB plus an offset inside
+ * those bounds, taken as low_base plus the sum, is the right host address
+ * while the sum is still below 12 GB and faults when it is not, which is what
+ * lets translated code leave such an offset unchecked (select_low_hoist in
+ * src/jit.c); the handler runs the instruction in the interpreter, which
+ * translates the address whatever it is.  ocerz_low_margin is 0 when the
+ * margins could not be reserved.
+ */
+#define OCERZ_LOW_MARGIN_LO 0x0000000800000000ull
+#define OCERZ_LOW_MARGIN_HI 0x0000001000000000ull
+extern int ocerz_low_margin;
+
 /* A host page below the low limit that native mode pinned (mem.c): the guest
    reads it through its alias in the shadow, and its number is the host's. */
 static inline int ocerz_pinned_page(uint64_t gaddr)
@@ -75,9 +90,18 @@ static inline uint64_t ocerz_h2g(const void *haddr)
     return h - ocerz_guest_base;
 }
 
+static inline int ocerz_host_in_low_margin(const void *haddr)
+{
+    uint64_t h = (uint64_t)(uintptr_t)haddr;
+    return ocerz_low_margin && (ocerz_low_base - h - 1 < OCERZ_LOW_MARGIN_LO ||
+                                h - ocerz_low_base - OCERZ_LOW_LIMIT < OCERZ_LOW_MARGIN_HI);
+}
+
 static inline int ocerz_host_in_guest_space(const void *haddr)
 {
     uint64_t h = (uint64_t)(uintptr_t)haddr;
+    if (ocerz_host_in_low_margin(haddr))
+        return 1;
     if (ocerz_commpage) {
         uint64_t c = (uint64_t)(uintptr_t)ocerz_commpage;
         if (h - c < OCERZ_COMMPAGE_HI - OCERZ_COMMPAGE_LO)

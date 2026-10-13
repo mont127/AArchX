@@ -1088,7 +1088,7 @@ void ocerz_vm_jit_escape(int r)
 
 extern __thread int ocerz_jit_exec_state;
 static __thread struct { uint32_t n; struct { uint8_t kind; uint64_t rip; uint64_t icount; } e[16]; } g_recov_ring;
-static const char *const g_recov_names[] = { "?", "ras-overflow", "align-interp", "worker-term", "commpage-interp", "sig-deliver", "wild-term", "cache-patch" };
+static const char *const g_recov_names[] = { "?", "ras-overflow", "align-interp", "worker-term", "commpage-interp", "sig-deliver", "wild-term", "cache-patch", "pair-interp", "margin-interp" };
 void ocerz_recov_note(int kind, uint64_t rip)
 {
     unsigned i = g_recov_ring.n++ & 15;
@@ -2186,7 +2186,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
 
         }
         uint64_t gs = g_cur_cpu->gs_base;
-        uint64_t gaddr = ocerz_h2g(si->si_addr);
+        uint64_t gaddr = ocerz_host_in_low_margin(si->si_addr) ? (uint64_t)(uintptr_t)si->si_addr - ocerz_low_base
+                                                               : ocerz_h2g(si->si_addr);
         int code = ocerz_addr_committed(gaddr) == 1 ? 2 : 1;
 
         uint64_t esr = ctx ? ((const ucontext_t *)ctx)->uc_mcontext->__es.__esr : 0;
@@ -2329,6 +2330,25 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             g_cur_cpu->sig_repeat = 0;
             g_cur_cpu->interp_once = 1;
             ocerz_recov_note(8, fault_rip);
+            depth = 0;
+            siglongjmp(*g_sig_recover, 1);
+        }
+        /*
+         * A fault in one of the low window's margins (mem.h): translated code
+         * took a base below 12 GB plus an offset it left unchecked, and the sum
+         * is outside the window.  The interpreter runs the instruction and
+         * translates its address in full; if that address is nobody's, the
+         * fault it takes is the guest's.  The block is translated again with
+         * its own checks.
+         */
+        if (in_jit && rip_exact && ocerz_host_in_low_margin(si->si_addr) &&
+            ocerz_jit_note_margin_fault(fvm, hpc, fault_rip)) {
+            g_cur_cpu->rip = fault_rip;
+            g_cur_cpu->sig_repeat = 0;
+            g_cur_cpu->interp_once = 1;
+            if (ENV_SET("OCERZ_MARGINLOG"))
+                fprintf(stderr, "ocerz: MARGIN rip=%#llx gaddr=%#llx\n", (unsigned long long)fault_rip, (unsigned long long)gaddr);
+            ocerz_recov_note(9, fault_rip);
             depth = 0;
             siglongjmp(*g_sig_recover, 1);
         }

@@ -1231,6 +1231,23 @@ else
     echo "FAIL dlow_loop_hoist_bail ($(grep -c 'LOWHOIST bail 0x2' "$TMP/dlow_loop_hoist.log2.err") given up)"
     fail=$((fail+1))
 fi
+# The low window's margins: indices the hoist leaves unchecked, in the normal layout (where nothing is hoisted), in
+# the Wine layout, and there with the margins off.  Then that the margins were used: loops checked once before they
+# start, and at least four accesses that left the window, faulted in a margin and went to the interpreter.
+run_golden_case dlow_margin tests/dynamic/low_margin.c tests/dynamic/low_margin.out
+run_low_golden_case dlow_margin_low tests/dynamic/low_margin.c tests/dynamic/low_margin.out
+export OCERZ_NO_LOW_MARGIN=1
+run_low_golden_case dlow_margin_low_off tests/dynamic/low_margin.c tests/dynamic/low_margin.out
+unset OCERZ_NO_LOW_MARGIN
+if run_bounded "$TMP/dlow_margin.log.out" "$TMP/dlow_margin.log.err" env OCERZ_TCACHE=off OCERZ_LOW_HOIST_LOG=1 OCERZ_MARGINLOG=1 "$OCERZ" "$TMP/dlow_margin_low/dlow_margin_low" &&
+   [ "$(grep -c 'LOWHOIST take 0x2[0-9a-f]* .* margin prex=0x[1-9a-f]' "$TMP/dlow_margin.log.err")" -ge 4 ] &&
+   [ "$(grep -c 'LOWHOIST take 0x2[0-9a-f]* .* margin .*prez=0x[1-9a-f]' "$TMP/dlow_margin.log.err")" -ge 3 ] &&
+   [ "$(grep -c 'MARGIN rip=0x2' "$TMP/dlow_margin.log.err")" -ge 4 ]; then
+    echo "PASS dlow_margin_decisions (loops checked once before they start; accesses that left the window interpreted)"; pass=$((pass+1))
+else
+    echo "FAIL dlow_margin_decisions ($(grep -c 'margin prex=0x[1-9a-f]' "$TMP/dlow_margin.log.err") stepped, $(grep -c 'prez=0x[1-9a-f]' "$TMP/dlow_margin.log.err") counters, $(grep -c 'MARGIN rip' "$TMP/dlow_margin.log.err") margin faults)"
+    fail=$((fail+1))
+fi
 run_low_golden_case dfist_rc_low tests/dynamic/fist_rc.c tests/dynamic/fist_rc.out
 run_low_golden_case dflip_phase_low tests/dynamic/flip_phase.c tests/dynamic/flip_phase.out
 run_low_golden_case dlow_top_strip tests/dynamic/low_top_strip.c tests/dynamic/low_top_strip.out
