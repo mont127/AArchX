@@ -265,11 +265,40 @@ static int sp_SndBadChannel(struct OcerzVM *vm, OcerzCPU *cpu)
     RET((uint16_t)-205);   /* badChannel */
 }
 
+/* QuickTime is gone from macOS too.  Unresolved, its calls answered 0 (noErr) without doing anything, and Left 4 Dead
+ * 2's valve_avi used the Movie NewMovieFromFile never wrote.  The Source engine needs EnterMovies to succeed (its
+ * IQuickTime system is required), so QuickTime starts, and no movie opens: unimpErr, with a null reference or Movie.
+ * The game shows no video materials.  ponytail: no QuickTime playback. */
+#define QT_UNIMP ((uint32_t)(int32_t)-4)   /* unimpErr, an OSErr in AX */
+static int sp_EnterMovies(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
+static int sp_GetMoviesError(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(QT_UNIMP); }
+static int sp_OpenMovieFile(struct OcerzVM *vm, OcerzCPU *cpu)   /* (const FSSpec *, short *resRefNum, SInt8) */
+{
+    (void)vm;
+    if (m32_arg(cpu, 1))
+        *(int16_t *)m32_h(m32_arg(cpu, 1)) = 0;
+    RET(QT_UNIMP);
+}
+static int sp_NewMovieFromFile(struct OcerzVM *vm, OcerzCPU *cpu)   /* (Movie *, short, short *, StringPtr, short, Boolean *) */
+{
+    (void)vm;
+    if (m32_arg(cpu, 0))
+        m32_wr(m32_arg(cpu, 0), 0);
+    RET(QT_UNIMP);
+}
+/* QuickDraw's offscreen worlds, gone with it: valve_avi looks them up with dlsym and calls SetGWorld(NULL, NULL) before
+ * opening any movie.  No GWorld ever exists here, so they do nothing and report nothing. */
+static int sp_qd_none(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
+
 const M32SpecialEntry m32_audio_specials[] = {
     { "_AudioUnitSetProperty", sp_AudioUnitSetProperty },
     { "_AudioQueueNewOutput", sp_AudioQueueNewOutput }, { "_AudioQueueAllocateBuffer", sp_AudioQueueAllocateBuffer },
     { "_AudioQueueEnqueueBuffer", sp_AudioQueueEnqueueBuffer }, { "_AudioQueueDispose", sp_AudioQueueDispose },
     { "_SndNewChannel", sp_SndNewChannel },
+    { "_EnterMovies", sp_EnterMovies }, { "_GetMoviesError", sp_GetMoviesError }, { "_OpenMovieFile", sp_OpenMovieFile },
+    { "_NewMovieFromFile", sp_NewMovieFromFile },
+    { "_SetGWorld", sp_qd_none }, { "_DisposeGWorld", sp_qd_none }, { "_GetGWorldPixMap", sp_qd_none },
+    { "_LockPixels", sp_qd_none }, { "_UnlockPixels", sp_qd_none }, { "_GetPixRowBytes", sp_qd_none },
     { "_SndDoCommand", sp_SndBadChannel }, { "_SndDoImmediate", sp_SndBadChannel },
     { "_SndChannelStatus", sp_SndBadChannel }, { "_SndDisposeChannel", sp_SndBadChannel },
     { NULL, NULL }
