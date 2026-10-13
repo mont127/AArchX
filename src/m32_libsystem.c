@@ -275,6 +275,61 @@ static int readdir_r_common(OcerzCPU *cpu, int inode64)
 }
 static int sp_readdir_r(struct OcerzVM *vm, OcerzCPU *cpu) { return readdir_r_common(cpu, 0); }
 static int sp_readdir_r64(struct OcerzVM *vm, OcerzCPU *cpu) { return readdir_r_common(cpu, 1); }
+/* scandir: the entries are guest dirents on the guest heap (the caller frees each one and the list), kept and
+ * ordered by the guest's own select and compar; compar reads two dirent pointers from guest slots */
+struct ScandirCmp { struct OcerzVM *vm; uint32_t fn, slots; };
+static int scandir_cmp(void *t, const void *a, const void *b)
+{
+    struct ScandirCmp *c = t;
+    m32_wr(c->slots, *(const uint32_t *)a);
+    m32_wr(c->slots + 4, *(const uint32_t *)b);
+    uint32_t args[2] = { c->slots, c->slots + 4 };
+    return (int32_t)m32_call(c->vm, c->fn, args, 2, NULL, NULL);
+}
+static int scandir_common(struct OcerzVM *vm, OcerzCPU *cpu, int inode64)
+{
+    uint32_t path = m32_arg(cpu, 0), out = m32_arg(cpu, 1), sel = m32_arg(cpu, 2), cmp = m32_arg(cpu, 3);
+    DIR *d = path ? opendir((const char *)m32_h(path)) : NULL;
+    if (!d)
+        RETV(-1);
+    uint32_t *v = NULL, n = 0, cap = 0;
+    for (struct dirent *e; (e = readdir(d));) {
+        uint32_t g = m32_malloc(inode64 ? 1048 : 264);
+        if (!g)
+            break;
+        dirent_out(g, e, inode64);
+        if (sel && !m32_call(vm, sel, &g, 1, NULL, NULL)) {
+            m32_free(g);
+            continue;
+        }
+        if (n == cap && !(v = realloc(v, (cap = cap ? cap * 2 : 64) * sizeof *v)))
+            break;
+        v[n++] = g;
+    }
+    closedir(d);
+    if (cmp && n > 1) {
+        struct ScandirCmp c = { vm, cmp, m32_malloc(8) };
+        qsort_r(v, n, sizeof *v, &c, scandir_cmp);
+        m32_free(c.slots);
+    }
+    uint32_t list = m32_malloc(4 * (n ? n : 1));
+    for (uint32_t i = 0; i < n; i++)
+        m32_wr(list + 4 * i, v[i]);
+    free(v);
+    m32_wr(out, list);
+    errno = 0;
+    RETV(n);
+}
+static int sp_scandir(struct OcerzVM *vm, OcerzCPU *cpu) { return scandir_common(vm, cpu, 0); }
+static int sp_scandir64(struct OcerzVM *vm, OcerzCPU *cpu) { return scandir_common(vm, cpu, 1); }
+static int alphasort_common(OcerzCPU *cpu, uint32_t name)
+{
+    const char *a = (const char *)m32_h(m32_rd(m32_arg(cpu, 0)) + name);
+    const char *b = (const char *)m32_h(m32_rd(m32_arg(cpu, 1)) + name);
+    return RETV_PLAIN(strcoll(a, b));
+}
+static int sp_alphasort(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; return alphasort_common(cpu, 8); }
+static int sp_alphasort64(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; return alphasort_common(cpu, 21); }
 static int sp_closedir(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     void *dir = m32_host(m32_arg(cpu, 0));
@@ -1204,6 +1259,8 @@ static const M32SpecialEntry g_specials[] = {
     { "_stat$INODE64", sp_stat64 }, { "_lstat$INODE64", sp_lstat64 }, { "_fstat$INODE64", sp_fstat64 },
     { "_stat64", sp_stat64 }, { "_lstat64", sp_lstat64 }, { "_fstat64", sp_fstat64 },
     { "_readdir", sp_readdir }, { "_readdir$INODE64", sp_readdir64 },
+    { "_scandir", sp_scandir }, { "_scandir$INODE64", sp_scandir64 }, { "_alphasort", sp_alphasort },
+    { "_alphasort$INODE64", sp_alphasort64 },
     { "_readdir_r", sp_readdir_r }, { "_readdir_r$INODE64", sp_readdir_r64 }, { "_closedir", sp_closedir },
     { "_gmtime_r", sp_gmtime_r }, { "_localtime_r", sp_localtime_r }, { "_gmtime", sp_gmtime },
     { "_localtime", sp_localtime }, { "_mktime", sp_mktime }, { "_timegm", sp_timegm },

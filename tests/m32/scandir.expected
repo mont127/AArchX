@@ -1,0 +1,5 @@
+legacy 4: a.wav(5,file) b.wav(5,file) c.txt(5,file) sub(3,dir)
+inode64 4: sub(3) c.txt(5) b.wav(5) a.wav(5)
+all 6: . .. a.wav
+missing -1
+exit 0
