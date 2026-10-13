@@ -2,8 +2,9 @@
  * that tests/m32/build.sh puts beside the programs: an i386 program that dlopens a steamclient.dylib with no i386
  * slice gets the host's, and its interfaces cross by the notations in steam.api (make steam32). Plain results, a
  * 64-bit result and argument, a C string, output pointers, interfaces returned by an interface and by name, an unknown
- * version, one object under two versions (each gets its own vtable), the callback queue, a call result, and string
- * results from two threads at once. steambridge.expected is this program built for arm64 and run
+ * version, one object under two versions (each gets its own vtable), the callback queue, a call result, string
+ * results from two threads at once, and Steam Input's records returned by value (2 bytes in a register, 13 and 40
+ * through a hidden pointer the method pops). steambridge.expected is this program built for arm64 and run
  * natively against the same stand-in. */
 #include <dlfcn.h>
 #include <pthread.h>
@@ -17,6 +18,11 @@ typedef struct Obj { void **vt; } Obj;
 #define SLOT(o, k, T) ((T)((Obj *)(o))->vt[k])
 
 typedef struct { int32_t user, id; uint8_t *param; int32_t size; } CallbackMsg;
+#pragma pack(push, 1)   /* as isteaminput.h declares them */
+typedef struct { bool state, active; } Digital;
+typedef struct { int32_t mode; float x, y; bool active; } Analog;
+typedef struct { float f[10]; } Motion;
+#pragma pack(pop)
 
 static void *g_utils;
 static void *languages(void *arg)
@@ -89,6 +95,27 @@ int main(void)
     printf("call result %d failed %d:", ok, failed);
     for (int i = 0; i < 6; i++) printf(" %02x", buf[i]);
     printf("\n");
+
+    void *in = create("SteamInput005", &rc);
+    if (!in) return 1;
+    Digital dg = { 0, 0 };
+    Analog an = { 0, 0, 0, 0 };
+    Motion mo = { { 0 } };
+    uintptr_t sp0 = 0, sp1 = 0;
+#if defined(__i386__)   /* the methods pop the hidden pointer themselves, so the stack comes back where it was */
+    __asm__ volatile("movl %%esp, %0" : "=r"(sp0));
+#endif
+    for (int i = 0; i < 100; i++) {
+        dg = SLOT(in, 17, Digital (*)(void *, uint64_t, uint64_t))(in, 5, 3);
+        an = SLOT(in, 21, Analog (*)(void *, uint64_t, uint64_t))(in, 7, 6);
+        mo = SLOT(in, 29, Motion (*)(void *, uint64_t))(in, 2);
+    }
+#if defined(__i386__)
+    __asm__ volatile("movl %%esp, %0" : "=r"(sp1));
+#endif
+    int stack_ok = sp0 == sp1;
+    printf("input digital %d %d analog %d %.2f %.2f %d motion %.0f %.0f stack %d\n", dg.state, dg.active, an.mode,
+           an.x, an.y, an.active, mo.f[0], mo.f[9], stack_ok);
 
     g_utils = t;
     pthread_t th[2];

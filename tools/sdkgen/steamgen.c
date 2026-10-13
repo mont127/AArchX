@@ -43,7 +43,7 @@ enum {
     T_DOUBLE = 22, T_POINTER = 101, T_LVALUEREF = 103, T_RECORD = 105, T_ENUM = 106, T_FUNCPROTO = 111,
 };
 
-typedef struct { char name[96]; char note[2][256]; char flag; const char *bad; } Method;
+typedef struct { char name[96]; char note[2][256]; char flag; const char *bad; int rsize; char rclass; } Method;
 typedef struct { char cls[64]; Method *m; int n, cap; int defined; } Class;
 typedef struct { Class *c; int n, cap; } Classes;
 typedef struct { char *version, *cls, *sdk, *text, *sig; int n; } Iface;
@@ -82,6 +82,25 @@ static int has_float(CXType rec)
     int f = 0;
     clang_Type_visitFields(rec, float_field, &f);
     return f;
+}
+
+/* how arm64 returns a record of up to 16 bytes: in s0-s3 when its fields are all floats (f), in d0-d3 when all doubles
+ * (d), otherwise in x0 and x1 (x).  ponytail: an array or a record among the fields counts as x */
+typedef struct { int n, floats, doubles; } Fields;
+static int count_field(CXCursor c, CXClientData d)
+{
+    Fields *f = d;
+    CXType t = clang_getCanonicalType(clang_getCursorType(c));
+    f->n++;
+    f->floats += t.kind == T_FLOAT;
+    f->doubles += t.kind == T_DOUBLE;
+    return CXVisit_Continue;
+}
+static char return_class(CXType rec)
+{
+    Fields f = { 0, 0, 0 };
+    clang_Type_visitFields(rec, count_field, &f);
+    return f.n && f.n <= 4 && f.floats == f.n ? 'f' : f.n && f.n <= 4 && f.doubles == f.n ? 'd' : 'x';
 }
 
 /* a record a call passes as its bytes has no copy or move constructor and no destructor of its own (CSteamID and
@@ -166,6 +185,10 @@ static char type_char(CXType t, int is_result, char *flag, const char **why)
         }
         if (size == 8 && !has_float(c)) return 'L';
         if (size == 4 && !has_float(c)) return 'u';
+        if (is_result && size > 0 && size <= 64 && size != 4 && size != 8) {
+            *flag = 'R';   /* a record the bridge returns itself (src/m32_steam.c sp_record) */
+            return 'v';
+        }
         *why = "struct-by-value";
         return 0;
     default:
@@ -225,6 +248,11 @@ static int method_visit(CXCursor c, CXCursor parent, CXClientData d)
     if (r && note[0] == 'p' && strstr(name, "GetISteam"))
         flag = 'I';   /* GetISteamGenericInterface and the DEPRECATED_ ones return void *, but an interface all the same */
     add_method(k, name, r ? note : "", flag, r ? NULL : why);
+    if (r && flag == 'R') {
+        CXType res = clang_getCanonicalType(clang_getCursorResultType(c));
+        k->m[k->n - 1].rsize = (int)clang_Type_getSizeOf(res);
+        k->m[k->n - 1].rclass = return_class(res);
+    }
     free(name);
     return CXChildVisit_Continue;
 }
@@ -345,8 +373,13 @@ static void versions(const char *dir, char **hdrs, int nh, Classes *x86, Classes
             for (int m = 0; m < kx->n; m++) {
                 Method *me = &kx->m[m];
                 const char *bad = me->bad ? me->bad : ka->m[m].bad;
+                if (!bad && me->flag == 'R' && me->rsize != ka->m[m].rsize)
+                    bad = "record-layout";   /* the record's i386 and arm64 sizes differ: no byte copy will do */
                 if (bad)
                     o += (size_t)snprintf(text + o, cap - o, "bad %d %s %s\n", m, me->name, bad);
+                else if (me->flag == 'R')   /* R<size><class>: the record's i386 size, and how arm64 returns it */
+                    o += (size_t)snprintf(text + o, cap - o, "m %d %s %s %s R%d%c\n", m, me->name, me->note[0],
+                                          ka->m[m].note[0], me->rsize, ka->m[m].rclass);
                 else if (me->flag)
                     o += (size_t)snprintf(text + o, cap - o, "m %d %s %s %s %c\n", m, me->name, me->note[0],
                                           ka->m[m].note[0], me->flag);

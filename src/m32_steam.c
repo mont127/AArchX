@@ -14,7 +14,8 @@
  * to the host object (m32_alias), so the generic crossing turns a proxy `this` into the host object by itself.  Each
  * slot is the host vtable's function at that index, crossed by the notations runtime/apis32/.../steam.api gives for
  * the version (tools/steamgen.sh writes it from the Steamworks headers, i386 and arm64 side by side).  Methods that
- * return a C string (S) copy it into guest memory, kept per host string; a slot the database marks bad answers 0.
+ * return a C string (S) copy it into guest memory, kept per host string; a record returned by value (R)
+ * crosses between the two ABIs' ways of returning one (sp_record); a slot the database marks bad answers 0.
  * Steamworks 1.23 and later lay callback structures out with pack(4) on macOS, which i386 and arm64 share, so call
  * results land in the guest's buffer as they are; Steam_BGetCallback's CallbackMsg_t holds a pointer and is
  * converted, its payload copied into a guest buffer that stays valid until the next one.
@@ -37,7 +38,7 @@
 
 #define STEAM_MAGIC 0x5354324du   /* 'M2TS': a guest dlopen handle for the bridged client */
 
-typedef struct Slot { char *name; char flag; int bad; M32Export ex; } Slot;
+typedef struct Slot { char *name; char flag; int bad; M32Export ex; int rsize; char rclass; } Slot;
 typedef struct Iface { char *version, *sdk; Slot *slots; int n; } Iface;
 typedef struct Vt { const Iface *iface; void **hostvt; uint32_t gvt; } Vt;
 typedef struct Proxy { void *host; const Iface *iface; uint32_t guest; } Proxy;
@@ -94,6 +95,8 @@ static void load_db(void)
         if (!strncmp(line, "m ", 2) && sscanf(line, "m %d %255s %255s %255s %7s", &k, b, c, d, e) >= 4) {
             s.name = strdup(b);
             s.flag = e[0];
+            if (s.flag == 'R' && (sscanf(e + 1, "%d%c", &s.rsize, &s.rclass) != 2 || s.rsize <= 0 || s.rsize > 64))
+                s.bad = 1;
             s.ex.kind = M32_EX_FN;
             s.ex.lib = "(steamclient)";
             s.ex.name = s.name;
@@ -214,6 +217,73 @@ static int sp_flagged(struct OcerzVM *vm, OcerzCPU *cpu)
     return rc;
 }
 
+/* A method returning a record by value (flag R<size><class>).  i386 code gets one of 1, 2, 4 or 8 bytes back in
+ * eax:edx; a larger one it hands a pointer for ahead of `this`, which the method fills, returns in eax and pops.  arm64
+ * returns one of up to 16 bytes in x0 and x1, or in s0-s3 or d0-d3 when its fields are all floats or doubles (class f
+ * or d), and a larger one through x8.  Steam Input's GetDigitalActionData and GetAnalogActionData are such methods,
+ * which Left 4 Dead 2 calls every frame once a controller is connected; answered as bad slots, the analog one left the
+ * hidden pointer on the stack and the game returned into it.  The arguments are this, integers and pointers. */
+static int sp_record(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t id = (uint32_t)(cpu->rip - OCERZ_DYLDAPI_LO);
+    Slot *s = NULL;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_nflagged && !s; i++)
+        if (g_flagged[i].id == id)
+            s = g_flagged[i].slot;
+    pthread_mutex_unlock(&g_lock);
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP];
+    int size = s ? s->rsize : 0, in_regs = size == 1 || size == 2 || size == 4 || size == 8;
+    uint32_t hidden = in_regs || !s ? 0 : m32_rd(esp + 4), at = esp + (in_regs ? 4 : 8);
+    uint64_t x[8] = { 0 }, v[8] = { 0 }, ox[8] = { 0 }, ov[8] = { 0 };
+    uint8_t res[64] = { 0 };
+    int nx = 0, ok = s && s->ex.host_fn;
+    for (const char *p = ok ? strchr(s->ex.gnote, '(') + 1 : ")"; ok && *p && *p != ')'; p++) {
+        if (nx == 8) {
+            ok = 0;
+            break;
+        }
+        switch (*p) {
+        case 'p': x[nx++] = (uint64_t)(uintptr_t)m32_host(m32_rd(at)); at += 4; break;
+        case 'L': case 'l': x[nx++] = m32_rd(at) | (uint64_t)m32_rd(at + 4) << 32; at += 8; break;
+        case 'u': x[nx++] = m32_rd(at); at += 4; break;
+        case 'i': x[nx++] = (uint64_t)(int64_t)(int32_t)m32_rd(at); at += 4; break;
+        case 'B': case 'b': case 'H': case 'h':
+            x[nx++] = *p == 'B' ? (uint8_t)m32_rd(at) : *p == 'b' ? (uint64_t)(int64_t)(int8_t)m32_rd(at)
+                    : *p == 'H' ? (uint16_t)m32_rd(at) : (uint64_t)(int64_t)(int16_t)m32_rd(at);
+            at += 4;
+            break;
+        default: ok = 0; break;
+        }
+    }
+    void *exception = NULL;
+    if (ok)
+        m32_call_native_catching(s->ex.host_fn, x, v, NULL, 0, size > 16 ? res : NULL, ox, ov, &exception);
+    else if (steam_log())
+        fprintf(stderr, "ocerz: m32: steam: %s's arguments do not cross, answering zeros\n", s ? s->name : "?");
+    if (ok && size <= 16) {
+        int unit = s->rclass == 'f' ? 4 : s->rclass == 'd' ? 8 : 0;
+        if (unit)   /* one per register */
+            for (int i = 0; i * unit < size; i++)
+                memcpy(res + i * unit, &ov[i], (size_t)unit);
+        else
+            memcpy(res, ox, (size_t)size);
+    }
+    if (in_regs || !s) {
+        uint32_t eax = 0, edx = 0;
+        memcpy(&eax, res, (size_t)(size < 4 ? size : 4));
+        if (size == 8)
+            memcpy(&edx, res + 4, 4);
+        m32_ret(cpu, eax, edx, 0);
+    } else {
+        if (hidden)
+            memcpy(m32_h(hidden), res, (size_t)size);
+        m32_ret(cpu, hidden, 0, 4);
+    }
+    return OCERZ_STEP_OK;
+}
+
 static uint32_t vtable_for(void **hostvt, const Iface *f)
 {
     for (int i = 0; i < g_nvts; i++)
@@ -232,7 +302,9 @@ static uint32_t vtable_for(void **hostvt, const Iface *f)
         } else {
             s->ex.host_fn = hostvt[k];
             if (s->flag) {
-                trap = m32_export_special(s->name, sp_flagged);
+                char name[256];
+                snprintf(name, sizeof name, "%s::%s", f->version, s->name);
+                trap = m32_export_special(s->flag == 'R' ? name : s->name, s->flag == 'R' ? sp_record : sp_flagged);
                 g_flagged = realloc(g_flagged, (size_t)(g_nflagged + 1) * sizeof *g_flagged);
                 g_flagged[g_nflagged++] = (Flagged){ trap - (uint32_t)OCERZ_DYLDAPI_LO, s };
             } else {

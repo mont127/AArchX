@@ -4,7 +4,8 @@
  * the slots the Steamworks interfaces of those versions put them, `this` first as an Itanium virtual call takes
  * it.  Slots tests/m32/steambridge.c does not call answer 0.  The callback queue holds one message.
  * GetSteamUILanguage answers another of 4096 strings each call, so two threads calling it race to add strings.
- * The SteamUtils object is handed out as SteamUtils008 as well, whose slot 26 SteamUtils007 does not have. */
+ * The SteamUtils object is handed out as SteamUtils008 as well, whose slot 26 SteamUtils007 does not have.
+ * CreateInterface hands out a SteamInput005 too, whose action and motion data are records returned by value. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,11 +44,41 @@ static const char *utils_language(Obj *self) { (void)self; return g_langs[__atom
 static bool utils_big_picture(Obj *self) { (void)self; return true; }
 static void *utils_vt[40];
 
+#pragma pack(push, 1)   /* as isteaminput.h declares them */
+typedef struct { bool state, active; } Digital;
+typedef struct { int32_t mode; float x, y; bool active; } Analog;
+typedef struct { float f[10]; } Motion;
+#pragma pack(pop)
+static Digital input_digital(Obj *self, uint64_t input, uint64_t action)
+{
+    (void)self;
+    return (Digital){ (action & 1) != 0, input == 5 };
+}
+static Analog input_analog(Obj *self, uint64_t input, uint64_t action)
+{
+    (void)self;
+    return (Analog){ (int32_t)input, 0.25f * (float)action, -1.5f, true };
+}
+static Motion input_motion(Obj *self, uint64_t input)
+{
+    (void)self;
+    Motion m;
+    for (int i = 0; i < 10; i++)
+        m.f[i] = (float)input * (float)(i + 1);
+    return m;
+}
+static Obj g_input;
+static void *input_vt[40];
+
 static Obj g_client;
 __attribute__((constructor)) static void init(void)
 {
     for (int i = 0; i < 40; i++)
-        client_vt[i] = user_vt[i] = utils_vt[i] = (void *)zero;
+        client_vt[i] = user_vt[i] = utils_vt[i] = input_vt[i] = (void *)zero;
+    input_vt[17] = (void *)input_digital;
+    input_vt[21] = (void *)input_analog;
+    input_vt[29] = (void *)input_motion;
+    g_input.vt = input_vt;
     client_vt[0] = (void *)client_create_pipe;
     client_vt[2] = (void *)client_connect_global;
     client_vt[5] = (void *)client_user;
@@ -70,9 +101,9 @@ __attribute__((constructor)) static void init(void)
 
 void *CreateInterface(const char *ver, int *rc)
 {
-    int ok = !strcmp(ver, "SteamClient017");
-    if (rc) *rc = ok ? 0 : 1;
-    return ok ? &g_client : NULL;
+    Obj *o = !strcmp(ver, "SteamClient017") ? &g_client : !strcmp(ver, "SteamInput005") ? &g_input : NULL;
+    if (rc) *rc = o ? 0 : 1;
+    return o;
 }
 
 typedef struct { int32_t user, id; uint8_t *param; int32_t size; } CallbackMsg;
