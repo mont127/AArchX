@@ -398,25 +398,49 @@ static int sp_vsscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return scan_common(cp
 static int sp_fscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return scan_common(cpu, 1, -1, call_vfscanf, m32_host(m32_arg(cpu, 0)), "fscanf"); }
 static int sp_vfscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return scan_common(cpu, 1, 2, call_vfscanf, m32_host(m32_arg(cpu, 0)), "vfscanf"); }
 static int sp_scanf(struct OcerzVM *vm, OcerzCPU *cpu) { return scan_common(cpu, 0, -1, call_vfscanf, stdin, "scanf"); }
-/* vswscanf(str, fmt, ap): wchar_t is 4 bytes for both, so only the walk over the format needs a narrow copy */
-static int sp_vswscanf(struct OcerzVM *vm, OcerzCPU *cpu)
+/* The wide families: wchar_t is 4 bytes for both, and the conversions are ASCII, so only the walk over the format
+ * needs a narrow copy (fmt must hold 512); NULL for a format too long to walk */
+static const wchar_t *wide_format(uint32_t f, char *fmt)
 {
-    uint32_t s = m32_arg(cpu, 0), f = m32_arg(cpu, 1);
     const wchar_t *wfmt = f ? (const wchar_t *)m32_h(f) : NULL;
-    char fmt[512];
     size_t i = 0;
-    for (; wfmt && wfmt[i] && i < sizeof fmt - 1; i++)
+    for (; wfmt && wfmt[i] && i < 511; i++)
         fmt[i] = wfmt[i] < 0x80 ? (char)wfmt[i] : '?';
     fmt[i] = 0;
+    return wfmt && !wfmt[i] ? wfmt : NULL;
+}
+/* swscanf(str, fmt, ...) and vswscanf(str, fmt, ap) */
+static int wscan_common(OcerzCPU *cpu, int vi, const char *who)
+{
+    uint32_t s = m32_arg(cpu, 0);
+    char fmt[512];
+    const wchar_t *wfmt = wide_format(m32_arg(cpu, 1), fmt);
     uint64_t slots[M32_MAX_SLOTS];
     ScanBack back[M32_MAX_SLOTS];
     int nback;
-    if (!s || !wfmt || wfmt[i] || scan_slots(fmt, m32_arg(cpu, 2), slots, back, &nback, "vswscanf") < 0)
+    uint32_t ap = vi >= 0 ? m32_arg(cpu, vi) : (uint32_t)cpu->gpr[OCERZ_RSP] + 12;
+    if (!s || !wfmt || scan_slots(fmt, ap, slots, back, &nback, who) < 0)
         FAIL();
     int r = vswscanf((const wchar_t *)m32_h(s), wfmt, M32_VA(slots));
     scan_back(back, nback);
     RET(r);
 }
+static int sp_vswscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return wscan_common(cpu, 2, "vswscanf"); }
+static int sp_swscanf(struct OcerzVM *vm, OcerzCPU *cpu) { return wscan_common(cpu, -1, "swscanf"); }
+/* swprintf(dst, maxlen, fmt, ...) and vswprintf(dst, maxlen, fmt, ap) */
+static int wprint_common(OcerzCPU *cpu, int vi, const char *who)
+{
+    uint32_t d = m32_arg(cpu, 0);
+    char fmt[512];
+    const wchar_t *wfmt = wide_format(m32_arg(cpu, 2), fmt);
+    uint64_t s[M32_MAX_SLOTS];
+    uint32_t ap = vi >= 0 ? m32_arg(cpu, vi) : (uint32_t)cpu->gpr[OCERZ_RSP] + 16;
+    if (!wfmt || m32_printf_slots(fmt, ap, s, M32_MAX_SLOTS, who) < 0)
+        FAIL();
+    RET(vswprintf(d ? (wchar_t *)m32_h(d) : NULL, m32_arg(cpu, 1), wfmt, M32_VA(s)));
+}
+static int sp_vswprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return wprint_common(cpu, 3, "vswprintf"); }
+static int sp_swprintf(struct OcerzVM *vm, OcerzCPU *cpu) { return wprint_common(cpu, -1, "swprintf"); }
 
 /* ---- the heap's entry points and malloc zones ----
  * Until the program registers a malloc zone of its own, malloc and friends are m32's dlmalloc heap.  A game that
@@ -687,7 +711,8 @@ const M32SpecialEntry m32_stdio_specials[] = {
     { "___vsnprintf_chk", sp_vsnprintf_chk }, { "_asprintf", sp_asprintf }, { "_vasprintf", sp_vasprintf },
     { "_syslog", sp_syslog },
     { "_sscanf", sp_sscanf }, { "_vsscanf", sp_vsscanf }, { "_fscanf", sp_fscanf }, { "_vfscanf", sp_vfscanf },
-    { "_scanf", sp_scanf }, { "_vswscanf", sp_vswscanf },
+    { "_scanf", sp_scanf }, { "_vswscanf", sp_vswscanf }, { "_swscanf", sp_swscanf },
+    { "_swprintf", sp_swprintf }, { "_vswprintf", sp_vswprintf },
     { "_malloc", sp_malloc }, { "_calloc", sp_calloc }, { "_realloc", sp_realloc }, { "_reallocf", sp_reallocf },
     { "_free", sp_free }, { "_valloc", sp_valloc }, { "_posix_memalign", sp_posix_memalign },
     { "_malloc_size", sp_malloc_size }, { "_malloc_good_size", sp_malloc_good_size },

@@ -1,0 +1,4 @@
+swprintf 38 [42 wide narrow 2.50 1099511627776 beef]
+vswprintf 9 [dir/00007]
+swscanf 3 12 34 [name]
+exit 0
