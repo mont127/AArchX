@@ -246,6 +246,45 @@ static int bundle_executable(const char *dir, char *out, size_t n)
     return len > 0 && (size_t)len < n && stat(out, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+/*
+ * A launch script rather than a program.  Steam's %command% for a Source game on the Mac is hl2.sh, which sets
+ * DYLD_LIBRARY_PATH and starts the game as `${GAME_DEBUGGER} <game> <args>`.  The script runs as itself with
+ * GAME_DEBUGGER naming this ocerz and the flags before the script, so `ocerz -native %command%` serves those games as
+ * it serves the rest; a GAME_DEBUGGER already set wins.  The scripts expand it unquoted, so an ocerz path with a space
+ * would split: it is refused with a message instead.  -1 when path is not a script.
+ */
+static int run_launch_script(const char *path, char **argv, int first)
+{
+    char magic[2];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    ssize_t got = read(fd, magic, sizeof magic);
+    close(fd);
+    if (got != 2 || magic[0] != '#' || magic[1] != '!')
+        return -1;
+    if (!getenv("GAME_DEBUGGER")) {
+        char self[PATH_MAX], real[PATH_MAX], debugger[PATH_MAX + 256];
+        uint32_t size = sizeof self;
+        if (_NSGetExecutablePath(self, &size) != 0 || !realpath(self, real))
+            return -1;
+        if (strchr(real, ' ')) {
+            OCERZ_FATAL("%s is a launch script, which starts its game through GAME_DEBUGGER, and ocerz's path has a "
+                        "space in it (%s): move ocerz to a path without one\n", path, real);
+            return 64;
+        }
+        snprintf(debugger, sizeof debugger, "%s", real);
+        for (int k = 1; k < first; k++) {
+            strlcat(debugger, " ", sizeof debugger);
+            strlcat(debugger, argv[k], sizeof debugger);
+        }
+        setenv("GAME_DEBUGGER", debugger, 1);
+    }
+    execv(path, argv + first);
+    OCERZ_FATAL("cannot run the launch script %s\n", path);
+    return 126;
+}
+
 static void reexec_without_host_insertion(char **argv)
 {
     const char *list = getenv("DYLD_INSERT_LIBRARIES");
@@ -382,6 +421,9 @@ int main(int argc, char **argv)
             argv[i] = bundle_exe;
         load_path = bundle_exe;
     }
+    int script = run_launch_script(load_path, argv, i);
+    if (script >= 0)
+        return script;
 
     apply_wine_defaults(load_path);
 

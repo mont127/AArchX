@@ -1,0 +1,6 @@
+#!/bin/sh
+# Valve's hl2.sh, cut down: the game runs under whatever GAME_DEBUGGER names, unquoted.  Started as
+# `ocerz -native ./launchscript`, as Steam starts a Source game with that launch option, ocerz names itself.
+case "$GAME_DEBUGGER" in */ocerz\ -native) echo "debugger ocerz -native" ;; *) echo "debugger '$GAME_DEBUGGER'" ;; esac
+${GAME_DEBUGGER} ./ret42 "$@"
+echo "game exit $?"
