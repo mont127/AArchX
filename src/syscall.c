@@ -2495,6 +2495,7 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             t.sig_altstack_size = 0;
             t.sig_mask = 0;
             t.sig_pending = 0;
+            t.sig_stop_n = 0;
             t.sig_on_stack = 0;
             t.sig_last_fault = 0;
             t.sig_repeat = 0;
@@ -2597,6 +2598,7 @@ static int ocerz_spawn_workloop_worker(OcerzVM *vm, const OcerzCPU *cpu,
     t.sig_altstack_size = 0;
     t.sig_mask = 0;
     t.sig_pending = 0;
+    t.sig_stop_n = 0;
     t.sig_on_stack = 0;
     t.sig_last_fault = 0;
     t.sig_repeat = 0;
@@ -3943,6 +3945,7 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     w->cpu.sig_altstack_sp = 0;
     w->cpu.sig_altstack_size = 0;
     w->cpu.sig_pending = 0;
+    w->cpu.sig_stop_n = 0;
     w->cpu.sig_on_stack = 0;
     w->cpu.sig_last_fault = 0;
     w->cpu.sig_repeat = 0;

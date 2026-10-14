@@ -28,6 +28,17 @@
  * SIGPIPE and relies on EPIPE, and without the mirror the whole server
  * vanished the first time a client died with a reply in flight.
  *
+ * The host handler only marks the signal pending on the thread's cpu, and the
+ * run loops deliver it between two steps, where the guest state is all in the
+ * cpu, as well as after a system call.  Until 2026-10-14 only system calls and
+ * bridged calls delivered: a thread spinning in a loop got one or two of 130
+ * SIGALRMs, and under Wine the SuspendThread that Mono's collector sends a busy
+ * thread waited for the loop to end.  A thread in translated code reaches the
+ * run loop only when its blocks exit to it, so the handler also has the JIT
+ * stop the loop the thread is in (ocerz_jit_signal_stop), and the dispatch stub
+ * returns to the run loop while a signal the thread does not block is pending.
+ * The dynamic test loop_signal pins it; OCERZ_NO_SIGNAL_STOP=1 goes back.
+ *
  * ---- faults ----
  * The fault handler is where most of the emulation's hard edges meet.  A first
  * touch of a lazily-slid shared-cache data page unpacks it and retries.  Any
@@ -333,6 +344,7 @@
 #include "ocerz/dyldapi.h"
 #include "ocerz/bridge.h"
 #include "ocerz/objcbridge.h"
+#include "ocerz/m32.h"
 
 #include <dlfcn.h>
 #include <signal.h>
@@ -1149,8 +1161,10 @@ void ocerz_vm_atfork_child(void)
     }
     g_fork_surviving_cpu = NULL;
     g_pending_async_mask = 0;
-    if (survivor)
+    if (survivor) {
         survivor->sig_pending = 0;
+        survivor->sig_stop_n = 0;
+    }
     g_riphist_n = 0;
     __atomic_store_n(&g_unstick_started, 0, __ATOMIC_RELEASE);
     if (g_vm && g_vm->jit_enabled && g_fork_keepjit <= 0) {
@@ -1441,7 +1455,20 @@ void ocerz_cpu_restore_saved(OcerzCPU *cpu, const OcerzCPU *saved)
     uint32_t ring_n = cpu->sysring_n;
     __typeof__(cpu->sysring) ring;
     memcpy(ring, cpu->sysring, sizeof ring);
+    uint32_t stop_n = cpu->sig_stop_n;
+    uint8_t stop_m32[OCERZ_SIG_STOP_MAX], stop_edges[OCERZ_SIG_STOP_MAX];
+    void *stop_blk[OCERZ_SIG_STOP_MAX];
+    uint64_t stop_rip[OCERZ_SIG_STOP_MAX];
+    memcpy(stop_m32, cpu->sig_stop_m32, sizeof stop_m32);
+    memcpy(stop_edges, cpu->sig_stop_edges, sizeof stop_edges);
+    memcpy(stop_blk, cpu->sig_stop_blk, sizeof stop_blk);
+    memcpy(stop_rip, cpu->sig_stop_rip, sizeof stop_rip);
     *cpu = *saved;
+    cpu->sig_stop_n = stop_n;
+    memcpy(cpu->sig_stop_m32, stop_m32, sizeof stop_m32);
+    memcpy(cpu->sig_stop_edges, stop_edges, sizeof stop_edges);
+    memcpy(cpu->sig_stop_blk, stop_blk, sizeof stop_blk);
+    memcpy(cpu->sig_stop_rip, stop_rip, sizeof stop_rip);
     cpu->sig_pending = pend;
     memcpy(cpu->sig_host_rcvd, rcvd, sizeof rcvd);
     memcpy(cpu->sig_delivered, dlv, sizeof dlv);
@@ -1458,9 +1485,12 @@ void ocerz_cpu_restore_saved(OcerzCPU *cpu, const OcerzCPU *saved)
 static struct { uint64_t t, tid; OcerzCPU *cpu; int sig, pid_from; } g_hsig_ring[512];
 static uint32_t g_hsig_n;
 
+/* OCERZ_NO_SIGNAL_STOP=1: a signal waits for its thread to reach the dispatcher on
+ * its own, and the dispatcher does not deliver it, as before 2026-10-14 */
+static int g_no_signal_stop;
+
 static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
 {
-    (void)ctx;
     {
         uint32_t k = __atomic_fetch_add(&g_hsig_n, 1, __ATOMIC_RELAXED) % 512;
         uint64_t tid = 0;
@@ -1479,6 +1509,11 @@ static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
             __atomic_or_fetch(&g_pending_async_mask, 1u << sig, __ATOMIC_SEQ_CST);
         if (c)
             __atomic_fetch_add(&c->sig_host_rcvd[sig], 1u, __ATOMIC_RELAXED);
+        /* a thread inside a translated loop would not see it until the loop ended */
+        if (c && !g_async_shared_only && !m32_active && ctx && !(c->sig_mask >> (sig - 1) & 1) &&
+            !g_no_signal_stop)
+            ocerz_jit_signal_stop(c->vm, c,
+                                  (const void *)(uintptr_t)((ucontext_t *)ctx)->uc_mcontext->__ss.__pc);
     }
 }
 
@@ -3361,6 +3396,7 @@ static void ocerz_install_kick_handler(void);
 void ocerz_vm_install_handlers(OcerzVM *vm)
 {
     ocerz_install_kick_handler();
+    g_no_signal_stop = getenv("OCERZ_NO_SIGNAL_STOP") != NULL;
     extern int ocerz_cftrap_on;
     ocerz_cftrap_on = getenv("OCERZ_CFTRAP") != NULL;
     g_crash_stack = getenv("OCERZ_CRASH_STACK") != NULL;
@@ -3607,6 +3643,12 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     ocerz_cpu_register(&local);
     while (local.rip != sentinel && !vm->exited && !local.terminated) {
         ocerz_vm_suspend_point(&local);
+        if (local.sig_stop_n)
+            ocerz_jit_signal_unstop(vm, &local);
+        if (!esc_r && !local.interp_once && !m32_active && !g_no_signal_stop &&
+            ((__atomic_load_n(&local.sig_pending, __ATOMIC_RELAXED) & ~local.sig_mask) ||
+             ocerz_peek_pending_async_sig()))
+            ocerz_guest_deliver_pending(vm, &local);
         g_riphist[g_riphist_n++ & 31] = local.rip;
         int r;
         int mtrace_hit = 0;
@@ -3742,6 +3784,8 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
             _exit(125);
         }
     }
+    if (local.sig_stop_n)
+        ocerz_jit_signal_unstop(vm, &local);
     ocerz_cpu_unregister(&local);
     if (prev_cpu) {
         pthread_mutex_lock(&g_cpus_lock);
@@ -4251,6 +4295,14 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
 
     while (!vm->exited && !cpu->terminated && !cpu->interrupt) {
         ocerz_vm_suspend_point(cpu);
+        if (cpu->sig_stop_n)
+            ocerz_jit_signal_unstop(vm, cpu);
+        /* between two steps the guest state is all in cpu, so a pending signal is
+         * delivered here, not only after a system call */
+        if (!esc_r && !cpu->interp_once && !m32_active && !g_no_signal_stop &&
+            ((__atomic_load_n(&cpu->sig_pending, __ATOMIC_RELAXED) & ~cpu->sig_mask) ||
+             ocerz_peek_pending_async_sig()))
+            ocerz_guest_deliver_pending(vm, cpu);
         g_riphist[g_riphist_n++ & 31] = cpu->rip;
         int r;
         if (ocerz_exc_trap && cpu->rip == ocerz_exc_trap)
@@ -4334,6 +4386,8 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
             return 125;
         }
     }
+    if (cpu->sig_stop_n)
+        ocerz_jit_signal_unstop(vm, cpu);
     g_sig_recover = prev_recover;
     g_cur_cpu = prev_cpu;
     ocerz_cpu_unregister(cpu);

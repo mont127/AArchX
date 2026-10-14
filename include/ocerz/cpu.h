@@ -72,6 +72,8 @@ enum {
     OCERZ_SEG_GS = 2,
 };
 
+#define OCERZ_SIG_STOP_MAX 8
+
 typedef struct OcerzCPU {
     uint64_t gpr[16];
     uint64_t rip;
@@ -166,6 +168,13 @@ typedef struct OcerzCPU {
     struct { uint64_t t, a0, a1, a2, ret, peek, peek2, peek3, peek4; int32_t num; } sysring[24];
     uint32_t sysring_n;
     uint64_t low_stack_delta;   /* the Wine layout's stack delta, kept with x0 while rsp's register holds a host pointer */
+    /* blocks whose stop sites and chained edges a signal rewrote so this thread
+     * would leave a loop for its dispatcher, which puts them back (ocerz_jit_signal_stop) */
+    uint32_t sig_stop_n;
+    uint8_t sig_stop_m32[OCERZ_SIG_STOP_MAX];
+    uint8_t sig_stop_edges[OCERZ_SIG_STOP_MAX];     /* which of the block's edges it unchained */
+    void *sig_stop_blk[OCERZ_SIG_STOP_MAX];
+    uint64_t sig_stop_rip[OCERZ_SIG_STOP_MAX];
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256

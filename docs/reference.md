@@ -189,6 +189,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_LOADMAP=1` | do not map a shared-cache image's Objective-C classes before its `+load` runs |
 | `OCERZ_NO_LATE_CATLIST=1` | do not report category lists for shared-cache images loaded after startup |
 | `OCERZ_NO_THREADACT=1` | hand `thread_suspend`, `thread_resume` and `thread_get_state` on guest threads to the kernel instead of emulating them |
+| `OCERZ_NO_SIGNAL_STOP=1` | deliver a signal only at its thread's next system call or bridged call, as before 2026-10-14, instead of also between any two blocks, with the translated loop the thread is in stopped so it reaches one |
 | `OCERZ_UNSTICK_ALL=1` | let the unstick monitor interrupt every blocking call, `read`, `recvmsg` and `poll` included |
 | `OCERZ_NO_VMMAP_STEER=1` | let `mach_vm_map` place mappings anywhere in host space instead of at guest-visible addresses |
 | `OCERZ_REFAULT_INVAL=1` | invalidate again on every repeated alignment or commpage fault, including faults from retired translations |

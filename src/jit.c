@@ -809,7 +809,8 @@ typedef struct JitBlock {
 
     uint32_t *stop_patch;
     uint32_t stop_insn;
-    struct { uint32_t *site; uint32_t insn; } stop_extra[6];
+    uint32_t stop_run;                  /* the word a stop site holds while the loop runs, 0 if unknown */
+    struct { uint32_t *site; uint32_t insn, run; } stop_extra[6];
     uint8_t n_stop_extra;
     uint32_t *push_fix;
     uint16_t n_push_fix;
@@ -17887,6 +17888,13 @@ static void emit_dispatch_stub(OcerzJit *jit, int mode32)
     to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 0, JT0, 0);
     a64_ldr(&b, 4, JT0, 0, (uint32_t)offsetof(struct OcerzVM, exited));
     to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 0, JT0, 0);
+    if (!m32_active && !getenv("OCERZ_NO_SIGNAL_STOP")) {
+        /* a signal this thread does not block goes back to the run loop, which delivers it */
+        a64_ldr(&b, 8, JT0, 1, (uint32_t)offsetof(OcerzCPU, sig_pending));
+        a64_ldr(&b, 8, JTU, 1, (uint32_t)offsetof(OcerzCPU, sig_mask));
+        a64_bic_reg(&b, 1, JT0, JT0, JTU, 0);
+        to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 1, JT0, 0);
+    }
     a64_ldr(&b, 8, JT1, 1, RIP_OFF);
     a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_LO);
     a64_sub_reg(&b, 1, JTT, JT1, JTU, 0);
@@ -21574,12 +21582,27 @@ static uint32_t tc_off(const JitBlock *blk, const uint32_t *p)
     return p ? (uint32_t)(p - (const uint32_t *)(const void *)blk->code) : TC_NONE;
 }
 
+/* Whether every stop site with a known running word holds it.  A block whose
+ * loop is stopped, by an exit or a signal, would come back from the cache
+ * stopped for good, so it is not saved. */
+static int stop_sites_running(const JitBlock *b)
+{
+    if (b->stop_patch && b->stop_run && *b->stop_patch != b->stop_run)
+        return 0;
+    for (int i = 0; i < b->n_stop_extra; i++)
+        if (b->stop_extra[i].run && *b->stop_extra[i].site != b->stop_extra[i].run)
+            return 0;
+    return 1;
+}
+
 static void tc_put(OcerzJit *jit, JitBlock *blk)
 {
     (void)jit;
     int n = blk->n_insns;
     int compact = blk->insns == NULL;
     if (!blk->code || !blk->insn_off || n <= 0 || (compact && !blk->iref))
+        return;
+    if (!stop_sites_running(blk))
         return;
     if (!g_tc_out && !(g_tc_out = (uint8_t *)malloc(TC_OUT_MAX)))
         return;
@@ -21849,10 +21872,13 @@ static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, i
     blk->ordered_loads = r->ordered_loads;
     blk->stop_patch = TC_AT(r->stop_patch);
     blk->stop_insn = r->stop_insn;
+    /* tc_put saves only blocks whose stop sites hold their running words */
+    blk->stop_run = blk->stop_patch && *blk->stop_patch != r->stop_insn ? *blk->stop_patch : 0;
     blk->n_stop_extra = r->n_stop_extra;
     for (uint32_t i = 0; i < r->n_stop_extra; i++) {
         blk->stop_extra[i].site = c + v.stop[i].off;
         blk->stop_extra[i].insn = v.stop[i].insn;
+        blk->stop_extra[i].run = *blk->stop_extra[i].site != v.stop[i].insn ? *blk->stop_extra[i].site : 0;
     }
     blk->n_edges = r->n_edges;
     for (uint32_t i = 0; i < r->n_edges; i++) {
@@ -23798,6 +23824,7 @@ promo_push_fallthrough:
             uint32_t running_insn = *g_stop_patch;
             blk->stop_patch = g_stop_patch;
             blk->stop_insn = stop_retarget(running_insn, g_stop_patch, g_stop_target);
+            blk->stop_run = running_insn;
             if (jit->stop_requested)
                 *g_stop_patch = blk->stop_insn;
             else
@@ -23815,6 +23842,7 @@ promo_push_fallthrough:
         for (int i = 0; i < g_n_stop_extra; i++) {
             uint32_t *site = g_stop_extra[i].site;
             blk->stop_extra[blk->n_stop_extra].site = site;
+            blk->stop_extra[blk->n_stop_extra].run = *site;
             blk->stop_extra[blk->n_stop_extra].insn =
                 stop_retarget(*site, site, g_stop_extra[i].target);
             blk->n_stop_extra++;
@@ -25429,6 +25457,175 @@ void ocerz_jit_request_stop(struct OcerzVM *vm)
     if (patched)
         sys_icache_invalidate(jit->code_base,
             (size_t)((uint8_t *)jit->code_cur - (uint8_t *)jit->code_base));
+    jl_release();
+}
+
+/*
+ * A guest signal for a thread running translated code is delivered where that
+ * code returns to the dispatcher, and a loop that stays inside its blocks never
+ * returns there.  So the host handler calls ocerz_jit_signal_stop on the
+ * interrupted thread, which does to the block the thread was in what a retire
+ * does: it unchains the block's chained edges, so its next jump to another
+ * block goes through the dispatch stub, and rewrites its stop sites, so a loop
+ * inside it leaves at its back-edge.  The same is done to the blocks those
+ * edges led to, a few hops on, because the thread may be on its way into one of
+ * them.  The dispatch stub sees the pending signal and returns to the run loop,
+ * which delivers it.  The thread records each block it changed and which edges
+ * it unchained, and ocerz_jit_signal_unstop, called from the run loop, puts
+ * them back: a stop site to the word it was translated with, an edge by
+ * chaining it again.  Another thread in the same blocks meanwhile takes a trip
+ * or two through its dispatcher.
+ *
+ * The handler does not take the JIT lock.  The thread that holds it is often
+ * the one that sent the signal, translating the code it runs next, and a
+ * handler that waited for it, or gave up, would leave the loop running.  So
+ * the handler can race a chain install on the same word.  Every word either
+ * side writes is a whole branch that is valid on its own, so the worst case is
+ * an edge chained again before this thread passes it, and the signal waits
+ * for the next stop as it did before.  The restore runs under the lock.  The
+ * blocks the walk reads stay allocated: a retired block moves to jit->retired
+ * and is freed only with the whole JIT, which is why the fault handlers can
+ * read them too.  A handler that interrupted host code rather than a block
+ * leaves the signal to the next return to the dispatcher.  So does a loop
+ * through blocks the walk does not reach, such as one that returns through
+ * the return-address stack into a block the walk did not visit, because the
+ * walk follows chained edges only.
+ */
+static void sig_store(uint32_t *site, uint32_t w)
+{
+    __atomic_store_n(site, w, __ATOMIC_RELEASE);
+    sys_icache_invalidate(site, 4);
+}
+
+static void sig_stop_sites(JitBlock *b)
+{
+    if (b->stop_patch && b->stop_insn && *b->stop_patch != b->stop_insn)
+        sig_store(b->stop_patch, b->stop_insn);
+    for (int i = 0; i < b->n_stop_extra; i++)
+        if (*b->stop_extra[i].site != b->stop_extra[i].insn)
+            sig_store(b->stop_extra[i].site, b->stop_extra[i].insn);
+}
+
+int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc)
+{
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    if (!jit || !cpu || jl_held || !ocerz_jit_pc_in_arena(vm, host_pc))
+        return 0;
+    int stopped = 0;
+    const JitBlock *first = fault_block(jit, (const uint32_t *)host_pc);
+    if (first && !jit->stop_requested) {
+        JitBlock *todo[OCERZ_SIG_STOP_MAX];
+        int n_todo = 0;
+        todo[n_todo++] = (JitBlock *)first;
+        pthread_jit_write_protect_np(0);
+        for (int k = 0; k < n_todo; k++) {
+            JitBlock *b = todo[k];
+            uint32_t n = cpu->sig_stop_n, j = 0;
+            while (j < n && cpu->sig_stop_blk[j] != b)
+                j++;
+            if (j == n) {
+                if (n == OCERZ_SIG_STOP_MAX)
+                    break;
+                cpu->sig_stop_blk[n] = b;
+                cpu->sig_stop_rip[n] = blk_rip(b);
+                cpu->sig_stop_m32[n] = (uint8_t)blk_mode32(b);
+                cpu->sig_stop_edges[n] = 0;
+                cpu->sig_stop_n = n + 1;
+            }
+            for (int e = 0; e < b->n_edges && e < 8; e++) {
+                uint32_t *pb = b->edges[e].patch_b, *cs = b->edges[e].cond_site;
+                uint32_t *sites[2] = { pb, cs };
+                for (int s = 0; s < 2; s++) {
+                    if (!sites[s])
+                        continue;
+                    const uint32_t *t = chain_target(jit, sites[s], *sites[s]);
+                    if (!t || ptr_in_block_code(b, t))
+                        continue;
+                    JitBlock *tb = (JitBlock *)fault_block(jit, t);
+                    int seen = !tb;
+                    for (int q = 0; q < n_todo && !seen; q++)
+                        seen = todo[q] == tb;
+                    if (!seen && n_todo < OCERZ_SIG_STOP_MAX)
+                        todo[n_todo++] = tb;
+                }
+                if (pb && b->edges[e].fallback_insn && *pb != b->edges[e].fallback_insn) {
+                    sig_store(pb, b->edges[e].fallback_insn);
+                    cpu->sig_stop_edges[j] |= (uint8_t)(1u << e);
+                }
+                if (cs && b->edges[e].cond_orig && *cs != b->edges[e].cond_orig) {
+                    sig_store(cs, b->edges[e].cond_orig);
+                    cpu->sig_stop_edges[j] |= (uint8_t)(1u << e);
+                }
+            }
+            sig_stop_sites(b);
+            stopped = 1;
+        }
+        pthread_jit_write_protect_np(1);
+    }
+    return stopped;
+}
+
+static void sig_rechain(OcerzJit *jit, JitBlock *b, int e)
+{
+    JitBlock *t = cache_lookup(jit, b->edges[e].target_rip, blk_mode32(b));
+    if (!t || !t->code)
+        return;
+    void *dst = (void *)t->code;
+    if (b->edges[e].kind == EDGE_BODY) {
+        int compatible = b->edges[e].pin_class
+            ? t->pin_class == b->edges[e].pin_class
+            : (t->pin_class == 0 && t->n_pinned == 0);
+        dst = compatible && t->body_code ? body_entry_for(t, b->hoist_sig) : NULL;
+    }
+    if (!dst)
+        return;
+    if (*b->edges[e].patch_b == b->edges[e].fallback_insn)
+        chain_activate(b->edges[e].patch_b, dst);
+    chain_cond_short(b->edges[e].probing ? NULL : b->edges[e].cond_site, dst);
+    for (uint32_t q = 0; q < t->n_preds; q++)
+        if (t->preds[q].pb == b && t->preds[q].e == e)
+            return;
+    pred_add(t, b, e);
+}
+
+static void sig_unstop_site(OcerzJit *jit, JitBlock *b, uint32_t *site, uint32_t stop, uint32_t run)
+{
+    if (!site || *site != stop)
+        return;
+    for (int e = 0; e < b->n_edges; e++)
+        if (b->edges[e].patch_b == site) {
+            sig_rechain(jit, b, e);
+            return;
+        }
+    if (!run || run == stop)
+        return;
+    pthread_jit_write_protect_np(0);
+    __atomic_store_n(site, run, __ATOMIC_RELEASE);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(site, 4);
+}
+
+void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    if (!jit) {
+        cpu->sig_stop_n = 0;
+        return;
+    }
+    jl_acquire(__LINE__);
+    for (uint32_t i = 0; i < cpu->sig_stop_n && !jit->stop_requested; i++) {
+        JitBlock *b = (JitBlock *)cpu->sig_stop_blk[i];
+        if (cache_lookup(jit, cpu->sig_stop_rip[i], cpu->sig_stop_m32[i]) != b ||
+            b->live_idx >= jit->n_live || jit->live[b->live_idx] != b)
+            continue;
+        sig_unstop_site(jit, b, b->stop_patch, b->stop_insn, b->stop_run);
+        for (int k = 0; k < b->n_stop_extra; k++)
+            sig_unstop_site(jit, b, b->stop_extra[k].site, b->stop_extra[k].insn, b->stop_extra[k].run);
+        for (int e = 0; e < b->n_edges && e < 8; e++)
+            if (cpu->sig_stop_edges[i] >> e & 1)
+                sig_rechain(jit, b, e);
+    }
+    cpu->sig_stop_n = 0;
     jl_release();
 }
 
