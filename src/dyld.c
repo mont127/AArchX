@@ -775,22 +775,77 @@ static uint64_t dimg_gen(void)
     return ((uint64_t)atomic_load_explicit(&g_dimgs_gen, memory_order_acquire) << 32) | (uint32_t)g_dimgs_n;
 }
 
+/* g_dimgs by path and by install, id or rpath name, which every bind and dlopen probes.  A slot names the
+ * image and field it was hashed from and is checked against that field when probed, so slots left by a
+ * rolled-back image only cost a strcmp, and the lowest matching index wins, as a scan of g_dimgs finds it.
+ * dimg_index must follow every write of those fields of a live image. */
+#define DIMGIDX_BITS 14
+enum { DIMG_KEY_PATH, DIMG_KEY_INSTALL, DIMG_KEY_ID, DIMG_KEY_RPATH, DIMG_KEYS };
+static struct { uint32_t h; int idx1; int kind; } g_dimgidx[1u << DIMGIDX_BITS];
+static unsigned g_dimgidx_n;
+static uint32_t depmap_hash(const char *s);
+
+static const char *dimg_key(const DynImage *d, int kind)
+{
+    return kind == DIMG_KEY_PATH ? d->path : kind == DIMG_KEY_INSTALL ? d->install_name :
+           kind == DIMG_KEY_ID ? d->id_name : d->rpath_name;
+}
+
+static void dimg_index_put(int idx, int kind)
+{
+    const char *k = dimg_key(&g_dimgs[idx], kind);
+    if (!k[0])
+        return;
+    uint32_t h = depmap_hash(k), m = (1u << DIMGIDX_BITS) - 1;
+    for (uint32_t s = h & m;; s = (s + 1) & m) {
+        if (!g_dimgidx[s].idx1) {
+            g_dimgidx[s].h = h;
+            g_dimgidx[s].kind = kind;
+            g_dimgidx[s].idx1 = idx + 1;
+            g_dimgidx_n++;
+            return;
+        }
+        if (g_dimgidx[s].idx1 == idx + 1 && g_dimgidx[s].kind == kind && g_dimgidx[s].h == h)
+            return;
+    }
+}
+
+static void dimg_index(DynImage *d)
+{
+    if (g_dimgidx_n >= (3u << DIMGIDX_BITS) / 4) {   /* live keys fill at most half: drop rolled-back ones */
+        memset(g_dimgidx, 0, sizeof g_dimgidx);
+        g_dimgidx_n = 0;
+        for (int i = 0; i < g_dimgs_n; i++)
+            for (int k = 0; k < DIMG_KEYS; k++)
+                dimg_index_put(i, k);
+    }
+    for (int k = 0; k < DIMG_KEYS; k++)
+        dimg_index_put((int)(d - g_dimgs), k);
+}
+
+static DynImage *dimg_index_find(const char *key, int by_name)
+{
+    if (!key[0])
+        return NULL;
+    uint32_t h = depmap_hash(key), m = (1u << DIMGIDX_BITS) - 1;
+    int best = -1;
+    for (uint32_t s = h & m; g_dimgidx[s].idx1; s = (s + 1) & m) {
+        int i = g_dimgidx[s].idx1 - 1, kind = g_dimgidx[s].kind;
+        if (g_dimgidx[s].h == h && (kind != DIMG_KEY_PATH) == by_name && i < g_dimgs_n &&
+            (best < 0 || i < best) && strcmp(dimg_key(&g_dimgs[i], kind), key) == 0)
+            best = i;
+    }
+    return best < 0 ? NULL : &g_dimgs[best];
+}
+
 static DynImage *dimg_find_by_path(const char *path)
 {
-    for (int i = 0; i < g_dimgs_n; i++)
-        if (g_dimgs[i].path[0] && strcmp(g_dimgs[i].path, path) == 0)
-            return &g_dimgs[i];
-    return NULL;
+    return dimg_index_find(path, 0);
 }
 
 static DynImage *dimg_find_by_install_name(const char *iname)
 {
-    for (int i = 0; i < g_dimgs_n; i++)
-        if ((g_dimgs[i].install_name[0] && strcmp(g_dimgs[i].install_name, iname) == 0) ||
-            (g_dimgs[i].id_name[0] && strcmp(g_dimgs[i].id_name, iname) == 0) ||
-            (g_dimgs[i].rpath_name[0] && strcmp(g_dimgs[i].rpath_name, iname) == 0))
-            return &g_dimgs[i];
-    return NULL;
+    return dimg_index_find(iname, 1);
 }
 
 static void dimg_record_id(DynImage *d)
@@ -4045,6 +4100,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         snprintf(v->path, sizeof v->path, "%s", install_name);
         snprintf(v->install_name, sizeof v->install_name, "%s", install_name);
         dimg_record_id(v);
+        dimg_index(v);
         if (map_segments(v, 0) != OCERZ_OK) {
             OCERZ_FATAL("cannot map segments of virtual %s\n", install_name);
             native_dl_reason("its synthesized image could not be mapped", NULL);
@@ -4073,8 +4129,10 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     }
     if (ocerz_mode == OCERZ_MODE_NATIVE && install_name[0] == '@' && access(resolved, F_OK) != 0) {
         DynImage *d = load_disk_dylib(cache, resolved, loader, rpaths);
-        if (d && !d->rpath_name[0])
+        if (d && !d->rpath_name[0]) {
             snprintf(d->rpath_name, sizeof d->rpath_name, "%s", install_name);
+            dimg_index(d);
+        }
         return d;
     }
     if (dep_find(cache, resolved) != 0)
@@ -4137,6 +4195,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     d->file_dev = fdev;
     d->file_ino = fino;
     dimg_record_id(d);
+    dimg_index(d);
 
     if (map_segments(d, 0) != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", resolved);
@@ -4274,6 +4333,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path, 
     snprintf(d->install_name, sizeof d->install_name, "%s", install_path);
     file_identity(install_path, &d->file_dev, &d->file_ino);
     dimg_record_id(d);
+    dimg_index(d);
     if (map_segments(d, 0) != OCERZ_OK) {
         dlerror_set("dlopen(%s): cannot map segments", install_path);
         g_dimgs_n--;
@@ -6091,6 +6151,7 @@ static DynImage *ndl_load_file(NdlTarget *t, const RpathList *chain)
     snprintf(d->install_name, sizeof d->install_name, "%s", t->path);
     file_identity(t->path, &d->file_dev, &d->file_ino);
     dimg_record_id(d);
+    dimg_index(d);
     if (map_segments(d, 0) != OCERZ_OK) {
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
