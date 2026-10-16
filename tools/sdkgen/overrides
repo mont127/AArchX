@@ -1187,6 +1187,19 @@ fn _objc_setProperty_nonatomic_copy objc_setProperty_nonatomic_copy v(pppl)
 fn _objc_storeStrong objc_storeStrong v(pp)
 fn _objc_storeWeakOrNil objc_storeWeakOrNil p(pp)
 fn _objc_unsafeClaimAutoreleasedReturnValue objc_unsafeClaimAutoreleasedReturnValue p(p)
+#
+# Garbage collection's write and read barriers, which -fobjc-gc code calls for
+# every store of an object pointer into a global, an ivar or through a
+# pointer (Sequel Pro's FeedbackReporter framework).  With no collector they
+# are plain assignments, and arm64's libobjc still exports them.
+fn _objc_assign_global objc_assign_global p(pp)
+fn _objc_assign_ivar objc_assign_ivar p(ppl)
+fn _objc_assign_strongCast objc_assign_strongCast p(pp)
+fn _objc_assign_threadlocal objc_assign_threadlocal p(pp)
+fn _objc_assign_weak objc_assign_weak p(pp)
+fn _objc_read_weak objc_read_weak p(p)
+fn _objc_memmove_collectable objc_memmove_collectable p(ppL)
+fn _objc_collectingEnabled objc_collectingEnabled b()
 
 library /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
 
@@ -1194,6 +1207,12 @@ special _NSLog NSLog
 special _NSLogv NSLogv
 special __NSDictionaryOfVariableBindings dictionary_of_variable_bindings
 special _NSGetUncaughtExceptionHandler NSGetUncaughtExceptionHandler
+# NSCreateMapTable and NSCreateHashTable take their callback structures by
+# value (src/bridge.c, br_ns_create_map_table).
+special _NSCreateMapTable ns_create_map_table
+special _NSCreateMapTableWithZone ns_create_map_table_with_zone
+special _NSCreateHashTable ns_create_hash_table
+special _NSCreateHashTableWithZone ns_create_hash_table_with_zone
 stub _NSFrameAddress override
 stub _NSReturnAddress override
 stub _NSCountFrames override

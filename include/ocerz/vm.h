@@ -73,6 +73,7 @@ uint32_t ocerz_take_pending_async_sig_mask(uint32_t accept);
 void ocerz_bigring_init(void);
 void ocerz_bigring_dump(void);
 void ocerz_cpu_restore_saved(OcerzCPU *cpu, const OcerzCPU *saved);
+void ocerz_diag_init(void);   /* a duplicate of descriptor 2 for fatal reports, before the guest runs */
 void ocerz_vm_install_handlers(OcerzVM *vm);
 uint64_t ocerz_vm_call(OcerzVM *vm, uint64_t func, const uint64_t *args, int nargs, uint64_t stack_top);
 

@@ -321,6 +321,7 @@ int main(int argc, char **argv)
             close(efd);
         }
     }
+    ocerz_diag_init();
     reexec_without_host_insertion(argv);
     restore_guest_insertion();
     if (getenv("OCERZ_HOSTMASKLOG")) {

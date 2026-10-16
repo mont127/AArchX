@@ -342,11 +342,13 @@
 #include "ocerz/cache.h"
 #include "ocerz/syscall.h"
 #include "ocerz/dyldapi.h"
+#include "ocerz/abi.h"
 #include "ocerz/bridge.h"
 #include "ocerz/objcbridge.h"
 #include "ocerz/m32.h"
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -1936,6 +1938,29 @@ static void wild_dump(void)
     fprintf(stderr, "\n");
 }
 
+/* The standard error ocerz started with.  A guest shares the process's descriptors and, in native mode, its
+ * stdio, so a program that turns its standard error into a pipe of its own (HandBrake's activity log) took
+ * ocerz's report of a fatal fault with it, and a report written through a stderr that faults faulted again
+ * inside the report, until the signal stack ran out.  A fatal report goes to a duplicate of descriptor 2 taken
+ * before the guest ran (ocerz_diag_init, from main), and a fault while writing it ends the process at once. */
+static int g_diag_fd = -1;
+
+void ocerz_diag_init(void)
+{
+    if (g_diag_fd < 0)
+        g_diag_fd = fcntl(2, F_DUPFD_CLOEXEC, 64);
+    if (!ocerz_stderr && (ocerz_stderr = fdopen(2, "w")) != NULL)
+        setvbuf(ocerz_stderr, NULL, _IONBF, 0);
+}
+
+static FILE *diag_stream(void)
+{
+    static FILE *f;
+    if (!f && g_diag_fd >= 0)
+        f = fdopen(g_diag_fd, "w");
+    return f ? f : stderr;
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
     static __thread volatile int depth;
@@ -2127,18 +2152,32 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     if (sig == SIGSEGV || sig == SIGBUS) {
         const struct OcerzBridgeFrame *bf = ocerz_bridge_in_flight();
         if (bf) {
+            /* native code that jumped straight into guest code runs it as a callback instead (src/abi.c) */
+            const ucontext_t *juc = (const ucontext_t *)ctx;
+            uint64_t to = 0;
+            if (ocerz_mode == OCERZ_MODE_NATIVE && juc && si->si_addr &&
+                juc->uc_mcontext->__ss.__pc == (uint64_t)(uintptr_t)si->si_addr &&
+                ocerz_host_in_guest_space(si->si_addr) &&
+                ocerz_abi_bounce_from_fault(ocerz_h2g(si->si_addr), &to)) {
+                ((ucontext_t *)ctx)->uc_mcontext->__ss.__pc = to;
+                return;
+            }
+            static volatile int reporting;
+            if (reporting++)
+                _exit(139);
+            FILE *out = diag_stream();
             const ucontext_t *buc = (const ucontext_t *)ctx;
             uint64_t bpc = buc ? buc->uc_mcontext->__ss.__pc : 0;
             const char *blib = bf->lib ? bf->lib : "?";
             const char *bsym = bf->sym ? bf->sym : "?";
             const char *bsig = bf->sig ? bf->sig : "?";
-            fprintf(stderr,
+            fprintf(out,
                     "ocerz: BRIDGE-FAULT[%d] %s inside a bridged call, not in guest code\n",
                     (int)getpid(), sig == SIGBUS ? "SIGBUS" : "SIGSEGV");
-            fprintf(stderr,
+            fprintf(out,
                     "ocerz:   call=%s:%s sig='%s' host_fn=%p depth=%d\n",
                     blib, bsym, bsig, (void *)(uintptr_t)bf->host_fn, bf->depth);
-            fprintf(stderr,
+            fprintf(out,
                     "ocerz:   fault_addr=%p host_pc=%#llx guest_rip=%#llx\n",
                     si->si_addr, (unsigned long long)bpc,
                     (unsigned long long)(g_cur_cpu ? g_cur_cpu->cur_rip : 0));
@@ -2149,40 +2188,40 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                 uint64_t fga = ocerz_host_in_guest_space(si->si_addr) ? ocerz_h2g(si->si_addr) : 0;
                 const char *fname = fga ? ocerz_dyld_name_for_addr(fga, &fbase) : NULL;
                 if (rname)
-                    fprintf(stderr, "ocerz:   guest_rip is %s+%#llx\n", rname,
+                    fprintf(out, "ocerz:   guest_rip is %s+%#llx\n", rname,
                             (unsigned long long)(rip - rbase));
                 if (fname)
-                    fprintf(stderr, "ocerz:   fault_addr is %s+%#llx\n", fname,
+                    fprintf(out, "ocerz:   fault_addr is %s+%#llx\n", fname,
                             (unsigned long long)(fga - fbase));
                 if (buc) {
                     Dl_info di;
                     uint64_t lr = buc->uc_mcontext->__ss.__lr;
                     if (dladdr((void *)(uintptr_t)lr, &di) && di.dli_sname)
-                        fprintf(stderr, "ocerz:   host_lr=%#llx %s in %s\n", (unsigned long long)lr,
+                        fprintf(out, "ocerz:   host_lr=%#llx %s in %s\n", (unsigned long long)lr,
                                 di.dli_sname, di.dli_fname ? di.dli_fname : "?");
                     else
-                        fprintf(stderr, "ocerz:   host_lr=%#llx\n", (unsigned long long)lr);
+                        fprintf(out, "ocerz:   host_lr=%#llx\n", (unsigned long long)lr);
                 }
             }
             if (bpc && (void *)(uintptr_t)bpc == si->si_addr && ocerz_host_in_guest_space(si->si_addr))
-                fprintf(stderr,
+                fprintf(out,
                         "ocerz:   cause: native code jumped to %#llx, which is guest memory: it was handed"
                         " an x86 function pointer no crossing converted\n",
                         (unsigned long long)ocerz_h2g(si->si_addr));
             else if (ocerz_host_in_guest_space(si->si_addr))
-                fprintf(stderr,
+                fprintf(out,
                         "ocerz:   cause: the fault address is in guest space, so the guest passed a bad"
                         " pointer to %s (guest addr %#llx)\n"
                         "ocerz:   note: in the identity map native mode uses that test is one upper bound,"
                         " so it is strong evidence and not proof\n",
                         bsym, (unsigned long long)ocerz_h2g(si->si_addr));
             else
-                fprintf(stderr,
+                fprintf(out,
                         "ocerz:   cause: the fault address is outside guest space, so ocerz marshalled"
                         " this crossing wrong; the guest's arguments are not implicated\n");
-            fprintf(stderr,
+            fprintf(out,
                     "ocerz:   a native frame cannot be resumed or unwound, so the process stops here\n");
-            fflush(stderr);
+            fflush(out);
             _exit(139);
         }
     }

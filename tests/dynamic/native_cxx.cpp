@@ -78,7 +78,8 @@ int main(int argc, char **argv)
 {
     if (argc == 2 && std::strcmp(argv[1], "unsupported-format") == 0) {
         char buffer[16];
-        return snprintf_l(buffer, sizeof buffer, nullptr, "%1$d", 7);
+        const char *volatile mixed = "%1$d %d";
+        return snprintf_l(buffer, sizeof buffer, nullptr, mixed, 7, 8);
     }
     GuestUnwindSections sections{};
     assert(_dyld_find_unwind_sections((void *)&main, &sections));

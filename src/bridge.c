@@ -2183,6 +2183,92 @@ static int br_cg_pattern_create(struct OcerzVM *vm, OcerzCPU *cpu)
                            OCERZ_RCX, words, 3);
 }
 
+#define BR_FOUNDATION "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"
+
+/* NSCreateMapTable and NSCreateHashTable take their callback structures by
+   value, which System V passes in memory above the return address and Apple's
+   arm64 as a pointer to a copy, so the C compiler makes the host's call from
+   copies of the guest's words, each guest function bound to a callback as
+   br_struct_cross binds one.  A word that is host code already, read out of
+   Foundation's NSObjectMapKeyCallBacks and the like, goes as it is, and so does
+   a map key's notAKeyMarker, which is data.  VLC's interface creates its
+   tables this way. */
+typedef struct { uint64_t w[6]; } BrMapKeyCallBacks;
+typedef struct { uint64_t w[3]; } BrMapValueCallBacks;
+typedef struct { uint64_t w[5]; } BrHashCallBacks;
+
+static void br_ns_table_words(const char *name, uint64_t at, const char *const *words, int n, uint64_t *out)
+{
+    for (int w = 0; w < n; w++) {
+        uint64_t v = ocerz_ld(at + 8 * (uint64_t)w, 8);
+        if (words[w] && v && ocerz_abi_is_guest_code(v) && ocerz_abi_callback_convert(v, words[w], &v) != OCERZ_OK) {
+            fprintf(stderr, "ocerz: bridge: _%s could not bind guest function %#llx in word %d of its callbacks\n",
+                    name, (unsigned long long)ocerz_ld(at + 8 * (uint64_t)w, 8), w);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        out[w] = v;
+    }
+}
+
+static void *br_foundation_fn(void *_Atomic *cache, const char *name)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(BR_FOUNDATION, name);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", name);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    return fn;
+}
+
+static const char *const br_map_key_words[6] = { "L(pp)", "b(ppp)", "v(pp)", "v(pp)", "p(pp)", NULL };
+static const char *const br_map_value_words[3] = { "v(pp)", "v(pp)", "p(pp)" };
+static const char *const br_hash_words[5] = { "L(pp)", "b(ppp)", "v(pp)", "v(pp)", "p(pp)" };
+
+static int br_ns_create_map_table_at(struct OcerzVM *vm, OcerzCPU *cpu, int zoned)
+{
+    static void *_Atomic fns[2];
+    const char *name = zoned ? "NSCreateMapTableWithZone" : "NSCreateMapTable";
+    void *fn = br_foundation_fn(&fns[zoned], name);
+    BrMapKeyCallBacks k;
+    BrMapValueCallBacks v;
+    uint64_t sp = cpu->gpr[OCERZ_RSP];
+    br_ns_table_words(name, sp + 8, br_map_key_words, 6, k.w);
+    br_ns_table_words(name, sp + 8 + sizeof k, br_map_value_words, 3, v.w);
+    uint64_t capacity = cpu->gpr[OCERZ_RDI], zone = cpu->gpr[OCERZ_RSI];
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_FOUNDATION, name, "p({LbvvpP}{vvp}Lp)", fn);
+    void *t = zoned ? ((void *(*)(BrMapKeyCallBacks, BrMapValueCallBacks, uint64_t, void *))fn)(
+                          k, v, capacity, zone ? ocerz_g2h(zone) : NULL)
+                    : ((void *(*)(BrMapKeyCallBacks, BrMapValueCallBacks, uint64_t))fn)(k, v, capacity);
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, t ? ocerz_h2g(t) : 0);
+}
+
+static int br_ns_create_hash_table_at(struct OcerzVM *vm, OcerzCPU *cpu, int zoned)
+{
+    static void *_Atomic fns[2];
+    const char *name = zoned ? "NSCreateHashTableWithZone" : "NSCreateHashTable";
+    void *fn = br_foundation_fn(&fns[zoned], name);
+    BrHashCallBacks c;
+    br_ns_table_words(name, cpu->gpr[OCERZ_RSP] + 8, br_hash_words, 5, c.w);
+    uint64_t capacity = cpu->gpr[OCERZ_RDI], zone = cpu->gpr[OCERZ_RSI];
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_FOUNDATION, name, "p({Lbvvp}Lp)", fn);
+    void *t = zoned ? ((void *(*)(BrHashCallBacks, uint64_t, void *))fn)(c, capacity, zone ? ocerz_g2h(zone) : NULL)
+                    : ((void *(*)(BrHashCallBacks, uint64_t))fn)(c, capacity);
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, t ? ocerz_h2g(t) : 0);
+}
+
+static int br_ns_create_map_table(struct OcerzVM *vm, OcerzCPU *cpu) { return br_ns_create_map_table_at(vm, cpu, 0); }
+static int br_ns_create_map_table_with_zone(struct OcerzVM *vm, OcerzCPU *cpu) { return br_ns_create_map_table_at(vm, cpu, 1); }
+static int br_ns_create_hash_table(struct OcerzVM *vm, OcerzCPU *cpu) { return br_ns_create_hash_table_at(vm, cpu, 0); }
+static int br_ns_create_hash_table_with_zone(struct OcerzVM *vm, OcerzCPU *cpu) { return br_ns_create_hash_table_at(vm, cpu, 1); }
+
 /* CoreMedia's CMBlockBufferCustomBlockSource is under pack(4) on both
    architectures: a 32-bit version, then AllocateBlock at offset 4 and
    FreeBlock at 12, so its function pointers are at no word boundary a shape
@@ -2847,6 +2933,10 @@ static const BrHandler g_br_handlers[] = {
     { "NSGetUncaughtExceptionHandler", ocerz_objc_NSGetUncaughtExceptionHandler },
     { "cg_data_consumer_create", br_cg_data_consumer_create },
     { "cg_pattern_create", br_cg_pattern_create },
+    { "ns_create_map_table", br_ns_create_map_table },
+    { "ns_create_map_table_with_zone", br_ns_create_map_table_with_zone },
+    { "ns_create_hash_table", br_ns_create_hash_table },
+    { "ns_create_hash_table_with_zone", br_ns_create_hash_table_with_zone },
     { "vt_decompression_session_create", br_vt_decompression_session_create },
     { "sqlite3_config", br_sqlite3_config },
     { "sqlite3_db_config", br_sqlite3_db_config },

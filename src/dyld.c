@@ -724,7 +724,7 @@ typedef struct DynImage {
     struct SymIndex *symidx;
 } DynImage;
 
-#define DYN_DIMG_MAX 256
+#define DYN_DIMG_MAX 2048   /* VLC 2.2 alone loads 301 plugins */
 static DynImage g_dimgs[DYN_DIMG_MAX];
 static int g_dimgs_n;
 static DynImage g_main_dimg;
@@ -868,6 +868,19 @@ static int dimg_segments_overlap(const DynImage *d, uint64_t lo, uint64_t hi, in
         lc += rd32(lc + 4);
     }
     return 0;
+}
+
+/* The file of the guest image whose segments hold addr, or NULL.  It answers class_getImageName for a guest class
+ * (src/objcclass.c), so it is the path the image was loaded from, never an install name such as
+ * @executable_path/..., which NSBundle cannot turn into a bundle. */
+const char *ocerz_dyld_path_containing(uint64_t addr)
+{
+    for (int i = 0; i < g_dimgs_n; i++) {
+        const DynImage *d = &g_dimgs[i];
+        if (!d->is_virtual && d->path[0] == '/' && dimg_segments_overlap(d, addr, addr + 1, 0))
+            return d->path;
+    }
+    return NULL;
 }
 
 const char *ocerz_dyld_image_overlapping(uint64_t lo, uint64_t hi, int exec_only, uint64_t *base_out)
@@ -1418,17 +1431,24 @@ static uint64_t disk_flat_resolve_ex(const char *name, int *found)
     return 0;
 }
 
-/* An image from the guest root (runtime/guest: the x86 libc++, libc++abi,
-   libunwind and libstdc++ that stand in for the system's).  The real ones live
+/* An image from a guest root (runtime/guest: the x86 libc++, libc++abi,
+   libunwind and Swift, and runtime/guest-gnu: libstdc++, which stand in for the
+   system's).  The real ones live
    in the shared cache, whose weak references dyld answers from the cache and
    the main executable's overrides only, never from another dylib: Unity 2019's
    UnityPlayer exports its own operator new, and libc++ bound to it allocated
    strings that a game's libsteam_api then freed with free(). */
 static int dimg_is_guest_system(const DynImage *d)
 {
-    const char *root = getenv("OCERZ_GUEST_ROOT");
-    size_t n = root ? strlen(root) : 0;
-    return d && (n ? strncmp(d->path, root, n) == 0 && d->path[n] == '/' : strstr(d->path, "/runtime/guest/") != NULL);
+    static const char *const envs[2] = { "OCERZ_GUEST_ROOT", "OCERZ_GUEST_GNU_ROOT" };
+    static const char *const dirs[2] = { "/runtime/guest/", "/runtime/guest-gnu/" };
+    for (int r = 0; d && r < 2; r++) {
+        const char *root = getenv(envs[r]);
+        size_t n = root ? strlen(root) : 0;
+        if (n ? strncmp(d->path, root, n) == 0 && d->path[n] == '/' : strstr(d->path, dirs[r]) != NULL)
+            return 1;
+    }
+    return 0;
 }
 
 static uint64_t disk_flat_resolve(const char *name)
@@ -1605,6 +1625,34 @@ static uint64_t missing_null_class(const char *cname, int meta)
     return (uint64_t)(uintptr_t)(meta ? meta_of(cls) : cls);
 }
 
+static const char *host_cache_real_path(const char *path);
+
+/*
+ * A library Apple shipped for Intel Macs that no macOS on Apple silicon has at
+ * all: under /System/Library or /usr/lib, on no disk, in neither the host's
+ * shared cache nor a guest root, and in no database.  QTKit, VideoDecodeAcceleration
+ * and the 0.9.x libcrypto are.  Rosetta's x86_64 cache still holds them, so an
+ * Intel program links them freely, and in native mode no image for one can
+ * exist: refusing a program, or a dlopen of its plug-in, over it keeps all of
+ * it from running.  Its imports are stubbed instead, by default, the way
+ * OCERZ_STUB_MISSING=1 stubs any (native_missing_stub), each named as it binds.
+ * VLC 2.2's interface links QTKit for its capture panel alone.
+ * OCERZ_NO_STUB_REMOVED=1 refuses them again.
+ */
+static int removed_system_library(const char *path)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_STUB_REMOVED") ? 1 : 0;
+    if (off || ocerz_mode != OCERZ_MODE_NATIVE || !path ||
+        (strncmp(path, "/System/Library/", 16) != 0 && strncmp(path, "/usr/lib/", 9) != 0))
+        return 0;
+    struct stat st;
+    char guest[PATH_MAX];
+    return stat(path, &st) != 0 && !host_cache_real_path(path) && !native_guest_path(path, guest, sizeof guest) &&
+           !ocerz_vdylib_have(path);
+}
+
 static uint64_t native_missing_stub(const char *name, const char *lib)
 {
     static uint64_t ret0;
@@ -1638,6 +1686,42 @@ static uint64_t native_missing_stub(const char *name, const char *lib)
     }
     fprintf(stderr, "ocerz: native: stubbed %s %s (missing in %s)\n", kind, name, lib ? lib : "(flat)");
     return v;
+}
+
+/*
+ * An _OBJC_IVAR_$_<class>.<ivar> import is the offset a guest subclass reads
+ * a superclass's field at, which the databases omit (tools/sdkgen, objc-ivar).
+ * In native mode the object is the native class's, so the offset is the native
+ * runtime's, ivar_getOffset, in a cell of its own: x86_64 reads the variable
+ * as 64 bits where arm64 declares it 32, so the host's own symbol would give
+ * the guest the next variable's bits as well.  VLC's interface reads
+ * NSWindow's _styleMask this way.  An ivar the native class does not have
+ * stays a miss.
+ */
+static uint64_t native_ivar_offset(const char *name, int *found)
+{
+    static const char prefix[] = "_OBJC_IVAR_$_";
+    const char *dot = strncmp(name, prefix, sizeof prefix - 1) == 0 ? strchr(name + sizeof prefix - 1, '.') : NULL;
+    if (ocerz_mode != OCERZ_MODE_NATIVE || !dot || getenv("OCERZ_NO_NATIVE_IVAR"))
+        return 0;
+    char cname[256];
+    size_t clen = (size_t)(dot - (name + sizeof prefix - 1));
+    if (clen == 0 || clen >= sizeof cname)
+        return 0;
+    memcpy(cname, name + sizeof prefix - 1, clen);
+    cname[clen] = '\0';
+    void *(*get)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    void *(*ivar)(void *, const char *) = dlsym(RTLD_DEFAULT, "class_getInstanceVariable");
+    ptrdiff_t (*offset)(void *) = dlsym(RTLD_DEFAULT, "ivar_getOffset");
+    void *cls = get ? get(cname) : NULL;
+    void *iv = cls && ivar ? ivar(cls, dot + 1) : NULL;
+    uint64_t *cell = iv && offset ? malloc(sizeof *cell) : NULL;
+    if (!cell)
+        return 0;
+    *cell = (uint64_t)offset(iv);
+    *found = 1;
+    OCERZ_LOG("dynamic: %s is native offset %llu\n", name, (unsigned long long)*cell);
+    return ocerz_h2g(cell);
 }
 
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
@@ -1725,12 +1809,15 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
             OCERZ_LOG("dynamic: %s in %s bound in %s instead\n", name, tgt ? tgt : "(flat)",
                       hit ? hit : "?");
     }
+    if (!found && ocerz_mode == OCERZ_MODE_NATIVE)
+        value = native_ivar_offset(name, &found);
     /* A weak import is stubbed too, except a weak class, which stays NULL as
        it would on a macOS without it: the game tests [NSTouchBar class] and
        skips the feature, where a placeholder would send it into it. */
-    if (!found && weak && !strncmp(name, "_OBJC_", 6) && ocerz_mode == OCERZ_MODE_NATIVE && stub_missing_enabled())
+    int stub = !found && ocerz_mode == OCERZ_MODE_NATIVE && (stub_missing_enabled() || removed_system_library(tgt));
+    if (stub && weak && !strncmp(name, "_OBJC_", 6))
         fprintf(stderr, "ocerz: native: weak class %s left NULL (missing in %s)\n", name, tgt ? tgt : "(flat)");
-    else if (!found && ocerz_mode == OCERZ_MODE_NATIVE && stub_missing_enabled()) {
+    else if (stub) {
         value = native_missing_stub(name, libord == -1 ? "(main executable)" : tgt);
         found = 1;
     }
@@ -3825,31 +3912,50 @@ static void native_dl_reason(const char *what, const char *path)
     snprintf(g_ndl.reason, sizeof g_ndl.reason, what, path ? path : "");
 }
 
+/* A guest root: the directory env names, or leaf beside ocerz's own executable
+   when it is unset, and none when it is set empty. */
+static const char *native_guest_root(const char *env, const char *leaf, char *buf, size_t n)
+{
+    const char *root = getenv(env);
+    if (root)
+        return root[0] ? root : NULL;
+    char exe[PATH_MAX];
+    uint32_t size = sizeof exe;
+    if (n < PATH_MAX || _NSGetExecutablePath(exe, &size) != 0 || !realpath(exe, buf))
+        return NULL;
+    char *slash = strrchr(buf, '/');
+    if (!slash || (size_t)(slash - buf) + strlen(leaf) + 1 > n)
+        return NULL;
+    strcpy(slash, leaf);
+    return buf;
+}
+
+/* The guest roots, in order: runtime/guest, the LLVM C++ runtime and Swift
+   ocerz builds and ships (OCERZ_GUEST_ROOT), then runtime/guest-gnu, GCC's
+   libstdc++ and what it links, which tools/fetch_guest_gnu_cxx.sh fetches and
+   no release carries (OCERZ_GUEST_GNU_ROOT).  macOS on Apple silicon has no
+   /usr/lib/libstdc++.6.dylib; Rosetta's x86_64 shared cache still does, and
+   VLC 2.2's matroska, DASH, live555, UPnP and taglib plugins import it. */
 static int native_guest_path(const char *name, char *out, size_t n)
 {
-    const char *root = getenv("OCERZ_GUEST_ROOT");
+    static const char *const envs[2] = { "OCERZ_GUEST_ROOT", "OCERZ_GUEST_GNU_ROOT" };
+    static const char *const leaves[2] = { "/runtime/guest", "/runtime/guest-gnu" };
     if (ocerz_mode != OCERZ_MODE_NATIVE || !name || name[0] != '/')
-        return 0;
-    char default_root[PATH_MAX];
-    if (!root) {
-        char exe[PATH_MAX];
-        uint32_t size = sizeof exe;
-        if (_NSGetExecutablePath(exe, &size) != 0 || !realpath(exe, default_root))
-            return 0;
-        char *slash = strrchr(default_root, '/');
-        if (!slash || (size_t)(slash - default_root) + sizeof "/runtime/guest" > sizeof default_root)
-            return 0;
-        strcpy(slash, "/runtime/guest");
-        root = default_root;
-    }
-    if (!root[0])
         return 0;
     static const char cryptex[] = "/System/Volumes/Preboot/Cryptexes/OS";
     if (strncmp(name, cryptex, sizeof cryptex - 1) == 0 && name[sizeof cryptex - 1] == '/')
         name += sizeof cryptex - 1;
-    int len = snprintf(out, n, "%s%s", root, name);
-    struct stat st;
-    return len > 0 && (size_t)len < n && lstat(out, &st) == 0;
+    for (int r = 0; r < 2; r++) {
+        char buf[PATH_MAX];
+        const char *root = native_guest_root(envs[r], leaves[r], buf, sizeof buf);
+        if (!root)
+            continue;
+        int len = snprintf(out, n, "%s%s", root, name);
+        struct stat st;
+        if (len > 0 && (size_t)len < n && lstat(out, &st) == 0)
+            return 1;
+    }
+    return 0;
 }
 
 static uint64_t virt_slot_of(void *ctx, const char *export_name)
@@ -4035,10 +4141,21 @@ static void load_disk_deps(OcerzCache *cache, DynImage *loader, const RpathList 
                 /* A library the host has but no database describes stops the
                    dlopen only if something is imported from it: the binds
                    count those as misses, Symbol not found, so one nothing
-                   uses is passed over the way dyld would load it unused. */
+                   uses is passed over the way dyld would load it unused.
+                   So is a system library no Apple silicon Mac has
+                   (removed_system_library), and under OCERZ_STUB_MISSING=1
+                   any that exists nowhere, as at startup; their imports are
+                   stubbed. */
                 int unused_host = !dep && g_ndl.host_only && !getenv("OCERZ_NO_HOST_ONLY_DEP");
+                int stubbed = !dep && !g_ndl.host_only && g_ndl.active &&
+                              (stub_missing_enabled() || removed_system_library(name));
                 if (unused_host)
                     OCERZ_LOG("dynamic: %s has no API database; %s loads without it\n", name, loader->path);
+                if (stubbed) {
+                    fprintf(stderr, "ocerz: native: %s is not on this system; %s loads without it\n", name,
+                            loader->path);
+                    unused_host = 1;
+                }
                 if (!dep && !unused_host && g_ndl.active && cmd != LC_LOAD_WEAK_DYLIB && !g_ndl.missing[0]) {
                     snprintf(g_ndl.missing, sizeof g_ndl.missing, "%s", name);
                     snprintf(g_ndl.missing_from, sizeof g_ndl.missing_from, "%s", loader->path);
@@ -6166,6 +6283,12 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                 g_native_miss_n + g_native_miss_dropped);
         fprintf(stderr, "ocerz: native: to run it translated instead, supply an x86_64 build at $OCERZ_GUEST_ROOT%s (JIT, no Rosetta needed)\n",
                 " or runtime/guest beside ocerz");
+        for (int i = 0; i < g_native_miss_n; i++)
+            if (strcmp(g_native_miss[i].lib, "/usr/lib/libstdc++.6.dylib") == 0) {
+                fprintf(stderr, "ocerz: native: libstdc++ is GCC's C++ runtime; bash tools/fetch_guest_gnu_cxx.sh fetches"
+                                " an x86_64 one into runtime/guest-gnu\n");
+                break;
+            }
         free(buf);
         return 71;
     }

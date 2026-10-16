@@ -469,6 +469,8 @@ void *ocerz_abi_callback_intern(uint64_t guest_fn, const char *notation);
 const OcerzAbiSig *ocerz_abi_callback_sig(const void *slot_address, uint64_t *guest_fn);
 
 int ocerz_abi_is_guest_code(uint64_t gptr);
+/* a native call that jumped into guest code: where to resume it so the guest function runs (src/abi.c) */
+int ocerz_abi_bounce_from_fault(uint64_t guest_fn, uint64_t *pc_out);
 uint64_t ocerz_abi_dtime_to_host(uint64_t t);
 uint64_t ocerz_abi_dtime_to_guest(uint64_t t);
 

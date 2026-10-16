@@ -7,14 +7,15 @@ echo "native framework logs: $work"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/key.pem" -out "$work/cert.pem" \
     -subj '/CN=ocerz framework test' -days 2 > "$work/certificate.log" 2>&1
 openssl x509 -in "$work/cert.pem" -outform der -out "$work/cert.der"
-# A framework with an identifier, an Info.plist and a resource, which
-# native_bundle_id dlopens and then looks up by identifier.
+# A framework with an identifier, an Info.plist, a resource and a class, which
+# native_bundle_id dlopens and then looks up by identifier and by the class.
 probe_framework() {
     local arch=$1 fw="$work/fw.$1/OcerzProbe.framework"
     mkdir -p "$fw/Versions/A/Resources"
-    printf 'int ocerz_probe(void) { return 7; }\n' > "$work/probe.c"
-    clang -arch "$arch" -dynamiclib -install_name @rpath/OcerzProbe.framework/OcerzProbe "$work/probe.c" \
-        -o "$fw/Versions/A/OcerzProbe"
+    printf '#import <Foundation/Foundation.h>\n@interface OcerzProbeClass : NSObject\n@end\n@implementation OcerzProbeClass\n@end\nint ocerz_probe(void) { return 7; }\n' \
+        > "$work/probe.m"
+    clang -arch "$arch" -dynamiclib -install_name @rpath/OcerzProbe.framework/OcerzProbe "$work/probe.m" \
+        -framework Foundation -o "$fw/Versions/A/OcerzProbe"
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>org.ocerz.probe</string><key>CFBundleExecutable</key><string>OcerzProbe</string><key>CFBundlePackageType</key><string>FMWK</string></dict></plist>\n' \
         > "$fw/Versions/A/Resources/Info.plist"
     printf 'shaders' > "$fw/Versions/A/Resources/probe.txt"
@@ -52,6 +53,8 @@ for arch in x86_64 arm64; do
         -framework SystemConfiguration -framework CoreFoundation -lresolv -o "$work/wine_imports.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_bundle_id.m \
         -framework Foundation -o "$work/bundle_id.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror -Wno-deprecated-declarations -fno-objc-arc \
+        tests/dynamic/native_legacy_apps.m -framework AppKit -o "$work/legacy_apps.$arch"
     probe_framework "$arch"
     # A library found only through the executable's LC_RPATH, by its leaf name.
     mkdir -p "$work/leaf.$arch"
@@ -97,6 +100,19 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/wine_imports.arm64" > "$work/wine_imports.expected"
 "$work/bundle_id.arm64" "$work/fw.arm64/OcerzProbe.framework/OcerzProbe" > "$work/bundle_id.expected"
 "$work/game_imports.arm64" > "$work/game_imports.expected"
+"$work/legacy_apps.arm64" > "$work/legacy_apps.expected"
+# A system library no Apple silicon Mac has, as QTKit is: linked by the program
+# and by a plug-in it opens, and on no disk when they run.  Rosetta is not the
+# oracle, it refuses both; native mode stubs the library's imports.
+mkdir -p "$work/removed"
+printf 'int ocerz_removed_probe(void) { return 7; }\n' > "$work/removed.c"
+clang -arch x86_64 -dynamiclib -install_name /usr/lib/libocerz_removed_probe.dylib "$work/removed.c" \
+    -o "$work/removed/libocerz_removed_probe.dylib"
+clang -arch x86_64 -O1 -Wall -Wextra -Werror tests/dynamic/native_removed_library.c \
+    "$work/removed/libocerz_removed_probe.dylib" -o "$work/removed_library.x86_64"
+clang -arch x86_64 -O1 -Wall -Wextra -Werror -dynamiclib -DPLUGIN tests/dynamic/native_removed_library.c \
+    "$work/removed/libocerz_removed_probe.dylib" -o "$work/removed_plugin.x86_64.dylib"
+printf 'removed library: call 0\nplug-in loaded 1, call 0\n' > "$work/removed_library.expected"
 for engine in jit interpreter slow-bridge; do
     args=(-native -v)
     extra=()
@@ -174,7 +190,21 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/bundle_id.x86_64" "$work/fw.x86_64/OcerzProbe.framework/OcerzProbe" \
         > "$work/bundle_id.$engine.out" 2> "$work/bundle_id.$engine.err"
     cmp "$work/bundle_id.expected" "$work/bundle_id.$engine.out"
-    echo "PASS native bundle lookup by identifier for a dlopened framework $engine"
+    echo "PASS native bundle lookup by identifier and by class for a dlopened framework $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/legacy_apps.x86_64" > "$work/legacy_apps.$engine.out" 2> "$work/legacy_apps.$engine.err"
+    cmp "$work/legacy_apps.expected" "$work/legacy_apps.$engine.out"
+    echo "PASS native GC barriers, gradient pairs, positional formats, a stored guest function, map and hash table callbacks, a union sent by value and a superclass ivar offset $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/removed_library.x86_64" "$work/removed_plugin.x86_64.dylib" \
+        > "$work/removed_library.$engine.out" 2> "$work/removed_library.$engine.err"
+    cmp "$work/removed_library.expected" "$work/removed_library.$engine.out"
+    rc=0
+    env OCERZ_GUEST_ROOT= OCERZ_NO_STUB_REMOVED=1 ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' \
+        "$repo/ocerz" "${args[@]}" "$work/removed_library.x86_64" > /dev/null \
+        2> "$work/removed_library.$engine.refused.err" || rc=$?
+    [ "$rc" = 71 ]
+    echo "PASS native system library no Apple silicon Mac has, stubbed for the program and its plug-in $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/game_imports.x86_64" > "$work/game_imports.$engine.out" 2> "$work/game_imports.$engine.err"
     cmp "$work/game_imports.expected" "$work/game_imports.$engine.out"

@@ -62,7 +62,9 @@
  * class keeps its address; every method implementation native code reaches is
  * a callback slot bound to the guest's function, or ocerz_objcbridge_dead_imp
  * for a method whose types do not cross or for which the bank had no slot, and
- * that function stops the process naming the method when it is called; every
+ * that function stops the process naming the method when native code calls it
+ * (a guest send reaches the guest's function through
+ * ocerz_objcbridge_dead_guest_imp, which answers 0 for a method not buried); every
  * __objc_protorefs word holds a native protocol afterwards; and the image's
  * +load methods are queued.  The answer is the number of class and category
  * list entries, or 0 for an image with none of those sections or one defined
@@ -188,6 +190,7 @@ enum {
     OCERZ_OBJC_VA_FORMAT = 1,
     OCERZ_OBJC_VA_NIL_TERMINATED,
     OCERZ_OBJC_VA_LIST,
+    OCERZ_OBJC_VA_OBJECT_DOUBLE,   /* nil-terminated pairs of an object and a double after the last named object */
 };
 
 typedef struct OcerzObjcVariadic {
@@ -292,6 +295,7 @@ int ocerz_objcbridge_guest_swift_object(const void *obj);
 int ocerz_objcbridge_swift_destroy_fault(uint64_t pc, uint64_t context);
 void ocerz_objcbridge_swift_destroy(void *object, uint64_t destroy);
 void *ocerz_objcbridge_dead_imp(void);
+uint64_t ocerz_objcbridge_dead_guest_imp(void *cls, void *sel);
 
 int ocerz_objc_read_class(uint64_t addr, OcerzObjcClass *out);
 int ocerz_objc_read_ro(uint64_t addr, OcerzObjcRo *out);

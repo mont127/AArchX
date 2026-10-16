@@ -173,7 +173,11 @@
  * dialect, where %K is an object and a quoted %@ is text.  encodeValuesOfObjCTypes:
  * and decodeValuesOfObjCTypes: take one pointer per type in their type list.  A
  * nil-terminated method's are pointers up to and including the first nil, and
- * none at all when the last named argument is already nil.  The engine gathers
+ * none at all when the last named argument is already nil.  NSGradient's
+ * initWithColorsAndLocations: takes pairs, a color and then a CGFloat location,
+ * the first color being its last named argument, up to a nil color; a double
+ * comes from where System V put a double, in the XMM save area or on the stack.
+ * The engine gathers
  * them from wherever System V put them, continuing after the named arguments
  * through ocerz_abi_va_start and ocerz_abi_va_arg, and they go on the native
  * stack after the named arguments' own, one slot each.  A selector in the list
@@ -202,7 +206,11 @@
  * and a 32-bit int in a CoreFoundation format, which is what each reads on this
  * host.  %c and %C are an int, %s and %S a pointer followed, %p a word printed
  * and never converted, %@ an object, the floating conversions a double.  A
- * long double conversion, %n, a positional argument, and a conversion the
+ * positional conversion, %1$@, takes the argument its position names, so the
+ * arguments are gathered in position order, as many as the highest position,
+ * and a format that leaves a position unused or mixes positional and
+ * sequential conversions is refused.  A
+ * long double conversion, %n, and a conversion the
  * dialect does not have are refused with the export and the format, because a
  * guess at any of them reads the wrong slot for every argument after it.  The
  * crossing's rounding mode is the default one, as for every crossing, so a
@@ -939,6 +947,9 @@ int ocerz_objc_format_classes(const char *fmt, int dialect, char *out, size_t ou
     const char *unused;
     size_t n = 0;
     char quote = 0;
+    int mode = 0;                 /* 1: sequential arguments, 2: positional */
+    char pos[OCERZ_OBJC_VARIADIC_MAX] = { 0 };
+    size_t npos = 0;
 
     if (!why)
         why = &unused;
@@ -996,34 +1007,57 @@ int ocerz_objc_format_classes(const char *fmt, int dialect, char *out, size_t ou
         if (*p == '\0')
             break;
 
+        /* %n$: the argument a conversion takes is the nth, and every conversion then names one (positional
+         * and sequential arguments do not mix, in C or in CoreFoundation's formats); the arguments are
+         * gathered in position order, which is the order the native formatter reads their slots in */
         const char *d = p;
+        long at = 0;
         while (isdigit((unsigned char)*d))
             d++;
         if (d > p && *d == '$') {
-            *why = "a positional argument (%n$)";
+            at = strtol(p, NULL, 10);
+            if (mode == 1 || at < 1 || (size_t)at >= outlen || at > (long)sizeof pos) {
+                *why = mode == 1 ? "positional and sequential arguments mixed" : "a positional argument out of range";
+                return -1;
+            }
+            mode = 2;
+            p = d + 1;
+        } else if (mode == 2) {
+            *why = "positional and sequential arguments mixed";
             return -1;
+        } else {
+            mode = 1;
         }
         while (*p && strchr("-+ #0'", *p))
             p++;
-        if (*p == '*') {
-            OB_EMIT('i');
-            p++;
-            if (isdigit((unsigned char)*p)) {
-                *why = "a positional width (*n$)";
-                return -1;
+        for (int part = 0; part < 2; part++) {   /* the width, then the precision after its '.' */
+            if (part == 1) {
+                if (*p != '.')
+                    break;
+                p++;
             }
-        } else {
-            while (isdigit((unsigned char)*p))
-                p++;
-        }
-        if (*p == '.') {
-            p++;
             if (*p == '*') {
-                OB_EMIT('i');
                 p++;
-                if (isdigit((unsigned char)*p)) {
-                    *why = "a positional precision (.*n$)";
-                    return -1;
+                const char *q = p;
+                while (isdigit((unsigned char)*q))
+                    q++;
+                if (mode == 2) {
+                    long w = q > p && *q == '$' ? strtol(p, NULL, 10) : 0;
+                    if (w < 1 || (size_t)w >= outlen || w > (long)sizeof pos ||
+                        (pos[w - 1] && pos[w - 1] != 'i')) {
+                        *why = "a positional width or precision that is not an int of its own position";
+                        return -1;
+                    }
+                    pos[w - 1] = 'i';
+                    if ((size_t)w > npos)
+                        npos = (size_t)w;
+                    p = q + 1;
+                } else {
+                    if (q > p) {
+                        *why = "a positional width or precision (*n$) among sequential arguments";
+                        return -1;
+                    }
+                    OB_EMIT('i');
                 }
             } else {
                 while (isdigit((unsigned char)*p))
@@ -1052,6 +1086,7 @@ int ocerz_objc_format_classes(const char *fmt, int dialect, char *out, size_t ou
             p++;
         }
 
+        char cls;
         switch (*p) {
         case 'd':
         case 'i':
@@ -1059,23 +1094,23 @@ int ocerz_objc_format_classes(const char *fmt, int dialect, char *out, size_t ou
         case 'u':
         case 'x':
         case 'X':
-            OB_EMIT(len == 'l' || len == 'q' ? 'l' : 'i');
+            cls = len == 'l' || len == 'q' ? 'l' : 'i';
             break;
         case 'D':
         case 'O':
         case 'U':
-            OB_EMIT(dialect == OCERZ_OBJC_FMT_C || len == 'l' || len == 'q' ? 'l' : 'i');
+            cls = dialect == OCERZ_OBJC_FMT_C || len == 'l' || len == 'q' ? 'l' : 'i';
             break;
         case 'c':
         case 'C':
-            OB_EMIT('i');
+            cls = 'i';
             break;
         case 's':
         case 'S':
-            OB_EMIT('p');
+            cls = 'p';
             break;
         case 'p':
-            OB_EMIT('L');
+            cls = 'L';
             break;
         case 'e':
         case 'E':
@@ -1089,7 +1124,7 @@ int ocerz_objc_format_classes(const char *fmt, int dialect, char *out, size_t ou
                 *why = "a long double conversion (%L)";
                 return -1;
             }
-            OB_EMIT('d');
+            cls = 'd';
             break;
         case 'n':
             *why = "%n, which writes through its argument";
@@ -1099,21 +1134,40 @@ int ocerz_objc_format_classes(const char *fmt, int dialect, char *out, size_t ou
                 *why = "%@, which a C format does not have";
                 return -1;
             }
-            OB_EMIT('p');
+            cls = 'p';
             break;
         case 'K':
             if (dialect != OCERZ_OBJC_FMT_PREDICATE) {
                 *why = "%K, which only a predicate format has";
                 return -1;
             }
-            OB_EMIT('p');
+            cls = 'p';
             break;
         case '\0':
-            return (int)n;
+            goto done;
         default:
             *why = "a conversion this format dialect does not have";
             return -1;
         }
+        if (mode == 2) {
+            if (pos[at - 1] && pos[at - 1] != cls) {
+                *why = "one positional argument converted as two different types";
+                return -1;
+            }
+            pos[at - 1] = cls;
+            if ((size_t)at > npos)
+                npos = (size_t)at;
+        } else {
+            OB_EMIT(cls);
+        }
+    }
+done:
+    for (size_t k = 0; mode == 2 && k < npos; k++) {
+        if (!pos[k]) {
+            *why = "a positional argument that no conversion takes";
+            return -1;
+        }
+        OB_EMIT(pos[k]);
     }
 #undef OB_EMIT
     return (int)n;
@@ -1151,6 +1205,7 @@ static const OcerzObjcVariadic g_ob_variadic[] = {
     { "orderedSetWithObjects:",                OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
     { "dictionaryWithObjectsAndKeys:",         OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
     { "initWithObjectsAndKeys:",               OCERZ_OBJC_VA_NIL_TERMINATED, 2, 0, 0, 0 },
+    { "initWithColorsAndLocations:",           OCERZ_OBJC_VA_OBJECT_DOUBLE, 2, 0, 0, 0 },
     { "initWithFormat:arguments:",             OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_CF, 0, 3 },
     { "initWithFormat:locale:arguments:",      OCERZ_OBJC_VA_LIST, 2, OCERZ_OBJC_FMT_CF, 0, 4 },
     { "initWithValidatedFormat:validFormatSpecifiers:arguments:error:",
@@ -1329,7 +1384,8 @@ static void ob_describe(void *cls, void *sel, const char *enc, const char *sourc
     const OcerzObjcVariadic *v = ocerz_objc_variadic(ob_sel_getName(sel));
     if (v) {
         const OcerzAbiSig *sig = &shape->sig;
-        int arg = v->kind == OCERZ_OBJC_VA_NIL_TERMINATED ? sig->nargs - 1 : v->arg;
+        int arg = v->kind == OCERZ_OBJC_VA_NIL_TERMINATED || v->kind == OCERZ_OBJC_VA_OBJECT_DOUBLE
+                  ? sig->nargs - 1 : v->arg;
         if (arg < 2 || arg >= sig->nargs || sig->arg[arg] != 'p')
             v = NULL;
         for (int k = 0; v && v->kind == OCERZ_OBJC_VA_LIST && k <= v->va; k++)
@@ -2118,12 +2174,16 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
      * to its x86 implementation with every register as the guest set it, the
      * return address still on the stack, as native objc_msgSend jumps to an
      * IMP.  Arguments native code could not take, x86 function pointers above
-     * all (Unity's PLCrashSignalHandler), then reach guest code unchanged.
+     * all (Unity's PLCrashSignalHandler), then reach guest code unchanged, and
+     * so does a method whose types do not cross at all, whose native
+     * implementation is the dead one (ocerz/objcbridge.h).
      */
     if (!imp) {
         void *nimp = ((void *(*)(void *, void *))ob_need(&g_ob_class_getMethodImplementation))(cls, sel);
         uint64_t gimp = 0;
-        if (nimp && !(ocerz_abi_callback_sig(nimp, &gimp) && gimp)) {
+        if (nimp && nimp == ocerz_objcbridge_dead_imp())
+            gimp = ocerz_objcbridge_dead_guest_imp(cls, sel);
+        else if (nimp && !(ocerz_abi_callback_sig(nimp, &gimp) && gimp)) {
             uint64_t g = ocerz_h2g(nimp);
             gimp = ocerz_abi_is_guest_code(g) ? g : 0;
         }
@@ -2179,6 +2239,19 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
                 if (nslots == OCERZ_OBJC_VARIADIC_MAX)
                     ob_refuse(cls, sel, "cannot cross: no nil among its first %d variadic arguments",
                               OCERZ_OBJC_VARIADIC_MAX);
+                ocerz_abi_va_arg(&va, cpu, 'p', &slots[nslots]);
+            } while (slots[nslots++] != 0);
+        }
+    } else if (v && v->kind == OCERZ_OBJC_VA_OBJECT_DOUBLE) {
+        if (ob_named(sig, cpu, sig->nargs - 1, 'p')) {
+            OcerzAbiVaList va;
+            if (ocerz_abi_va_start(sig, cpu, &va) != OCERZ_OK)
+                ob_refuse(cls, sel, "cannot cross: the ABI engine cannot find its variadic arguments");
+            do {
+                if (nslots + 2 > OCERZ_OBJC_VARIADIC_MAX)
+                    ob_refuse(cls, sel, "cannot cross: no nil among its first %d variadic arguments",
+                              OCERZ_OBJC_VARIADIC_MAX);
+                ocerz_abi_va_arg(&va, cpu, 'd', &slots[nslots++]);   /* the location of the color before it */
                 ocerz_abi_va_arg(&va, cpu, 'p', &slots[nslots]);
             } while (slots[nslots++] != 0);
         }

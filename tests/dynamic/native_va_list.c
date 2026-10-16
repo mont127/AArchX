@@ -139,7 +139,7 @@ int main(int argc, char **argv)
 {
     if (argc == 2) {
         if (strcmp(argv[1], "reject-positional") == 0)
-            refuse_format("%1$d", 1);
+            refuse_format("%1$d %d", 1, 2);   /* positional and sequential mixed */
         else if (strcmp(argv[1], "reject-long-double") == 0)
             refuse_format("%Lf", (long double)1.5);
         else if (strcmp(argv[1], "reject-writeback") == 0) {

@@ -271,6 +271,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <mach/mach_time.h>
 #include <math.h>
 
@@ -1507,6 +1508,71 @@ const OcerzAbiSig *ocerz_abi_callback_sig(const void *slot_address, uint64_t *gu
     if (guest_fn)
         *guest_fn = g_abi_cb[slot].guest_fn;
     return &g_abi_cb[slot].shape->sig;
+}
+
+/*
+ * Native code that calls a guest function directly.  A crossing converts every guest function a signature says
+ * it passes, but a program can also store an x86 function pointer where native code reads one: HandBrake points
+ * stderr->_write at its own function to collect its log, and in native mode stderr is the host's FILE, so libc's
+ * _swrite jumped into x86 code.  The fault that jump takes (ocerz_abi_bounce_from_fault, from the fault handler,
+ * native mode only) resumes the thread in ocerz_abi_bounce with the native call's registers as they were, so the
+ * guest function runs as a callback with x0 to x5 as rdi to r9, and its rax goes back to the native caller as x0.
+ * That is right for a function taking only integers and pointers, which is every libc hook of this kind; one
+ * taking floating point or a structure by value cannot be told apart and gets garbage there.  Each such function
+ * is named once on stderr.  OCERZ_NO_NATIVE_BOUNCE=1 lets the fault stop the process as before.
+ */
+static __thread uint64_t t_bounce_target;
+
+uint64_t ocerz_abi_bounce(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    uint64_t target = t_bounce_target;
+    OcerzCPU *cpu = ocerz_vm_current_cpu();
+    if (!cpu)
+        cpu = ocerz_thread_attach(ocerz_vm_process());
+    if (!cpu || !cpu->vm || cpu->vm->exited || !target)
+        return 0;
+    OcerzGuestCall call;
+    memset(&call, 0, sizeof call);
+    call.gpr[0] = a0;
+    call.gpr[1] = a1;
+    call.gpr[2] = a2;
+    call.gpr[3] = a3;
+    call.gpr[4] = a4;
+    call.gpr[5] = a5;
+    uint64_t stack_top = (cpu->gpr[OCERZ_RSP] - 128) & ~0xfull;
+    struct OcerzBridgeFrame saved;
+    ocerz_bridge_guest_enter(&saved);
+    uint64_t fpcr = ocerz_abi_round_swap(ocerz_abi_round_of_mxcsr(cpu->mxcsr));
+    ocerz_vm_call_abi(cpu->vm, target, &call, stack_top);
+    ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
+    ocerz_bridge_guest_leave(&saved);
+    return call.rax;
+}
+
+int ocerz_abi_bounce_from_fault(uint64_t guest_fn, uint64_t *pc_out)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_NATIVE_BOUNCE") ? 1 : 0;
+    if (off || !ocerz_abi_is_guest_code(guest_fn))
+        return 0;
+    static uint64_t named[64];
+    static int nnamed;
+    int seen = 0;
+    for (int i = 0; i < nnamed && !seen; i++)
+        seen = named[i] == guest_fn;
+    if (!seen) {
+        if (nnamed < 64)
+            named[nnamed++] = guest_fn;
+        char line[160];
+        int n = snprintf(line, sizeof line, "ocerz: native: native code called guest function %#llx directly; it"
+                         " runs with its integer arguments\n", (unsigned long long)guest_fn);
+        if (n > 0)
+            write(2, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+    }
+    t_bounce_target = guest_fn;
+    *pc_out = (uint64_t)(uintptr_t)ocerz_abi_bounce;
+    return 1;
 }
 
 int ocerz_abi_is_guest_code(uint64_t gptr)

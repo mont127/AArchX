@@ -73,9 +73,12 @@
  * A method whose types do not cross - a long double, a union, a bitfield, more
  * arguments than the ABI engine carries - does not keep its class out.  Its
  * implementation is one native function, the same for every such method, and
- * the class, selector, types and reason are recorded beside it; called, it walks
- * the receiver's classes for the record and stops with OCERZ_BRIDGE_UNIMPL_EXIT
- * naming the method and why.  A method the callback bank has no slot left for
+ * the class, selector, types, reason and guest function are recorded beside it;
+ * called, it walks the receiver's classes for the record and stops with
+ * OCERZ_BRIDGE_UNIMPL_EXIT naming the method and why.  A guest send of it needs
+ * no crossing, and ocerz_objcbridge_dead_guest_imp hands objc_msgSend the guest
+ * function: VLC's interface initializes its menu items with a vlc_value_t, a
+ * union, by value.  A method the callback bank has no slot left for
  * is bound to it the same way, so a full bank is a named refusal when the method
  * is called and not before.  The records are an append-only list read without
  * a lock.
@@ -236,6 +239,7 @@
 #include "ocerz/objcbridge.h"
 #include "ocerz/abi.h"
 #include "ocerz/bridge.h"
+#include "ocerz/dyld.h"
 #include "ocerz/mem.h"
 #include "ocerz/vdylib.h"
 #include "ocerz/vm.h"
@@ -297,6 +301,7 @@ static OcSym g_oc_protocol_addMethodDescription = OC_SYM("protocol_addMethodDesc
 static OcSym g_oc_protocol_addProperty = OC_SYM("protocol_addProperty");
 static OcSym g_oc_pool_push = OC_SYM("objc_autoreleasePoolPush");
 static OcSym g_oc_pool_pop = OC_SYM("objc_autoreleasePoolPop");
+static OcSym g_oc_setHook_getImageName = OC_SYM("objc_setHook_getImageName");
 
 static void *oc_sym(OcSym *s)
 {
@@ -756,6 +761,7 @@ typedef struct OcDead {
     void *cls;
     void *sel;
     const char *types;
+    uint64_t imp;
     char why[];
 } OcDead;
 
@@ -804,7 +810,17 @@ void *ocerz_objcbridge_dead_imp(void)
     return (void *)oc_dead_imp;
 }
 
-static void *oc_bury(void *cls, const char *clsname, int meta, void *sel, const char *types, const char *why)
+uint64_t ocerz_objcbridge_dead_guest_imp(void *cls, void *sel)
+{
+    for (void *c = cls; c; c = oc_superclass(c))
+        for (const OcDead *d = g_oc_dead; d; d = d->next)
+            if (d->cls == c && d->sel == sel)
+                return d->imp;
+    return 0;
+}
+
+static void *oc_bury(void *cls, const char *clsname, int meta, void *sel, const char *types, const char *why,
+                     uint64_t imp)
 {
     size_t len = strlen(why);
     OcDead *d = malloc(sizeof *d + len + 1);
@@ -813,6 +829,7 @@ static void *oc_bury(void *cls, const char *clsname, int meta, void *sel, const 
     d->cls = cls;
     d->sel = sel;
     d->types = types;
+    d->imp = imp;
     memcpy(d->why, why, len + 1);
     d->next = g_oc_dead;
     g_oc_dead = d;
@@ -831,10 +848,10 @@ static void *oc_imp(void *cls, const char *clsname, int meta, void *sel, const c
     char notation[OCERZ_OBJC_NOTATION_MAX];
     int rc = ocerz_objc_method_notation(types, notation, sizeof notation);
     if (rc != OCERZ_OBJC_OK)
-        return oc_bury(cls, clsname, meta, sel, types, ocerz_objc_refusal(rc));
+        return oc_bury(cls, clsname, meta, sel, types, ocerz_objc_refusal(rc), imp);
     void *tramp = ocerz_abi_callback_intern(imp, notation);
     if (!tramp)
-        return oc_bury(cls, clsname, meta, sel, types, "no slot left in the callback bank");
+        return oc_bury(cls, clsname, meta, sel, types, "no slot left in the callback bank", imp);
     if (oc_logging())
         fprintf(stderr, "ocerz: OBJCLOG[%d] define %c[%s %s] %s at %#llx\n", (int)getpid(), meta ? '+' : '-',
                 clsname, oc_sel_name(sel), notation, (unsigned long long)imp);
@@ -1506,6 +1523,37 @@ static void oc_schedule_category(uint64_t addr, uint32_t image_flags)
     }
 }
 
+/*
+ * Which image a class came from.  Foundation's +[NSBundle bundleForClass:] asks class_getImageName, and libobjc
+ * asks the host's dyld, which never heard of a guest image: every guest class then answered the main bundle, and
+ * a framework's resources were not found in it (Sparkle's nibs, in Sequel Pro).  A guest class lives in its
+ * image's own memory, since objc_readClassPair realizes it in place, so the image whose segments hold it is
+ * the answer; any other class goes to the hook before ours.
+ */
+static bool (*g_oc_prev_image_name)(void *cls, const char **out);
+
+static bool oc_guest_image_name(void *cls, const char **out)
+{
+    if (cls && ocerz_host_in_guest_space(cls)) {
+        const char *name = ocerz_dyld_path_containing(ocerz_h2g(cls));
+        if (name) {
+            *out = name;
+            return true;
+        }
+    }
+    return g_oc_prev_image_name ? g_oc_prev_image_name(cls, out) : false;
+}
+
+static void oc_hook_image_names(void)
+{
+    static int done;
+    if (done || getenv("OCERZ_NO_GUEST_IMAGE_NAME"))
+        return;
+    done = 1;
+    ((void (*)(void *, void *))oc_need(&g_oc_setHook_getImageName))((void *)oc_guest_image_name,
+                                                                    (void *)&g_oc_prev_image_name);
+}
+
 int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide)
 {
     OcImage im;
@@ -1520,6 +1568,7 @@ int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide)
         return 0;
     }
     oc_map_put(&g_oc_images, key, 1);
+    oc_hook_image_names();
     g_oc_defining = key;
     uint32_t flags = im.imageinfo.size >= 8 ? oc_u32(im.imageinfo.addr + 4) : 0;
     int defined = 0;

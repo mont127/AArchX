@@ -697,6 +697,10 @@ static const FormatCase kFormats[] = {
     { OCERZ_OBJC_FMT_CF, "%D %O %U %lD %qU", "iiill" },
     { OCERZ_OBJC_FMT_CF, "%C %c %S %hhu %hu %lu %zd", "iipiill" },
     { OCERZ_OBJC_FMT_CF, "%.3g %%@ %@%@", "dpp" },
+    { OCERZ_OBJC_FMT_C, "%1$d", "i" },
+    { OCERZ_OBJC_FMT_CF, "%2$@ %1$@", "pp" },
+    { OCERZ_OBJC_FMT_CF, "Should %1$@ check? From the %1$@ menu, %2$d times", "pi" },
+    { OCERZ_OBJC_FMT_C, "%2$.*1$f %3$s", "idp" },
     { OCERZ_OBJC_FMT_PREDICATE, "name == %@ AND age > %d AND %K BEGINSWITH %@", "pipp" },
     { OCERZ_OBJC_FMT_PREDICATE, "title == '%@' OR x == \"%K\" OR y == %f", "d" },
     { OCERZ_OBJC_FMT_PREDICATE, "s == 'it\\'s %@' AND z == %ld", "l" },
@@ -716,8 +720,10 @@ static const FormatRefusal kFormatRefusals[] = {
     { OCERZ_OBJC_FMT_C, "%d %hhn", "%n" },
     { OCERZ_OBJC_FMT_C, "%Lf", "long double" },
     { OCERZ_OBJC_FMT_CF, "%Lg", "long double" },
-    { OCERZ_OBJC_FMT_C, "%1$d", "positional" },
-    { OCERZ_OBJC_FMT_CF, "%2$@ %1$@", "positional" },
+    { OCERZ_OBJC_FMT_C, "%1$d %d", "mixed" },
+    { OCERZ_OBJC_FMT_C, "%d %1$d", "mixed" },
+    { OCERZ_OBJC_FMT_C, "%2$d", "no conversion takes" },
+    { OCERZ_OBJC_FMT_CF, "%1$@ %1$d", "two different types" },
     { OCERZ_OBJC_FMT_C, "%*1$d", "positional" },
     { OCERZ_OBJC_FMT_C, "%.*2$f", "positional" },
     { OCERZ_OBJC_FMT_C, "%@", "C format" },
@@ -1373,9 +1379,9 @@ static void r_va_overflow(OcerzCPU *cpu)
     ocerz_st(cpu->gpr[OCERZ_RCX], 4, 48);
 }
 
-static void r_nslog_positional(OcerzCPU *cpu)
+static void r_nslog_mixed(OcerzCPU *cpu)
 {
-    cpu->gpr[OCERZ_RDI] = ocerz_h2g(nsstr("%2$@ %1$@"));
+    cpu->gpr[OCERZ_RDI] = ocerz_h2g(nsstr("%1$@ %@"));
 }
 
 static void r_null_super(OcerzCPU *cpu)
@@ -1405,8 +1411,8 @@ static const Refusal kRefusals[] = {
     { "invalid va_list FP offsets", r_va_fp_offset, ocerz_fmt_vsnprintf, "invalid guest va_list offsets" },
     { "a null va_list save area", r_va_saved, ocerz_fmt_vsnprintf, "null guest va_list register save area" },
     { "a null va_list overflow area", r_va_overflow, ocerz_fmt_vsnprintf, "null guest va_list overflow area" },
-    { "NSLog positional", r_nslog_positional, ocerz_fmt_NSLog, "_NSLog refuses the format \"%2$@ %1$@\": it has"
-      " a positional argument" },
+    { "NSLog mixing positional and sequential", r_nslog_mixed, ocerz_fmt_NSLog, "_NSLog refuses the format"
+      " \"%1$@ %@\": it has positional and sequential arguments mixed" },
     { "a null objc_super", r_null_super, ocerz_objc_msgSendSuper, "_objc_msgSendSuper was handed a null struct"
       " objc_super" },
 };
