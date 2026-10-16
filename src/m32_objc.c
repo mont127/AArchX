@@ -1083,7 +1083,9 @@ static int system_font(OcerzCPU *cpu, void *hself, const char *name)
     static int off = -1;
     if (off < 0)
         off = getenv("OCERZ_NO_M32_LUCIDA") != NULL;
-    Class font_cls = objc_getClass("NSFont");
+    static Class font_cls;
+    if (!font_cls)
+        font_cls = objc_getClass("NSFont");
     if (off || hself != (void *)font_cls)
         return 0;
     size_t i = 0;
