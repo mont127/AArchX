@@ -11,6 +11,37 @@
 /* Exported and in no header since the Window Manager headers went. */
 extern Boolean IsWindowVisible(WindowRef window);
 
+/* QuickDraw's region and rectangle math, exported and in no header since QuickDraw's went private
+ * (tools/sdkgen/headers/QuickDrawRetained.h) */
+extern RgnHandle NewRgn(void);
+extern void DisposeRgn(RgnHandle rgn);
+extern void RectRgn(RgnHandle rgn, const Rect *r);
+extern void UnionRgn(RgnHandle a, RgnHandle b, RgnHandle dst);
+extern Rect *GetRegionBounds(RgnHandle region, Rect *bounds);
+extern Boolean PtInRgn(Point pt, RgnHandle rgn);
+extern Boolean IsRegionRectangular(RgnHandle region);
+extern void SetRect(Rect *r, short left, short top, short right, short bottom);
+extern Boolean SectRect(const Rect *a, const Rect *b, Rect *dst);
+
+static void regions(void)
+{
+    Rect a, b, both, out;
+    SetRect(&a, 0, 0, 20, 10);
+    SetRect(&b, 10, 5, 40, 30);
+    Boolean meet = SectRect(&a, &b, &both);
+    RgnHandle ra = NewRgn(), rb = NewRgn();
+    RectRgn(ra, &a);
+    RectRgn(rb, &b);
+    UnionRgn(ra, rb, ra);
+    GetRegionBounds(ra, &out);
+    Point in = { 20, 30 }, outside = { 2, 30 };   /* v, h */
+    printf("qd regions: sect %d (%d,%d,%d,%d) union (%d,%d,%d,%d) rectangular %d in %d out %d\n", meet, both.top,
+           both.left, both.bottom, both.right, out.top, out.left, out.bottom, out.right, IsRegionRectangular(ra),
+           PtInRgn(in, ra), PtInRgn(outside, ra));
+    DisposeRgn(ra);
+    DisposeRgn(rb);
+}
+
 static void opengl(void)
 {
     CGLPixelFormatAttribute attrs[] = { kCGLPFAAllowOfflineRenderers, kCGLPFAColorSize, 24, kCGLPFAAlphaSize, 8, 0 };
@@ -86,5 +117,6 @@ int main(void)
 {
     opengl();
     carbon();
+    regions();
     return 0;
 }

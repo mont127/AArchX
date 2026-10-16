@@ -4,11 +4,15 @@
  * that links i386 (tests/m32/build.sh): keymgr, _dyld_func_lookup, the wcsrtombs family, NSLogv, the raw system
  * calls a self-loading program makes and the dyld m32 hands it (src/m32_selfload.c).
  *
+ * QuickDraw's GWorlds and drawing (src/m32_qd.c) are checked pixel by pixel in their guest memory.
+ *
  * `test_m32 carbon`, which make check-m32 runs once runtime/apis32 is generated, crosses Carbon calls through those
  * databases as translated code does: the window, menu and title functions 32-bit code alone is declared to have and
  * arm64 HIToolbox still exports (tools/sdkgen, declare_hidden), and CreateNewWindow without the compositing
- * attribute, which 64-bit HIToolbox refuses and m32 adds (src/m32_carbon.c).
+ * attribute, which 64-bit HIToolbox refuses and m32 adds (src/m32_carbon.c); then a window's QuickDraw port, the
+ * graphics devices, cursors and the region calls QuickDraw still exports, through tools/sdkgen/headers/QuickDrawRetained.h.
  */
+#include <CoreGraphics/CoreGraphics.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -209,6 +213,173 @@ static void test_raw_syscalls(void)
 }
 
 #define CARBON "/System/Library/Frameworks/Carbon.framework/Versions/A/Carbon"
+#define APPSERVICES "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices"
+
+/* the 32-bit pixel at (h, v) of the port whose PixMap handle is pmh, as 0xRRGGBB (QuickDraw's xRGB, big-endian) */
+static uint32_t qd_pixel(uint32_t pmh, int h, int v)
+{
+    uint32_t pm[1] = { pmh };
+    uint32_t base = call("_GetPixBaseAddr", 1, pm), rb = call("_GetPixRowBytes", 1, pm);
+    const uint8_t *px = (const uint8_t *)m32_h(base + (uint32_t)v * rb + 4 * (uint32_t)h);
+    return (uint32_t)px[1] << 16 | (uint32_t)px[2] << 8 | px[3];
+}
+
+static uint32_t qd_rect(uint32_t g, int16_t top, int16_t left, int16_t bottom, int16_t right)
+{
+    const int16_t r[4] = { top, left, bottom, right };
+    memcpy(m32_h(g), r, sizeof r);
+    return g;
+}
+
+static void qd_rgb(uint32_t g, uint16_t r, uint16_t gr, uint16_t b)
+{
+    const uint16_t c[3] = { r, gr, b };
+    memcpy(m32_h(g), c, sizeof c);
+}
+
+/* red, after the display's color matching (0xff0000 shows as 0xff2500 or so) */
+static int reddish(uint32_t c) { return (c >> 16 & 0xff) > 0xe0 && (c >> 8 & 0xff) < 0x60 && (c & 0xff) < 0x60; }
+
+/* the pixel at (h, v) of a window's content view as HIToolbox draws it, through every draw handler, as 0xRRGGBB:
+ * whatever a window's QuickDraw port shows */
+static uint32_t view_pixel(void *window, int h, int v)
+{
+    typedef struct { uint32_t signature; int32_t id; } ViewID;
+    void *hi = dlopen(CARBON, RTLD_LAZY);
+    void *(*root)(void *) = (void *(*)(void *))dlsym(hi, "HIViewGetRoot");
+    int32_t (*find)(void *, ViewID, void **) = (int32_t (*)(void *, ViewID, void **))dlsym(hi, "HIViewFindByID");
+    const ViewID *content_id = (const ViewID *)dlsym(hi, "kHIViewWindowContentID");
+    int32_t (*offscreen)(void *, uint32_t, CGRect *, CGImageRef *) =
+        (int32_t (*)(void *, uint32_t, CGRect *, CGImageRef *))dlsym(hi, "HIViewCreateOffscreenImage");
+    size_t (*width)(CGImageRef) = (size_t (*)(CGImageRef))dlsym(RTLD_DEFAULT, "CGImageGetWidth");
+    size_t (*height)(CGImageRef) = (size_t (*)(CGImageRef))dlsym(RTLD_DEFAULT, "CGImageGetHeight");
+    CGColorSpaceRef (*rgb)(void) = (CGColorSpaceRef (*)(void))dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+    CGContextRef (*bitmap)(void *, size_t, size_t, size_t, size_t, CGColorSpaceRef, uint32_t) =
+        (CGContextRef (*)(void *, size_t, size_t, size_t, size_t, CGColorSpaceRef, uint32_t))dlsym(RTLD_DEFAULT, "CGBitmapContextCreate");
+    void (*draw)(CGContextRef, CGRect, CGImageRef) = (void (*)(CGContextRef, CGRect, CGImageRef))dlsym(RTLD_DEFAULT, "CGContextDrawImage");
+    void (*release)(const void *) = (void (*)(const void *))dlsym(RTLD_DEFAULT, "CFRelease");
+    void *content = NULL;
+    CGRect frame;
+    CGImageRef img = NULL;
+    if (!root || !find || !content_id || !offscreen || find(root(window), *content_id, &content) || !content ||
+        offscreen(content, 0, &frame, &img) || !img)
+        return 0xdeadbeef;
+    size_t w = width(img), ht = height(img), scale = frame.size.width > 0 ? w / (size_t)frame.size.width : 1;
+    uint8_t *px = calloc(w * ht, 4);
+    CGColorSpaceRef cs = rgb();
+    CGContextRef c = bitmap(px, w, ht, 8, w * 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    draw(c, CGRectMake(0, 0, (CGFloat)w, (CGFloat)ht), img);
+    const uint8_t *at = px + ((size_t)v * scale + scale / 2) * w * 4 + ((size_t)h * scale + scale / 2) * 4;
+    uint32_t value = (uint32_t)at[0] << 16 | (uint32_t)at[1] << 8 | at[2];
+    release(c);
+    release(cs);
+    release(img);
+    free(px);
+    return value;
+}
+
+/* GWorlds: their pixels and PixMap in guest memory, pens, fills, clipping, the origin and CopyBits */
+static void test_quickdraw(void)
+{
+    uint32_t out = DATA + 0xb00, r = DATA + 0xb10, rgb = DATA + 0xb20;
+    uint32_t a[6] = { out, 32, qd_rect(r, 0, 0, 32, 64), 0, 0, 0 };
+    check("NewGWorld 32 bits", call("_NewGWorld", 6, a) == 0 && m32_rd(out) != 0);
+    uint32_t gw = m32_rd(out);
+    uint32_t s[2] = { gw, 0 };
+    call("_SetGWorld", 2, s);
+    uint32_t g[2] = { DATA + 0xb30, DATA + 0xb34 };
+    call("_GetGWorld", 2, g);
+    check("GetGWorld answers the GWorld SetGWorld set", m32_rd(DATA + 0xb30) == gw);
+    uint32_t w[1] = { gw };
+    uint32_t pmh = call("_GetGWorldPixMap", 1, w), pm[1] = { pmh };
+    check("LockPixels", (call("_LockPixels", 1, pm) & 0xff) == 1);
+    check("GetPixBaseAddr, GetPixRowBytes and GetPixDepth", call("_GetPixBaseAddr", 1, pm) != 0 &&
+                                                              call("_GetPixRowBytes", 1, pm) >= 256 &&
+                                                              (call("_GetPixDepth", 1, pm) & 0xffff) == 32);
+    uint32_t pmp = m32_rd(pmh);
+    int16_t rowbytes, bounds[4];
+    memcpy(&rowbytes, m32_h(pmp + 4), 2);
+    memcpy(bounds, m32_h(pmp + 6), 8);
+    check("the PixMap is marked one and bounds the GWorld", (rowbytes & 0x8000) && bounds[0] == 0 && bounds[1] == 0 &&
+                                                            bounds[2] == 32 && bounds[3] == 64);
+    uint32_t whole[1] = { qd_rect(r, 0, 0, 32, 64) };
+    call("_EraseRect", 1, whole);
+    check("EraseRect paints the background, white", qd_pixel(pmh, 5, 5) == 0xffffff);
+    qd_rgb(rgb, 0xffff, 0, 0);
+    uint32_t c[1] = { rgb };
+    call("_RGBForeColor", 1, c);
+    uint32_t m[2] = { 0, 10 }, l[2] = { 63, 10 };
+    call("_MoveTo", 2, m);
+    call("_LineTo", 2, l);
+    check("LineTo draws a one-pixel line below and right of the pen", qd_pixel(pmh, 20, 10) == 0xff0000 &&
+                                                                     qd_pixel(pmh, 20, 11) == 0xffffff &&
+                                                                     qd_pixel(pmh, 20, 9) == 0xffffff);
+    uint32_t pen[1] = { DATA + 0xb40 };
+    call("_GetPen", 1, pen);
+    int16_t pv[2];
+    memcpy(pv, m32_h(DATA + 0xb40), 4);
+    check("the pen ends where the line does", pv[0] == 10 && pv[1] == 63);
+    qd_rgb(rgb, 0, 0, 0xffff);
+    call("_RGBForeColor", 1, c);
+    uint32_t pr[1] = { qd_rect(r, 20, 40, 30, 50) };
+    call("_PaintRect", 1, pr);
+    check("PaintRect fills its rectangle and not its right or bottom edge",
+          qd_pixel(pmh, 45, 25) == 0x0000ff && qd_pixel(pmh, 40, 20) == 0x0000ff && qd_pixel(pmh, 39, 25) == 0xffffff &&
+          qd_pixel(pmh, 50, 25) == 0xffffff && qd_pixel(pmh, 45, 30) == 0xffffff);
+    uint32_t o[2] = { 100, 200 };
+    call("_SetOrigin", 2, o);
+    uint32_t b[2] = { gw, DATA + 0xb50 };
+    call("_GetPortBounds", 2, b);
+    int16_t pb[4];
+    memcpy(pb, m32_h(DATA + 0xb50), 8);
+    check("SetOrigin moves the port's bounds", pb[0] == 200 && pb[1] == 100 && pb[2] == 232 && pb[3] == 164);
+    qd_rgb(rgb, 0, 0xffff, 0);
+    call("_RGBForeColor", 1, c);
+    uint32_t po[1] = { qd_rect(r, 201, 101, 203, 103) };
+    call("_PaintRect", 1, po);
+    check("drawing after SetOrigin lands at the pixels the local coordinates name", qd_pixel(pmh, 1, 1) == 0x00ff00 &&
+                                                                                   qd_pixel(pmh, 3, 3) == 0xffffff);
+    uint32_t z[2] = { 0, 0 };
+    call("_SetOrigin", 2, z);
+    uint32_t left[1] = { qd_rect(r, 0, 0, 32, 32) };
+    call("_ClipRect", 1, left);
+    qd_rgb(rgb, 0, 0, 0);
+    call("_RGBForeColor", 1, c);
+    uint32_t low[1] = { qd_rect(r, 0, 0, 8, 64) };
+    call("_PaintRect", 1, low);
+    check("the clip region keeps drawing inside it", qd_pixel(pmh, 10, 5) == 0x000000 && qd_pixel(pmh, 40, 5) == 0xffffff);
+    uint32_t wide[1] = { qd_rect(r, -32767, -32767, 32767, 32767) };
+    call("_ClipRect", 1, wide);
+    uint32_t a2[6] = { out, 32, qd_rect(r, 0, 0, 32, 64), 0, 0, 0 };
+    call("_NewGWorld", 6, a2);
+    uint32_t gw2 = m32_rd(out), w2[1] = { gw2 };
+    uint32_t pmh2 = call("_GetGWorldPixMap", 1, w2);
+    uint32_t pw[1] = { gw }, pw2[1] = { gw2 };
+    uint32_t cb[6] = { call("_GetPortBitMapForCopyBits", 1, pw), call("_GetPortBitMapForCopyBits", 1, pw2),
+                       qd_rect(DATA + 0xb60, 20, 40, 30, 50), qd_rect(DATA + 0xb68, 0, 0, 10, 10), 0, 0 };
+    call("_CopyBits", 6, cb);
+    check("CopyBits copies one GWorld's rectangle into another's", qd_pixel(pmh2, 5, 5) == 0x0000ff &&
+                                                                   qd_pixel(pmh2, 9, 9) == 0x0000ff);
+    uint32_t q[2] = { gw, DATA + 0xb70 };
+    check("QDBeginCGContext hands out the port's context", call("_QDBeginCGContext", 2, q) == 0 && m32_rd(DATA + 0xb70) != 0);
+    check("QDEndCGContext takes it back", call("_QDEndCGContext", 2, q) == 0);
+    call("_DisposeGWorld", 1, w2);
+    check("a disposed GWorld is no port", call("_IsValidPort", 1, w2) == 0 && call("_IsValidPort", 1, w) == 1);
+    uint32_t a16[6] = { out, 16, qd_rect(r, 0, 0, 8, 8), 0, 0, 0 };
+    check("NewGWorld 16 bits", call("_NewGWorld", 6, a16) == 0);
+    uint32_t g16[1] = { m32_rd(out) };
+    call("_SetGWorld", 2, (uint32_t[]){ g16[0], 0 });
+    qd_rgb(rgb, 0xffff, 0, 0);
+    call("_RGBForeColor", 1, c);
+    call("_PaintRect", 1, (uint32_t[]){ qd_rect(r, 0, 0, 8, 8) });
+    uint32_t pm16[1] = { call("_GetGWorldPixMap", 1, g16) };
+    const uint8_t *px16 = (const uint8_t *)m32_h(call("_GetPixBaseAddr", 1, pm16));
+    check("16-bit pixels are big-endian x555", (call("_GetPixDepth", 1, pm16) & 0xffff) == 16 && px16[0] == 0x7c &&
+                                               px16[1] == 0x00);
+    uint32_t a8[6] = { out, 8, qd_rect(r, 0, 0, 8, 8), 0, 0, 0 };
+    check("an 8-bit GWorld is refused with cDepthErr", (int16_t)call("_NewGWorld", 6, a8) == -157 && m32_rd(out) == 0);
+    call("_SetGWorld", 2, s);
+}
 
 static void test_carbon(void)
 {
@@ -250,7 +421,77 @@ static void test_carbon(void)
     check("InsertMenuItemTextWithCFString", cross(CARBON, "_InsertMenuItemTextWithCFString", 5, i) == 0);
     uint32_t n[1] = { m32_rd(DATA + 0xa40) };
     check("CountMenuItems counts it", (cross(CARBON, "_CountMenuItems", 1, n) & 0xffff) == 1);
+
+    /* the window's QuickDraw port: its content's size, drawn into in guest memory */
+    uint32_t port = call("_GetWindowPort", 1, v), pt[1] = { port };
+    check("GetWindowPort", port != 0 && call("_GetWindowPort", 1, v) == port && call("_GetWindowFromPort", 1, pt) == w);
+    call("_SetPortWindowPort", 1, v);
+    uint32_t gp[1] = { DATA + 0xa50 };
+    call("_GetPort", 1, gp);
+    check("SetPortWindowPort makes it the current port", m32_rd(DATA + 0xa50) == port);
+    uint32_t pb[2] = { port, DATA + 0xa60 };
+    call("_GetPortBounds", 2, pb);
+    int16_t pr[4];
+    memcpy(pr, m32_h(DATA + 0xa60), 8);
+    check("a window's port bounds its content", pr[0] == 0 && pr[1] == 0 && pr[2] == 200 && pr[3] == 400);
+    qd_rgb(DATA + 0xa70, 0xffff, 0, 0);
+    call("_RGBForeColor", 1, (uint32_t[]){ DATA + 0xa70 });
+    call("_PaintRect", 1, (uint32_t[]){ qd_rect(DATA + 0xa80, 10, 10, 20, 20) });
+    uint32_t pmh = call("_GetPortPixMap", 1, pt);
+    check("drawing into a window's port fills its pixels", qd_pixel(pmh, 15, 15) == 0xff0000 && qd_pixel(pmh, 25, 15) != 0xff0000);
+    check("... and the window's content view shows them, on white", reddish(view_pixel(m32_host(w), 15, 15)) &&
+                                                                    view_pixel(m32_host(w), 25, 15) == 0xffffff &&
+                                                                    view_pixel(m32_host(w), 15, 185) == 0xffffff);
+    {
+        int16_t p0[2] = { 5, 7 };   /* v, h */
+        memcpy(m32_h(DATA + 0xa90), p0, 4);
+        call("_LocalToGlobal", 1, (uint32_t[]){ DATA + 0xa90 });
+        memcpy(p0, m32_h(DATA + 0xa90), 4);
+        check("LocalToGlobal adds the content's top left", p0[0] == 105 && p0[1] == 127);
+        call("_GlobalToLocal", 1, (uint32_t[]){ DATA + 0xa90 });
+        memcpy(p0, m32_h(DATA + 0xa90), 4);
+        check("GlobalToLocal takes it away", p0[0] == 5 && p0[1] == 7);
+    }
+    uint32_t q[2] = { port, DATA + 0xaa0 };
+    check("QDBeginCGContext on a window's port", call("_QDBeginCGContext", 2, q) == 0 && m32_rd(DATA + 0xaa0) != 0 &&
+                                                 call("_QDEndCGContext", 2, q) == 0);
+
+    /* devices: the main display first, in global coordinates */
+    CGRect (*bounds)(uint32_t) = (CGRect (*)(uint32_t))dlsym(RTLD_DEFAULT, "CGDisplayBounds");
+    uint32_t (*main_id)(void) = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "CGMainDisplayID");
+    uint32_t gd = call("_GetMainDevice", 0, NULL), gdh[1] = { gd };
+    int16_t gr[4];
+    memcpy(gr, m32_h(m32_rd(gd) + 34), 8);
+    CGRect mb = bounds(main_id());
+    check("GetMainDevice bounds the main display", gd && gr[1] == (int16_t)mb.origin.x && gr[0] == (int16_t)mb.origin.y &&
+                                                   gr[3] == (int16_t)(mb.origin.x + mb.size.width) &&
+                                                   gr[2] == (int16_t)(mb.origin.y + mb.size.height));
+    check("QDGetCGDirectDisplayID names it", call("_QDGetCGDirectDisplayID", 1, gdh) == main_id());
+    check("TestDeviceAttribute: mainScreen", (call("_TestDeviceAttribute", 2, (uint32_t[]){ gd, 11 }) & 0xff) == 1);
+
+    /* cursors: the arrow and a system cursor become NSCursor's */
+    call("_GetQDGlobalsArrow", 1, (uint32_t[]){ DATA + 0xab0 });
+    call("_SetCursor", 1, (uint32_t[]){ DATA + 0xab0 });
+    uint32_t ib = call("_GetCursor", 1, (uint32_t[]){ 1 });
+    check("GetCursor(iBeamCursor)", ib != 0 && m32_rd(ib) != 0);
+    call("_SetCursor", 1, (uint32_t[]){ m32_rd(ib) });
+
+    /* the region and rectangle calls QuickDraw still exports cross */
+    uint32_t rgn = cross(APPSERVICES, "_NewRgn", 0, NULL);
+    check("NewRgn", rgn != 0);
+    cross(APPSERVICES, "_RectRgn", 2, (uint32_t[]){ rgn, qd_rect(DATA + 0xac0, 1, 2, 30, 40) });
+    cross(APPSERVICES, "_GetRegionBounds", 2, (uint32_t[]){ rgn, DATA + 0xac8 });
+    check("RectRgn and GetRegionBounds", !memcmp(m32_h(DATA + 0xac0), m32_h(DATA + 0xac8), 8));
+    check("PtInRgn takes its Point by value", (cross(APPSERVICES, "_PtInRgn", 2, (uint32_t[]){ 10u | 20u << 16, rgn }) & 0xff) == 1 &&
+                                              (cross(APPSERVICES, "_PtInRgn", 2, (uint32_t[]){ 10u | 50u << 16, rgn }) & 0xff) == 0);
+    call("_SetClip", 1, (uint32_t[]){ rgn });
+    uint32_t clip = cross(APPSERVICES, "_NewRgn", 0, NULL);
+    call("_GetClip", 1, (uint32_t[]){ clip });
+    check("SetClip and GetClip", (cross(APPSERVICES, "_EqualRgn", 2, (uint32_t[]){ rgn, clip }) & 0xff) == 1);
+    cross(APPSERVICES, "_DisposeRgn", 1, (uint32_t[]){ rgn });
+    cross(APPSERVICES, "_DisposeRgn", 1, (uint32_t[]){ clip });
     cross(CARBON, "_DisposeWindow", 1, v);
+    check("DisposeWindow takes the window's port with it", call("_IsValidPort", 1, pt) == 0);
 }
 
 int main(int argc, char **argv)
@@ -266,6 +507,7 @@ int main(int argc, char **argv)
     g_vm.jit_enabled = 0;
     ocerz_cpu_reset(cpu());
     cpu()->mode32 = 1;
+    m32_heap_init();
     if (argc > 1 && !strcmp(argv[1], "carbon")) {
         char db[PATH_MAX];
         if (!realpath("runtime/apis32", db)) {
@@ -282,6 +524,7 @@ int main(int argc, char **argv)
     test_wide_conversions();
     test_nslogv();
     test_raw_syscalls();
+    test_quickdraw();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

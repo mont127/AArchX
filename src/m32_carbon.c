@@ -9,7 +9,8 @@
  * - CreateNewWindow: 64-bit HIToolbox makes only compositing windows.  Without kWindowCompositingAttribute it
  *   answers errUnsupportedWindowAttributesForClass (-5601) for every class and attribute set, where 32-bit Carbon
  *   made a classic window that the program drew into with QuickDraw.  A window an i386 program creates gets the
- *   attribute.  QuickDraw itself is not on Apple silicon, and m32 does not provide it yet (docs/m32.md, Limits).
+ *   attribute, and its QuickDraw port is m32's (src/m32_qd.c).
+ * - DisposeWindow: the window's QuickDraw port goes first, so no drawing call reaches the window after it.
  */
 #include <stdint.h>
 #include <stdlib.h>
@@ -26,6 +27,14 @@ static int32_t create_new_window(uint32_t window_class, uint32_t attributes, con
     return g_create_new_window(window_class, attributes | M32_kWindowCompositingAttribute, bounds, out);
 }
 
+static void (*g_dispose_window)(void *);
+
+static void dispose_window(void *window)
+{
+    m32_qd_window_gone(window);
+    g_dispose_window(window);
+}
+
 void *m32_carbon_wrap(const char *symbol, void *fn)
 {
     if (!fn || getenv("OCERZ_NO_M32_CARBON_WRAP"))
@@ -33,6 +42,10 @@ void *m32_carbon_wrap(const char *symbol, void *fn)
     if (!strcmp(symbol, "CreateNewWindow")) {
         g_create_new_window = (int32_t (*)(uint32_t, uint32_t, const void *, void **))fn;
         return (void *)create_new_window;
+    }
+    if (!strcmp(symbol, "DisposeWindow")) {
+        g_dispose_window = (void (*)(void *))fn;
+        return (void *)dispose_window;
     }
     return fn;
 }

@@ -286,9 +286,6 @@ static int sp_NewMovieFromFile(struct OcerzVM *vm, OcerzCPU *cpu)   /* (Movie *,
         m32_wr(m32_arg(cpu, 0), 0);
     RET(QT_UNIMP);
 }
-/* QuickDraw's offscreen worlds, gone with it: valve_avi looks them up with dlsym and calls SetGWorld(NULL, NULL) before
- * opening any movie.  No GWorld ever exists here, so they do nothing and report nothing. */
-static int sp_qd_none(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
 
 const M32SpecialEntry m32_audio_specials[] = {
     { "_AudioUnitSetProperty", sp_AudioUnitSetProperty },
@@ -297,8 +294,6 @@ const M32SpecialEntry m32_audio_specials[] = {
     { "_SndNewChannel", sp_SndNewChannel },
     { "_EnterMovies", sp_EnterMovies }, { "_GetMoviesError", sp_GetMoviesError }, { "_OpenMovieFile", sp_OpenMovieFile },
     { "_NewMovieFromFile", sp_NewMovieFromFile },
-    { "_SetGWorld", sp_qd_none }, { "_DisposeGWorld", sp_qd_none }, { "_GetGWorldPixMap", sp_qd_none },
-    { "_LockPixels", sp_qd_none }, { "_UnlockPixels", sp_qd_none }, { "_GetPixRowBytes", sp_qd_none },
     { "_SndDoCommand", sp_SndBadChannel }, { "_SndDoImmediate", sp_SndBadChannel },
     { "_SndChannelStatus", sp_SndBadChannel }, { "_SndDisposeChannel", sp_SndBadChannel },
     { NULL, NULL }

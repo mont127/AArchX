@@ -38,6 +38,7 @@ extern const M32SpecialEntry m32_unwind_specials[];   /* src/m32_unwind.c: C++ e
 extern const M32SpecialEntry m32_gl_specials[];   /* src/m32_gl.c: mapped GL buffers */
 extern const M32SpecialEntry m32_audio_specials[];   /* src/m32_audio.c: CoreAudio render callbacks */
 extern const M32SpecialEntry m32_atsu_specials[];   /* src/m32_atsu.c: ATSUI text and ATS fonts */
+extern const M32SpecialEntry m32_qd_specials[];     /* src/m32_qd.c: QuickDraw ports, GWorlds and drawing */
 extern uint32_t m32_argc_var, m32_argv_var, m32_environ_var, m32_progname_var;   /* guest variables */
 int m32_printf_slots(const char *fmt, uint32_t ap, uint64_t *slots, int max, const char *who);
 
@@ -51,6 +52,7 @@ int m32_dyld_entry(struct OcerzVM *vm, OcerzCPU *cpu);                   /* the 
 uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint64_t off);   /* src/m32_libsystem.c */
 void m32_selfload_begin(const char *path);                                 /* m32_run, before the program starts */
 void *m32_carbon_wrap(const char *symbol, void *fn);   /* src/m32_carbon.c: the host function an export calls */
+void m32_qd_window_gone(void *window);                 /* src/m32_qd.c: DisposeWindow drops the window's port */
 int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap);   /* a trap made from inside a block */
 uint32_t m32_export_special(const char *name, M32Special fn);
 /* the Steam bridge (src/m32_steam.c): a steamclient.dylib with no i386 slice opens as the host's own */

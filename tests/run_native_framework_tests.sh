@@ -148,7 +148,7 @@ for engine in jit interpreter slow-bridge; do
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/gl_carbon.x86_64" > "$work/gl_carbon.$engine.out" 2> "$work/gl_carbon.$engine.err"
     cmp "$work/gl_carbon.expected" "$work/gl_carbon.$engine.out"
-    echo "PASS native OpenGL, GLU, Carbon time and hot keys $engine"
+    echo "PASS native OpenGL, GLU, Carbon time and hot keys, QuickDraw regions $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/callback_structs.x86_64" > "$work/callback_structs.$engine.out" \
         2> "$work/callback_structs.$engine.err"
