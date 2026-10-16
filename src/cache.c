@@ -22,12 +22,15 @@
  * mapping and installed atomically: unpacking in place after an mprotect(RW)
  * let every other thread read the raw pointer chains mid-unpack, and
  * libswiftCore in steam.exe dereferenced one of those half-baked pointers.
- * Kept PROT_NONE until the remap, a concurrent reader simply faults, waits on
- * the lock and retries against the finished page.  A page this thread already
+ * Kept PROT_NONE until the remap, a concurrent reader simply faults, waits for
+ * the page to finish and retries against it.  A page this thread already
  * retried once is not a lazy-unpack fault, so an alignment or protection fault
- * on an unpacked page still reaches the real handler.  The unpack now holds its
- * lock across a whole page rebuild, so fork takes that lock like the other
- * emulator locks or the child inherits one nobody releases.
+ * on an unpacked page still reaches the real handler.  The lock covers only the
+ * per-page state: a page is marked in flight under it and rebuilt outside it,
+ * so threads touching different pages unpack them in parallel, and a thread
+ * waiting on the lock or on an in-flight page yields and then sleeps rather
+ * than spinning.  Fork takes that lock like the other emulator locks, once no
+ * page is in flight, or the child inherits one nobody releases.
  *
  * ---- patched pages ----
  * Some engines make a libsystem page writable to patch it in place, so every
@@ -100,6 +103,8 @@
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
+#include <time.h>
 
 #include "ocerz/mem.h"
 #include "ocerz/tcache.h"
@@ -192,6 +197,30 @@ static struct {
 } g_lazy[LAZY_MAX];
 static int g_n_lazy;
 static volatile int g_lazy_lock;
+static int g_lazy_inflight;
+
+static void lazy_backoff(unsigned s)
+{
+    if (s < 64) {
+        sched_yield();
+    } else {
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = s < 512 ? 200000 : 2000000;
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void lazy_lock(void)
+{
+    for (unsigned s = 0; __atomic_exchange_n(&g_lazy_lock, 1, __ATOMIC_ACQUIRE); s++)
+        lazy_backoff(s);
+}
+
+static void lazy_unlock(void)
+{
+    __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
+}
 
 static void rebase_page_v2(uint64_t page_base, uint64_t page_size, uint32_t pg,
                            uint64_t cache_base, const uint8_t *si)
@@ -228,14 +257,22 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
         size_t hidx = (size_t)(off / hp);
         static __thread uintptr_t last_retry;
         uintptr_t page = (uintptr_t)(g_lazy[i].addr + off);
-        while (__atomic_exchange_n(&g_lazy_lock, 1, __ATOMIC_ACQUIRE)) { }
+        for (unsigned s = 0;; s++) {
+            lazy_lock();
+            if (g_lazy[i].done[hidx] != 2) break;
+            lazy_unlock();
+            lazy_backoff(s);
+        }
         if (g_lazy[i].done[hidx]) {
             int again = last_retry == page;
             last_retry = page;
-            __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
+            lazy_unlock();
             return again ? 0 : 1;
         }
         last_retry = 0;
+        g_lazy[i].done[hidx] = 2;
+        g_lazy_inflight++;
+        lazy_unlock();
         {
             uint64_t base = g_lazy[i].addr + off;
             uint32_t per = (uint32_t)(hp / g_lazy[i].page_size);
@@ -296,9 +333,11 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
                 if (g_lazy[i].final_prot != (PROT_READ | PROT_WRITE))
                     mprotect((void *)(uintptr_t)base, (size_t)hp, g_lazy[i].final_prot);
             }
-            g_lazy[i].done[hidx] = 1;
         }
-        __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
+        lazy_lock();
+        g_lazy[i].done[hidx] = 1;
+        g_lazy_inflight--;
+        lazy_unlock();
         return 1;
     }
     return 0;
@@ -306,12 +345,17 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
 
 void ocerz_cache_prefork(void)
 {
-    while (__atomic_exchange_n(&g_lazy_lock, 1, __ATOMIC_ACQUIRE)) { }
+    for (unsigned s = 0;; s++) {
+        lazy_lock();
+        if (!g_lazy_inflight) return;
+        lazy_unlock();
+        lazy_backoff(s);
+    }
 }
 
 void ocerz_cache_postfork(void)
 {
-    __atomic_store_n(&g_lazy_lock, 0, __ATOMIC_RELEASE);
+    lazy_unlock();
 }
 
 int ocerz_cache_lazy_region(uintptr_t addr)
