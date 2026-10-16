@@ -723,6 +723,9 @@ typedef struct DynImage {
     uint64_t file_ino;
     struct SymIndex *symidx;
     struct SymIndex *symtab_ix;   /* image_symtab_resolve's index, built on first use */
+    const uint8_t *ext_slice;    /* the slice and slide ext_* bound the segments of (dimg_record_extent) */
+    uint64_t ext_slide;
+    uint64_t ext_lo, ext_hi, ext_xlo, ext_xhi;
 } DynImage;
 
 #define DYN_DIMG_MAX 2048   /* VLC 2.2 alone loads 301 plugins */
@@ -852,9 +855,38 @@ const char *ocerz_dyld_name_for_addr(uint64_t addr, uint64_t *base_out)
     return best->install_name[0] ? best->install_name : best->path;
 }
 
+static void dimg_record_extent(DynImage *d)
+{
+    uint64_t lo = ~0ull, hi = 0, xlo = ~0ull, xhi = 0;
+    const uint8_t *mh = d->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < ncmds; k++) {
+        if (rd32(lc) == LC_SEGMENT_64 && rd64(lc + 32) && rd32(lc + 60)) {
+            uint64_t slo = rd64(lc + 24) + d->slide, shi = slo + rd64(lc + 32);
+            if (slo < lo) lo = slo;
+            if (shi > hi) hi = shi;
+            if (rd32(lc + 60) & VM_PROT_EXECUTE) {
+                if (slo < xlo) xlo = slo;
+                if (shi > xhi) xhi = shi;
+            }
+        }
+        lc += rd32(lc + 4);
+    }
+    d->ext_lo = lo;
+    d->ext_hi = hi;
+    d->ext_xlo = xlo;
+    d->ext_xhi = xhi;
+    d->ext_slide = d->slide;
+    d->ext_slice = d->slice;
+}
+
 static int dimg_segments_overlap(const DynImage *d, uint64_t lo, uint64_t hi, int exec_only)
 {
     if (!d->slice || d->is_virtual)
+        return 0;
+    if (d->ext_slice == d->slice && d->ext_slide == d->slide &&
+        (exec_only ? hi <= d->ext_xlo || lo >= d->ext_xhi : hi <= d->ext_lo || lo >= d->ext_hi))
         return 0;
     const uint8_t *mh = d->slice;
     uint32_t ncmds = rd32(mh + 16);
@@ -1028,6 +1060,7 @@ static int map_segments(DynImage *img, int is_main)
     }
     if (is_main)
         ocerz_main_mh = img->load_base;
+    dimg_record_extent(img);
 
     lc = mh + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < ncmds; i++) {
