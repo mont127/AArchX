@@ -401,39 +401,46 @@ static const FloatArray g_float_arrays[] = {
     { "_CTFontGetVerticalTranslationsForGlyphs", 2, 2, 3, -1, -1, 0, 1 },
 };
 
-/* how many CGFloats argument arg of export name points at, from the guest's other arguments at esp; 0: no rule */
-static int float_array_count(const char *name, int arg, uint32_t esp, int *out)
+_Static_assert(sizeof g_float_arrays / sizeof g_float_arrays[0] < 255, "M32Sig.farr holds 1 + a row");
+
+/* the rules for the arguments of export name, into g->farr, once when its notations are first parsed */
+static void float_array_rules(M32Sig *g, const char *name)
 {
-    static int off = -1;
-    if (off < 0)
-        off = getenv("OCERZ_NO_M32_FLOAT_ARRAYS") != NULL;
-    if (off)
-        return 0;
-    for (size_t r = 0; r < sizeof g_float_arrays / sizeof g_float_arrays[0]; r++) {
-        const FloatArray *f = &g_float_arrays[r];
-        if (f->arg != arg || strcmp(f->name, name))
+    if (getenv("OCERZ_NO_M32_FLOAT_ARRAYS"))
+        return;
+    for (int i = 0; i < g->nargs; i++) {
+        if (g->arg[i].cls != 'Q' && g->arg[i].cls != 'r' && g->arg[i].cls != 'R')
             continue;
-        *out = f->out;
-        if (f->fixed)
-            return f->fixed;
-        uint64_t n = (uint64_t)f->per;
-        if (f->count_word >= 0)
-            n *= m32_rd(esp + 4 + 4 * (uint32_t)f->count_word);
-        if (f->space_word >= 0 || f->array_word >= 0) {
-            static size_t (*components)(void *);
-            static long (*count)(void *);
-            if (!components) {
-                components = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "CGColorSpaceGetNumberOfComponents");
-                count = (long (*)(void *))dlsym(RTLD_DEFAULT, "CFArrayGetCount");
+        for (size_t r = 0; r < sizeof g_float_arrays / sizeof g_float_arrays[0]; r++)
+            if (g_float_arrays[r].arg == i && !strcmp(g_float_arrays[r].name, name)) {
+                g->farr[i] = (uint8_t)(r + 1);
+                break;
             }
-            void *obj = m32_host(m32_rd(esp + 4 + 4 * (uint32_t)(f->space_word >= 0 ? f->space_word : f->array_word)));
-            if (!obj || !components || !count)
-                return 0;
-            n *= f->space_word >= 0 ? components(obj) + 1 : (uint64_t)count(obj);
-        }
-        return n > 0 && n <= 1u << 20 ? (int)n : 0;
     }
-    return 0;
+}
+
+/* how many CGFloats an argument with rule f points at, from the guest's other arguments at esp; 0: none */
+static int float_array_count(const FloatArray *f, uint32_t esp, int *out)
+{
+    *out = f->out;
+    if (f->fixed)
+        return f->fixed;
+    uint64_t n = (uint64_t)f->per;
+    if (f->count_word >= 0)
+        n *= m32_rd(esp + 4 + 4 * (uint32_t)f->count_word);
+    if (f->space_word >= 0 || f->array_word >= 0) {
+        static size_t (*components)(void *);
+        static long (*count)(void *);
+        if (!components) {
+            components = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "CGColorSpaceGetNumberOfComponents");
+            count = (long (*)(void *))dlsym(RTLD_DEFAULT, "CFArrayGetCount");
+        }
+        void *obj = m32_host(m32_rd(esp + 4 + 4 * (uint32_t)(f->space_word >= 0 ? f->space_word : f->array_word)));
+        if (!obj || !components || !count)
+            return 0;
+        n *= f->space_word >= 0 ? components(obj) + 1 : (uint64_t)count(obj);
+    }
+    return n > 0 && n <= 1u << 20 ? (int)n : 0;
 }
 
 static pthread_mutex_t g_sig_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -746,6 +753,7 @@ int m32_export_sigs(M32Export *e)
                 free(g);
                 return 0;
             }
+            float_array_rules(g, e->name);
             e->hsig = h;
             __atomic_store_n(&e->gsig, g, __ATOMIC_RELEASE);
         }
@@ -775,8 +783,8 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
     hc.scratch_used = 0;
     Writeback wb[16];
     int nwb = 0;
-    double *floats[4];
-    int nfloats = 0;
+    double *floats[4], fbuf[64];   /* float arrays: the small ones in fbuf, the rest malloc'd into floats */
+    int nfloats = 0, nheap = 0, fused = 0;
     uint32_t ap = (uint32_t)cpu->gpr[OCERZ_RSP] + 4, sret = 0;
     int pop = 0;
     if (g->ret.cls == '{' && !(m32_struct_in_regs(&g->ret))) {
@@ -823,15 +831,20 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             put_int(&hc, (uint64_t)(uintptr_t)m32_callback((uint32_t)raw, ga->cb, ha->cb), 8);
             continue;
         }
-        if ((ga->cls == 'Q' || ga->cls == 'r' || ga->cls == 'R') && raw && nfloats < 4 && nwb < 16) {
-            int out = 0, n = float_array_count(e->name, i, (uint32_t)cpu->gpr[OCERZ_RSP], &out);
+        if (g->farr[i] && raw && nfloats < 4 && nwb < 16) {
+            int out = 0, n = float_array_count(&g_float_arrays[g->farr[i] - 1], (uint32_t)cpu->gpr[OCERZ_RSP], &out);
             if (n) {
-                double *d = malloc(sizeof *d * (size_t)n);
+                int small = n <= (int)(sizeof fbuf / sizeof fbuf[0]) - fused;
+                double *d = small ? fbuf + fused : malloc(sizeof *d * (size_t)n);
                 const float *src = (const float *)m32_h((uint32_t)raw);
                 for (int k = 0; d && k < n; k++)
                     d[k] = src[k];
                 if (d) {
-                    floats[nfloats++] = d;
+                    nfloats++;
+                    if (small)
+                        fused += n;
+                    else
+                        floats[nheap++] = d;
                     if (out)
                         wb[nwb++] = (Writeback){ 'F', (uint32_t)raw, (uint64_t *)d, NULL, NULL, (uint32_t)n };
                 }
@@ -914,7 +927,7 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
     ocerz_bridge_lower(&frame);
     m32_refresh_data();
     if (exc) {   /* the host raised: the guest's innermost @try gets it */
-        for (int i = 0; i < nfloats; i++)
+        for (int i = 0; i < nheap; i++)
             free(floats[i]);
         return m32_objc_guest_throw(cpu, m32_objc_to_guest(exc));
     }
@@ -961,7 +974,7 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
         else
             m32_wr(wb[i].guest, wb[i].cls == 'P' ? m32_handle((void *)(uintptr_t)v) : (uint32_t)v);
     }
-    for (int i = 0; i < nfloats; i++)
+    for (int i = 0; i < nheap; i++)
         free(floats[i]);
     const M32Type *gr = &g->ret, *hr = &h->ret;
     if (gr->cls == 'v') {

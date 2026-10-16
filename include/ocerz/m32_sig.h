@@ -23,6 +23,7 @@ typedef struct M32Sig {
     M32Type ret;
     M32Type arg[16];
     int nargs;
+    uint8_t farr[16];         /* m32_cross's guest signatures: 1 + each argument's float-array rule, 0 none */
 } M32Sig;
 
 M32Sig *m32_sig_parse(const char *notation, int guest);   /* guest: i386 sizes and layout */
