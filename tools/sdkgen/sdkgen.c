@@ -2658,33 +2658,60 @@ static void apply_override(Rec *r, Override *o)
     }
 }
 
-static void overrides_for(Rec *r)
+static Map g_ovr_exact, g_ovr_dup, g_ovr_stub;
+static int *g_ovr_glob, g_novr_glob;
+
+static void index_overrides(void)
 {
-    Override *exact = NULL, *variant = NULL, *glob = NULL;
-    size_t nlen = strlen(r->name);
+    g_ovr_glob = xalloc(NULL, (size_t)(g_novr + 1) * sizeof *g_ovr_glob);
     for (int i = 0; i < g_novr; i++) {
         Override *o = &g_ovr[i];
         const char *k = o->kind;
         if (strcmp(k, "shape") == 0 || strcmp(k, "struct") == 0 || strcmp(k, "inplace") == 0 ||
             strcmp(k, "opaque") == 0)
             continue;
-        const char *pat = o->f[1];
         if (o->glob) {
-            if (!glob && (strcmp(k, "var") == 0 ? !r->functionish : r->functionish) &&
-                fnmatch(pat, r->name, 0) == 0)
-                glob = o;
+            g_ovr_glob[g_novr_glob++] = i;
             continue;
         }
-        if (strcmp(pat, r->name) == 0) {
-            if (exact)
-                die("overrides:%d and overrides:%d both name %s", exact->line, o->line, r->name);
-            exact = o;
-            continue;
+        if (map_get(&g_ovr_exact, o->f[1]) < 0)
+            map_set(&g_ovr_exact, o->f[1], i);
+        else if (map_get(&g_ovr_dup, o->f[1]) < 0)
+            map_set(&g_ovr_dup, o->f[1], i);
+        if (strcmp(k, "stub") == 0 && map_get(&g_ovr_stub, o->f[1]) < 0)
+            map_set(&g_ovr_stub, o->f[1], i);
+    }
+}
+
+static void overrides_for(Rec *r)
+{
+    Override *exact = NULL, *variant = NULL, *glob = NULL;
+    int ei = map_get(&g_ovr_exact, r->name);
+    if (ei >= 0) {
+        int di = map_get(&g_ovr_dup, r->name);
+        if (di >= 0)
+            die("overrides:%d and overrides:%d both name %s", g_ovr[ei].line, g_ovr[di].line,
+                r->name);
+        exact = &g_ovr[ei];
+    }
+    if (strchr(r->name, '$')) {
+        char *pre = xstrdup(r->name);
+        int vi = -1;
+        for (char *d = strchr(pre, '$'); d; d = strchr(d + 1, '$')) {
+            *d = '\0';
+            int si = map_get(&g_ovr_stub, pre);
+            if (si >= 0 && (vi < 0 || si < vi))
+                vi = si;
+            *d = '$';
         }
-        size_t plen = strlen(pat);
-        if (strcmp(k, "stub") == 0 && plen < nlen && strncmp(pat, r->name, plen) == 0 &&
-            r->name[plen] == '$')
-            variant = variant ? variant : o;
+        free(pre);
+        variant = vi >= 0 ? &g_ovr[vi] : NULL;
+    }
+    for (int i = 0; i < g_novr_glob && !glob; i++) {
+        Override *o = &g_ovr[g_ovr_glob[i]];
+        if ((strcmp(o->kind, "var") == 0 ? !r->functionish : r->functionish) &&
+            fnmatch(o->f[1], r->name, 0) == 0)
+            glob = o;
     }
     Override *o = exact ? exact : variant ? variant : glob;
     if (o)
@@ -2793,6 +2820,8 @@ int main(int argc, char **argv)
     int nextra = 0;
     collect_doc(&ex, &tbd, top, &seen, &extra, &nextra, 1);
     qsort(ex.v, (size_t)ex.n, sizeof *ex.v, cmp_str);
+    for (int i = 0; i < ex.n; i++)   /* names now index the sorted v (and recs) */
+        map_set(&ex.names, ex.v[i], i);
 
     g_host = dlopen(g_lib.install, RTLD_LAZY | RTLD_LOCAL);
     if (!g_host)
@@ -2819,6 +2848,8 @@ int main(int argc, char **argv)
         recs[i].objc = map_get(&ex.objc_kind, ex.v[i]) > 0 ? map_get(&ex.objc_kind, ex.v[i]) : OBJC_NONE;
         classify(&recs[i]);
     }
+    if (!g_guest32)
+        index_overrides();
     for (int i = 0; i < ex.n && !g_guest32; i++)
         overrides_for(&recs[i]);
     for (int i = 0; i < g_novr && !g_guest32; i++) {
@@ -2827,9 +2858,8 @@ int main(int argc, char **argv)
             int idx = map_get(&ex.names, o->f[1]);
             if (idx < 0)
                 die("overrides:%d: %s does not export %s", o->line, g_lib.install, o->f[1]);
-            for (int j = 0; j < ex.n; j++)
-                if (strcmp(recs[j].name, o->f[1]) == 0 && recs[j].kind != R_FN)
-                    die("overrides:%d: %s record for %s, which is not fn", o->line, o->kind, o->f[1]);
+            if (recs[idx].kind != R_FN)
+                die("overrides:%d: %s record for %s, which is not fn", o->line, o->kind, o->f[1]);
             o->used = 1;
         }
         if (!o->used && o->scope && strcmp(o->kind, "opaque") == 0)
