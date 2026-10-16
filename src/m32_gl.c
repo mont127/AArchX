@@ -16,7 +16,7 @@
  * transform feedback, glCopyBufferSubData) does not go through m32, so only array and element array buffers are
  * mirrored and a buffer bound elsewhere is copied in at every map.
  *
- * ponytail: 256 shadows, a linear scan under one lock.
+ * ponytail: 256 shadows, a linear scan under one lock behind a one-slot hint.
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -103,22 +103,44 @@ static uint32_t bound(unsigned target)
     return (uint32_t)b;
 }
 
-/* the shadow of (group, buffer), or NULL; with g_lock held */
-static Shadow *find(void *group, uint32_t buffer)
+/* the slot last made or found, tried before the scan: a (group, buffer) has at most one slot, and the buffer just
+ * mapped is the one flushed and unmapped next (and usually mapped again) */
+static int g_hint;
+
+static int is(const Shadow *s, void *group, uint32_t buffer) { return s->group == group && s->buffer == buffer; }
+
+/* whether s is the shadow of (group, buffer) with a guest copy (live) or a mapping (!live) */
+static int has(const Shadow *s, void *group, uint32_t buffer, int live)
 {
+    return is(s, group, buffer) && (live ? s->guest != 0 : s->host != NULL);
+}
+
+static Shadow *lookup(void *group, uint32_t buffer, int live)
+{
+    Shadow *h = &g_shadows[__atomic_load_n(&g_hint, __ATOMIC_RELAXED)];
+    if (has(h, group, buffer, live))
+        return h;
     for (int i = 0; i < 256; i++)
-        if (g_shadows[i].group == group && g_shadows[i].buffer == buffer && g_shadows[i].guest)
+        if (has(&g_shadows[i], group, buffer, live)) {
+            __atomic_store_n(&g_hint, i, __ATOMIC_RELAXED);
             return &g_shadows[i];
+        }
     return NULL;
 }
+
+/* the shadow of (group, buffer), or NULL; with g_lock held */
+static Shadow *find(void *group, uint32_t buffer) { return lookup(group, buffer, 1); }
 
 /* the shadow of (group, buffer), made or grown to size (a grown one mirrors nothing yet); NULL when there is no room */
 static Shadow *shadow_for(void *group, uint32_t buffer, uint32_t size)
 {
     Shadow *s = NULL, *spare = NULL;
     pthread_mutex_lock(&g_lock);
+    Shadow *h = &g_shadows[__atomic_load_n(&g_hint, __ATOMIC_RELAXED)];
+    if (is(h, group, buffer))
+        s = h;
     for (int i = 0; i < 256 && !s; i++) {
-        if (g_shadows[i].group == group && g_shadows[i].buffer == buffer)
+        if (is(&g_shadows[i], group, buffer))
             s = &g_shadows[i];
         else if (!spare && !g_shadows[i].host)
             spare = &g_shadows[i];   /* empty, or an unmapped one to recycle */
@@ -134,19 +156,13 @@ static Shadow *shadow_for(void *group, uint32_t buffer, uint32_t size)
         s->cap = s->guest ? size : 0;
         s->mirror = 0;
     }
+    if (s)
+        __atomic_store_n(&g_hint, (int)(s - g_shadows), __ATOMIC_RELAXED);
     pthread_mutex_unlock(&g_lock);
     return s && s->guest ? s : NULL;
 }
 
-static Shadow *mapped(unsigned target)
-{
-    void *group = share_group();
-    uint32_t buffer = bound(target);
-    for (int i = 0; i < 256; i++)
-        if (g_shadows[i].group == group && g_shadows[i].buffer == buffer && g_shadows[i].host)
-            return &g_shadows[i];
-    return NULL;
-}
+static Shadow *mapped(unsigned target) { return lookup(share_group(), bound(target), 0); }
 
 #define RET(v) do { m32_ret(cpu, (uint32_t)(v), 0, 0); return OCERZ_STEP_OK; } while (0)
 
