@@ -226,6 +226,8 @@ typedef struct {
     uint8_t *shared;
     uint8_t *armed;
     uint32_t *slots;
+    uint64_t *used;
+    uint64_t *edge;
 } MemRegion;
 
 #define MEM_REGION_MAX 128
@@ -323,12 +325,6 @@ static uint32_t slot_load(const MemRegion *r, size_t i)
     return r->slots ? __atomic_load_n(&r->slots[i], __ATOMIC_ACQUIRE) : 0;
 }
 
-static void slot_store(const MemRegion *r, size_t i, uint32_t value)
-{
-    if (r->slots)
-        __atomic_store_n(&r->slots[i], value, __ATOMIC_RELEASE);
-}
-
 static uint32_t slot_owner(uint32_t state)
 {
     return state & MEM_SLOT_OWNER_MASK;
@@ -342,6 +338,86 @@ static int slot_is_data(uint32_t state)
 static uint32_t slot_data_state(uint32_t owner, int prot)
 {
     return owner | ((uint32_t)(prot & 7) << MEM_SLOT_PROT_SHIFT);
+}
+
+static unsigned slot_class(uint32_t state)
+{
+    return slot_is_data(state) ? 8u | ((state & MEM_SLOT_PROT_MASK) >> MEM_SLOT_PROT_SHIFT) : 0u;
+}
+
+static size_t region_slots(const MemRegion *r)
+{
+    return (size_t)((r->ghi - r->glo) / OCERZ_GUEST_PAGE);
+}
+
+static void word_bit_put(uint64_t *w, size_t i, int on)
+{
+    if (on)
+        w[i >> 6] |= 1ull << (i & 63);
+    else
+        w[i >> 6] &= ~(1ull << (i & 63));
+}
+
+static void word_bits_fill(uint64_t *w, size_t i0, size_t i1, int on)
+{
+    for (; i0 < i1 && (i0 & 63); i0++)
+        word_bit_put(w, i0, on);
+    for (; i0 + 64 <= i1; i0 += 64)
+        w[i0 >> 6] = on ? ~0ull : 0;
+    for (; i0 < i1; i0++)
+        word_bit_put(w, i0, on);
+}
+
+static size_t word_bit_next(const uint64_t *w, size_t i, size_t n, int on)
+{
+    while (i < n) {
+        uint64_t v = (on ? w[i >> 6] : ~w[i >> 6]) & (~0ull << (i & 63));
+        if (v) {
+            size_t j = (i & ~(size_t)63) + (size_t)__builtin_ctzll(v);
+            return j < n ? j : n;
+        }
+        i = (i | 63) + 1;
+    }
+    return n;
+}
+
+static size_t word_bit_prev(const uint64_t *w, size_t i)
+{
+    for (;;) {
+        uint64_t v = w[i >> 6] & (~0ull >> (63 - (i & 63)));
+        if (v)
+            return (i & ~(size_t)63) + 63 - (size_t)__builtin_clzll(v);
+        if (i < 64)
+            return 0;
+        i = (i & ~(size_t)63) - 1;
+    }
+}
+
+static void slot_edge_sync(const MemRegion *r, size_t i)
+{
+    if (i >= region_slots(r))
+        return;
+    unsigned prev = i ? slot_class(slot_load(r, i - 1)) : 0;
+    word_bit_put(r->edge, i, slot_class(slot_load(r, i)) != prev);
+}
+
+static void slot_edges_uniform(const MemRegion *r, size_t i0, size_t i1)
+{
+    if (i0 >= i1)
+        return;
+    word_bits_fill(r->edge, i0, i1, 0);
+    slot_edge_sync(r, i0);
+    slot_edge_sync(r, i1);
+}
+
+static void slot_store(const MemRegion *r, size_t i, uint32_t value)
+{
+    if (!r->slots)
+        return;
+    __atomic_store_n(&r->slots[i], value, __ATOMIC_RELEASE);
+    word_bit_put(r->used, i, value != 0);
+    slot_edge_sync(r, i);
+    slot_edge_sync(r, i + 1);
 }
 
 static int bit_test(const MemRegion *r, size_t i)
@@ -391,11 +467,15 @@ static MemRegion *region_add(uint64_t glo, uint64_t ghi)
     uint8_t *shared = (uint8_t *)calloc((size_t)npages, sizeof(*shared));
     uint8_t *armed = (uint8_t *)calloc((size_t)npages, sizeof(*armed));
     uint32_t *slots = (uint32_t *)calloc((size_t)nslots, sizeof(*slots));
-    if (!bm || !shared || !armed || !slots) {
+    uint64_t *used = (uint64_t *)calloc((size_t)((nslots + 63) / 64), sizeof(*used));
+    uint64_t *edge = (uint64_t *)calloc((size_t)((nslots + 63) / 64), sizeof(*edge));
+    if (!bm || !shared || !armed || !slots || !used || !edge) {
         free(bm);
         free(shared);
         free(armed);
         free(slots);
+        free(used);
+        free(edge);
         return NULL;
     }
     regions[region_n].glo = glo;
@@ -404,6 +484,8 @@ static MemRegion *region_add(uint64_t glo, uint64_t ghi)
     regions[region_n].shared = shared;
     regions[region_n].armed = armed;
     regions[region_n].slots = slots;
+    regions[region_n].used = used;
+    regions[region_n].edge = edge;
     MemRegion *result = &regions[region_n];
     __atomic_store_n(&region_n, region_n + 1, __ATOMIC_RELEASE);
     return result;
@@ -612,7 +694,8 @@ static void release_range_locked(MemRegion *r, uint64_t lo, uint64_t hi,
             release_slot_locked(r, p, affected_lo, affected_hi);
         return;
     }
-    uint32_t *slots = r->slots + slot_index(r, lo);
+    size_t i0 = slot_index(r, lo);
+    uint32_t *slots = r->slots + i0;
     uint64_t n = (hi - lo) / OCERZ_GUEST_PAGE;
     uint32_t run_id = 0;
     uint64_t run_n = 0, first = UINT64_MAX, last = 0;
@@ -629,6 +712,7 @@ static void release_range_locked(MemRegion *r, uint64_t lo, uint64_t hi,
                 shared_store(r, page_i, (uint8_t)(shared & ~shared_slot_bit(p)));
         }
         slots[k] = 0;
+        word_bit_put(r->used, i0 + (size_t)k, 0);
         if (first == UINT64_MAX)
             first = p;
         last = p + OCERZ_GUEST_PAGE;
@@ -640,6 +724,7 @@ static void release_range_locked(MemRegion *r, uint64_t lo, uint64_t hi,
         run_n++;
     }
     __atomic_thread_fence(__ATOMIC_RELEASE);
+    slot_edges_uniform(r, i0, i0 + (size_t)n);
     if (first < last)
         affected_include(first, last, affected_lo, affected_hi);
     release_owner_run_locked(run_id, run_n, affected_lo, affected_hi);
@@ -718,7 +803,8 @@ static int install_fresh_locked(MemRegion *r, uint64_t lo, uint64_t hi, uint64_t
     }
     bits_set_range(r, pg_index(r, lo), pg_index(r, dhi));
     if (r->slots) {
-        uint32_t *s = r->slots + slot_index(r, lo);
+        size_t i0 = slot_index(r, lo);
+        uint32_t *s = r->slots + i0;
         uint32_t v = slot_data_state(owner, prot);
         for (uint64_t k = 0; k < nslots; k++)
             s[k] = v;
@@ -726,6 +812,9 @@ static int install_fresh_locked(MemRegion *r, uint64_t lo, uint64_t hi, uint64_t
         for (uint64_t k = 0; k < ng; k++)
             s[nslots + k] = owner | MEM_SLOT_GUARD;
         __atomic_thread_fence(__ATOMIC_RELEASE);
+        word_bits_fill(r->used, i0, i0 + (size_t)(nslots + ng), 1);
+        slot_edges_uniform(r, i0, i0 + (size_t)nslots);
+        slot_edges_uniform(r, i0 + (size_t)nslots, i0 + (size_t)(nslots + ng));
     }
     if (owner_out)
         *owner_out = owner;
@@ -1368,6 +1457,7 @@ static uint64_t find_free_span_locked(uint64_t start, uint64_t end,
     if (start > UINT64_MAX - (align - 1))
         return 0;
     uint64_t candidate = align_up(start, align);
+    size_t end_i = slot_index(r, end);
     while (candidate < end) {
         if (glen > end - candidate)
             break;
@@ -1376,19 +1466,18 @@ static uint64_t find_free_span_locked(uint64_t start, uint64_t end,
         if (!allocation_guard_end(data_hi, &guard_hi) || guard_hi > end)
             break;
 
-        uint64_t occupied = 0;
-        for (uint64_t p = candidate; p < guard_hi; p += OCERZ_GUEST_PAGE) {
-            if (slot_load(r, slot_index(r, p)) != 0) {
-                occupied = p;
-                break;
-            }
-        }
-        if (!occupied)
+        size_t guard_i = slot_index(r, guard_hi);
+        size_t occupied = word_bit_next(r->used, slot_index(r, candidate), guard_i, 1);
+        if (occupied == guard_i)
             return candidate;
 
-        if (occupied > UINT64_MAX - OCERZ_GUEST_PAGE - (align - 1))
+        size_t free_i = word_bit_next(r->used, occupied, end_i, 0);
+        if (free_i >= end_i)
             break;
-        candidate = align_up(occupied + OCERZ_GUEST_PAGE, align);
+        uint64_t next = r->glo + (uint64_t)free_i * OCERZ_GUEST_PAGE;
+        if (next > UINT64_MAX - (align - 1))
+            break;
+        candidate = align_up(next, align);
     }
     return 0;
 }
@@ -1718,42 +1807,18 @@ int ocerz_guest_vm_region(uint64_t *addr, uint64_t *size, unsigned *prot,
                 next = &regions[k];
         }
         if (cls) {
-            uint64_t pos = query;
-            uint32_t state = slot_load(cls, slot_index(cls, pos));
-            if (!slot_is_data(state)) {
-                do {
-                    pos += OCERZ_GUEST_PAGE;
-                    if (pos >= cls->ghi)
-                        break;
-                    state = slot_load(cls, slot_index(cls, pos));
-                } while (!slot_is_data(state));
-            }
-            if (pos < cls->ghi && slot_is_data(state)) {
+            size_t n = region_slots(cls);
+            size_t qi = slot_index(cls, query);
+            size_t pi = slot_is_data(slot_load(cls, qi))
+                ? qi : word_bit_next(cls->edge, qi + 1, n, 1);
+            if (pi < n) {
+                uint32_t state = slot_load(cls, pi);
                 unsigned run_prot =
                     (state & MEM_SLOT_PROT_MASK) >> MEM_SLOT_PROT_SHIFT;
-                uint64_t base = pos;
-                if (pos == query) {
-                    while (base > cls->glo) {
-                        uint32_t before = slot_load(
-                            cls, slot_index(cls, base - OCERZ_GUEST_PAGE));
-                        if (!slot_is_data(before) ||
-                            ((before & MEM_SLOT_PROT_MASK) >>
-                             MEM_SLOT_PROT_SHIFT) != run_prot)
-                            break;
-                        base -= OCERZ_GUEST_PAGE;
-                    }
-                }
-                uint64_t end = pos + OCERZ_GUEST_PAGE;
-                while (end < cls->ghi) {
-                    uint32_t after = slot_load(cls, slot_index(cls, end));
-                    if (!slot_is_data(after) ||
-                        ((after & MEM_SLOT_PROT_MASK) >>
-                         MEM_SLOT_PROT_SHIFT) != run_prot)
-                        break;
-                    end += OCERZ_GUEST_PAGE;
-                }
-                *addr = base;
-                *size = end - base;
+                size_t bi = pi == qi ? word_bit_prev(cls->edge, pi) : pi;
+                size_t ei = word_bit_next(cls->edge, pi + 1, n, 1);
+                *addr = cls->glo + (uint64_t)bi * OCERZ_GUEST_PAGE;
+                *size = (uint64_t)(ei - bi) * OCERZ_GUEST_PAGE;
                 *prot = run_prot;
                 *max_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
                 map_lock_release();
