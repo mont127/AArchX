@@ -734,24 +734,34 @@ static void log_cfdesc(void *p)
 
 __thread void *m32_cross_self;   /* when set, the first host argument (a super send's objc_super) */
 
-int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
+int m32_export_sigs(M32Export *e)
 {
-    void *self_override = m32_cross_self;
-    m32_cross_self = NULL;
     if (!e->gsig) {
         pthread_mutex_lock(&g_sig_lock);
         if (!e->gsig) {
             M32Sig *h = m32_sig_parse(e->hnote, 0), *g = m32_sig_parse(e->gnote, 1);
             if (!h || !g || h->nargs != g->nargs) {
                 pthread_mutex_unlock(&g_sig_lock);
-                m32_log_once("notations do not parse, returning 0:", e->name);
-                m32_ret(cpu, 0, 0, 0);
-                return OCERZ_STEP_OK;
+                free(h);
+                free(g);
+                return 0;
             }
             e->hsig = h;
             __atomic_store_n(&e->gsig, g, __ATOMIC_RELEASE);
         }
         pthread_mutex_unlock(&g_sig_lock);
+    }
+    return 1;
+}
+
+int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
+{
+    void *self_override = m32_cross_self;
+    m32_cross_self = NULL;
+    if (!m32_export_sigs(e)) {
+        m32_log_once("notations do not parse, returning 0:", e->name);
+        m32_ret(cpu, 0, 0, 0);
+        return OCERZ_STEP_OK;
     }
     const M32Sig *g = e->gsig, *h = e->hsig;
     static const char *calllog = (const char *)1;   /* OCERZ_M32_CALLLOG also names the notations a crossing uses */

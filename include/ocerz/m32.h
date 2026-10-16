@@ -141,6 +141,7 @@ void m32_activate_soon(void);         /* src/m32.c: the game's app comes to the 
 uint32_t m32_export_hostfn(void *fn, const char *gnote, const char *hnote);   /* host function as guest address */
 
 int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e);          /* src/m32_cross.c */
+int m32_export_sigs(M32Export *e);   /* parses e->gsig and e->hsig once; 0 when the notations do not parse */
 extern __thread void *m32_cross_self;
 int m32_call_native_catching(const void *fn, const uint64_t *x, const uint64_t *v, const uint64_t *stack,
                              uint64_t stackbytes, void *x8, uint64_t *out_x, uint64_t *out_v, void **exception);

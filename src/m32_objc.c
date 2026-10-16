@@ -109,15 +109,23 @@ uint32_t m32_sel_guest(void *host_sel)
     return g;
 }
 
-void *m32_sel_host(uint32_t g)
+static void *sel_host_locked(uint32_t g)
 {
     if (!g)
         return NULL;
     uint64_t v;
-    LOCK();
     void *h = map_get(&g_sel_host, g, &v) ? (void *)(uintptr_t)v : NULL;
     if (!h)   /* a selector string the guest made itself */
-        h = (void *)m32_sel_host(sel_intern((const char *)m32_h(g), 0));
+        h = sel_host_locked(sel_intern((const char *)m32_h(g), 0));
+    return h;
+}
+
+void *m32_sel_host(uint32_t g)
+{
+    if (!g)
+        return NULL;
+    LOCK();
+    void *h = sel_host_locked(g);
     UNLOCK();
     return h;
 }
@@ -802,13 +810,11 @@ static void main_call(void *fn, void *self, SEL sel, void *arg)
 }
 static void main_send(void *self, SEL sel, void *arg) { main_call(M32_MSGSEND, self, sel, arg); }
 static void main_send_super(void *sup, SEL sel, void *arg) { main_call(M32_MSGSENDSUPER, sup, sel, arg); }
-static int on_main(Class cls, const char *sel)
+static int on_main(Class cls)   /* setView: and update (SF_MAIN) */
 {
     static Class gl;
     if (!gl)
         gl = objc_getClass("NSOpenGLContext");
-    if (strcmp(sel, "setView:") && strcmp(sel, "update"))
-        return 0;
     for (; cls; cls = class_getSuperclass(cls))
         if (cls == gl)
             return 1;
@@ -915,17 +921,11 @@ static int fast_enumeration(OcerzCPU *cpu, void *hself, Class super_cls, SEL hs)
 /* A variadic method: the named arguments convert as usual, then either a format's arguments (the last named one is
  * the format NSString) or objects up to a nil, each in an 8-byte arm64 variadic stack slot. */
 static int send_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, SEL hs, const char *name,
-                         const char *genc, const char *henc)
+                         M32Export *e, int format)
 {
-    char gn[1024], hn[1024];
-    M32Sig *g = NULL, *h = NULL;
-    if (!m32_encoding_notation(genc, 1, gn, sizeof gn) && !m32_encoding_notation(henc, 0, hn, sizeof hn)) {
-        g = m32_sig_parse(gn, 1);
-        h = m32_sig_parse(hn, 0);
-    }
-    if (!g || !h || g->nargs != h->nargs || g->nargs < 2) {
+    const M32Sig *g = e && m32_export_sigs(e) ? e->gsig : NULL, *h = g ? e->hsig : NULL;
+    if (!g || g->nargs < 2) {
         m32_log_once("a variadic message m32 cannot carry:", name);
-        free(g); free(h);
         return ret_nil(cpu, 0);
     }
     uint32_t ap = (uint32_t)cpu->gpr[OCERZ_RSP] + 4;
@@ -944,7 +944,7 @@ static int send_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class s
         last = (void *)(uintptr_t)hv;
     }
     int ns = 0;
-    if (strstr(name, "ormat")) {          /* the format is the last named argument */
+    if (format) {                         /* the format is the last named argument */
         const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
         const char *fmt = last ? utf8(last, sel_registerName("UTF8String")) : "";
         ns = m32_printf_slots(fmt, ap, slots, 64, name);
@@ -953,18 +953,17 @@ static int send_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class s
             slots[ns++] = (uint64_t)(uintptr_t)m32_objc_to_host(w);
         slots[ns++] = 0;
     }
-    free(g); free(h);
     if (ns < 0)
         return ret_nil(cpu, 0);
     uint64_t out_x[2] = { 0 }, out_v[4] = { 0 };
     struct OcerzBridgeFrame frame;
-    ocerz_bridge_raise(&frame, "objc", name, hn, NULL);
+    ocerz_bridge_raise(&frame, "objc", name, e->hnote, NULL);
     void *exc = NULL;
     m32_call_native_catching(super_cls ? M32_MSGSENDSUPER : M32_MSGSEND, x, v, slots, (uint64_t)ns * 8, NULL, out_x, out_v, &exc);
     ocerz_bridge_lower(&frame);
     if (exc)
         return m32_objc_guest_throw(cpu, m32_objc_to_guest(exc));
-    char r = gn[0];
+    char r = e->gnote[0];
     uint32_t eax = r == '@' ? m32_objc_to_guest((void *)(uintptr_t)out_x[0]) : r == 'v' ? 0 : (uint32_t)out_x[0];
     m32_ret(cpu, eax, 0, 0);
     return OCERZ_STEP_OK;
@@ -975,21 +974,15 @@ static int send_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class s
  * argument on the guest's stack, becomes a pointer to 8-byte arm64 slots, which is what an Apple arm64 va_list is.
  * The format is the argument whose part of the selector ends in "ormat". */
 static int send_va_list(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, SEL hs, const char *name,
-                        const char *genc, const char *henc)
+                        M32Export *e)
 {
-    char gn[1024], hn[1024];
-    M32Sig *g = NULL, *h = NULL;
-    if (!m32_encoding_notation(genc, 1, gn, sizeof gn) && !m32_encoding_notation(henc, 0, hn, sizeof hn)) {
-        g = m32_sig_parse(gn, 1);
-        h = m32_sig_parse(hn, 0);
-    }
+    const M32Sig *g = e && m32_export_sigs(e) ? e->gsig : NULL, *h = g ? e->hsig : NULL;
     int fi = -1, part = 0;
     for (const char *p = name, *colon; (colon = strchr(p, ':')); p = colon + 1, part++)
         if (colon - p >= 5 && !strncmp(colon - 5, "ormat", 5))
             fi = 2 + part;
-    if (!g || !h || g->nargs != h->nargs || g->nargs < 4 || fi < 2 || fi >= g->nargs - 1 || g->nargs > 8) {
+    if (!g || g->nargs < 4 || fi < 2 || fi >= g->nargs - 1 || g->nargs > 8) {
         m32_log_once("a va_list message m32 cannot carry:", name);
-        free(g); free(h);
         return ret_nil(cpu, 0);
     }
     uint32_t at = (uint32_t)cpu->gpr[OCERZ_RSP] + 12;
@@ -1005,20 +998,18 @@ static int send_va_list(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class su
     const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
     const char *fmt = x[fi] ? utf8((id)(uintptr_t)x[fi], sel_registerName("UTF8String")) : "";
     int ns = m32_printf_slots(fmt, m32_rd(at), slots, 64, name);
-    int nargs = g->nargs;
-    free(g); free(h);
     if (ns < 0)
         return ret_nil(cpu, 0);
-    x[nargs - 1] = (uint64_t)(uintptr_t)slots;
+    x[g->nargs - 1] = (uint64_t)(uintptr_t)slots;
     uint64_t out_x[2] = { 0 }, out_v[4] = { 0 };
     struct OcerzBridgeFrame frame;
-    ocerz_bridge_raise(&frame, "objc", name, hn, NULL);
+    ocerz_bridge_raise(&frame, "objc", name, e->hnote, NULL);
     void *exc = NULL;
     m32_call_native_catching(super_cls ? M32_MSGSENDSUPER : M32_MSGSEND, x, v, NULL, 0, NULL, out_x, out_v, &exc);
     ocerz_bridge_lower(&frame);
     if (exc)
         return m32_objc_guest_throw(cpu, m32_objc_to_guest(exc));
-    char r = gn[0];
+    char r = e->gnote[0];
     uint32_t eax = r == '@' ? m32_objc_to_guest((void *)(uintptr_t)out_x[0]) : r == 'v' ? 0 : (uint32_t)out_x[0];
     m32_ret(cpu, eax, 0, 0);
     return OCERZ_STEP_OK;
@@ -1029,11 +1020,9 @@ static int send_va_list(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class su
  * ids, written back as guest ids when the method fills it. */
 static int objects_send(struct OcerzVM *vm, OcerzCPU *cpu, Method m, M32Export *e)
 {
-    M32Sig *g = m32_sig_parse(e->gnote, 1);
-    if (!g || g->nargs < 3 || (g->arg[g->nargs - 1].cls != 'u' && g->arg[g->nargs - 1].cls != 'i')) {
-        free(g);
+    const M32Sig *g = m32_export_sigs(e) ? e->gsig : NULL;
+    if (!g || g->nargs < 3 || (g->arg[g->nargs - 1].cls != 'u' && g->arg[g->nargs - 1].cls != 'i'))
         return m32_cross(vm, cpu, e);
-    }
     uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP], at[8], old[8], buf[8], off = 4, count = 0;
     int out[8], n = 0;
     for (int i = 0; i < g->nargs; off += g->arg[i].size > 4 ? 8 : 4, i++) {
@@ -1045,7 +1034,6 @@ static int objects_send(struct OcerzVM *vm, OcerzCPU *cpu, Method m, M32Export *
         }
         count = m32_rd(esp + off);
     }
-    free(g);
     if (count > (1u << 24))
         return m32_cross(vm, cpu, e);
     for (int a = 0; a < n; a++) {
@@ -1109,9 +1097,40 @@ static int system_font(OcerzCPU *cpu, void *hself, const char *name)
     return 1;
 }
 
+/* what host_send asks of a selector's name, worked out on its first send */
+enum { SF_FAST_ENUM = 1, SF_VA_LIST = 2, SF_FORMAT = 4, SF_COUNT = 8, SF_HIDPI = 16, SF_GL_VIEW = 32, SF_MAIN = 64 };
+static Map g_sel_flags;   /* host SEL -> SF_* */
+
+static unsigned name_flags(const char *name)
+{
+    size_t l = strlen(name);
+    return (!strcmp(name, "countByEnumeratingWithState:objects:count:") ? SF_FAST_ENUM : 0) |
+           (strstr(name, "ormat:") && l > 10 && !strcmp(name + l - 10, "arguments:") ? SF_VA_LIST : 0) |
+           (strstr(name, "ormat") ? SF_FORMAT : 0) | (strstr(name, "count:") ? SF_COUNT : 0) |
+           (!strcmp(name, "setWantsBestResolutionOpenGLSurface:") ? SF_HIDPI : 0) |
+           (!strcmp(name, "initWithFrame:pixelFormat:") ? SF_GL_VIEW : 0) |
+           (!strcmp(name, "setView:") || !strcmp(name, "update") ? SF_MAIN : 0);
+}
+
+static SEL send_sel(uint32_t gsel, unsigned *flags)
+{
+    uint64_t v;
+    LOCK();
+    SEL hs = sel_host_locked(gsel);
+    if (!hs || !map_get(&g_sel_flags, (uint64_t)(uintptr_t)hs, &v)) {
+        v = name_flags(sel_getName(hs));
+        if (hs)
+            map_put(&g_sel_flags, (uint64_t)(uintptr_t)hs, v);
+    }
+    UNLOCK();
+    *flags = (unsigned)v;
+    return hs;
+}
+
 static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, uint32_t gsel, uint32_t gtypes, int is_super)
 {
-    SEL hs = m32_sel_host(gsel);
+    unsigned f;
+    SEL hs = send_sel(gsel, &f);
     const char *name = sel_getName(hs);
     if (!is_super && system_font(cpu, hself, name))
         return OCERZ_STEP_OK;
@@ -1129,7 +1148,7 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
     uint64_t own;
     if (!genc && map_get(&g_imp_types, (uint64_t)(uintptr_t)method_getImplementation(m), &own))
         genc = (const char *)m32_h((uint32_t)own);
-    if (!strcmp(name, "countByEnumeratingWithState:objects:count:"))
+    if (f & SF_FAST_ENUM)
         return fast_enumeration(cpu, hself, super_cls, hs);
     if (!genc)
         genc = m32_objc_guest_encoding(is_class ? (Class)hself : class_isMetaClass(lookup_cls) ? (Class)hself : lookup_cls,
@@ -1140,10 +1159,11 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
         genc = guess_guest(henc, buf, sizeof buf);
     }
     if (m32_objc_last_variadic() && !gtypes)
-        return send_variadic(vm, cpu, is_super ? NULL : hself, super_cls, hs, name, genc, henc);
-    if (!gtypes && strstr(name, "ormat:") && strlen(name) > 10 && !strcmp(name + strlen(name) - 10, "arguments:"))
-        return send_va_list(vm, cpu, is_super ? NULL : hself, super_cls, hs, name, genc, henc);
-    M32Export *e = send_export(name, genc, henc, is_super, on_main(lookup_cls, name));
+        return send_variadic(vm, cpu, is_super ? NULL : hself, super_cls, hs, name, send_export(name, genc, henc, is_super, 0),
+                             f & SF_FORMAT);
+    if (!gtypes && (f & SF_VA_LIST))
+        return send_va_list(vm, cpu, is_super ? NULL : hself, super_cls, hs, name, send_export(name, genc, henc, is_super, 0));
+    M32Export *e = send_export(name, genc, henc, is_super, (f & SF_MAIN) && on_main(lookup_cls));
     if (!e) {
         m32_log_once("a message m32 cannot carry (union, bitfield, long double):", name);
         return ret_nil(cpu, 0);
@@ -1154,12 +1174,12 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
         sup.super_class = super_cls;
         m32_cross_self = &sup;
     }
-    if (strstr(henc, "^@") && strstr(name, "count:"))
+    if ((f & SF_COUNT) && strstr(henc, "^@"))
         return objects_send(vm, cpu, m, e);
-    if (!strcmp(name, "setWantsBestResolutionOpenGLSurface:"))
+    if (f & SF_HIDPI)
         chose_hidpi(hself, 1);
     int r = m32_cross(vm, cpu, e);
-    if (!strcmp(name, "initWithFrame:pixelFormat:") && is_kind(lookup_cls, "NSOpenGLView"))   /* attaches its own */
+    if ((f & SF_GL_VIEW) && is_kind(lookup_cls, "NSOpenGLView"))   /* attaches its own */
         legacy_drawable(m32_objc_to_host((uint32_t)cpu->gpr[OCERZ_RAX]));
     return r;
 }
