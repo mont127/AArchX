@@ -20,11 +20,13 @@
 #include <unistd.h>
 
 #include "ocerz/bridge.h"
+#include "ocerz/interp.h"
 #include "ocerz/m32.h"
 #include "ocerz/mem.h"
 #include "ocerz/m32_image.h"
 #include "ocerz/m32_objc.h"
 #include "ocerz/types.h"
+#include "ocerz/vm.h"
 
 M32Image *m32_images[M32_MAX_IMAGES];
 int m32_nimages;
@@ -569,9 +571,35 @@ static void protect_segments(M32Image *img)
     }
 }
 
+static int sp_ret0(struct OcerzVM *vm, OcerzCPU *cpu);
+static int sp_dyld_func_lookup(struct OcerzVM *vm, OcerzCPU *cpu);
+
+/* A lazy pointer left unbound: m32 binds every one at load, so reaching dyld's binding helper means it could not */
+static int sp_stub_binding_helper(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    fprintf(stderr, "ocerz: m32: a lazy symbol was left unbound (dyld_stub_binding_helper from %#x)\n",
+            m32_rd((uint32_t)cpu->gpr[OCERZ_RSP] + 8));
+    ocerz_vm_request_exit(vm, 134);
+    return OCERZ_STEP_EXIT;
+}
+
+/* An image linked for Mac OS X 10.4 or earlier reaches dyld through its __DATA,__dyld section: the first word is
+ * the lazy binding helper and the second _dyld_func_lookup, at the fixed addresses dyld had then (0x8fe01000 and
+ * 0x8fe01008), which nothing maps any more.  They point at m32's own. */
+static void dyld_section(M32Image *img)
+{
+    const M32Sect *s = m32_section(img, "__DATA", "__dyld");
+    if (!s || s->size < 8)
+        return;
+    uint32_t at = s->addr + (uint32_t)img->slide;
+    m32_wr(at, m32_export_special("dyld_stub_binding_helper", sp_stub_binding_helper));
+    m32_wr(at + 4, m32_export_special("__dyld_func_lookup", sp_dyld_func_lookup));
+}
+
 /* Apply rebases and every bind of one image; returns the number of required imports left unresolved. */
 int m32_image_fixup(M32Image *img)
 {
+    dyld_section(img);
     if (!img->has_dyld_info) {
         int bad = legacy_fixups(img);
         m32_cf_alias_strings(img);
@@ -1192,6 +1220,24 @@ static int sp_register_add_image(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 static int sp_ret0(struct OcerzVM *vm, OcerzCPU *cpu) { m32_ret(cpu, 0, 0, 0); return OCERZ_STEP_OK; }
 
+/* int _dyld_func_lookup(const char *name, void **address): how code linked for 10.4 and before finds dyld's
+ * functions (dyld_section).  crt1.o asks for two, which do nothing here because m32 runs the initializers and
+ * terminators itself; a dyld API m32 answers comes back as its export, anything else as 0. */
+static int sp_dyld_func_lookup(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t name_g = m32_arg(cpu, 0), out = m32_arg(cpu, 1), fn = 0;
+    const char *name = name_g && ocerz_addr_readable(name_g) ? (const char *)m32_h(name_g) : "";
+    if (!strcmp(name, "__dyld_make_delayed_module_initializer_calls") || !strcmp(name, "__dyld_mod_term_funcs"))
+        fn = m32_export_special("__dyld_m32_nothing", sp_ret0);
+    else if (!strncmp(name, "__dyld_", 7) && m32_special(name))
+        fn = m32_export(NULL, name);
+    else if (name[0])
+        m32_log_once("_dyld_func_lookup of a function m32 does not have:", name);
+    if (out)
+        m32_wr(out, fn);
+    m32_ret(cpu, fn != 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
 
 static int sp_NSGetExecutablePath(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -1242,6 +1288,7 @@ static int sp_getsectdatafromheader(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 
 const M32SpecialEntry m32_dyld_specials[] = {
+    { "__dyld_func_lookup", sp_dyld_func_lookup },
     { "_dlopen", sp_dlopen }, { "_dlsym", sp_dlsym }, { "_dlclose", sp_dlclose }, { "_dlerror", sp_dlerror },
     { "_dladdr", sp_dladdr },
     { "_NSIsSymbolNameDefined", sp_NSIsSymbolNameDefined }, { "_NSLookupAndBindSymbol", sp_NSLookupAndBindSymbol },

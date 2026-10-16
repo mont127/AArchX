@@ -815,6 +815,60 @@ static int send_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class s
     return OCERZ_STEP_OK;
 }
 
+/* A method whose last argument is a format's va_list (initWithFormat:arguments:, initWithFormat:locale:arguments:,
+ * +raise:format:arguments:): the named arguments convert as usual, and the va_list, the address of the format's first
+ * argument on the guest's stack, becomes a pointer to 8-byte arm64 slots, which is what an Apple arm64 va_list is.
+ * The format is the argument whose part of the selector ends in "ormat". */
+static int send_va_list(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, SEL hs, const char *name,
+                        const char *genc, const char *henc)
+{
+    char gn[1024], hn[1024];
+    M32Sig *g = NULL, *h = NULL;
+    if (!m32_encoding_notation(genc, 1, gn, sizeof gn) && !m32_encoding_notation(henc, 0, hn, sizeof hn)) {
+        g = m32_sig_parse(gn, 1);
+        h = m32_sig_parse(hn, 0);
+    }
+    int fi = -1, part = 0;
+    for (const char *p = name, *colon; (colon = strchr(p, ':')); p = colon + 1, part++)
+        if (colon - p >= 5 && !strncmp(colon - 5, "ormat", 5))
+            fi = 2 + part;
+    if (!g || !h || g->nargs != h->nargs || g->nargs < 4 || fi < 2 || fi >= g->nargs - 1 || g->nargs > 8) {
+        m32_log_once("a va_list message m32 cannot carry:", name);
+        free(g); free(h);
+        return ret_nil(cpu, 0);
+    }
+    uint32_t at = (uint32_t)cpu->gpr[OCERZ_RSP] + 12;
+    uint64_t x[8] = { 0 }, v[8] = { 0 }, slots[64];
+    struct objc_super sup = { hself, super_cls };
+    x[0] = super_cls ? (uint64_t)(uintptr_t)&sup : (uint64_t)(uintptr_t)hself;
+    x[1] = (uint64_t)(uintptr_t)hs;
+    for (int i = 2; i < g->nargs - 1; i++) {
+        uint64_t raw = g->arg[i].size == 8 ? (m32_rd(at) | (uint64_t)m32_rd(at + 4) << 32) : m32_rd(at);
+        at += g->arg[i].size == 8 ? 8 : 4;
+        x[i] = m32_scalar_in(g->arg[i].cls, h->arg[i].cls, raw, name, i);
+    }
+    const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
+    const char *fmt = x[fi] ? utf8((id)(uintptr_t)x[fi], sel_registerName("UTF8String")) : "";
+    int ns = m32_printf_slots(fmt, m32_rd(at), slots, 64, name);
+    int nargs = g->nargs;
+    free(g); free(h);
+    if (ns < 0)
+        return ret_nil(cpu, 0);
+    x[nargs - 1] = (uint64_t)(uintptr_t)slots;
+    uint64_t out_x[2] = { 0 }, out_v[4] = { 0 };
+    struct OcerzBridgeFrame frame;
+    ocerz_bridge_raise(&frame, "objc", name, hn, NULL);
+    void *exc = NULL;
+    m32_call_native_catching(super_cls ? M32_MSGSENDSUPER : M32_MSGSEND, x, v, NULL, 0, NULL, out_x, out_v, &exc);
+    ocerz_bridge_lower(&frame);
+    if (exc)
+        return m32_objc_guest_throw(cpu, m32_objc_to_guest(exc));
+    char r = gn[0];
+    uint32_t eax = r == '@' ? m32_objc_to_guest((void *)(uintptr_t)out_x[0]) : r == 'v' ? 0 : (uint32_t)out_x[0];
+    m32_ret(cpu, eax, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 /* Arrays of objects with their count last (arrayWithObjects:count:, dictionaryWithObjects:forKeys:count:,
  * getObjects:andKeys:count:): the guest's ids are 4 bytes and the host's 8, so each array crosses as a copy of host
  * ids, written back as guest ids when the method fills it. */
@@ -890,6 +944,8 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
     }
     if (m32_objc_last_variadic() && !gtypes)
         return send_variadic(vm, cpu, is_super ? NULL : hself, super_cls, hs, name, genc, henc);
+    if (!gtypes && strstr(name, "ormat:") && strlen(name) > 10 && !strcmp(name + strlen(name) - 10, "arguments:"))
+        return send_va_list(vm, cpu, is_super ? NULL : hself, super_cls, hs, name, genc, henc);
     M32Export *e = send_export(name, genc, henc, is_super, on_main(lookup_cls, name));
     if (!e) {
         m32_log_once("a message m32 cannot carry (union, bitfield, long double):", name);
@@ -1202,23 +1258,28 @@ static int sp_enumerationMutation(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(0);
 }
 
-/* NSLog(format, ...): the format walk, then NSLogv */
-static int sp_NSLog(struct OcerzVM *vm, OcerzCPU *cpu)
+/* NSLog(format, ...) and NSLogv(format, va_list): the format walk over the arguments at ap, then the host's NSLogv.
+ * An i386 va_list is the address of the next argument on the stack.  NSLogv had no special: crossed by its
+ * notation, the guest's va_list reached Foundation as an arm64 one, and iWeb crashed there.  NSLog looked NSLogv
+ * up in libobjc, found nothing and logged nothing. */
+static int ns_logv(OcerzCPU *cpu, uint32_t ap)
 {
     void *fmt = m32_objc_to_host(m32_arg(cpu, 0));
     const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
     uint64_t slots[64];
-    int n = fmt ? m32_printf_slots(utf8(fmt, sel_registerName("UTF8String")), (uint32_t)cpu->gpr[OCERZ_RSP] + 8, slots, 64, "NSLog") : -1;
+    int n = fmt ? m32_printf_slots(utf8(fmt, sel_registerName("UTF8String")), ap, slots, 64, "NSLog") : -1;
     static void (*logv)(id, void *);
-    if (!logv)
-        logv = (void (*)(id, void *))m32rt_sym("NSLogv");
+    if (!logv)   /* Foundation's, not libobjc's: m32rt_sym only searches libobjc and what it links */
+        logv = (void (*)(id, void *))dlsym(RTLD_DEFAULT, "NSLogv");
     if (n >= 0 && logv)
         logv(fmt, slots);
     RET(0);
 }
+static int sp_NSLog(struct OcerzVM *vm, OcerzCPU *cpu) { return ns_logv(cpu, (uint32_t)cpu->gpr[OCERZ_RSP] + 8); }
+static int sp_NSLogv(struct OcerzVM *vm, OcerzCPU *cpu) { return ns_logv(cpu, m32_arg(cpu, 1)); }
 
 const M32SpecialEntry m32_objc_specials[] = {
-    { "_NSLog", sp_NSLog },
+    { "_NSLog", sp_NSLog }, { "_NSLogv", sp_NSLogv },
     { "_objc_msgSend", sp_msgSend }, { "_objc_msgSend_fpret", sp_msgSend }, { "_objc_msgSend_stret", sp_msgSend_stret },
     { "_objc_msgSendSuper", sp_msgSendSuper }, { "_objc_msgSendSuper_stret", sp_msgSendSuper_stret },
     { "_objc_getClass", sp_objc_getClass }, { "_objc_lookUpClass", sp_objc_getClass },

@@ -717,8 +717,35 @@ uint32_t m32_file(void *host_file)
     return g;
 }
 
+/* wcsrtombs(dst, &src, len, ps), mbsrtowcs and their n forms: src points at the guest's 4-byte pointer to the
+ * string, which the call advances (or sets to NULL at the end).  The host gets a pointer of its own and the guest's
+ * is written back from it.  mbstate_t is 128 bytes on both. */
+static int src_conv(OcerzCPU *cpu, int nform, int wide_src)
+{
+    uint32_t dst = m32_arg(cpu, 0), srcp = m32_arg(cpu, 1), n = nform ? m32_arg(cpu, 2) : 0;
+    uint32_t len = m32_arg(cpu, nform ? 3 : 2), ps = m32_arg(cpu, nform ? 4 : 3);
+    uint32_t src = srcp ? m32_rd(srcp) : 0;
+    const void *hsrc = src ? m32_h(src) : NULL;
+    size_t r;
+    if (wide_src)
+        r = nform ? wcsnrtombs(dst ? m32_h(dst) : NULL, (const wchar_t **)&hsrc, n, len, ps ? m32_h(ps) : NULL)
+                  : wcsrtombs(dst ? m32_h(dst) : NULL, (const wchar_t **)&hsrc, len, ps ? m32_h(ps) : NULL);
+    else
+        r = nform ? mbsnrtowcs(dst ? m32_h(dst) : NULL, (const char **)&hsrc, n, len, ps ? m32_h(ps) : NULL)
+                  : mbsrtowcs(dst ? m32_h(dst) : NULL, (const char **)&hsrc, len, ps ? m32_h(ps) : NULL);
+    if (srcp && dst)   /* without a destination the call leaves src alone */
+        m32_wr(srcp, hsrc ? src + (uint32_t)((const char *)hsrc - (const char *)m32_h(src)) : 0);
+    RET(r);
+}
+static int sp_wcsrtombs(struct OcerzVM *vm, OcerzCPU *cpu) { return src_conv(cpu, 0, 1); }
+static int sp_wcsnrtombs(struct OcerzVM *vm, OcerzCPU *cpu) { return src_conv(cpu, 1, 1); }
+static int sp_mbsrtowcs(struct OcerzVM *vm, OcerzCPU *cpu) { return src_conv(cpu, 0, 0); }
+static int sp_mbsnrtowcs(struct OcerzVM *vm, OcerzCPU *cpu) { return src_conv(cpu, 1, 0); }
+
 const M32SpecialEntry m32_stdio_specials[] = {
     { "___error", sp___error },
+    { "_wcsrtombs", sp_wcsrtombs }, { "_wcsnrtombs", sp_wcsnrtombs },
+    { "_mbsrtowcs", sp_mbsrtowcs }, { "_mbsnrtowcs", sp_mbsnrtowcs },
     { "_printf", sp_printf }, { "_vprintf", sp_vprintf }, { "_fprintf", sp_fprintf }, { "_vfprintf", sp_vfprintf },
     { "_dprintf", sp_dprintf }, { "_sprintf", sp_sprintf }, { "_vsprintf", sp_vsprintf },
     { "_snprintf", sp_snprintf }, { "_vsnprintf", sp_vsnprintf }, { "___sprintf_chk", sp_sprintf_chk },

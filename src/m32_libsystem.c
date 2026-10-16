@@ -1280,8 +1280,62 @@ static int exec_guest(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t genv)
 static int sp_execv(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, cpu, 0); }
 static int sp_execve(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, cpu, m32_arg(cpu, 2)); }
 
+/* keymgr: the process-wide pointers GCC 3 and 4's runtime support keeps under fixed keys, one lock each (crt3.o's
+ * atexit list, libgcc's unwinder object list).  libkeymgr has no header in today's SDK, so its calls had no
+ * declaration and answered 0 without writing the pointer back: Kega Fusion's crt3.o then read whatever the stack
+ * held.  Here every key's pointer starts NULL, as keymgr's did, and one recursive lock stands for all the keys. */
+static pthread_mutex_t g_keymgr_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+static struct { uint32_t key, ptr; } g_keymgr[64];
+static int g_nkeymgr;
+static uint32_t *keymgr_slot(uint32_t key)
+{
+    for (int i = 0; i < g_nkeymgr; i++)
+        if (g_keymgr[i].key == key)
+            return &g_keymgr[i].ptr;
+    if (g_nkeymgr == (int)(sizeof g_keymgr / sizeof g_keymgr[0]))
+        return NULL;
+    g_keymgr[g_nkeymgr].key = key;
+    g_keymgr[g_nkeymgr].ptr = 0;
+    return &g_keymgr[g_nkeymgr++].ptr;
+}
+/* int _keymgr_get_and_lock_processwide_ptr_2(unsigned key, void **result) */
+static int sp_keymgr_get_lock_2(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    pthread_mutex_lock(&g_keymgr_lock);
+    uint32_t *slot = keymgr_slot(m32_arg(cpu, 0));
+    if (m32_arg(cpu, 1))
+        m32_wr(m32_arg(cpu, 1), slot ? *slot : 0);
+    return RETV_PLAIN(slot ? 0 : ENOMEM);
+}
+/* void *_keymgr_get_and_lock_processwide_ptr(unsigned key) */
+static int sp_keymgr_get_lock(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    pthread_mutex_lock(&g_keymgr_lock);
+    uint32_t *slot = keymgr_slot(m32_arg(cpu, 0));
+    return RETV_PLAIN(slot ? *slot : 0);
+}
+/* int _keymgr_set_and_unlock_processwide_ptr(unsigned key, void *ptr) */
+static int sp_keymgr_set_unlock(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t *slot = keymgr_slot(m32_arg(cpu, 0));
+    if (slot)
+        *slot = m32_arg(cpu, 1);
+    pthread_mutex_unlock(&g_keymgr_lock);
+    return RETV_PLAIN(slot ? 0 : ENOMEM);
+}
+/* int _keymgr_unlock_processwide_ptr(unsigned key) */
+static int sp_keymgr_unlock(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    pthread_mutex_unlock(&g_keymgr_lock);
+    return RETV_PLAIN(0);
+}
+
 static const M32SpecialEntry g_specials[] = {
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
+    { "__keymgr_get_and_lock_processwide_ptr_2", sp_keymgr_get_lock_2 },
+    { "__keymgr_get_and_lock_processwide_ptr", sp_keymgr_get_lock },
+    { "__keymgr_set_and_unlock_processwide_ptr", sp_keymgr_set_unlock },
+    { "__keymgr_unlock_processwide_ptr", sp_keymgr_unlock },
     { "_execv", sp_execv }, { "_execve", sp_execve },
     { "_ioctl", sp_ioctl }, { "_pipe", sp_pipe },
     { "_getaddrinfo", sp_getaddrinfo }, { "_freeaddrinfo", sp_freeaddrinfo }, { "_gethostbyname", sp_gethostbyname },
