@@ -19153,15 +19153,42 @@ static void chain_sites_sync(uint32_t *const *sites, int n)
     __asm__ volatile("dsb ish\n\tisb" ::: "memory");
 }
 
+static void chain_sites_flush(uint32_t *const *sites, int n)
+{
+    if (ENV_ON("OCERZ_NO_CHAIN_SYNC_BATCH")) {
+        for (int i = 0; i < n; i++)
+            sys_icache_invalidate(sites[i], 4);
+    } else if (n) {
+        chain_sites_sync(sites, n);
+    }
+}
+
+/*
+ * The same batching for the stop, unstop and retire paths, which patch a run
+ * of words outside a chain install.  The signal handler cannot use
+ * g_chain_patched, which belongs to whoever holds jit_lock, so each caller
+ * keeps its own on the stack and flushes it before it returns.
+ */
+typedef struct { uint32_t *site[CHAIN_BATCH_MAX]; int n; } SiteBatch;
+
+static void site_batch_flush(SiteBatch *sb)
+{
+    chain_sites_flush(sb->site, sb->n);
+    sb->n = 0;
+}
+
+static void site_batch_store(SiteBatch *sb, uint32_t *site, uint32_t w)
+{
+    __atomic_store_n(site, w, __ATOMIC_RELEASE);
+    if (sb->n == CHAIN_BATCH_MAX)
+        site_batch_flush(sb);
+    sb->site[sb->n++] = site;
+}
+
 static void chain_batch_end(void)
 {
     pthread_jit_write_protect_np(1);
-    if (ENV_ON("OCERZ_NO_CHAIN_SYNC_BATCH")) {
-        for (int i = 0; i < g_chain_npatched; i++)
-            sys_icache_invalidate(g_chain_patched[i], 4);
-    } else if (g_chain_npatched) {
-        chain_sites_sync(g_chain_patched, g_chain_npatched);
-    }
+    chain_sites_flush(g_chain_patched, g_chain_npatched);
     g_chain_npatched = 0;
     g_chain_batching = 0;
 }
@@ -25518,19 +25545,13 @@ void ocerz_jit_request_stop(struct OcerzVM *vm)
  * the return-address stack into a block the walk did not visit, because the
  * walk follows chained edges only.
  */
-static void sig_store(uint32_t *site, uint32_t w)
-{
-    __atomic_store_n(site, w, __ATOMIC_RELEASE);
-    sys_icache_invalidate(site, 4);
-}
-
-static void sig_stop_sites(JitBlock *b)
+static void sig_stop_sites(SiteBatch *sb, JitBlock *b)
 {
     if (b->stop_patch && b->stop_insn && *b->stop_patch != b->stop_insn)
-        sig_store(b->stop_patch, b->stop_insn);
+        site_batch_store(sb, b->stop_patch, b->stop_insn);
     for (int i = 0; i < b->n_stop_extra; i++)
         if (*b->stop_extra[i].site != b->stop_extra[i].insn)
-            sig_store(b->stop_extra[i].site, b->stop_extra[i].insn);
+            site_batch_store(sb, b->stop_extra[i].site, b->stop_extra[i].insn);
 }
 
 int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc)
@@ -25542,7 +25563,9 @@ int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc
     const JitBlock *first = fault_block(jit, (const uint32_t *)host_pc);
     if (first && !jit->stop_requested) {
         JitBlock *todo[OCERZ_SIG_STOP_MAX];
+        SiteBatch sb;
         int n_todo = 0;
+        sb.n = 0;
         todo[n_todo++] = (JitBlock *)first;
         pthread_jit_write_protect_np(0);
         for (int k = 0; k < n_todo; k++) {
@@ -25576,18 +25599,19 @@ int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc
                         todo[n_todo++] = tb;
                 }
                 if (pb && b->edges[e].fallback_insn && *pb != b->edges[e].fallback_insn) {
-                    sig_store(pb, b->edges[e].fallback_insn);
+                    site_batch_store(&sb, pb, b->edges[e].fallback_insn);
                     cpu->sig_stop_edges[j] |= (uint8_t)(1u << e);
                 }
                 if (cs && b->edges[e].cond_orig && *cs != b->edges[e].cond_orig) {
-                    sig_store(cs, b->edges[e].cond_orig);
+                    site_batch_store(&sb, cs, b->edges[e].cond_orig);
                     cpu->sig_stop_edges[j] |= (uint8_t)(1u << e);
                 }
             }
-            sig_stop_sites(b);
+            sig_stop_sites(&sb, b);
             stopped = 1;
         }
         pthread_jit_write_protect_np(1);
+        site_batch_flush(&sb);
     }
     return stopped;
 }
@@ -25615,7 +25639,7 @@ static void sig_rechain(OcerzJit *jit, JitBlock *b, int e)
     pred_add(t, b, e);
 }
 
-static void sig_unstop_site(OcerzJit *jit, JitBlock *b, uint32_t *site, uint32_t stop, uint32_t run)
+static void sig_unstop_site(SiteBatch *sb, OcerzJit *jit, JitBlock *b, uint32_t *site, uint32_t stop, uint32_t run)
 {
     if (!site || *site != stop)
         return;
@@ -25627,9 +25651,8 @@ static void sig_unstop_site(OcerzJit *jit, JitBlock *b, uint32_t *site, uint32_t
     if (!run || run == stop)
         return;
     pthread_jit_write_protect_np(0);
-    __atomic_store_n(site, run, __ATOMIC_RELEASE);
+    site_batch_store(sb, site, run);
     pthread_jit_write_protect_np(1);
-    sys_icache_invalidate(site, 4);
 }
 
 void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -25639,19 +25662,22 @@ void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu)
         cpu->sig_stop_n = 0;
         return;
     }
+    SiteBatch sb;
+    sb.n = 0;
     jl_acquire(__LINE__);
     for (uint32_t i = 0; i < cpu->sig_stop_n && !jit->stop_requested; i++) {
         JitBlock *b = (JitBlock *)cpu->sig_stop_blk[i];
         if (cache_lookup(jit, cpu->sig_stop_rip[i], cpu->sig_stop_m32[i]) != b ||
             b->live_idx >= jit->n_live || jit->live[b->live_idx] != b)
             continue;
-        sig_unstop_site(jit, b, b->stop_patch, b->stop_insn, b->stop_run);
+        sig_unstop_site(&sb, jit, b, b->stop_patch, b->stop_insn, b->stop_run);
         for (int k = 0; k < b->n_stop_extra; k++)
-            sig_unstop_site(jit, b, b->stop_extra[k].site, b->stop_extra[k].insn, b->stop_extra[k].run);
+            sig_unstop_site(&sb, jit, b, b->stop_extra[k].site, b->stop_extra[k].insn, b->stop_extra[k].run);
         for (int e = 0; e < b->n_edges && e < 8; e++)
             if (cpu->sig_stop_edges[i] >> e & 1)
                 sig_rechain(jit, b, e);
     }
+    site_batch_flush(&sb);
     cpu->sig_stop_n = 0;
     jl_release();
 }
@@ -25911,25 +25937,21 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
 #define IN_BLK(p) ((const uint32_t *)(p) >= lo && (const uint32_t *)(p) < hi)
     size_t idx = live_index_of(jit, blk);
     if (idx == jit->n_live) return;
+    SiteBatch sb;
+    sb.n = 0;
     pthread_jit_write_protect_np(0);
-    if (blk->stop_patch && blk->stop_insn && *blk->stop_patch != blk->stop_insn) {
-        __atomic_store_n(blk->stop_patch, blk->stop_insn, __ATOMIC_RELEASE);
-        sys_icache_invalidate(blk->stop_patch, 4);
-    }
+    if (blk->stop_patch && blk->stop_insn && *blk->stop_patch != blk->stop_insn)
+        site_batch_store(&sb, blk->stop_patch, blk->stop_insn);
     for (int i = 0; i < blk->n_stop_extra; i++)
-        if (*blk->stop_extra[i].site != blk->stop_extra[i].insn) {
-            __atomic_store_n(blk->stop_extra[i].site, blk->stop_extra[i].insn, __ATOMIC_RELEASE);
-            sys_icache_invalidate(blk->stop_extra[i].site, 4);
-        }
+        if (*blk->stop_extra[i].site != blk->stop_extra[i].insn)
+            site_batch_store(&sb, blk->stop_extra[i].site, blk->stop_extra[i].insn);
     for (int i = 0; i < blk->n_edges; i++) {
         uint32_t *cs = blk->edges[i].cond_site;
         int is_stop = blk->edges[i].patch_b == blk->stop_patch;
         for (int q = 0; q < blk->n_stop_extra && !is_stop; q++)
             is_stop = blk->edges[i].patch_b == blk->stop_extra[q].site;
-        if (cs && blk->edges[i].cond_orig && *cs != blk->edges[i].cond_orig && is_stop) {
-            __atomic_store_n(cs, blk->edges[i].cond_orig, __ATOMIC_RELEASE);
-            sys_icache_invalidate(cs, 4);
-        }
+        if (cs && blk->edges[i].cond_orig && *cs != blk->edges[i].cond_orig && is_stop)
+            site_batch_store(&sb, cs, blk->edges[i].cond_orig);
     }
     for (uint32_t q = 0; q < blk->n_preds; q++) {
         JitBlock *sblk = blk->preds[q].pb;
@@ -25940,15 +25962,13 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
             uint32_t fallback = sblk->edges[i].fallback_insn;
             int cut = 0;
             if (at && fallback && *at != fallback && IN_BLK(chain_target(jit, at, *at))) {
-                __atomic_store_n(at, fallback, __ATOMIC_RELEASE);
-                sys_icache_invalidate(at, 4);
+                site_batch_store(&sb, at, fallback);
                 cut = 1;
             }
             uint32_t *cs = sblk->edges[i].cond_site;
             if (cs && sblk->edges[i].cond_orig && *cs != sblk->edges[i].cond_orig &&
                 IN_BLK(chain_target(jit, cs, *cs))) {
-                __atomic_store_n(cs, sblk->edges[i].cond_orig, __ATOMIC_RELEASE);
-                sys_icache_invalidate(cs, 4);
+                site_batch_store(&sb, cs, sblk->edges[i].cond_orig);
                 cut = 1;
             }
             if (cut)
@@ -25962,6 +25982,7 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
         if (IN_BLK(*g_ras_cells[i]))
             __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
     pthread_jit_write_protect_np(1);
+    site_batch_flush(&sb);
     unsigned h = hash_key(blk->key);
     JitBlock **pp = &jit->buckets[h];
     while (*pp && *pp != blk) pp = &(*pp)->hnext;
