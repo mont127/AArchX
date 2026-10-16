@@ -1116,8 +1116,7 @@ static int ocerz_sysctl_ovr_emit(OcerzCPU *cpu, const struct ocerz_sysctl_ovr *o
             return OCERZ_STEP_OK;
         }
         if (o->is_str)
-            for (uint64_t k = 0; k < need; k++)
-                ocerz_st(oldp + k, 1, (uint64_t)(uint8_t)o->sval[k]);
+            memcpy(ocerz_g2h(oldp), o->sval, (size_t)need);
         else
             ocerz_st(oldp, (int)need, o->ival);
     }
@@ -1175,8 +1174,7 @@ static int x86_sysctl_emit(OcerzCPU *cpu, int idx, uint64_t oldp, uint64_t oldle
             return OCERZ_STEP_OK;
         }
         if (s)
-            for (uint64_t k = 0; k < need; k++)
-                ocerz_st(oldp + k, 1, (uint64_t)(uint8_t)s[k]);
+            memcpy(ocerz_g2h(oldp), s, (size_t)need);
         else
             ocerz_st(oldp, (int)need, g_x86_sysctl[idx].val);
     }
@@ -1195,8 +1193,7 @@ static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     if (nlen == 2 && a[4] && a[5] && a[5] < 160 &&
         ocerz_ld(a[0], 4) == 0 && ocerz_ld(a[0] + 4, 4) == 3) {
         char nm[160];
-        for (uint64_t i = 0; i < a[5]; i++)
-            nm[i] = (char)ocerz_ld(a[4] + i, 1);
+        memcpy(nm, ocerz_g2h(a[4]), (size_t)a[5]);
         nm[a[5]] = 0;
         int idx = x86_sysctl_find(nm);
         if (idx >= 0) {
@@ -1317,8 +1314,8 @@ static int sys_sysctlbyname(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     char name[160];
     uint64_t nl = a[1];
     if (nl >= sizeof name) nl = sizeof name - 1;
-    for (uint64_t i = 0; i < nl; i++)
-        name[i] = (char)ocerz_ld(a[0] + i, 1);
+    if (nl)
+        memcpy(name, ocerz_g2h(a[0]), (size_t)nl);
     name[nl] = 0;
     static int sclog = -1;
     if (sclog < 0) sclog = getenv("OCERZ_SYSCTLLOG") ? 1 : 0;
@@ -4928,12 +4925,11 @@ static int sys_iov(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8], int num)
     if (cnt > OCERZ_IOV_MAX)
         cnt = OCERZ_IOV_MAX;
     struct ocerz_iovec scratch[OCERZ_IOV_MAX];
-    for (uint64_t i = 0; i < cnt; i++) {
-        uint64_t base = ocerz_ld(giov + i * 16, 8);
-        uint64_t len = ocerz_ld(giov + i * 16 + 8, 8);
-        scratch[i].iov_base = base ? (uint64_t)(uintptr_t)ocerz_g2h(base) : 0;
-        scratch[i].iov_len = len;
-    }
+    if (cnt)
+        memcpy(scratch, ocerz_g2h(giov), (size_t)cnt * sizeof scratch[0]);
+    for (uint64_t i = 0; i < cnt; i++)
+        if (scratch[i].iov_base)
+            scratch[i].iov_base = (uint64_t)(uintptr_t)ocerz_g2h(scratch[i].iov_base);
     uint64_t fa[8] = { a[0], (uint64_t)(uintptr_t)scratch, a[2], 0, 0, 0, 0, 0 };
     forward_with_scratch(cpu, num, fa, 0);
     return OCERZ_STEP_OK;
@@ -4946,11 +4942,11 @@ static int sys_preadv_pwritev(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8], int num
     if (cnt > OCERZ_IOV_MAX)
         cnt = OCERZ_IOV_MAX;
     struct ocerz_iovec scratch[OCERZ_IOV_MAX];
-    for (uint64_t i = 0; i < cnt; i++) {
-        uint64_t base = ocerz_ld(giov + i * 16, 8);
-        scratch[i].iov_base = base ? (uint64_t)(uintptr_t)ocerz_g2h(base) : 0;
-        scratch[i].iov_len = ocerz_ld(giov + i * 16 + 8, 8);
-    }
+    if (cnt)
+        memcpy(scratch, ocerz_g2h(giov), (size_t)cnt * sizeof scratch[0]);
+    for (uint64_t i = 0; i < cnt; i++)
+        if (scratch[i].iov_base)
+            scratch[i].iov_base = (uint64_t)(uintptr_t)ocerz_g2h(scratch[i].iov_base);
     uint64_t fa[8] = { a[0], (uint64_t)(uintptr_t)scratch, a[2], a[3], 0, 0, 0, 0 };
     forward_with_scratch(cpu, num, fa, 0);
     return OCERZ_STEP_OK;
