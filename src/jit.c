@@ -2091,6 +2091,7 @@ static int is_terminator(unsigned op)
     case OCERZ_OP_CALLF:
     case OCERZ_OP_RETF:
     case OCERZ_OP_SYSCALL:
+    case OCERZ_OP_SYSENTER:
     case OCERZ_OP_INT3:
     case OCERZ_OP_INT:
     case OCERZ_OP_UD2:
@@ -19522,7 +19523,7 @@ static int insn_may_write_gpr(const X86Insn *in, unsigned reg)
     case OCERZ_OP_MOVS: case OCERZ_OP_STOS: case OCERZ_OP_LODS: case OCERZ_OP_SCAS: case OCERZ_OP_CMPS:
         if (reg == OCERZ_RSI || reg == OCERZ_RDI || reg == OCERZ_RCX || reg == OCERZ_RAX) return 1;
         break;
-    case OCERZ_OP_SYSCALL: case OCERZ_OP_INT: case OCERZ_OP_INT3:
+    case OCERZ_OP_SYSCALL: case OCERZ_OP_SYSENTER: case OCERZ_OP_INT: case OCERZ_OP_INT3:
         return 1;
     case OCERZ_OP_XCHG: case OCERZ_OP_XADD:
         for (int k = 0; k < in->nops; k++)

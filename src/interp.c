@@ -71,6 +71,7 @@
 #include "ocerz/syscall.h"
 #include "ocerz/dyldapi.h"
 #include "ocerz/dyld.h"
+#include "ocerz/m32.h"
 #include <stdlib.h>
 #include <signal.h>
 
@@ -1872,7 +1873,14 @@ int ocerz_interp_exec(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn * restric
             return OCERZ_STEP_OK;
         return trap_fatal(insnp, "guest breakpoint/interrupt");
     case OCERZ_OP_INT:
+        if (insnp->mode32 && m32_active && insnp->ops[0].imm == 0x80)
+            return m32_raw_syscall(vm, cpu, 0);
         return trap_fatal(insnp, "guest breakpoint/interrupt");
+
+    case OCERZ_OP_SYSENTER:
+        if (insnp->mode32 && m32_active)
+            return m32_raw_syscall(vm, cpu, 1);
+        return ocerz_unimpl(vm, cpu, insnp, "sysenter outside an i386 program");
 
     case OCERZ_OP_UD2:
 

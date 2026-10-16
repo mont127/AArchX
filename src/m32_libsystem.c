@@ -677,14 +677,13 @@ static int map_part(uint32_t page, uint32_t a, uint32_t b)
     return 0;
 }
 
-static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
+/* mmap from i386 code, the bridged call's and a raw system call's (src/m32_selfload.c): the guest address, or
+ * M32_MAP_FAILED with errno set */
+uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint64_t off)
 {
-    uint32_t want = m32_arg(cpu, 0), len = m32_arg(cpu, 1);
-    int prot = (int)m32_arg(cpu, 2), flags = (int)m32_arg(cpu, 3), fd = (int)m32_arg(cpu, 4);
-    uint64_t off = m32_arg64(cpu, 5);
     if (!len) {
         errno = EINVAL;
-        RETV(M32_MAP_FAILED);
+        return M32_MAP_FAILED;
     }
     uint32_t size = map_len(len), g;
     if (flags & MAP_FIXED) {
@@ -695,7 +694,7 @@ static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
         uint64_t end = (uint64_t)g + ((len + 0xfffu) & ~0xfffu), lo = ((uint64_t)g + 0x3fff) & ~0x3fffull, hi = end & ~0x3fffull;
         if ((g & 0xfff) || end > M32_HANDLE_LO) {
             errno = EINVAL;
-            RETV(M32_MAP_FAILED);
+            return M32_MAP_FAILED;
         }
         int bad = 0;
         if (lo < hi) {
@@ -708,19 +707,19 @@ static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
             bad |= map_part((uint32_t)hi, (uint32_t)hi, (uint32_t)end);
         if (bad) {
             errno = ENOMEM;
-            RETV(M32_MAP_FAILED);
+            return M32_MAP_FAILED;
         }
     } else {
         g = m32_map(size);
         if (!g) {
             errno = ENOMEM;
-            RETV(M32_MAP_FAILED);
+            return M32_MAP_FAILED;
         }
     }
     if (!(flags & MAP_ANON) && fd >= 0) {
         /* a file: shared mappings overlay the file where the offset allows it, anything else is a copy */
         if ((flags & MAP_SHARED) && !(off & 0x3fff) && !(g & 0x3fff) && ocerz_map_shared_file(g, size, prot | PROT_READ, fd, off) == OCERZ_OK)
-            RETV(g);
+            return g;
         uint64_t done = 0;
         while (done < len) {
             ssize_t r = pread(fd, (char *)m32_h(g) + done, len - done, (off_t)(off + done));
@@ -731,8 +730,14 @@ static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
         if ((flags & MAP_SHARED) && (prot & PROT_WRITE))
             m32_log_once("a writable shared file mapping at an unaligned offset is a copy (writes are not saved):", "mmap");
     }
-    (void)prot;
-    RETV(g);
+    return g;
+}
+
+static int sp_mmap(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t want = m32_arg(cpu, 0), len = m32_arg(cpu, 1);
+    int prot = (int)m32_arg(cpu, 2), flags = (int)m32_arg(cpu, 3), fd = (int)m32_arg(cpu, 4);
+    RETV(m32_mmap(want, len, prot, flags, fd, m32_arg64(cpu, 5)));
 }
 static int sp_munmap(struct OcerzVM *vm, OcerzCPU *cpu)
 {

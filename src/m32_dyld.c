@@ -336,6 +336,9 @@ static int parse(M32Image *img)
             if (le32(lc + 8) == 1 /* x86_THREAD_STATE32 */)
                 img->entry_thread = le32(lc + 16 + 40);
             break;
+        case LC_LOAD_DYLINKER:
+            img->has_dylinker = 1;
+            break;
         case LC_ID_DYLIB:
             snprintf(img->install_name, sizeof img->install_name, "%s", (const char *)lc + le32(lc + 8));
             break;
@@ -818,6 +821,87 @@ M32Image *m32_load_program(const char *path)
     return main_img;
 }
 
+/*
+ * A program that loaded itself (src/m32_selfload.c) has its segments in the window already, mh being its mapped
+ * mach header: at their own addresses (UPX 3), or all slid by the same amount, wherever the stub found room (UPX 5,
+ * which relies on the program being position-independent, as i386 programs for 10.7 and later are).  Its file is
+ * put back together from them, each segment's bytes at its file offset, so the load commands, symbols, rebase and
+ * bind opcodes are read as for any image, and the fixups slide it as dyld would; the segments are not mapped again.
+ * It replaces the packed image as the main one.
+ */
+M32Image *m32_adopt_program(uint32_t mh, const char *path)
+{
+    if (!ocerz_addr_readable(mh) || m32_rd(mh) != MH_MAGIC || m32_rd(mh + 4) != CPU_TYPE_I386)
+        return NULL;
+    uint32_t ncmds = m32_rd(mh + 16), sizeofcmds = m32_rd(mh + 20), flen = 28 + sizeofcmds;
+    if (sizeofcmds > (1u << 20) || !ocerz_addr_readable(mh + flen - 1))
+        return NULL;
+    const uint8_t *lc = m32_h(mh + 28), *lend = lc + sizeofcmds;
+    int have_text = 0;
+    int32_t slide = 0;
+    for (uint32_t i = 0; i < ncmds && lc + 8 <= lend; i++) {
+        uint32_t size = le32(lc + 4);
+        if (size < 8 || lc + size > lend)
+            return NULL;
+        if (le32(lc) == LC_SEGMENT && le32(lc + 36)) {
+            if (le32(lc + 32) + le32(lc + 36) > flen)
+                flen = le32(lc + 32) + le32(lc + 36);
+            if (le32(lc + 32) == 0 && !have_text) {   /* the segment holding the header */
+                slide = (int32_t)(mh - le32(lc + 24));
+                have_text = 1;
+            }
+        }
+        lc += size;
+    }
+    uint8_t *buf = have_text ? calloc(1, flen) : NULL;
+    if (!buf)
+        return NULL;
+    lc = m32_h(mh + 28);
+    for (uint32_t i = 0; i < ncmds && lc + 8 <= lend; i++) {
+        uint32_t at = le32(lc + 24) + (uint32_t)slide, fileoff = le32(lc + 32), filesize = le32(lc + 36);
+        if (le32(lc) == LC_SEGMENT && filesize) {
+            if (!ocerz_addr_readable(at) || !ocerz_addr_readable(at + filesize - 1)) {
+                free(buf);
+                return NULL;
+            }
+            memcpy(buf + fileoff, m32_h(at), filesize);
+        }
+        lc += le32(lc + 4);
+    }
+    M32Image *img = calloc(1, sizeof *img);
+    img->buf = buf;
+    img->file = buf;
+    img->flen = flen;
+    img->slide = slide;
+    snprintf(img->path, sizeof img->path, "%s", path);
+    snprintf(img->install_name, sizeof img->install_name, "%s", path);
+    if (parse(img) != 0) {
+        free(buf);
+        free(img);
+        return NULL;
+    }
+    uint32_t lo = 0xffffffffu, hi = 0;
+    for (int i = 0; i < img->nseg; i++) {
+        const M32Seg *s = &img->seg[i];
+        if (!s->vmsize || (!s->filesize && !s->initprot))
+            continue;
+        if (s->vmaddr < lo) lo = s->vmaddr;
+        if (s->vmaddr + s->vmsize > hi) hi = s->vmaddr + s->vmsize;
+    }
+    img->lo = lo + (uint32_t)slide;
+    img->hi = hi + (uint32_t)slide;
+    img->base = mh;
+    if (img->has_main)
+        img->entry_main = img->base + img->entry_main_off;
+    if (img->entry_thread)
+        img->entry_thread += (uint32_t)slide;
+    m32_nimages = 0;
+    m32_images[m32_nimages++] = img;
+    if (load_deps(img) != 0)
+        return NULL;
+    return img;
+}
+
 int m32_fixup_all(int from)
 {
     int bad = 0;
@@ -1107,6 +1191,7 @@ static int sp_register_add_image(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 static int sp_ret0(struct OcerzVM *vm, OcerzCPU *cpu) { m32_ret(cpu, 0, 0, 0); return OCERZ_STEP_OK; }
+
 
 static int sp_NSGetExecutablePath(struct OcerzVM *vm, OcerzCPU *cpu)
 {

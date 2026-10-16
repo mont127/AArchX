@@ -588,6 +588,7 @@ enum OcerzOp {
     OCERZ_OP_XSAVE,
     OCERZ_OP_XRSTOR,
     OCERZ_OP_RDRAND,
+    OCERZ_OP_SYSENTER,
     OCERZ_OP_COUNT,
 };
 

@@ -104,6 +104,50 @@ void m32_activate_soon(void)
 
 int m32_active;
 
+/* Start the program from the kernel's frame at sp: its entry state set on the main cpu, then the initializers of
+ * every image, dependencies first.  Returns the exit code when an initializer ended the process, else -1. */
+int m32_start_program(struct OcerzVM *vm, M32Image *img, uint32_t sp, const char *path)
+{
+    OcerzCPU *cpu = &vm->cpu;
+    int argc = (int)m32_rd(sp);
+    uint32_t argv_g = sp + 4, envp_g = argv_g + 4 * ((uint32_t)argc + 1), apple_g = envp_g;
+    while (m32_rd(apple_g))
+        apple_g += 4;
+    apple_g += 4;
+    if (img->entry_main) {
+        /* dyld's LC_MAIN contract: main(argc, argv, envp, apple), then exit(result) */
+        uint32_t esp = ((sp - 20) & ~15u) - 4;   /* (esp + 4) % 16 == 0 at main's first instruction */
+        m32_wr(esp, M32_TRAP(M32_ID_EXIT));
+        m32_wr(esp + 4, (uint32_t)argc);
+        m32_wr(esp + 8, argv_g);
+        m32_wr(esp + 12, envp_g);
+        m32_wr(esp + 16, apple_g);
+        cpu->gpr[OCERZ_RSP] = esp;
+        cpu->rip = img->entry_main;
+    } else {
+        cpu->gpr[OCERZ_RSP] = sp;
+        cpu->rip = img->entry_thread;
+    }
+    OCERZ_LOG("m32: %s entry %#x esp %#x\n", path, (unsigned)cpu->rip, (unsigned)cpu->gpr[OCERZ_RSP]);
+    /* initializers, dependencies before their dependents (m32_images is in load order, the main image first) */
+    uint32_t init_args[5] = { (uint32_t)argc, argv_g, envp_g, apple_g, 0 };
+    m32_argc_var = m32_static_alloc(16, 4);   /* what _NSGetArgc and friends point at */
+    m32_argv_var = m32_argc_var + 4;
+    m32_environ_var = m32_argc_var + 8;
+    m32_progname_var = m32_argc_var + 12;
+    m32_wr(m32_argc_var, (uint32_t)argc);
+    m32_wr(m32_argv_var, argv_g);
+    m32_wr(m32_environ_var, envp_g);
+    const char *base = strrchr(path, '/');
+    m32_wr(m32_progname_var, m32_cstring(base ? base + 1 : path));
+    for (int i = m32_nimages - 1; i >= 0 && !vm->exited; i--)
+        m32_run_initializers(vm, m32_images[i], init_args);
+    if (vm->exited)
+        return vm->exit_code;
+    m32_started = 1;
+    return -1;
+}
+
 int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     m32_active = 1;
@@ -124,9 +168,21 @@ int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **
     M32Image *img = m32_load_program(path);
     if (!img)
         return 65;
+    /* No dylinker and no libraries: the program loads itself (a UPX-packed executable, src/m32_selfload.c).  What
+     * it unpacks goes where an i386 program is linked, from 0x1000 up, below the packed segments (UPX 3) or over
+     * and past them (UPX 5), so the low 256 MB around them are reserved before anything else is put in the
+     * window, for the unpacking to map over. */
+    int selfload = img->entry_thread && !img->has_dylinker && !img->ndeps && !getenv("OCERZ_M32_NO_SELFLOAD");
+    if (selfload) {
+        uint32_t flo = img->lo & ~0x3fffu, fhi = (img->hi + 0x3fffu) & ~0x3fffu, top = 0x10000000u;
+        if (flo)
+            ocerz_map_fixed(0, flo, PROT_NONE);
+        if (fhi < top)
+            ocerz_map_fixed(fhi, top - fhi, PROT_NONE);
+    }
     if (m32_heap_init() != 0)
         return 70;
-    if (m32_fixup_all(0)) {
+    if (!selfload && m32_fixup_all(0)) {
         fprintf(stderr, "ocerz: m32: %s: required imports are unresolved\n", path);
         if (!getenv("OCERZ_M32_KEEP_GOING"))
             return 71;
@@ -148,45 +204,18 @@ int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **
     cpu->mode32 = 1;
     cpu->cs_sel = M32_CS;
     cpu->seg_sel[OCERZ_SREG_CS] = M32_CS;
-    if (img->entry_main) {
-        /* dyld's LC_MAIN contract: main(argc, argv, envp, apple), then exit(result) */
-        uint32_t argv_g = sp + 4, envp_g = argv_g + 4 * ((uint32_t)argc + 1), apple_g = envp_g;
-        while (m32_rd(apple_g))
-            apple_g += 4;
-        apple_g += 4;
-        uint32_t esp = ((sp - 20) & ~15u) - 4;   /* (esp + 4) % 16 == 0 at main's first instruction */
-        m32_wr(esp, M32_TRAP(M32_ID_EXIT));
-        m32_wr(esp + 4, (uint32_t)argc);
-        m32_wr(esp + 8, argv_g);
-        m32_wr(esp + 12, envp_g);
-        m32_wr(esp + 16, apple_g);
-        cpu->gpr[OCERZ_RSP] = esp;
-        cpu->rip = img->entry_main;
-    } else {
+    ocerz_vm_install_handlers(vm);
+    if (selfload) {
+        /* its own start routine, with argc at the stack pointer as the kernel leaves it; the dyld it maps
+         * hands the unpacked program back (m32_dyld_entry) */
+        m32_selfload_begin(path);
         cpu->gpr[OCERZ_RSP] = sp;
         cpu->rip = img->entry_thread;
+        OCERZ_LOG("m32: %s loads itself from %#x\n", path, (unsigned)cpu->rip);
+        return ocerz_vm_run(vm);
     }
-    OCERZ_LOG("m32: %s entry %#x esp %#x\n", path, (unsigned)cpu->rip, (unsigned)cpu->gpr[OCERZ_RSP]);
-    ocerz_vm_install_handlers(vm);
-    /* initializers, dependencies before their dependents (m32_images is in load order, the main image first) */
-    uint32_t argv_g = sp + 4, envp_g = argv_g + 4 * ((uint32_t)argc + 1), apple_g = envp_g;
-    while (m32_rd(apple_g))
-        apple_g += 4;
-    apple_g += 4;
-    uint32_t init_args[5] = { (uint32_t)argc, argv_g, envp_g, apple_g, 0 };
-    m32_argc_var = m32_static_alloc(16, 4);   /* what _NSGetArgc and friends point at */
-    m32_argv_var = m32_argc_var + 4;
-    m32_environ_var = m32_argc_var + 8;
-    m32_progname_var = m32_argc_var + 12;
-    m32_wr(m32_argc_var, (uint32_t)argc);
-    m32_wr(m32_argv_var, argv_g);
-    m32_wr(m32_environ_var, envp_g);
-    const char *base = strrchr(path, '/');
-    m32_wr(m32_progname_var, m32_cstring(base ? base + 1 : path));
-    for (int i = m32_nimages - 1; i >= 0 && !vm->exited; i--)
-        m32_run_initializers(vm, m32_images[i], init_args);
-    if (vm->exited)
-        return vm->exit_code;
-    m32_started = 1;
+    int rc = m32_start_program(vm, img, sp, path);
+    if (rc >= 0)
+        return rc;
     return ocerz_vm_run(vm);
 }

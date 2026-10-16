@@ -64,3 +64,6 @@ for f in *.c *.cpp *.m; do [ -e "$f" ] || continue; n=${f%.*}; case $n in lib*) 
   [ -f "bin/$n" ] || { echo "build.sh: link failed for $n" >&2; exit 1; }; done
 # the arm64 stand-in for Steam's client that steambridge loads through the i386 Steam bridge
 xcrun clang -arch arm64 -O1 -dynamiclib -install_name @rpath/steamclient.dylib steamfake/steamclient.c -o bin/steamclient.dylib
+# selfload is objc_basic packed by UPX (5.2.1 made the committed one): a program that loads itself
+# (src/m32_selfload.c).  Without upx the committed program stays.
+if command -v upx >/dev/null 2>&1; then rm -f bin/selfload; upx -q --force-macos -o bin/selfload bin/objc_basic >/dev/null; fi

@@ -35,6 +35,7 @@ typedef struct M32Image {
     uint32_t base, lo, hi;        /* mach header, extent (after the slide) */
     uint32_t entry_main, entry_main_off, entry_thread;
     int has_main;
+    int has_dylinker;             /* LC_LOAD_DYLINKER: a program without one loads itself (src/m32_selfload.c) */
     M32Seg seg[M32_MAX_SEGS];
     int nseg;
     M32Sect sect[M32_MAX_SECTS];
@@ -57,6 +58,7 @@ extern int m32_nimages;
 
 M32Image *m32_image_load(const char *path, int is_main);
 M32Image *m32_load_program(const char *path);          /* main image and its guest dependencies, not yet fixed up */
+M32Image *m32_adopt_program(uint32_t mh, const char *path);   /* the same for a program already in the window */
 int m32_fixup_all(int from);                            /* fix up m32_images[from..], dependencies first */
 int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t outlen);   /* "" = system */
 uint32_t m32_image_symbol(M32Image *img, const char *name);
@@ -67,5 +69,6 @@ void m32_cf_alias_strings(M32Image *img);   /* src/m32_cf.c */
 void m32_tlv_register(M32Image *img);       /* src/m32_thread.c */
 struct OcerzVM;
 void m32_run_initializers(struct OcerzVM *vm, M32Image *img, const uint32_t args[5]);
+int m32_start_program(struct OcerzVM *vm, M32Image *img, uint32_t sp, const char *path);   /* src/m32.c */
 
 #endif

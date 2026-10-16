@@ -1975,6 +1975,10 @@ static int decode_0f(DecState *s, uint8_t op2)
         set_op(s, OCERZ_OP_SYSCALL);
         s->out->nops = 0;
         return OCERZ_OK;
+    case 0x34:
+        set_op(s, OCERZ_OP_SYSENTER);
+        s->out->nops = 0;
+        return OCERZ_OK;
     case 0x0b:
         set_op(s, OCERZ_OP_UD2);
         s->out->nops = 0;
@@ -3849,6 +3853,7 @@ static void init_op_names(void)
     op_names[OCERZ_OP_CLD] = "cld";
     op_names[OCERZ_OP_STD] = "std";
     op_names[OCERZ_OP_SYSCALL] = "syscall";
+    op_names[OCERZ_OP_SYSENTER] = "sysenter";
     op_names[OCERZ_OP_CPUID] = "cpuid";
     op_names[OCERZ_OP_RDTSC] = "rdtsc";
     op_names[OCERZ_OP_RDTSCP] = "rdtscp";

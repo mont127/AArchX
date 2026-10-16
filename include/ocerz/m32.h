@@ -26,6 +26,7 @@ struct OcerzVM;
 #define M32_ID_SENTINEL  0xfff0           /* return address of calls into the guest */
 #define M32_ID_EXIT      0xfff4           /* main()'s return address: exit(eax) */
 #define M32_ID_TLV       0xfff8           /* __tlv_bootstrap thunk */
+#define M32_ID_DYLD      0xfffc           /* the entry of the dyld a self-loading program maps (src/m32_selfload.c) */
 #define M32_ID_FIRST     0x0010           /* first export id */
 #define M32_ID_LIMIT     0xfff0
 
@@ -44,6 +45,11 @@ int m32_is_i386(const char *path);
 int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp);
 extern int m32_active;   /* set by m32_run: the process is an i386 Mach-O program, not Wine's WoW64 */
 int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu);
+/* src/m32_selfload.c: programs that load themselves, as a UPX-packed executable does */
+int m32_raw_syscall(struct OcerzVM *vm, OcerzCPU *cpu, int sysenter);   /* sysenter, or int 0x80 */
+int m32_dyld_entry(struct OcerzVM *vm, OcerzCPU *cpu);                   /* the M32_ID_DYLD trap */
+uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint64_t off);   /* src/m32_libsystem.c */
+void m32_selfload_begin(const char *path);                                 /* m32_run, before the program starts */
 int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap);   /* a trap made from inside a block */
 uint32_t m32_export_special(const char *name, M32Special fn);
 /* the Steam bridge (src/m32_steam.c): a steamclient.dylib with no i386 slice opens as the host's own */

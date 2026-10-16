@@ -344,6 +344,8 @@ int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu)
     }
     if (id == M32_ID_TLV)
         return m32_tlv_trap(vm, cpu);
+    if (id == M32_ID_DYLD)
+        return m32_dyld_entry(vm, cpu);
     M32Export *e = m32_export_by_id(id);
     if (!e) {
         fprintf(stderr, "ocerz: m32: call to trap id %#x with no export (from %#x)\n", (unsigned)id,
