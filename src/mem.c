@@ -2232,24 +2232,36 @@ int ocerz_mem_disarm_range(uint64_t lo, uint64_t hi, uint64_t *pages, int max)
     return n;
 }
 
+static int disarm_ri;
+static size_t disarm_pi;
+
 int ocerz_mem_disarm_all(uint64_t *pages, int max)
 {
+    if (__atomic_load_n(&g_armed_live, __ATOMIC_RELAXED) <= 0) return 0;
     int n = 0;
     map_lock_acquire();
-    for (int ri = 0; ri < region_n && n < max; ri++) {
-        MemRegion *r = &regions[ri];
-        if (!r->armed) continue;
-        size_t np = (size_t)((r->ghi - r->glo) / OCERZ_HOST_PAGE);
-        for (size_t i = 0; i < np && n < max; i++) {
-            if (!r->armed[i]) continue;
-            r->armed[i] = 0;
-            __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
-            uint64_t page = r->glo + (uint64_t)i * OCERZ_HOST_PAGE;
-            int has_data;
-            int gp = host_page_guest_prot(r, page, &has_data);
-            if (has_data)
-                mprotect(ocerz_g2h(page), (size_t)OCERZ_HOST_PAGE, host_prot(gp));
-            pages[n++] = page;
+    int sri = disarm_ri;
+    size_t spi = disarm_pi;
+    for (int pass = 0; pass < 2 && n < max; pass++) {
+        int rend = pass ? sri + 1 : region_n;
+        for (int ri = pass ? 0 : sri; ri < rend && n < max; ri++) {
+            MemRegion *r = &regions[ri];
+            if (!r->armed) continue;
+            size_t np = (size_t)((r->ghi - r->glo) / OCERZ_HOST_PAGE);
+            size_t i = !pass && ri == sri ? spi : 0;
+            if (pass && ri == sri && spi < np) np = spi;
+            for (; i < np && n < max; i++) {
+                if (!r->armed[i]) continue;
+                r->armed[i] = 0;
+                __atomic_sub_fetch(&g_armed_live, 1, __ATOMIC_RELAXED);
+                uint64_t page = r->glo + (uint64_t)i * OCERZ_HOST_PAGE;
+                int has_data;
+                int gp = host_page_guest_prot(r, page, &has_data);
+                if (has_data)
+                    mprotect(ocerz_g2h(page), (size_t)OCERZ_HOST_PAGE, host_prot(gp));
+                pages[n++] = page;
+            }
+            disarm_ri = ri, disarm_pi = i;
         }
     }
     map_lock_release();
