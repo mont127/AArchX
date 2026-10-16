@@ -6648,21 +6648,51 @@ static int alias_reg_find(uint64_t g, uint32_t obj, int any_obj)
     return hit;
 }
 
-static int alias_page_ours(uint64_t hpage)
+struct alias_walk { uint64_t hs, he, rlo, rhi; uint32_t hobj, robj; };
+
+static int alias_reg_entry(uint64_t g, uint32_t obj, struct alias_walk *w)
 {
-    uint64_t start, end;
-    uint32_t obj;
-    int prot;
-    uint64_t h = (uint64_t)(uintptr_t)ocerz_g2h(hpage);
-    return alias_reg_find(hpage, 0, 1) && host_region_entry(h, &start, &end, &obj, &prot) && start <= h &&
-           alias_reg_find(hpage, obj, 0);
+    int hit = 0;
+    pthread_mutex_lock(&g_alias_reg_lock);
+    for (uint32_t i = 0; i < g_alias_reg_n && !hit; i++)
+        if ((hit = g >= g_alias_reg[i].lo && g < g_alias_reg[i].hi && (!obj || g_alias_reg[i].obj == obj))) {
+            w->rlo = g_alias_reg[i].lo;
+            w->rhi = g_alias_reg[i].hi;
+            w->robj = g_alias_reg[i].obj;
+        }
+    pthread_mutex_unlock(&g_alias_reg_lock);
+    return hit;
 }
 
-static int alias_page_taken(uint64_t hpage)
+static int alias_page_ours_in(uint64_t hpage, struct alias_walk *w)
+{
+    uint64_t h = (uint64_t)(uintptr_t)ocerz_g2h(hpage);
+    if ((hpage < w->rlo || hpage >= w->rhi) && !alias_reg_entry(hpage, 0, w))
+        return 0;
+    if (h < w->hs || h >= w->he) {
+        uint64_t start, end;
+        uint32_t obj;
+        int prot;
+        if (!host_region_entry(h, &start, &end, &obj, &prot) || start > h)
+            return 0;
+        w->hs = start;
+        w->he = end;
+        w->hobj = obj;
+    }
+    return w->hobj && (w->robj == w->hobj || alias_reg_entry(hpage, w->hobj, w));
+}
+
+static int alias_page_ours(uint64_t hpage)
+{
+    struct alias_walk w = { 0 };
+    return alias_page_ours_in(hpage, &w);
+}
+
+static int alias_page_taken(uint64_t hpage, struct alias_walk *w)
 {
     for (uint64_t p = hpage; p < hpage + OCERZ_HOST_PAGE_SIZE; p += OCERZ_GUEST_PAGE_SIZE)
         if (ocerz_addr_prot(p) > 0)
-            return !alias_page_ours(hpage);
+            return !alias_page_ours_in(hpage, w);
     return 0;
 }
 
@@ -6730,16 +6760,17 @@ static int alias_raw_region(OcerzVM *vm, uint64_t pointer, int refresh)
         uint64_t lo = pointer & ~(OCERZ_HOST_PAGE_SIZE - 1), hi = lo + OCERZ_HOST_PAGE_SIZE;
         uint64_t rlo = (uint64_t)raddr, rhi = (uint64_t)raddr + rsize;
         uint64_t win = 0x10000000ull;
-        if (alias_page_taken(lo)) {
+        struct alias_walk w = { 0 };
+        if (alias_page_taken(lo, &w)) {
             if (getenv("OCERZ_MIGTRACE"))
                 fprintf(stderr, "ocerz: ALIASCLIP[%d] pointer=%#llx page taken readable=%d\n", (int)getpid(),
                         (unsigned long long)pointer, ocerz_addr_readable(pointer));
             return ocerz_addr_readable(pointer) ? 0 : -1;
         }
         while (lo > rlo && pointer - (lo - OCERZ_HOST_PAGE_SIZE) <= win &&
-               !alias_page_taken(lo - OCERZ_HOST_PAGE_SIZE))
+               !alias_page_taken(lo - OCERZ_HOST_PAGE_SIZE, &w))
             lo -= OCERZ_HOST_PAGE_SIZE;
-        while (hi < rhi && hi + OCERZ_HOST_PAGE_SIZE - pointer <= win && !alias_page_taken(hi))
+        while (hi < rhi && hi + OCERZ_HOST_PAGE_SIZE - pointer <= win && !alias_page_taken(hi, &w))
             hi += OCERZ_HOST_PAGE_SIZE;
         if (getenv("OCERZ_MIGTRACE"))
             fprintf(stderr, "ocerz: ALIASCLIP[%d] pointer=%#llx region=%#llx+%#llx -> %#llx..%#llx\n",
