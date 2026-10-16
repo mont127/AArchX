@@ -2298,41 +2298,48 @@ static int gran_any(uint64_t lo, uint64_t hi)
 #define GBLK_SLOTS 65536
 static struct { uint64_t page; uint32_t n, cap; JitBlock **v; } g_gblk[GBLK_SLOTS];
 static int g_gblk_off = -1;
+#define GBLK_OVF 4096
+static struct { uint64_t page; JitBlock *b; } g_gblk_ovf[GBLK_OVF];
+static uint32_t g_gblk_novf;
 static int gblk_slot(uint64_t page, int create)
 {
     unsigned i = (unsigned)(page * 0x9E3779B97F4A7C15ull >> 48) & (GBLK_SLOTS - 1);
+    int t = -1;
     for (unsigned n = 0; n < 64; n++, i = (i + 1) & (GBLK_SLOTS - 1)) {
         if (g_gblk[i].page == page + 1) return (int)i;
-        if (g_gblk[i].page == 0) {
-            if (!create) return -1;
-            g_gblk[i].page = page + 1;
-            return (int)i;
-        }
+        if (g_gblk[i].page == 0) { if (t < 0) t = (int)i; break; }
+        if (t < 0 && g_gblk[i].n == 0) t = (int)i;
     }
-    return create ? -2 : -1;
+    if (!create) return -1;
+    if (t < 0) return -2;
+    g_gblk[t].page = page + 1;
+    return t;
 }
 static void gblk_note(uint64_t page, JitBlock *b, int d)
 {
     if (g_gblk_off) return;
     int s = gblk_slot(page, d > 0);
-    if (s < 0) {
-        if (s == -2 || d > 0) g_gblk_off = 1;
-        return;
-    }
     if (d > 0) {
-        if (g_gblk[s].n == g_gblk[s].cap) {
+        if (s >= 0 && g_gblk[s].n == g_gblk[s].cap) {
             uint32_t nc = g_gblk[s].cap ? g_gblk[s].cap * 2 : 8;
             JitBlock **nv = (JitBlock **)realloc(g_gblk[s].v, nc * sizeof *nv);
-            if (!nv) { g_gblk_off = 1; return; }
-            g_gblk[s].v = nv;
-            g_gblk[s].cap = nc;
+            if (nv) { g_gblk[s].v = nv; g_gblk[s].cap = nc; }
         }
-        g_gblk[s].v[g_gblk[s].n++] = b;
+        if (s >= 0 && g_gblk[s].n < g_gblk[s].cap) { g_gblk[s].v[g_gblk[s].n++] = b; return; }
+        if (g_gblk_novf == GBLK_OVF) { g_gblk_off = 1; return; }
+        g_gblk_ovf[g_gblk_novf].page = page;
+        g_gblk_ovf[g_gblk_novf++].b = b;
         return;
     }
-    for (uint32_t j = 0; j < g_gblk[s].n; j++)
-        if (g_gblk[s].v[j] == b) {
-            g_gblk[s].v[j] = g_gblk[s].v[--g_gblk[s].n];
+    if (s >= 0)
+        for (uint32_t j = 0; j < g_gblk[s].n; j++)
+            if (g_gblk[s].v[j] == b) {
+                g_gblk[s].v[j] = g_gblk[s].v[--g_gblk[s].n];
+                return;
+            }
+    for (uint32_t j = 0; j < g_gblk_novf; j++)
+        if (g_gblk_ovf[j].page == page && g_gblk_ovf[j].b == b) {
+            g_gblk_ovf[j] = g_gblk_ovf[--g_gblk_novf];
             return;
         }
 }
@@ -2358,6 +2365,7 @@ static void gran_clear_all(void)
     for (unsigned i = 0; i < GBLK_SLOTS; i++)
         free(g_gblk[i].v);
     memset(g_gblk, 0, sizeof g_gblk);
+    g_gblk_novf = 0;
     g_gblk_off = getenv("OCERZ_INV_SCAN") ? 1 : 0;
 }
 
@@ -25435,14 +25443,19 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
         int listed = g_gblk_off == 0 && g1 - g0 <= 256;
         size_t n_cand = listed ? 0 : jit->n_live;
         uint64_t gp = g0;
-        uint32_t gj = 0;
+        uint32_t gj = 0, go = 0;
         for (size_t k = 0;; k++) {
             JitBlock *b;
             if (listed) {
                 int gs = -1;
                 while (gp < g1 && ((gs = gblk_slot(gp, 0)) < 0 || gj >= g_gblk[gs].n)) { gp++; gj = 0; }
-                if (gp >= g1) break;
-                b = g_gblk[gs].v[gj++];
+                if (gp < g1) {
+                    b = g_gblk[gs].v[gj++];
+                } else {
+                    while (go < g_gblk_novf && (g_gblk_ovf[go].page < g0 || g_gblk_ovf[go].page >= g1)) go++;
+                    if (go >= g_gblk_novf) break;
+                    b = g_gblk_ovf[go++].b;
+                }
                 if (b->inv_hit) continue;
             } else {
                 if (k >= n_cand) break;
