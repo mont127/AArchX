@@ -218,13 +218,15 @@ static int bind_stream(M32Image *img, uint32_t boff, uint32_t bsize, int lazy, i
     const uint8_t *p = img->file + boff, *end = p + bsize;
     int ordinal = 0, type = BIND_TYPE_POINTER, flags = 0, bad = 0;
     const char *name = "";
+    const char *weak_name = NULL;   /* the last weak symbol looked up, and its definition: one lookup per symbol */
+    uint32_t w = 0;
     int64_t addend = 0;
     unsigned seg = 0;
     uint64_t off = 0;
 #define M32_BIND_ONE() do {                                                                         \
         uint32_t a = seg_addr(img, seg, off);                                                        \
         if (weak_stream) {  /* dyld coalesces a weak symbol to its first definition in load order */  \
-            uint32_t w = m32_weak_definition(name);                                                  \
+            if (name != weak_name) { weak_name = name; w = m32_weak_definition(name); }              \
             if (a && w) m32_wr(a, type == BIND_TYPE_TEXT_PCREL32 ? w + (uint32_t)addend - (a + 4)     \
                                                                  : w + (uint32_t)addend);            \
             off += 4; break;                                                                         \
@@ -416,6 +418,46 @@ const M32Sect *m32_section(const M32Image *img, const char *seg, const char *sec
     return NULL;
 }
 
+static int defined_ext(const uint8_t *nl) { return (nl[4] & N_TYPE) == N_SECT && (nl[4] & N_EXT); }
+
+static uint32_t sym_hash(const char *s)
+{
+    uint32_t h = 2166136261u;
+    while (*s)
+        h = (h ^ (uint8_t)*s++) * 16777619u;
+    return h;
+}
+
+/* An image without an export trie is looked up in its symbol table: hash its external definitions by name once,
+ * before the image is published.  Linear probing in symbol table order finds the first definition of a name
+ * first, as the scan it replaces did. */
+static void index_symbols(M32Image *img)
+{
+    if (img->export_size || !img->nsyms)
+        return;
+    uint32_t n = 0, cap = 64;
+    for (uint32_t i = 0; i < img->nsyms; i++) {
+        const uint8_t *nl = img->file + img->symoff + i * 12;
+        n += defined_ext(nl) && le32(nl) < img->strsize;
+    }
+    while (cap < n * 2u)
+        cap <<= 1;
+    uint32_t *t = calloc(cap, sizeof *t);
+    if (!t)
+        return;
+    for (uint32_t i = 0; i < img->nsyms; i++) {
+        const uint8_t *nl = img->file + img->symoff + i * 12;
+        if (!defined_ext(nl) || le32(nl) >= img->strsize)
+            continue;
+        uint32_t h = sym_hash((const char *)img->file + img->stroff + le32(nl)) & (cap - 1);
+        while (t[h])
+            h = (h + 1) & (cap - 1);
+        t[h] = i + 1;
+    }
+    img->symhash = t;
+    img->symhash_mask = cap - 1;
+}
+
 /* Load an i386 image from path. The main executable maps at its own addresses. */
 M32Image *m32_image_load(const char *path, int is_main)
 {
@@ -444,6 +486,7 @@ M32Image *m32_image_load(const char *path, int is_main)
         img->entry_main = img->base + img->entry_main_off;   /* entryoff counts from the mach header */
     if (img->entry_thread)
         img->entry_thread += (uint32_t)img->slide;
+    index_symbols(img);
     if (m32_nimages < M32_MAX_IMAGES)
         m32_images[m32_nimages++] = img;
     static int log_images = -1;
@@ -784,6 +827,14 @@ static uint32_t trie_lookup(M32Image *img, const char *name, int depth)
 
 static uint32_t nlist_lookup(M32Image *img, const char *name)
 {
+    if (img->symhash) {
+        for (uint32_t h = sym_hash(name) & img->symhash_mask; img->symhash[h]; h = (h + 1) & img->symhash_mask) {
+            const uint8_t *nl = img->file + img->symoff + (img->symhash[h] - 1) * 12;
+            if (!strcmp((const char *)img->file + img->stroff + le32(nl), name))
+                return le32(nl + 8) + (uint32_t)img->slide;
+        }
+        return 0;
+    }
     for (uint32_t i = 0; i < img->nsyms; i++) {
         const uint8_t *nl = img->file + img->symoff + i * 12;   /* struct nlist: strx, type, sect, desc, value */
         uint8_t type = nl[4];
@@ -923,6 +974,7 @@ M32Image *m32_adopt_program(uint32_t mh, const char *path)
         img->entry_main = img->base + img->entry_main_off;
     if (img->entry_thread)
         img->entry_thread += (uint32_t)slide;
+    index_symbols(img);
     m32_nimages = 0;
     m32_images[m32_nimages++] = img;
     if (load_deps(img) != 0)
@@ -1116,7 +1168,10 @@ static int sp_dlsym(struct OcerzVM *vm, OcerzCPU *cpu)
     uint32_t v = dl_sym(h, sym);
     if (!v)
         set_dlerror("dlsym: symbol %s not found", sym + 1);
-    if (!v && getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "dlsym"))   /* OCERZ_M32LOG=dlsym: lookups that found nothing */
+    static int log_dlsym = -1;   /* OCERZ_M32LOG=dlsym: lookups that found nothing */
+    if (log_dlsym < 0)
+        log_dlsym = getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "dlsym");
+    if (!v && log_dlsym)
         fprintf(stderr, "ocerz: m32: dlsym found no %s (called from %#x)\n", sym + 1, m32_rd((uint32_t)cpu->gpr[OCERZ_RSP]));
     m32_ret(cpu, v, 0, 0);
     return OCERZ_STEP_OK;
@@ -1198,6 +1253,35 @@ static M32Image *image_at(uint32_t addr)
     return NULL;
 }
 
+static int byaddr_cmp(const void *x, const void *y)
+{
+    const uint32_t *a = x, *b = y;
+    return a[0] != b[0] ? (a[0] > b[0]) - (a[0] < b[0]) : (a[1] > b[1]) - (a[1] < b[1]);
+}
+
+/* img's external definitions by address, then symbol table order: sorted on dladdr's first call for the image */
+static void index_addresses(M32Image *img)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!img->byaddr_built) {
+        uint32_t n = 0;
+        img->byaddr = malloc(((size_t)img->nsyms + 1) * sizeof *img->byaddr);
+        for (uint32_t i = 0; img->byaddr && i < img->nsyms; i++) {
+            const uint8_t *nl = img->file + img->symoff + i * 12;
+            if (!defined_ext(nl))
+                continue;
+            img->byaddr[n][0] = le32(nl + 8) + (uint32_t)img->slide;
+            img->byaddr[n++][1] = i;
+        }
+        if (n)
+            qsort(img->byaddr, n, sizeof *img->byaddr, byaddr_cmp);
+        img->nbyaddr = n;
+        img->byaddr_built = 1;
+    }
+    pthread_mutex_unlock(&lock);
+}
+
 /* dladdr(addr, Dl_info *): i386 Dl_info is {dli_fname, dli_fbase, dli_sname, dli_saddr} */
 static int sp_dladdr(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -1207,17 +1291,17 @@ static int sp_dladdr(struct OcerzVM *vm, OcerzCPU *cpu)
         m32_ret(cpu, 0, 0, 0);
         return OCERZ_STEP_OK;
     }
-    uint32_t best = 0, best_name = 0;
-    for (uint32_t i = 0; i < img->nsyms; i++) {   /* the nearest external symbol at or below addr */
-        const uint8_t *nl = img->file + img->symoff + i * 12;
-        if ((nl[4] & N_TYPE) != N_SECT || !(nl[4] & N_EXT))
-            continue;
-        uint32_t a = le32(nl + 8) + (uint32_t)img->slide;
-        if (a <= addr && a >= best) {
-            best = a;
-            best_name = le32(nl);
-        }
+    index_addresses(img);
+    uint32_t lo = 0, hi = img->nbyaddr;   /* the nearest external symbol at or below addr, the last of equals */
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (img->byaddr[mid][0] <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
     }
+    uint32_t best = lo ? img->byaddr[lo - 1][0] : 0;
+    uint32_t best_name = lo ? le32(img->file + img->symoff + img->byaddr[lo - 1][1] * 12) : 0;
     m32_wr(info, m32_cstring(img->path));
     m32_wr(info + 4, img->base);
     m32_wr(info + 8, best && best_name < img->strsize ? m32_cstring((const char *)img->file + img->stroff + best_name + 1) : 0);

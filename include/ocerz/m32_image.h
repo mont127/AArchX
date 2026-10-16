@@ -43,6 +43,9 @@ typedef struct M32Image {
     uint32_t rebase_off, rebase_size, bind_off, bind_size, weak_off, weak_size;
     uint32_t lazy_off, lazy_size, export_off, export_size;
     uint32_t symoff, nsyms, stroff, strsize;
+    uint32_t *symhash, symhash_mask;   /* external definitions by name, when there is no export trie: nlist index + 1 */
+    uint32_t (*byaddr)[2], nbyaddr;    /* external definitions as {address, nlist index}, sorted, for dladdr */
+    int byaddr_built;
     uint32_t indirectsymoff, nindirectsyms, extreloff, nextrel, locreloff, nlocrel;   /* LC_DYSYMTAB */
     int has_dyld_info;
     char *deps[M32_MAX_DEPS];
