@@ -731,6 +731,11 @@ typedef struct DynImage {
 #define DYN_DIMG_MAX 2048   /* VLC 2.2 alone loads 301 plugins */
 static DynImage g_dimgs[DYN_DIMG_MAX];
 static int g_dimgs_n;
+/* Bumped as an image finishes loading and whenever one is dropped, the list is
+   published, the main image is set or a local image is made global, so with
+   g_dimgs_n it names one state of the image list: what a dlsym answer
+   depends on. */
+static _Atomic unsigned g_dimgs_gen;
 static DynImage g_main_dimg;
 static int g_main_dimg_valid;
 /* the main executable while it and its disk dylibs are bound, before g_main_dimg holds it */
@@ -759,6 +764,16 @@ static struct OcerzVM *g_run_vm;
 static uint64_t g_run_init_args[5];
 static int g_run_init_ready;
 static uint64_t g_dlerror_g;
+
+static void dimg_changed(void)
+{
+    atomic_fetch_add_explicit(&g_dimgs_gen, 1, memory_order_acq_rel);
+}
+
+static uint64_t dimg_gen(void)
+{
+    return ((uint64_t)atomic_load_explicit(&g_dimgs_gen, memory_order_acquire) << 32) | (uint32_t)g_dimgs_n;
+}
 
 static DynImage *dimg_find_by_path(const char *path)
 {
@@ -4034,12 +4049,14 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
             OCERZ_FATAL("cannot map segments of virtual %s\n", install_name);
             native_dl_reason("its synthesized image could not be mapped", NULL);
             g_dimgs_n--;
+            dimg_changed();
             free(vbuf);
             return NULL;
         }
         protect_ro_segments(v);
         ocerz_vdylib_late_fill(install_name, virt_slot_of, v);
         v->seq = ++g_dimg_seq;
+        dimg_changed();
         OCERZ_LOG("dynamic: registered virtual dylib %s at load_base=%#llx slide=%#llx\n",
                   install_name, (unsigned long long)v->load_base,
                   (unsigned long long)v->slide);
@@ -4125,6 +4142,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         OCERZ_FATAL("cannot map segments of %s\n", resolved);
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
+        dimg_changed();
         free(buf);
         return NULL;
     }
@@ -4145,6 +4163,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     if (d->cf_off == 0)
         apply_classic_fixups(d, cache);
     d->seq = ++g_dimg_seq;
+    dimg_changed();
 
     if (ocerz_mode == OCERZ_MODE_CACHE)
         ocerz_dyldapi_register_image(d->load_base, d->path);
@@ -4258,6 +4277,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path, 
     if (map_segments(d, 0) != OCERZ_OK) {
         dlerror_set("dlopen(%s): cannot map segments", install_path);
         g_dimgs_n--;
+        dimg_changed();
         free(buf);
         return NULL;
     }
@@ -4929,6 +4949,7 @@ static uint64_t g_native_init_args[5];
 static void native_publish(void)
 {
     atomic_store_explicit(&g_dimgs_pub, g_dimgs_n, memory_order_release);
+    dimg_changed();
 }
 
 static int ndl_pub(void)
@@ -5331,17 +5352,13 @@ static DynImage *ndl_dep_of(DynImage *img, const char *name, int pub)
     return NULL;
 }
 
-static uint64_t ndl_search_deps(DynImage *root, const char *usym, int *found)
+static int ndl_closure(DynImage *root, DynImage **queue)
 {
     int pub = ndl_pub();
-    DynImage *queue[DYN_DIMG_MAX + 1];
     int qn = 0;
     queue[qn++] = root;
     for (int qi = 0; qi < qn; qi++) {
         DynImage *d = queue[qi];
-        uint64_t v = ndl_lookup_in(d, usym, found);
-        if (*found)
-            return v;
         const uint8_t *mh = d->slice;
         uint32_t ncmds = rd32(mh + 16);
         const uint8_t *lc = mh + sizeof(struct mach_header_64);
@@ -5360,8 +5377,130 @@ static uint64_t ndl_search_deps(DynImage *root, const char *usym, int *found)
             lc += rd32(lc + 4);
         }
     }
+    return qn;
+}
+
+/* A handle's dependency closure, in the order dlsym searches it, kept for the
+   image list's state it was walked in: naming each dependency compares it with
+   every loaded image, which a dlsym that misses its root would otherwise do
+   again for every name. */
+typedef struct NdlDeps {
+    uint64_t gen;
+    int n;
+    DynImage **v;
+} NdlDeps;
+
+static NdlDeps g_ndl_deps[DYN_DIMG_MAX];
+static pthread_mutex_t g_ndl_deps_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t ndl_search_deps(DynImage *root, const char *usym, int *found)
+{
+    uint64_t v = ndl_lookup_in(root, usym, found);
+    if (*found)
+        return v;
+    DynImage *queue[DYN_DIMG_MAX + 1];
+    int qn;
+    long idx = root - g_dimgs;
+    if (idx < 0 || idx >= DYN_DIMG_MAX) {
+        qn = ndl_closure(root, queue);
+    } else {
+        pthread_mutex_lock(&g_ndl_deps_lock);
+        NdlDeps *c = &g_ndl_deps[idx];
+        uint64_t gen = dimg_gen();
+        if (c->v && c->gen == gen) {
+            qn = c->n;
+            memcpy(queue, c->v, (size_t)qn * sizeof *queue);
+        } else {
+            qn = ndl_closure(root, queue);
+            DynImage **keep = realloc(c->v, (size_t)qn * sizeof *keep);
+            if (keep) {
+                memcpy(keep, queue, (size_t)qn * sizeof *keep);
+                c->v = keep;
+                c->n = qn;
+                c->gen = gen;
+            }
+        }
+        pthread_mutex_unlock(&g_ndl_deps_lock);
+    }
+    for (int qi = 1; qi < qn; qi++) {
+        v = ndl_lookup_in(queue[qi], usym, found);
+        if (*found)
+            return v;
+    }
     *found = 0;
     return 0;
+}
+
+/* dlsym's answer for a handle and name, kept for the image list's state it was
+   found in (dimg_gen), not found included: each lookup through a disk image's
+   handle or RTLD_DEFAULT otherwise searches image after image again, and Wine
+   looks its OpenGL entry points up by name.  RTLD_NEXT and RTLD_SELF depend on
+   the caller and are not kept. */
+#define NDL_MEMO_SLOTS (1u << 14)
+typedef struct NdlMemo {
+    uint64_t handle;
+    uint64_t gen;
+    char *name;
+    uint64_t val;
+    int found;
+} NdlMemo;
+
+static NdlMemo g_ndl_memo[NDL_MEMO_SLOTS];
+static pthread_mutex_t g_ndl_memo_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned ndl_memo_hash(uint64_t handle, const char *s)
+{
+    unsigned h = 2166136261u ^ (unsigned)(handle >> 12) ^ (unsigned)(handle >> 32) ^ (unsigned)handle;
+    for (; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    return h & (NDL_MEMO_SLOTS - 1);
+}
+
+static int ndl_memo_get(uint64_t handle, const char *usym, uint64_t gen, uint64_t *v, int *found)
+{
+    int hit = 0;
+    unsigned i = ndl_memo_hash(handle, usym);
+    pthread_mutex_lock(&g_ndl_memo_lock);
+    for (unsigned n = 0; n < 16 && g_ndl_memo[i].name; n++, i = (i + 1) & (NDL_MEMO_SLOTS - 1)) {
+        NdlMemo *m = &g_ndl_memo[i];
+        if (m->handle == handle && strcmp(m->name, usym) == 0) {
+            hit = m->gen == gen;
+            if (hit) {
+                *v = m->val;
+                *found = m->found;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_ndl_memo_lock);
+    return hit;
+}
+
+static void ndl_memo_put(uint64_t handle, const char *usym, uint64_t gen, uint64_t v, int found)
+{
+    if (gen != dimg_gen())
+        return;
+    unsigned i = ndl_memo_hash(handle, usym);
+    pthread_mutex_lock(&g_ndl_memo_lock);
+    for (unsigned n = 0; n < 16; n++, i = (i + 1) & (NDL_MEMO_SLOTS - 1)) {
+        NdlMemo *m = &g_ndl_memo[i];
+        int same = m->name && m->handle == handle && strcmp(m->name, usym) == 0;
+        if (m->name && !same && m->gen == gen)
+            continue;
+        if (!same) {
+            char *name = strdup(usym);
+            if (!name)
+                break;
+            free(m->name);
+            m->name = name;
+            m->handle = handle;
+        }
+        m->gen = gen;
+        m->val = v;
+        m->found = found;
+        break;
+    }
+    pthread_mutex_unlock(&g_ndl_memo_lock);
 }
 
 static uint64_t ndl_search_from(uint32_t start, uint32_t own, const char *usym, int *found)
@@ -5430,7 +5569,11 @@ static uint64_t native_dlsym_inner(uint64_t handle, const char *name, uint64_t c
         ndl_err("dlsym(%s, %s): symbol not found", htext, name ? name : "(null)");
         return 0;
     }
-    if (handle == NDL_DEFAULT) {
+    int memo = handle != NDL_NEXT && handle != NDL_SELF;
+    uint64_t gen = dimg_gen();
+    if (memo && ndl_memo_get(handle, usym, gen, &v, &found)) {
+        memo = 0;
+    } else if (handle == NDL_DEFAULT) {
         v = ndl_search_from(0, UINT32_MAX, usym, &found);
         /* RTLD_DEFAULT reaches frameworks the program never linked, because
            AppKit and the rest loaded them already (Unity 2018 finds
@@ -5474,6 +5617,8 @@ static uint64_t native_dlsym_inner(uint64_t handle, const char *name, uint64_t c
             }
         }
     }
+    if (memo)
+        ndl_memo_put(handle, usym, gen, v, found);
     if (!found) {
         ndl_err("dlsym(%s, %s): symbol not found", htext, name);
         return 0;
@@ -5949,6 +6094,7 @@ static DynImage *ndl_load_file(NdlTarget *t, const RpathList *chain)
     if (map_segments(d, 0) != OCERZ_OK) {
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
+        dimg_changed();
         free(d->owned_buf);
         memset(d, 0, sizeof *d);
         return NULL;
@@ -5970,6 +6116,7 @@ static DynImage *ndl_load_file(NdlTarget *t, const RpathList *chain)
         apply_classic_fixups(d, g_run_cache);
     protect_ro_segments(d);
     d->seq = ++g_dimg_seq;
+    dimg_changed();
     OCERZ_LOG("dynamic: native dlopen loaded %s at load_base=%#llx slide=%#llx\n", d->path,
               (unsigned long long)d->load_base, (unsigned long long)d->slide);
     return d;
@@ -5986,6 +6133,7 @@ static void ndl_rollback(int before)
         memset(d, 0, sizeof *d);
     }
     g_dimgs_n = before;
+    dimg_changed();
 }
 
 static uint64_t *g_ndl_add_funcs;
@@ -6104,8 +6252,10 @@ static uint64_t ndl_dlopen_locked(struct OcerzVM *vm, const char *path, int mode
     } else if (t->kind == NDL_MAIN) {
         handle = ocerz_main_mh | first;
     } else if (t->kind == NDL_LOADED) {
-        if (!(mode & NDL_RTLD_LOCAL))
+        if (!(mode & NDL_RTLD_LOCAL) && t->img->local) {
             t->img->local = 0;
+            dimg_changed();
+        }
         handle = t->img->load_base | first;
     } else if (t->kind == NDL_NATIVE_ONLY) {
         ndl_err("dlopen(%s, 0x%04x): native library without an API database: %s", path, mode, t->why);
@@ -6589,6 +6739,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     g_main_dimg = img;
     g_main_dimg.owned_buf = buf;
     g_main_dimg_valid = 1;
+    dimg_changed();
     g_main_loading = NULL;
     buf = NULL;
     free(buf);
