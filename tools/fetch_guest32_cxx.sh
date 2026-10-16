@@ -1,16 +1,17 @@
 #!/bin/bash
 # fetch_guest32_cxx.sh -- the guest i386 GNU libstdc++ and libgcc_s that m32 programs built with GCC import from
 # /usr/lib, which macOS no longer ships (Batman: Arkham Asylum takes the old-ABI std::string, iostreams and
-# _Rb_tree_* from libstdc++.6.dylib).  Source: MacPorts' i386 build of GCC 15.2's runtime for darwin_10, pinned by
-# SHA-256 (GPLv3 with the GCC Runtime Library Exception).  Games built with Apple's clang import LLVM's libc++ instead
-# (Call of Duty: Modern Warfare 3's std::__1 strings): MacPorts' i386 libc++ 5.0.1 and libc++abi for darwin_10, also
-# pinned (MIT and UIUC licenses).  They run as guest code from runtime/guest32, where m32 looks for /usr/lib names
-# first; the directory is not tracked.
+# _Rb_tree_* from libstdc++.6.dylib).  Source: the i386 slice of MacPorts' universal build of GCC 15.2's runtime for
+# darwin_10, pinned by SHA-256 (GPLv3 with the GCC Runtime Library Exception); its i386-only package was replaced by
+# GCC 15.3's in October 2026.  Games built with Apple's clang import LLVM's libc++ instead (Call of Duty: Modern
+# Warfare 3's std::__1 strings): MacPorts' i386 libc++ 5.0.1 and libc++abi for darwin_10, also pinned (MIT and UIUC
+# licenses).  They run as guest code from runtime/guest32, where m32 looks for /usr/lib names first; the directory is
+# not tracked.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 G=runtime/guest32/usr/lib
-F=libgcc15-15.2.0_0+stdlib_flag.darwin_10.i386.tbz2
-SHA=7ed674a36aacf8fcf742e2f63eac85c4fa9a04fbbdda784ab44fac1cee06ad16
+F=libgcc15-15.2.0_0+stdlib_flag+universal.darwin_10.i386-x86_64.tbz2
+SHA=d23b0099c24e4452c848ed2d39d0b3c50d6b23badfdc4d2bd60fa0c84ee2b6d5
 T=$(mktemp -d)
 curl -sfL -o "$T/$F" "https://packages.macports.org/libgcc15/$F"
 if [ "$SHA" = PENDING ]; then shasum -a 256 "$T/$F"; else echo "$SHA  $T/$F" | shasum -a 256 -c -; fi
