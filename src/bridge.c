@@ -1103,7 +1103,7 @@ static int br_zone_is_guest(uint64_t zone)
 }
 
 static int br_zone_forward(struct OcerzVM *vm, OcerzCPU *cpu, const char *export_name,
-                           const char *sig, unsigned slot)
+                           const char *sig, unsigned slot, void *_Atomic *cache)
 {
     uint64_t zone = cpu->gpr[OCERZ_RDI];
     const BrZoneView *view = br_view_find(zone);
@@ -1114,9 +1114,13 @@ static int br_zone_forward(struct OcerzVM *vm, OcerzCPU *cpu, const char *export
         cpu->rip = target;
         return OCERZ_STEP_OK;
     }
-    void *fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, export_name + 1);
-    if (!fn)
-        return br_answer(vm, cpu, 0);
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_LIBSYSTEM, export_name + 1);
+        if (!fn)
+            return br_answer(vm, cpu, 0);
+        *cache = fn;
+    }
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, OCERZ_BRIDGE_LIBSYSTEM, export_name, sig, fn);
     uint64_t r = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t))fn)(
@@ -1128,70 +1132,85 @@ static int br_zone_forward(struct OcerzVM *vm, OcerzCPU *cpu, const char *export
 
 static int br_malloc_zone_malloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_zone_malloc", "p(pL)", BR_ZONE_MALLOC);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_zone_malloc", "p(pL)", BR_ZONE_MALLOC, &cached);
 }
 
 static int br_malloc_zone_calloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_zone_calloc", "p(pLL)", BR_ZONE_CALLOC);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_zone_calloc", "p(pLL)", BR_ZONE_CALLOC, &cached);
 }
 
 static int br_malloc_zone_valloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_zone_valloc", "p(pL)", BR_ZONE_VALLOC);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_zone_valloc", "p(pL)", BR_ZONE_VALLOC, &cached);
 }
 
 static int br_malloc_zone_free(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_zone_free", "v(pp)", BR_ZONE_FREE);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_zone_free", "v(pp)", BR_ZONE_FREE, &cached);
 }
 
 static int br_malloc_zone_realloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_zone_realloc", "p(ppL)", BR_ZONE_REALLOC);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_zone_realloc", "p(ppL)", BR_ZONE_REALLOC, &cached);
 }
 
 static int br_malloc_zone_memalign(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_zone_memalign", "p(pLL)", BR_ZONE_MEMALIGN);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_zone_memalign", "p(pLL)", BR_ZONE_MEMALIGN, &cached);
 }
 
 /* The typed calls carry a malloc_type_id_t after the untyped arguments. A view passes it on to
    the host's typed call; a guest zone gets its untyped slot, which ignores the extra register. */
 static int br_malloc_type_zone_malloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_type_zone_malloc", "p(pLL)", BR_ZONE_MALLOC);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_malloc", "p(pLL)", BR_ZONE_MALLOC, &cached);
 }
 
 static int br_malloc_type_zone_calloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_type_zone_calloc", "p(pLLL)", BR_ZONE_CALLOC);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_calloc", "p(pLLL)", BR_ZONE_CALLOC, &cached);
 }
 
 static int br_malloc_type_zone_valloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_type_zone_valloc", "p(pLL)", BR_ZONE_VALLOC);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_valloc", "p(pLL)", BR_ZONE_VALLOC, &cached);
 }
 
 static int br_malloc_type_zone_free(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_type_zone_free", "v(ppL)", BR_ZONE_FREE);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_free", "v(ppL)", BR_ZONE_FREE, &cached);
 }
 
 static int br_malloc_type_zone_realloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_type_zone_realloc", "p(ppLL)", BR_ZONE_REALLOC);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_realloc", "p(ppLL)",
+                           BR_ZONE_REALLOC, &cached);
 }
 
 static int br_malloc_type_zone_memalign(struct OcerzVM *vm, OcerzCPU *cpu)
 {
-    return br_zone_forward(vm, cpu, "_malloc_type_zone_memalign", "p(pLLL)", BR_ZONE_MEMALIGN);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_type_zone_memalign", "p(pLLL)",
+                           BR_ZONE_MEMALIGN, &cached);
 }
 
 static int br_malloc_zone_pressure_relief(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    static void *_Atomic cached = NULL;
     return br_zone_forward(vm, cpu, "_malloc_zone_pressure_relief", "L(pL)",
-                           BR_ZONE_PRESSURE_RELIEF);
+                           BR_ZONE_PRESSURE_RELIEF, &cached);
 }
 
 /* malloc_zone_statistics fills a malloc_statistics_t, a count and three sizes
@@ -1221,7 +1240,8 @@ static int br_malloc_zone_statistics(struct OcerzVM *vm, OcerzCPU *cpu)
 static int br_malloc_destroy_zone(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     br_zone_remove(cpu->gpr[OCERZ_RDI]);
-    return br_zone_forward(vm, cpu, "_malloc_destroy_zone", "v(p)", BR_ZONE_DESTROY);
+    static void *_Atomic cached = NULL;
+    return br_zone_forward(vm, cpu, "_malloc_destroy_zone", "v(p)", BR_ZONE_DESTROY, &cached);
 }
 
 static int br_malloc_create_zone(struct OcerzVM *vm, OcerzCPU *cpu)
