@@ -1500,24 +1500,42 @@ unsigned ocerz_dyld_generation(void)
     return (unsigned)g_dimgs_n;
 }
 
+/* The dylib load commands' names of the image being bound, by ordinal, read
+   once for all of its imports.  apply_fixups and apply_classic_fixups drop it,
+   so an image that comes to occupy a freed one's DynImage reads its own. */
+static const DynImage *g_ord_img;
+static const char **g_ord_name;
+static int g_ord_n, g_ord_cap;
+
 static const char *dimg_ordinal_name(DynImage *img, int ord)
 {
     if (ord <= 0)
         return NULL;
-    const uint8_t *mh = img->slice;
-    uint32_t ncmds = rd32(mh + 16);
-    const uint8_t *lc = mh + sizeof(struct mach_header_64);
-    int n = 0;
-    for (uint32_t i = 0; i < ncmds; i++) {
-        uint32_t cmd = rd32(lc);
-        if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
-            cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
-            if (++n == ord)
-                return (const char *)(lc + rd32(lc + 8));
+    if (g_ord_img != img) {
+        const uint8_t *mh = img->slice;
+        uint32_t ncmds = rd32(mh + 16);
+        const uint8_t *lc = mh + sizeof(struct mach_header_64);
+        g_ord_img = NULL;
+        g_ord_n = 0;
+        for (uint32_t i = 0; i < ncmds; i++) {
+            uint32_t cmd = rd32(lc);
+            if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB ||
+                cmd == LC_REEXPORT_DYLIB || cmd == LC_LOAD_UPWARD_DYLIB) {
+                if (g_ord_n == g_ord_cap) {
+                    int cap = g_ord_cap ? g_ord_cap * 2 : 64;
+                    const char **grown = realloc(g_ord_name, (size_t)cap * sizeof *grown);
+                    if (!grown)
+                        return NULL;
+                    g_ord_name = grown;
+                    g_ord_cap = cap;
+                }
+                g_ord_name[g_ord_n++] = (const char *)(lc + rd32(lc + 8));
+            }
+            lc += rd32(lc + 4);
         }
-        lc += rd32(lc + 4);
+        g_ord_img = img;
     }
-    return NULL;
+    return ord <= g_ord_n ? g_ord_name[ord - 1] : NULL;
 }
 
 static uint64_t disk_flat_resolve_ex(const char *name, int *found)
@@ -2050,6 +2068,7 @@ static void protect_ro_drop(const DynImage *img)
 
 static int apply_fixups(DynImage *img, OcerzCache *cache)
 {
+    g_ord_img = NULL;
     if (img->cf_off == 0)
         return OCERZ_OK;
     const uint8_t *cf = img->slice + img->cf_off;
@@ -2548,6 +2567,7 @@ static int weak_stream_enabled(void)
 
 static int apply_classic_fixups(DynImage *img, OcerzCache *cache)
 {
+    g_ord_img = NULL;
     if (!img->has_dyld_info)
         return apply_legacy_relocations(img, cache);
     classic_rebase(img);
