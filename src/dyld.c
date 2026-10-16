@@ -5036,15 +5036,123 @@ static int ndl_covers(uint64_t mh, uint64_t addr, uint64_t len, int *readonly)
     return 0;
 }
 
+/* every segment ndl_covers would match, sorted by lo; last_max is the running max of each
+ * segment's last byte, so a backward scan from the bsearch hit can stop early yet still find
+ * overlapping segments (shared-cache __LINKEDIT) and pick the lowest image index as before */
+typedef struct NdlSeg {
+    uint64_t lo;
+    uint64_t size;
+    uint64_t last_max;
+    uint32_t index;
+} NdlSeg;
+
+static struct {
+    NdlSeg *v;
+    int n;
+    int cap;
+    uint32_t images;
+    uint64_t main_mh;
+} g_ndl_segs;
+static pthread_mutex_t g_ndl_segs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int ndl_seg_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const NdlSeg *)a)->lo, y = ((const NdlSeg *)b)->lo;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static int ndl_segs_add(uint32_t index, uint64_t mh)
+{
+    const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
+    if (!mh || rd32(h) != MH_MAGIC_64)
+        return 1;
+    int64_t slide = image_slide_d(mh);
+    uint32_t ncmds = rd32(h + 16);
+    const uint8_t *lc = h + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < ncmds; i++, lc += rd32(lc + 4)) {
+        if (rd32(lc) != LC_SEGMENT_64)
+            continue;
+        uint64_t vmaddr = rd64(lc + 24), vmsize = rd64(lc + 32);
+        if (!vmsize || (vmaddr == 0 && rd32(lc + 60) == 0))
+            continue;
+        if (g_ndl_segs.n == g_ndl_segs.cap) {
+            int cap = g_ndl_segs.cap ? g_ndl_segs.cap * 2 : 256;
+            NdlSeg *grown = realloc(g_ndl_segs.v, (size_t)cap * sizeof *grown);
+            if (!grown)
+                return 0;
+            g_ndl_segs.v = grown;
+            g_ndl_segs.cap = cap;
+        }
+        NdlSeg *s = &g_ndl_segs.v[g_ndl_segs.n++];
+        s->lo = (uint64_t)((int64_t)vmaddr + slide);
+        s->size = vmsize;
+        s->index = index;
+    }
+    return 1;
+}
+
+/* images are only ever appended once published, so the index grows with the image count */
+static int ndl_segs_sync(uint32_t n)
+{
+    if (g_ndl_segs.main_mh != ocerz_main_mh || n < g_ndl_segs.images) {
+        g_ndl_segs.n = 0;
+        g_ndl_segs.images = 0;
+        g_ndl_segs.main_mh = ocerz_main_mh;
+    }
+    if (g_ndl_segs.images == n)
+        return 1;
+    int before = g_ndl_segs.n;
+    for (uint32_t i = g_ndl_segs.images; i < n; i++) {
+        NdlImage im;
+        if (ndl_image(i, &im) && !ndl_segs_add(i, im.mh)) {
+            g_ndl_segs.n = before;
+            return 0;
+        }
+    }
+    if (g_ndl_segs.n > 1)
+        qsort(g_ndl_segs.v, (size_t)g_ndl_segs.n, sizeof g_ndl_segs.v[0], ndl_seg_cmp);
+    uint64_t m = 0;
+    for (int j = 0; j < g_ndl_segs.n; j++) {
+        NdlSeg *s = &g_ndl_segs.v[j];
+        uint64_t last = s->size - 1 > UINT64_MAX - s->lo ? UINT64_MAX : s->lo + (s->size - 1);
+        m = last > m ? last : m;
+        s->last_max = m;
+    }
+    g_ndl_segs.images = n;
+    return 1;
+}
+
+static uint32_t ndl_segs_find(uint64_t addr)
+{
+    int lo = 0, hi = g_ndl_segs.n;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g_ndl_segs.v[mid].lo <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    uint32_t best = UINT32_MAX;
+    for (int j = lo - 1; j >= 0 && g_ndl_segs.v[j].last_max >= addr; j--)
+        if (addr - g_ndl_segs.v[j].lo < g_ndl_segs.v[j].size && g_ndl_segs.v[j].index < best)
+            best = g_ndl_segs.v[j].index;
+    return best;
+}
+
 static int ndl_containing(uint64_t addr, NdlImage *out, uint32_t *index_out)
 {
     uint32_t n = ocerz_dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        if (ndl_image(i, out) && ndl_covers(out->mh, addr, 1, NULL)) {
-            if (index_out)
-                *index_out = i;
-            return 1;
-        }
+    pthread_mutex_lock(&g_ndl_segs_lock);
+    int indexed = ndl_segs_sync(n);
+    uint32_t hit = indexed ? ndl_segs_find(addr) : UINT32_MAX;
+    pthread_mutex_unlock(&g_ndl_segs_lock);
+    for (uint32_t i = 0; !indexed && hit == UINT32_MAX && i < n; i++)
+        if (ndl_image(i, out) && ndl_covers(out->mh, addr, 1, NULL))
+            hit = i;
+    if (hit != UINT32_MAX && ndl_image(hit, out)) {
+        if (index_out)
+            *index_out = hit;
+        return 1;
     }
     memset(out, 0, sizeof *out);
     return 0;
@@ -5437,9 +5545,36 @@ static int ndl_trie_nearest(DynImage *d, uint64_t addr, uint64_t *sname, uint64_
     return 1;
 }
 
-static int ndl_symtab_nearest(uint64_t mh, int64_t slide, uint64_t addr, uint64_t *sname,
-                              uint64_t *saddr)
+typedef struct NdlNearSym {
+    uint64_t addr;
+    uint32_t strx;
+    uint32_t order;
+} NdlNearSym;
+
+/* an image's defined N_SECT nlist entries sorted by address, one per address (the first in
+ * symtab order, as the linear scan picked); n == 0 when the image has no usable LC_SYMTAB */
+typedef struct NdlNear {
+    NdlNearSym *v;
+    uint32_t n;
+    uint64_t strtab;
+} NdlNear;
+
+static NdlNear *_Atomic g_ndl_near[DYN_DIMG_MAX + 1];
+static pthread_mutex_t g_ndl_near_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int ndl_near_cmp(const void *a, const void *b)
 {
+    const NdlNearSym *x = a, *y = b;
+    if (x->addr != y->addr)
+        return x->addr < y->addr ? -1 : 1;
+    return x->order < y->order ? -1 : x->order > y->order ? 1 : 0;
+}
+
+static NdlNear *ndl_near_build(uint64_t mh, int64_t slide)
+{
+    NdlNear *s = calloc(1, sizeof *s);
+    if (!s)
+        return NULL;
     const uint8_t *h = (const uint8_t *)ocerz_g2h(mh);
     uint32_t ncmds = rd32(h + 16);
     const uint8_t *lc = h + sizeof(struct mach_header_64);
@@ -5464,31 +5599,61 @@ static int ndl_symtab_nearest(uint64_t mh, int64_t slide, uint64_t addr, uint64_
     if (!have_le || !nsyms || symoff < le_fileoff || stroff < le_fileoff ||
         symoff + (uint64_t)nsyms * 16 > le_fileoff + le_filesize ||
         (uint64_t)stroff + strsize > le_fileoff + le_filesize)
-        return 0;
+        return s;
     uint64_t symtab = (uint64_t)((int64_t)le_vmaddr + slide) + (symoff - le_fileoff);
-    uint64_t strtab = (uint64_t)((int64_t)le_vmaddr + slide) + (stroff - le_fileoff);
-    uint64_t best = 0, best_strx = 0;
-    int have = 0;
+    s->strtab = (uint64_t)((int64_t)le_vmaddr + slide) + (stroff - le_fileoff);
+    s->v = malloc((size_t)nsyms * sizeof *s->v);
+    if (!s->v) {
+        free(s);
+        return NULL;
+    }
     for (uint32_t i = 0; i < nsyms; i++) {
         const uint8_t *e = (const uint8_t *)ocerz_g2h(symtab + (uint64_t)i * 16);
         uint32_t strx = rd32(e);
         uint8_t type = e[4];
         if ((type & 0xe0) || (type & 0x0e) != 0x0e || strx == 0 || strx >= strsize)
             continue;
-        uint64_t val = (uint64_t)((int64_t)rd64(e + 8) + slide);
-        if (val > addr || (have && val <= best))
-            continue;
-        best = val;
-        best_strx = strx;
-        have = 1;
+        s->v[s->n].addr = (uint64_t)((int64_t)rd64(e + 8) + slide);
+        s->v[s->n].strx = strx;
+        s->v[s->n].order = i;
+        s->n++;
     }
-    if (!have)
+    if (s->n > 1)
+        qsort(s->v, s->n, sizeof s->v[0], ndl_near_cmp);
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < s->n; i++)
+        if (!kept || s->v[i].addr != s->v[kept - 1].addr)
+            s->v[kept++] = s->v[i];
+    s->n = kept;
+    return s;
+}
+
+static int ndl_symtab_nearest(uint32_t index, uint64_t mh, int64_t slide, uint64_t addr,
+                              uint64_t *sname, uint64_t *saddr)
+{
+    NdlNear *s = g_ndl_near[index];
+    if (!s) {
+        pthread_mutex_lock(&g_ndl_near_lock);
+        s = g_ndl_near[index];
+        if (!s && (s = ndl_near_build(mh, slide)))
+            g_ndl_near[index] = s;
+        pthread_mutex_unlock(&g_ndl_near_lock);
+    }
+    if (!s || !s->n || addr < s->v[0].addr)
         return 0;
-    uint64_t namep = strtab + best_strx;
+    uint32_t lo = 0, hi = s->n - 1;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo + 1) / 2;
+        if (s->v[mid].addr <= addr)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    uint64_t namep = s->strtab + s->v[lo].strx;
     if (*(const char *)ocerz_g2h(namep) == '_')
         namep++;
     *sname = namep;
-    *saddr = best;
+    *saddr = s->v[lo].addr;
     return 1;
 }
 
@@ -5508,12 +5673,14 @@ static int ndl_host_dladdr(uint64_t addr, uint64_t info)
 int ocerz_dyld_native_dladdr(uint64_t addr, uint64_t info)
 {
     NdlImage im;
+    uint32_t index;
     if (!info)
         return 0;
-    if (!ndl_containing(addr, &im, NULL))
+    if (!ndl_containing(addr, &im, &index))
         return ndl_host_dladdr(addr, info);
     uint64_t sname = 0, saddr = 0;
-    if (!ndl_symtab_nearest(im.mh, im.slide, addr, &sname, &saddr) && im.d && im.d != &g_main_dimg)
+    if (!ndl_symtab_nearest(index, im.mh, im.slide, addr, &sname, &saddr) && im.d &&
+        im.d != &g_main_dimg)
         ndl_trie_nearest(im.d, addr, &sname, &saddr);
     ocerz_st(info + 0x00, 8, im.name);
     ocerz_st(info + 0x08, 8, im.mh);
