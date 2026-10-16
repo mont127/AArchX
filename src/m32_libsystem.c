@@ -1391,7 +1391,7 @@ static const M32SpecialEntry g_specials[] = {
     { "_stat$INODE64", sp_stat64 }, { "_lstat$INODE64", sp_lstat64 }, { "_fstat$INODE64", sp_fstat64 },
     { "_stat64", sp_stat64 }, { "_lstat64", sp_lstat64 }, { "_fstat64", sp_fstat64 },
     { "_statfs", sp_statfs }, { "_fstatfs", sp_fstatfs }, { "_statfs$INODE64", sp_statfs64 },
-    { "_fstatfs$INODE64", sp_fstatfs64 },
+    { "_fstatfs$INODE64", sp_fstatfs64 }, { "_statfs64", sp_statfs64 }, { "_fstatfs64", sp_fstatfs64 },
     { "_readdir", sp_readdir }, { "_readdir$INODE64", sp_readdir64 },
     { "_scandir", sp_scandir }, { "_scandir$INODE64", sp_scandir64 }, { "_alphasort", sp_alphasort },
     { "_alphasort$INODE64", sp_alphasort64 },

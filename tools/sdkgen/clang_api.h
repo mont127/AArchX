@@ -114,6 +114,8 @@ CXSourceLocation clang_getCursorLocation(CXCursor cursor);
 void clang_getExpansionLocation(CXSourceLocation location, CXFile *file, unsigned *line,
                                 unsigned *column, unsigned *offset);
 CXString clang_getFileName(CXFile file);
+void clang_getSpellingLocation(CXSourceLocation location, CXFile *file, unsigned *line,
+                               unsigned *column, unsigned *offset);
 
 CXType clang_getCanonicalType(CXType type);
 CXType clang_getUnqualifiedType(CXType type);
@@ -163,6 +165,7 @@ CXString clang_getCursorPrettyPrinted(CXCursor cursor, void *policy);
 
 unsigned clang_getNumDiagnostics(CXTranslationUnit tu);
 CXDiagnostic clang_getDiagnostic(CXTranslationUnit tu, unsigned index);
+CXSourceLocation clang_getDiagnosticLocation(CXDiagnostic diagnostic);
 int clang_getDiagnosticSeverity(CXDiagnostic diagnostic);
 CXString clang_formatDiagnostic(CXDiagnostic diagnostic, unsigned options);
 unsigned clang_defaultDiagnosticDisplayOptions(void);

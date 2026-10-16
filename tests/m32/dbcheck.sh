@@ -15,4 +15,9 @@ want libSystem.B.dylib 'data32 ___stdoutp __stdoutp 4 8 ptr'
 want CoreFoundation 'fn32 _CFStringGetLength CFStringGetLength i(p) l(p)'
 want CoreFoundation 'fn32 _CFArrayCreate CFArrayCreate p(pQiQ) p(pplp)'
 want CoreFoundation 'data32 _kCFAllocatorDefault kCFAllocatorDefault 4 8 ptr'
+# declared for i386 only and still exported by arm64 HIToolbox: crossed with an arm64 declaration made from the
+# i386 one (tools/sdkgen, "declared for i386 only")
+want Carbon 'fn32 _CreateNewWindow CreateNewWindow i(uupP) i(uupp)'
+want Carbon 'fn32 _ShowWindow ShowWindow v(p) v(p)'
+want Carbon 'fn32 _GetWindowBounds GetWindowBounds i(pHp) i(pHp)'
 echo "dbcheck ok"

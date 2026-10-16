@@ -121,7 +121,9 @@ AArchX.app: app/AArchX.m app/Info.plist app/icon.m include/ocerz/version.h
 	sed 's/@VERSION@/$(OCERZ_VER)/g' app/Info.plist > $@/Contents/Info.plist
 	codesign --force -s - $@
 
-check-m32: ocerz apis32
+check-m32: ocerz apis32 tests/unit/bin/test_m32
+	bash tests/m32/dbcheck.sh
+	OCERZ_NO_ARM_EXEC=1 tests/unit/bin/test_m32 carbon
 	bash tests/run_m32_tests.sh
 	OCERZ_NO_HIGH8_ARITH=1 OCERZ_NO_SHIFT_MEM_IMM=1 bash tests/run_m32_tests.sh high8 shiftmem
 

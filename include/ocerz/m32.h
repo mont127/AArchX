@@ -50,6 +50,7 @@ int m32_raw_syscall(struct OcerzVM *vm, OcerzCPU *cpu, int sysenter);   /* sysen
 int m32_dyld_entry(struct OcerzVM *vm, OcerzCPU *cpu);                   /* the M32_ID_DYLD trap */
 uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint64_t off);   /* src/m32_libsystem.c */
 void m32_selfload_begin(const char *path);                                 /* m32_run, before the program starts */
+void *m32_carbon_wrap(const char *symbol, void *fn);   /* src/m32_carbon.c: the host function an export calls */
 int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap);   /* a trap made from inside a block */
 uint32_t m32_export_special(const char *name, M32Special fn);
 /* the Steam bridge (src/m32_steam.c): a steamclient.dylib with no i386 slice opens as the host's own */

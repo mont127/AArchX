@@ -3,12 +3,19 @@
  * the i386 programs in tests/m32 cannot pin on a machine without Xcode 26, whose ld-classic is the last linker
  * that links i386 (tests/m32/build.sh): keymgr, _dyld_func_lookup, the wcsrtombs family, NSLogv, the raw system
  * calls a self-loading program makes and the dyld m32 hands it (src/m32_selfload.c).
+ *
+ * `test_m32 carbon`, which make check-m32 runs once runtime/apis32 is generated, crosses Carbon calls through those
+ * databases as translated code does: the window, menu and title functions 32-bit code alone is declared to have and
+ * arm64 HIToolbox still exports (tools/sdkgen, declare_hidden), and CreateNewWindow without the compositing
+ * attribute, which 64-bit HIToolbox refuses and m32 adds (src/m32_carbon.c).
  */
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <mach-o/loader.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -71,6 +78,22 @@ static uint32_t sysenter(uint32_t eax, int n, const uint32_t *args)
 }
 
 static int carry(void) { return (cpu()->rflags & OCERZ_CF) != 0; }
+
+/* a cdecl call of an import through its trap, as translated code makes it: m32_export's address, crossed by the
+ * record runtime/apis32 has for it */
+static uint32_t cross(const char *lib, const char *symbol, int n, const uint32_t *args)
+{
+    uint32_t trap = m32_export(lib, symbol);
+    check(symbol, trap != 0);
+    m32_wr(STACK, RET_ADDR);
+    for (int i = 0; i < n; i++)
+        m32_wr(STACK + 4 + 4 * (uint32_t)i, args[i]);
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    cpu()->rip = trap;
+    m32_trap(&g_vm, cpu());
+    check("a crossing returns to its caller", cpu()->rip == RET_ADDR && cpu()->gpr[OCERZ_RSP] == STACK + 4);
+    return (uint32_t)cpu()->gpr[OCERZ_RAX];
+}
 
 static void put_str(uint32_t g, const char *s) { memcpy(m32_h(g), s, strlen(s) + 1); }
 
@@ -185,7 +208,52 @@ static void test_raw_syscalls(void)
         close(fd);
 }
 
-int main(void)
+#define CARBON "/System/Library/Frameworks/Carbon.framework/Versions/A/Carbon"
+
+static void test_carbon(void)
+{
+    void *(*session)(void) = (void *(*)(void))dlsym(dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+                                                           RTLD_LAZY), "CGSessionCopyCurrentDictionary");
+    void *(*make)(void *, const char *, uint32_t) = (void *(*)(void *, const char *, uint32_t))dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+    int (*get)(void *, char *, long, uint32_t) = (int (*)(void *, char *, long, uint32_t))dlsym(RTLD_DEFAULT, "CFStringGetCString");
+    if (!session || !session()) {
+        printf("test_m32: SKIP carbon (no window server session)\n");
+        return;
+    }
+    check("Carbon opens", dlopen(CARBON, RTLD_LAZY | RTLD_GLOBAL) != NULL);   /* as m32 opens a program's libraries */
+    const int16_t rect[4] = { 100, 120, 300, 520 };   /* top, left, bottom, right */
+    memcpy(m32_h(DATA + 0xa00), rect, sizeof rect);
+    m32_wr(DATA + 0xa10, 0);
+    uint32_t a[4] = { 6 /* kDocumentWindowClass */, 0, DATA + 0xa00, DATA + 0xa10 };
+    check("CreateNewWindow without the compositing attribute makes a window", cross(CARBON, "_CreateNewWindow", 4, a) == 0);
+    uint32_t w = m32_rd(DATA + 0xa10);
+    check("... and hands the guest a window", w != 0);
+    if (!w)
+        return;
+    uint32_t b[3] = { w, 33 /* kWindowContentRgn */, DATA + 0xa20 };
+    check("GetWindowBounds answers the bounds it was made with", cross(CARBON, "_GetWindowBounds", 3, b) == 0 &&
+                                                                 !memcmp(m32_h(DATA + 0xa20), rect, sizeof rect));
+    uint32_t title = m32_handle(make(NULL, "m32 carbon", 0x08000100));
+    uint32_t t[2] = { w, title };
+    check("SetWindowTitleWithCFString", cross(CARBON, "_SetWindowTitleWithCFString", 2, t) == 0);
+    uint32_t c[2] = { w, DATA + 0xa30 };
+    char back[64] = "";
+    check("CopyWindowTitleAsCFString gives the title back", cross(CARBON, "_CopyWindowTitleAsCFString", 2, c) == 0 &&
+                                                            get(m32_host(m32_rd(DATA + 0xa30)), back, sizeof back, 0x08000100) &&
+                                                            !strcmp(back, "m32 carbon"));
+    uint32_t v[1] = { w };
+    check("IsWindowVisible before ShowWindow", (cross(CARBON, "_IsWindowVisible", 1, v) & 0xff) == 0);
+    uint32_t m[3] = { 128, 0, DATA + 0xa40 };
+    check("CreateNewMenu", cross(CARBON, "_CreateNewMenu", 3, m) == 0 && m32_rd(DATA + 0xa40) != 0);
+    uint32_t item = m32_handle(make(NULL, "Open ROM", 0x08000100));
+    uint32_t i[5] = { m32_rd(DATA + 0xa40), item, 0, 0, 0x6f70656e /* 'open' */ };
+    check("InsertMenuItemTextWithCFString", cross(CARBON, "_InsertMenuItemTextWithCFString", 5, i) == 0);
+    uint32_t n[1] = { m32_rd(DATA + 0xa40) };
+    check("CountMenuItems counts it", (cross(CARBON, "_CountMenuItems", 1, n) & 0xffff) == 1);
+    cross(CARBON, "_DisposeWindow", 1, v);
+}
+
+int main(int argc, char **argv)
 {
     if (ocerz_mem_init(0, M32_WINDOW) != OCERZ_OK ||
         ocerz_map_fixed(STACK - 0x10000, 0x10000 + 0x10000, PROT_READ | PROT_WRITE) != OCERZ_OK ||
@@ -198,6 +266,17 @@ int main(void)
     g_vm.jit_enabled = 0;
     ocerz_cpu_reset(cpu());
     cpu()->mode32 = 1;
+    if (argc > 1 && !strcmp(argv[1], "carbon")) {
+        char db[PATH_MAX];
+        if (!realpath("runtime/apis32", db)) {
+            fprintf(stderr, "test_m32: no runtime/apis32 here (make apis32, run from the repository)\n");
+            return 2;
+        }
+        setenv("OCERZ_APIDB32", db, 0);   /* unless the caller named one */
+        test_carbon();
+        printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
+        return g_failures != 0;
+    }
     test_keymgr();
     test_dyld_func_lookup();
     test_wide_conversions();

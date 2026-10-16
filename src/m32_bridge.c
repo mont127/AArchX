@@ -249,6 +249,7 @@ uint32_t m32_export(const char *lib, const char *name)
                 e->reason = "host-missing";
             }
             e->host_fn = hud_wrap(r.host_symbol, e->host_fn);
+            e->host_fn = m32_carbon_wrap(r.host_symbol, e->host_fn);
             char key[128];
             snprintf(key, sizeof key, "|%s|", r.host_symbol);
             e->file_ret = !!strstr("|fopen|fdopen|freopen|popen|tmpfile|funopen|fmemopen|open_memstream|", key);

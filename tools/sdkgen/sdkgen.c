@@ -1573,26 +1573,33 @@ static int collect_visit(CXCursor c, CXCursor parent, CXClientData d)
     return CXChildVisit_Continue;
 }
 
+/* the compiler arguments of a pass's parse for arch; target must hold 96 bytes */
+static int pass_args(const Pass *p, int arch, char *target, const char **args)
+{
+    snprintf(target, 96, "%s-apple-macos%s", g_arch_name[arch],
+             g_guest32 && arch == ARCH_X86 ? "10.14" : g_version);   /* The last i386 macOS */
+    int n = 0;
+    args[n++] = "-x";
+    args[n++] = g_lib.language;
+    args[n++] = "-target";
+    args[n++] = target;
+    args[n++] = "-isysroot";
+    args[n++] = g_sdk;
+    args[n++] = "-std=gnu17";
+    args[n++] = "-w";
+    for (int i = 0; i < p->ndefines; i++)
+        args[n++] = p->defines[i];
+    return n;
+}
+
 static void parse_pass(CXIndex index, Pass *p)
 {
     for (int arch = 0; arch < 2; arch++) {
         char target[96];
-        snprintf(target, sizeof target, "%s-apple-macos%s", g_arch_name[arch],
-                 g_guest32 && arch == ARCH_X86 ? "10.14" : g_version);   /* The last i386 macOS */
         const char *args[16 + MAX_DEFINES];
-        int n = 0;
+        int n = pass_args(p, arch, target, args);
         int objc = strcmp(g_lib.language, "objective-c") == 0;
         const char *file = objc ? "sdkgen-umbrella.m" : "sdkgen-umbrella.c";
-        args[n++] = "-x";
-        args[n++] = g_lib.language;
-        args[n++] = "-target";
-        args[n++] = target;
-        args[n++] = "-isysroot";
-        args[n++] = g_sdk;
-        args[n++] = "-std=gnu17";
-        args[n++] = "-w";
-        for (int i = 0; i < p->ndefines; i++)
-            args[n++] = p->defines[i];
         /* Foundation keeps these 64-bit-only classes out of an i386 parse while AppKit, CoreImage and
          * UniformTypeIdentifiers still name them */
         const char *prelude = g_guest32 && arch == ARCH_X86 && objc
@@ -1627,6 +1634,153 @@ static void parse_pass(CXIndex index, Pass *p)
         Collect cc = { p, arch };
         clang_visitChildren(clang_getTranslationUnitCursor(tu), collect_visit, &cc);
     }
+}
+
+/*
+ * ---- declared for i386 only ----
+ * Much of Carbon is declared for 32-bit code alone (#if !__LP64__ in HIToolbox's headers) yet still exported,
+ * and working, in the arm64 library: HIToolbox makes compositing windows, menus and the standard controls for
+ * arm64 callers.  With --guest i386, an export whose i386 declaration has no arm64 twin and whose host symbol
+ * is code is declared again in a second arm64 translation unit, after the same umbrella header, written from the
+ * i386 declaration's type spellings, so that each type takes its arm64 meaning (WindowRef a 64-bit pointer,
+ * SInt32 still an int).  A declaration whose types arm64 lacks (QuickDraw's GrafPtr) is an error on its own line
+ * and is dropped; the rest join the pass's arm64 declarations as if the header had made them, and get notations
+ * and layout checks like any other.  A function returning a function pointer cannot be written this way and is
+ * left out.  SDKGEN_NO_HIDDEN=1 leaves them all out, as before.
+ */
+static int host_is_code(void *addr);
+static void *g_host;
+
+typedef struct Hidden {
+    Pass *p;
+    const char *shim;
+    unsigned char *bad;      /* by line */
+    unsigned nlines;
+    int added;
+} Hidden;
+
+static int hidden_visit(CXCursor c, CXCursor parent, CXClientData d)
+{
+    (void)parent;
+    Hidden *h = d;
+    if (c.kind == CK.LinkageSpec || c.kind == CK.UnexposedDecl)
+        return CXChildVisit_Recurse;
+    if (c.kind != CK.FunctionDecl)
+        return CXChildVisit_Continue;
+    CXFile f;
+    unsigned line = 0, col = 0, off = 0;
+    clang_getSpellingLocation(clang_getCursorLocation(c), &f, &line, &col, &off);
+    char *fname = cx(clang_getFileName(f));
+    int ours = fname && !strcmp(fname, h->shim);
+    free(fname);
+    if (!ours || line >= h->nlines || h->bad[line])
+        return CXChildVisit_Continue;
+    Pass *p = h->p;
+    char *usr = cx(clang_getCursorUSR(c));
+    if (map_get(&p->usr, usr) < 0) {
+        if (p->ndecl[ARCH_ARM] == p->capdecl[ARCH_ARM]) {
+            p->capdecl[ARCH_ARM] = p->capdecl[ARCH_ARM] ? p->capdecl[ARCH_ARM] * 2 : 4096;
+            p->decl[ARCH_ARM] = xalloc(p->decl[ARCH_ARM], (size_t)p->capdecl[ARCH_ARM] * sizeof *p->decl[ARCH_ARM]);
+        }
+        p->decl[ARCH_ARM][p->ndecl[ARCH_ARM]] = c;
+        map_set(&p->usr, usr, p->ndecl[ARCH_ARM]++);
+        h->added++;
+    }
+    free(usr);
+    return CXChildVisit_Continue;
+}
+
+static void declare_hidden(CXIndex index, Pass *p)
+{
+    int objc = strcmp(g_lib.language, "objective-c") == 0;
+    const char *shim = objc ? "sdkgen-hidden.m" : "sdkgen-hidden.c";
+    Buf src = { 0 };
+    buf_add(&src, "#include \"");
+    buf_add(&src, p->header);
+    buf_add(&src, "\"\n");
+    unsigned line = 2;
+    int wanted = 0;
+    for (int i = 0; i < p->ndecl[ARCH_X86]; i++) {
+        CXCursor x = p->decl[ARCH_X86][i];
+        if (x.kind != CK.FunctionDecl)
+            continue;
+        char *usr = cx(clang_getCursorUSR(x));
+        int have = map_get(&p->usr, usr) >= 0;
+        free(usr);
+        CXType ft = clang_getCursorType(x);
+        if (have || ft.kind != TK.FunctionProto)
+            continue;
+        CXType rt = clang_getResultType(ft), rc = canon(rt);
+        if (rc.kind == TK.Pointer && canon(clang_getPointeeType(rc)).kind == TK.FunctionProto)
+            continue;
+        char *name = cx(clang_getCursorSpelling(x));
+        void *hs = g_host ? dlsym(g_host, name) : NULL;
+        if (!hs || !host_is_code(hs)) {
+            free(name);
+            continue;
+        }
+        char *ret = cx(clang_getTypeSpelling(rt));
+        Buf d = { 0 };
+        buf_add(&d, "extern ");
+        buf_add(&d, ret);
+        buf_add(&d, " ");
+        buf_add(&d, name);
+        buf_add(&d, "(");
+        int na = clang_getNumArgTypes(ft);
+        for (int a = 0; a < na; a++) {
+            char *as = cx(clang_getTypeSpelling(clang_getArgType(ft, (unsigned)a)));
+            if (a)
+                buf_add(&d, ", ");
+            buf_add(&d, as);
+            free(as);
+        }
+        if (!na)
+            buf_add(&d, "void");
+        if (clang_isFunctionTypeVariadic(ft))
+            buf_add(&d, ", ...");
+        buf_add(&d, ");\n");
+        buf_add(&src, buf_str(&d));
+        free(d.s);
+        free(ret);
+        free(name);
+        line++;
+        wanted++;
+    }
+    if (!wanted) {
+        free(src.s);
+        return;
+    }
+    char target[96];
+    const char *args[16 + MAX_DEFINES];
+    int n = pass_args(p, ARCH_ARM, target, args);
+    struct CXUnsavedFile uf = { shim, buf_str(&src), strlen(buf_str(&src)) };
+    CXTranslationUnit tu = NULL;
+    if (clang_parseTranslationUnit2(index, shim, args, n, &uf, 1, CXTranslationUnit_SkipFunctionBodies, &tu) != 0 ||
+        !tu) {
+        fprintf(stderr, "sdkgen: the arm64 declarations of %d i386-only functions did not parse\n", wanted);
+        free(src.s);
+        return;
+    }
+    Hidden h = { p, shim, calloc(line + 1, 1), line + 1, 0 };
+    unsigned nd = clang_getNumDiagnostics(tu);
+    for (unsigned i = 0; i < nd; i++) {
+        CXDiagnostic dg = clang_getDiagnostic(tu, i);
+        if (clang_getDiagnosticSeverity(dg) >= CXDiagnostic_Error) {
+            CXFile f;
+            unsigned l = 0, c = 0, o = 0;
+            clang_getSpellingLocation(clang_getDiagnosticLocation(dg), &f, &l, &c, &o);
+            char *fname = cx(clang_getFileName(f));
+            if (fname && !strcmp(fname, shim) && l < h.nlines)
+                h.bad[l] = 1;
+            free(fname);
+        }
+        clang_disposeDiagnostic(dg);
+    }
+    clang_visitChildren(clang_getTranslationUnitCursor(tu), hidden_visit, &h);
+    fprintf(stderr, "sdkgen: %d of %d functions declared for i386 only are crossed with an arm64 declaration made "
+            "from theirs\n", h.added, wanted);
+    free(h.bad);
+    free(src.s);   /* the translation unit stays: the pass keeps its cursors */
 }
 
 static char **split_words(char *line, int *n)
@@ -2648,8 +2802,11 @@ int main(int argc, char **argv)
     char *ver = cx(clang_getClangVersion());
     fprintf(stderr, "sdkgen: %s, %s, SDK %s at %s\n", ver, g_lib.install, g_version, g_sdk);
     free(ver);
-    for (int pi = 0; pi < g_lib.npasses; pi++)
+    for (int pi = 0; pi < g_lib.npasses; pi++) {
         parse_pass(index, &g_lib.passes[pi]);
+        if (g_guest32 && !getenv("SDKGEN_NO_HIDDEN"))
+            declare_hidden(index, &g_lib.passes[pi]);
+    }
 
     if (!g_guest32)   /* Shapes describe the 64-bit layouts */
         verify_shapes();
