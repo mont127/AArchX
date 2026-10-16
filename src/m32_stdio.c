@@ -69,9 +69,132 @@ static double x87_ext_to_double(const uint8_t *p)   /* an 80-bit extended value,
     return sign * __builtin_ldexp((double)mant, exp - 16383 - 63);
 }
 
+/* Positional arguments (%2$@, %1$d, *3$): the host's printf takes argument n from the nth slot, so the slots are
+ * filled in position order, each argument read from the i386 list once its predecessors' sizes are known from the
+ * conversions that take them.  A format that mixes positional and sequential arguments, leaves a position unused or
+ * converts one position as two sizes is refused.  Sparkle's localized strings and VLC 1.1's are positional. */
+enum { PA_NONE, PA_I32, PA_U32, PA_I64, PA_F64, PA_LD, PA_STR, PA_OBJ, PA_PTR, PA_N };
+
+static int pos_number(const char **p)   /* digits followed by '$': the position, with *p past the '$'; else 0 */
+{
+    const char *q = *p;
+    int v = 0;
+    while (isdigit((unsigned char)*q))
+        v = v * 10 + (*q++ - '0');
+    if (*q != '$' || q == *p || v <= 0 || v > 64)
+        return 0;
+    *p = q + 1;
+    return v;
+}
+
+static int positional_slots(const char *fmt, uint32_t ap, uint64_t *slots, int max, const char *who)
+{
+    uint8_t kind[65] = { 0 };
+    int top = 0;
+#define WANT(pos, k) do { if (kind[pos] && kind[pos] != (k)) goto refuse; kind[pos] = (k); if ((pos) > top) top = (pos); } while (0)
+    for (const char *p = fmt; *p; p++) {
+        if (*p != '%')
+            continue;
+        p++;
+        if (*p == '%')
+            continue;
+        int pos = pos_number(&p);
+        if (!pos)
+            goto refuse;
+        while (*p && strchr("-+ #0'", *p))
+            p++;
+        if (*p == '*') {
+            p++;
+            int w = pos_number(&p);
+            if (!w)
+                goto refuse;
+            WANT(w, PA_I32);
+        } else
+            while (isdigit((unsigned char)*p))
+                p++;
+        if (*p == '.') {
+            p++;
+            if (*p == '*') {
+                p++;
+                int w = pos_number(&p);
+                if (!w)
+                    goto refuse;
+                WANT(w, PA_I32);
+            } else
+                while (isdigit((unsigned char)*p))
+                    p++;
+        }
+        int len = 0;
+        for (;; p++) {
+            if (*p == 'h') len = len == 2 ? 1 : 2;
+            else if (*p == 'l') len = len == 3 ? 4 : 3;
+            else if (*p == 'q' || *p == 'j') len = 4;
+            else if (*p == 'z' || *p == 't') len = 5;
+            else if (*p == 'L') len = 6;
+            else break;
+        }
+        switch (*p) {
+        case 'd': case 'i': WANT(pos, len == 4 ? PA_I64 : PA_I32); break;
+        case 'u': case 'o': case 'x': case 'X': case 'c': case 'C': WANT(pos, len == 4 ? PA_I64 : PA_U32); break;
+        case 'e': case 'E': case 'f': case 'F': case 'g': case 'G': case 'a': case 'A': WANT(pos, len == 6 ? PA_LD : PA_F64); break;
+        case 's': case 'S': WANT(pos, PA_STR); break;
+        case '@': WANT(pos, PA_OBJ); break;
+        case 'p': WANT(pos, PA_PTR); break;
+        case 'n': if (len >= 3) goto refuse; WANT(pos, PA_N); break;
+        default: goto refuse;
+        }
+        if (!*p)
+            break;
+    }
+#undef WANT
+    if (top > max)
+        goto refuse;
+    for (int i = 1; i <= top; i++) {
+        uint64_t v;
+        switch (kind[i]) {
+        case PA_I32: v = (uint64_t)(int64_t)(int32_t)m32_rd(ap); ap += 4; break;
+        case PA_U32: v = m32_rd(ap); ap += 4; break;
+        case PA_PTR: v = m32_rd(ap); ap += 4; break;
+        case PA_I64: case PA_F64: v = (uint64_t)m32_rd(ap) | (uint64_t)m32_rd(ap + 4) << 32; ap += 8; break;
+        case PA_LD: {
+            uint8_t ext[12];
+            memcpy(ext, m32_h(ap), 12);
+            ap += 12;
+            double d = x87_ext_to_double(ext);
+            memcpy(&v, &d, 8);
+            break;
+        }
+        case PA_STR: v = (uintptr_t)m32_host(m32_rd(ap)); ap += 4; break;
+        case PA_OBJ: v = (uintptr_t)m32_objc_to_host(m32_rd(ap)); ap += 4; break;
+        case PA_N: v = (uintptr_t)m32_h(m32_rd(ap)); ap += 4; break;
+        default: goto refuse;   /* a position no conversion takes: its size is unknown */
+        }
+        slots[i - 1] = v;
+    }
+    return top;
+refuse:
+    m32_log_once("positional printf arguments m32 cannot place (mixed, a gap or two sizes):", who);
+    return -1;
+}
+
+static int has_position(const char *fmt)
+{
+    for (const char *p = fmt; p && *p; p++)
+        if (*p == '%' && p[1] != '%') {
+            const char *q = p + 1;
+            if (pos_number(&q))
+                return 1;
+        } else if (*p == '%') {
+            p++;
+        }
+    return 0;
+}
+
 /* returns the number of slots written, or -1 when the format uses something this does not handle (logged) */
 int m32_printf_slots(const char *fmt, uint32_t ap, uint64_t *slots, int max, const char *who)
 {
+    if (has_position(fmt))
+        return positional_slots(fmt, ap, slots, max, who);
     int n = 0;
 #define TAKE32() (ap += 4, m32_rd(ap - 4))
 #define TAKE64() (ap += 8, (uint64_t)m32_rd(ap - 8) | (uint64_t)m32_rd(ap - 4) << 32)
@@ -91,7 +214,7 @@ int m32_printf_slots(const char *fmt, uint32_t ap, uint64_t *slots, int max, con
             while (isdigit((unsigned char)*p))
                 p++;
             if (*p == '$') {
-                m32_log_once("positional printf arguments are not supported:", who);
+                m32_log_once("positional printf arguments mixed with sequential ones are not supported:", who);
                 return -1;
             }
         }

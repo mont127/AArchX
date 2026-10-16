@@ -346,6 +346,31 @@ static int sp_FMGetFontFamilyInstanceFromFont(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(NO_ERR);
 }
 
+/* an ATSFontFamilyRef (the host ATS's, which a crossed ATSFontFamilyFindFromName hands out) and a family ID, through
+ * the family's name */
+static int sp_FMGetFontFamilyFromATSFontFamilyRef(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static int32_t (*get_name)(uint32_t, uint32_t, CFStringRef *);
+    if (!get_name)
+        get_name = (int32_t (*)(uint32_t, uint32_t, CFStringRef *))dlsym(RTLD_DEFAULT, "ATSFontFamilyGetName");
+    CFStringRef n = NULL;
+    if (!ready() || !get_name || get_name(A(0), 0, &n) != 0 || !n)
+        RET((uint32_t)INVALID_FAMILY);
+    int id = family_id(n);
+    release(n);
+    RET((uint32_t)(int32_t)id);
+}
+static int sp_FMGetATSFontFamilyRefFromFontFamily(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static uint32_t (*find_family)(CFStringRef, uint32_t);
+    if (!find_family)
+        find_family = (uint32_t (*)(CFStringRef, uint32_t))dlsym(RTLD_DEFAULT, "ATSFontFamilyFindFromName");
+    CFStringRef n = ready() ? family_name((int16_t)A(0)) : NULL;
+    RET(n && find_family ? find_family(n, 0) : 0);
+}
+
 static int sp_identity(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(A(0)); }
 static int sp_GetAppFont(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(1); }
 static int sp_GetSysFont(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
@@ -836,6 +861,8 @@ const M32SpecialEntry m32_atsu_specials[] = {
     { "_FMGetFontFromFontFamilyInstance", sp_FMGetFontFromFontFamilyInstance },
     { "_FMGetFontFamilyInstanceFromFont", sp_FMGetFontFamilyInstanceFromFont },
     { "_FMGetATSFontRefFromFont", sp_identity }, { "_FMGetFontFromATSFontRef", sp_identity },
+    { "_FMGetFontFamilyFromATSFontFamilyRef", sp_FMGetFontFamilyFromATSFontFamilyRef },
+    { "_FMGetATSFontFamilyRefFromFontFamily", sp_FMGetATSFontFamilyRefFromFontFamily },
     { "_GetAppFont", sp_GetAppFont }, { "_GetSysFont", sp_GetSysFont }, { "_GetDefFontSize", sp_GetDefFontSize },
     { "_GetThemeFont", sp_GetThemeFont },
     { "_ATSUSetAttributes", sp_ATSUSetAttributes },

@@ -11,6 +11,7 @@
  * host runtime).
  */
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
@@ -24,6 +25,7 @@
 #include "ocerz/mem.h"
 #include "ocerz/m32_objc.h"
 #include "ocerz/m32_objcrt.h"
+#include "ocerz/m32_image.h"
 #include "ocerz/m32_sig.h"
 #include "ocerz/types.h"
 #include "ocerz/vm.h"
@@ -382,6 +384,154 @@ static uint32_t class_lists(uint32_t c, uint32_t *out, int max)
     return (uint32_t)n;
 }
 
+/* The image a paired class came from, for NSBundle's bundleForClass:, which asks class_getImageName: a class made at
+ * run time has none, so Sparkle's window controllers looked for their nibs in the main bundle and stopped VLC 1.1
+ * with "Invalid parameter not satisfying: windowNibPath".  The hook takes a lock of its own, which nothing holds
+ * while calling into the runtime (OCERZ_NO_M32_IMAGE_NAME=1 leaves the hook out). */
+static struct { Class cls; const char *path; } g_class_images[8192];
+static int g_nclass_images;
+static pthread_mutex_t g_class_image_lock = PTHREAD_MUTEX_INITIALIZER;
+static objc_hook_getImageName g_prev_image_name;
+
+static BOOL class_image_name(Class cls, const char **out)
+{
+    const char *path = NULL;
+    pthread_mutex_lock(&g_class_image_lock);
+    for (int i = 0; i < g_nclass_images && !path; i++)
+        if (g_class_images[i].cls == cls)
+            path = g_class_images[i].path;
+    pthread_mutex_unlock(&g_class_image_lock);
+    if (path) {
+        *out = path;
+        return YES;
+    }
+    return g_prev_image_name ? g_prev_image_name(cls, out) : NO;
+}
+
+static void remember_image(Class hc, uint32_t g)
+{
+    static int hooked;
+    if (getenv("OCERZ_NO_M32_IMAGE_NAME"))
+        return;
+    const char *path = NULL;
+    for (int i = 0; i < m32_nimages && !path; i++)
+        if (m32_images[i] && g >= m32_images[i]->lo && g < m32_images[i]->hi)
+            path = m32_images[i]->path;
+    if (!path)
+        return;
+    pthread_mutex_lock(&g_class_image_lock);
+    for (int k = 0; k < 2 && g_nclass_images < 8192; k++) {
+        g_class_images[g_nclass_images].cls = k ? object_getClass((id)hc) : hc;
+        g_class_images[g_nclass_images++].path = path;
+    }
+    int first = !hooked;
+    hooked = 1;
+    pthread_mutex_unlock(&g_class_image_lock);
+    if (first)
+        objc_setHook_getImageName(class_image_name, &g_prev_image_name);
+}
+
+/* Key-value coding reaches an instance variable directly when no accessor answers, and a paired host class has none
+ * of the guest's: Sparkle's update prompt binds its nib to two BOOL ivars, and KVC raised valueForUndefinedKey:.
+ * The pair answers valueForUndefinedKey: and setValue:forUndefinedKey: from the guest ivar named key or _key in the
+ * guest twin, a number boxed or unboxed by its type, an object converted (and, set, retained, the old one released),
+ * and the superclass's answer, which raises, for any other key (OCERZ_NO_M32_KVC=1 leaves them out). */
+static uint32_t guest_ivar(uint32_t cls, const char *key, const char **type)
+{
+    char under[256];
+    snprintf(under, sizeof under, "_%s", key);
+    for (uint32_t c = cls; c && is_guest_class(c); c = rd(c + OC_SUPER)) {
+        uint32_t list = rd(c + OC_IVARS), n = list ? rd(list) : 0;
+        for (uint32_t i = 0; i < n && i < 4096; i++) {
+            uint32_t iv = list + 4 + 12 * i, name = rd(iv), t = rd(iv + 4);
+            const char *nm = name ? (const char *)m32_h(name) : "";
+            if (t && (!strcmp(nm, key) || !strcmp(nm, under))) {
+                *type = (const char *)m32_h(t);
+                return rd(iv + 8) + 1;   /* offset + 1: 0 is none */
+            }
+        }
+    }
+    return 0;
+}
+
+static id kvc_super(id self, SEL cmd, id a, id b, int set)
+{
+    struct objc_super sup = { self, class_getSuperclass(object_getClass(self)) };
+    if (set)
+        return ((id (*)(struct objc_super *, SEL, id, id))objc_msgSendSuper)(&sup, cmd, a, b);
+    return ((id (*)(struct objc_super *, SEL, id))objc_msgSendSuper)(&sup, cmd, a);
+}
+
+static id kvc_number(const char *type, uint32_t at)
+{
+    Class num = objc_getClass("NSNumber");
+    id (*mk_i)(Class, SEL, long long) = (id (*)(Class, SEL, long long))M32_MSGSEND;
+    id (*mk_u)(Class, SEL, unsigned long long) = (id (*)(Class, SEL, unsigned long long))M32_MSGSEND;
+    id (*mk_d)(Class, SEL, double) = (id (*)(Class, SEL, double))M32_MSGSEND;
+    switch (type[0]) {
+    case 'c': return ((id (*)(Class, SEL, char))M32_MSGSEND)(num, sel_registerName("numberWithChar:"), *(int8_t *)m32_h(at));
+    case 'B': return ((id (*)(Class, SEL, BOOL))M32_MSGSEND)(num, sel_registerName("numberWithBool:"), *(uint8_t *)m32_h(at) != 0);
+    case 'C': return mk_u(num, sel_registerName("numberWithUnsignedLongLong:"), *(uint8_t *)m32_h(at));
+    case 's': return mk_i(num, sel_registerName("numberWithLongLong:"), *(int16_t *)m32_h(at));
+    case 'S': return mk_u(num, sel_registerName("numberWithUnsignedLongLong:"), *(uint16_t *)m32_h(at));
+    case 'i': case 'l': return mk_i(num, sel_registerName("numberWithLongLong:"), (int32_t)rd(at));
+    case 'I': case 'L': return mk_u(num, sel_registerName("numberWithUnsignedLongLong:"), rd(at));
+    case 'q': return mk_i(num, sel_registerName("numberWithLongLong:"), (long long)(rd(at) | (uint64_t)rd(at + 4) << 32));
+    case 'Q': return mk_u(num, sel_registerName("numberWithUnsignedLongLong:"), rd(at) | (uint64_t)rd(at + 4) << 32);
+    case 'f': { float f; memcpy(&f, m32_h(at), 4); return mk_d(num, sel_registerName("numberWithDouble:"), f); }
+    case 'd': { double d; memcpy(&d, m32_h(at), 8); return mk_d(num, sel_registerName("numberWithDouble:"), d); }
+    default: return NULL;
+    }
+}
+
+static id kvc_get(id self, SEL cmd, id key)
+{
+    const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
+    const char *k = key ? utf8(key, sel_registerName("UTF8String")) : NULL, *type = NULL;
+    uint32_t g = m32_objc_to_guest(self), off = k && g ? guest_ivar(rd(g + OC_ISA), k, &type) : 0;
+    if (!off)
+        return kvc_super(self, cmd, key, NULL, 0);
+    uint32_t at = g + off - 1;
+    if (type[0] == '@')
+        return (id)m32_objc_to_host(rd(at));
+    id boxed = kvc_number(type, at);
+    return boxed ? boxed : kvc_super(self, cmd, key, NULL, 0);
+}
+
+static void kvc_set(id self, SEL cmd, id value, id key)
+{
+    const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
+    const char *k = key ? utf8(key, sel_registerName("UTF8String")) : NULL, *type = NULL;
+    uint32_t g = m32_objc_to_guest(self), off = k && g ? guest_ivar(rd(g + OC_ISA), k, &type) : 0;
+    if (!off) {
+        kvc_super(self, cmd, value, key, 1);
+        return;
+    }
+    uint32_t at = g + off - 1;
+    id (*msg)(id, SEL) = (id (*)(id, SEL))M32_MSGSEND;
+    if (type[0] == '@') {
+        id old = (id)m32_objc_to_host(rd(at));
+        if (value)
+            msg(value, sel_registerName("retain"));
+        m32_wr(at, m32_objc_to_guest(value));
+        if (old)
+            msg(old, sel_registerName("release"));
+        return;
+    }
+    long long (*ll)(id, SEL) = (long long (*)(id, SEL))M32_MSGSEND;
+    double (*dd)(id, SEL) = (double (*)(id, SEL))M32_MSGSEND;
+    long long v = value ? ll(value, sel_registerName("longLongValue")) : 0;
+    switch (type[0]) {
+    case 'c': case 'C': case 'B': *(uint8_t *)m32_h(at) = (uint8_t)v; break;
+    case 's': case 'S': *(uint16_t *)m32_h(at) = (uint16_t)v; break;
+    case 'i': case 'I': case 'l': case 'L': m32_wr(at, (uint32_t)v); break;
+    case 'q': case 'Q': m32_wr(at, (uint32_t)v); m32_wr(at + 4, (uint32_t)((uint64_t)v >> 32)); break;
+    case 'f': { float f = value ? (float)dd(value, sel_registerName("doubleValue")) : 0; memcpy(m32_h(at), &f, 4); break; }
+    case 'd': { double d = value ? dd(value, sel_registerName("doubleValue")) : 0; memcpy(m32_h(at), &d, 8); break; }
+    default: kvc_super(self, cmd, value, key, 1); break;
+    }
+}
+
 static void ensure_pair(uint32_t g)
 {
     uint64_t v;
@@ -427,11 +577,16 @@ static void ensure_pair(uint32_t g)
             else
                 m32_log_once("a guest class adopts a protocol the host does not know:", pn);
         }
+    if (!getenv("OCERZ_NO_M32_KVC")) {   /* class_addMethod leaves a guest class's own versions be */
+        class_addMethod(hc, sel_registerName("valueForUndefinedKey:"), (IMP)kvc_get, "@@:@");
+        class_addMethod(hc, sel_registerName("setValue:forUndefinedKey:"), (IMP)kvc_set, "v@:@@");
+    }
     objc_registerClassPair(hc);
     map_put(&g_host_of, g, (uint64_t)(uintptr_t)hc);
     map_put(&g_host_of, meta, (uint64_t)(uintptr_t)object_getClass((id)hc));
     map_put(&g_pair_guest, (uint64_t)(uintptr_t)hc, g);
     map_put(&g_pair_guest, (uint64_t)(uintptr_t)object_getClass((id)hc), meta);
+    remember_image(hc, g);
 }
 
 /* ---- loading an image's __OBJC ---- */
@@ -1278,7 +1433,69 @@ static int ns_logv(OcerzCPU *cpu, uint32_t ap)
 static int sp_NSLog(struct OcerzVM *vm, OcerzCPU *cpu) { return ns_logv(cpu, (uint32_t)cpu->gpr[OCERZ_RSP] + 8); }
 static int sp_NSLogv(struct OcerzVM *vm, OcerzCPU *cpu) { return ns_logv(cpu, m32_arg(cpu, 1)); }
 
+/* NSCreateMapTable and NSCreateHashTable take their callback structures by value: on i386 they are the words on the
+ * stack, a key's six (hash, isEqual, retain, release, describe, notAKeyMarker), a value's three, a hash table's five,
+ * then the capacity and, ...WithZone, the zone.  A function word is NULL, a host function the guest copied out of
+ * Foundation's NSObjectMapKeyCallBacks and the like (a handle), or a guest function, called back; the arm64 call
+ * takes the structures as copies.  VLC 1.1's interface makes its tables this way. */
+typedef struct { uint64_t w[6]; } HostMapKeyCallBacks;
+typedef struct { uint64_t w[3]; } HostMapValueCallBacks;
+typedef struct { uint64_t w[5]; } HostHashCallBacks;
+
+static uint64_t table_fn(uint32_t word, const char *guest, const char *host)
+{
+    if (!word)
+        return 0;
+    if (m32_is_handle(word))
+        return (uint64_t)(uintptr_t)m32_host(word);
+    return (uint64_t)(uintptr_t)m32_callback(word, guest, host);
+}
+
+static const char *const g_key_sigs[5][2] = { { "u(pp)", "L(pp)" }, { "b(ppp)", "B(ppp)" }, { "v(pp)", "v(pp)" },
+                                              { "v(pp)", "v(pp)" }, { "@(pp)", "@(pp)" } };
+
+static int map_table(struct OcerzVM *vm, OcerzCPU *cpu, int zoned)
+{
+    (void)vm;
+    void *fn = dlsym(RTLD_DEFAULT, zoned ? "NSCreateMapTableWithZone" : "NSCreateMapTable");
+    if (!fn)
+        RET(0);
+    HostMapKeyCallBacks k;
+    HostMapValueCallBacks v;
+    for (int i = 0; i < 5; i++)
+        k.w[i] = table_fn(m32_arg(cpu, i), g_key_sigs[i][0], g_key_sigs[i][1]);
+    k.w[5] = m32_arg(cpu, 5) ? (uint64_t)(uintptr_t)m32_host(m32_arg(cpu, 5)) : 0;   /* notAKeyMarker, as keys cross */
+    for (int i = 0; i < 3; i++)
+        v.w[i] = table_fn(m32_arg(cpu, 6 + i), g_key_sigs[i + 2][0], g_key_sigs[i + 2][1]);
+    uint64_t capacity = m32_arg(cpu, 9);
+    void *t = zoned ? ((void *(*)(HostMapKeyCallBacks, HostMapValueCallBacks, uint64_t, void *))fn)(k, v, capacity, NULL)
+                    : ((void *(*)(HostMapKeyCallBacks, HostMapValueCallBacks, uint64_t))fn)(k, v, capacity);
+    RET(m32_handle(t));
+}
+
+static int hash_table(struct OcerzVM *vm, OcerzCPU *cpu, int zoned)
+{
+    (void)vm;
+    void *fn = dlsym(RTLD_DEFAULT, zoned ? "NSCreateHashTableWithZone" : "NSCreateHashTable");
+    if (!fn)
+        RET(0);
+    HostHashCallBacks c;
+    for (int i = 0; i < 5; i++)
+        c.w[i] = table_fn(m32_arg(cpu, i), g_key_sigs[i][0], g_key_sigs[i][1]);
+    uint64_t capacity = m32_arg(cpu, 5);
+    void *t = zoned ? ((void *(*)(HostHashCallBacks, uint64_t, void *))fn)(c, capacity, NULL)
+                    : ((void *(*)(HostHashCallBacks, uint64_t))fn)(c, capacity);
+    RET(m32_handle(t));
+}
+
+static int sp_NSCreateMapTable(struct OcerzVM *vm, OcerzCPU *cpu) { return map_table(vm, cpu, 0); }
+static int sp_NSCreateMapTableWithZone(struct OcerzVM *vm, OcerzCPU *cpu) { return map_table(vm, cpu, 1); }
+static int sp_NSCreateHashTable(struct OcerzVM *vm, OcerzCPU *cpu) { return hash_table(vm, cpu, 0); }
+static int sp_NSCreateHashTableWithZone(struct OcerzVM *vm, OcerzCPU *cpu) { return hash_table(vm, cpu, 1); }
+
 const M32SpecialEntry m32_objc_specials[] = {
+    { "_NSCreateMapTable", sp_NSCreateMapTable }, { "_NSCreateMapTableWithZone", sp_NSCreateMapTableWithZone },
+    { "_NSCreateHashTable", sp_NSCreateHashTable }, { "_NSCreateHashTableWithZone", sp_NSCreateHashTableWithZone },
     { "_NSLog", sp_NSLog }, { "_NSLogv", sp_NSLogv },
     { "_objc_msgSend", sp_msgSend }, { "_objc_msgSend_fpret", sp_msgSend }, { "_objc_msgSend_stret", sp_msgSend_stret },
     { "_objc_msgSendSuper", sp_msgSendSuper }, { "_objc_msgSendSuper_stret", sp_msgSendSuper_stret },

@@ -60,6 +60,7 @@ void m32_qd_set_current_port(uint32_t port);           /* SetPort, for host code
 void m32_qd_quiet(int on);                              /* drawing asks no view to redraw while on (a view drawing) */
 void m32_qd_show_window_rect(void *window, void *cg_context, double x, double y, double w, double h);   /* port pixels */
 extern const M32SpecialEntry m32_controls_specials[]; /* src/m32_controls.c: menus and controls arm64 dropped */
+extern const M32SpecialEntry m32_tsearch_specials[];  /* src/m32_tsearch.c: tsearch's trees, in guest memory */
 void m32_qd_window_gone(void *window);                 /* src/m32_qd.c: DisposeWindow drops the window's port */
 void *m32_qd_port_window(uint32_t port);               /* a QuickDraw port's host window, or NULL */
 int m32_qd_port_pixels(uint32_t port, int *w, int *h, uint32_t *rowbytes, uint32_t *pixels);   /* a GWorld's */

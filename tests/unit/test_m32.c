@@ -278,6 +278,91 @@ static uint32_t view_pixel(void *window, int h, int v)
     return value;
 }
 
+/* tsearch's trees live in guest memory, compared and walked by guest functions (src/m32_tsearch.c) */
+#define CODE 0x00a00000u
+static void test_tsearch(void)
+{
+    /* int compare(const int *a, const int *b) { return *a - *b; } */
+    static const uint8_t cmp[] = { 0x8b, 0x44, 0x24, 0x04, 0x8b, 0x00, 0x8b, 0x4c, 0x24, 0x08, 0x2b, 0x01, 0xc3 };
+    /* void action(const void *node, VISIT v, int level) { if (v == postorder || v == leaf) visits++; } */
+    uint8_t act[] = { 0x8b, 0x44, 0x24, 0x08, 0x83, 0xf8, 0x01, 0x74, 0x05, 0x83, 0xf8, 0x03, 0x75, 0x06,
+                      0xff, 0x05, 0, 0, 0, 0, 0xc3 };
+    uint32_t visits = DATA + 0x1100;
+    memcpy(act + 16, &visits, 4);
+    memcpy(m32_h(CODE), cmp, sizeof cmp);
+    memcpy(m32_h(CODE + 0x40), act, sizeof act);
+    uint32_t root = DATA + 0x1104, keys = DATA + 0x1120;
+    m32_wr(root, 0);
+    const int32_t vals[7] = { 50, 20, 80, 10, 30, 70, 90 };
+    int inserted = 1;
+    for (int i = 0; i < 7; i++) {
+        m32_wr(keys + 4 * (uint32_t)i, (uint32_t)vals[i]);
+        uint32_t node = call("_tsearch", 3, (uint32_t[]){ keys + 4 * (uint32_t)i, root, CODE });
+        inserted &= node != 0 && m32_rd(node) == keys + 4 * (uint32_t)i;   /* a node's first word is its key */
+    }
+    check("tsearch inserts, its node's first word the key", inserted);
+    m32_wr(DATA + 0x1140, 30);
+    uint32_t found = call("_tfind", 3, (uint32_t[]){ DATA + 0x1140, root, CODE });
+    check("tfind finds by the guest comparison", found && m32_rd(found) == keys + 16);
+    uint32_t again = call("_tsearch", 3, (uint32_t[]){ DATA + 0x1140, root, CODE });
+    check("tsearch of a key already there hands back its node", again == found);
+    m32_wr(DATA + 0x1144, 31);
+    check("tfind of a missing key", call("_tfind", 3, (uint32_t[]){ DATA + 0x1144, root, CODE }) == 0);
+    m32_wr(visits, 0);
+    call("_twalk", 2, (uint32_t[]){ m32_rd(root), CODE + 0x40 });
+    check("twalk visits every node once in order", m32_rd(visits) == 7);
+    check("tdelete", call("_tdelete", 3, (uint32_t[]){ DATA + 0x1140, root, CODE }) != 0 &&
+                     call("_tfind", 3, (uint32_t[]){ DATA + 0x1140, root, CODE }) == 0);
+    m32_wr(visits, 0);
+    call("_twalk", 2, (uint32_t[]){ m32_rd(root), CODE + 0x40 });
+    check("... and six are left", m32_rd(visits) == 6);
+}
+
+/* positional printf arguments, placed in position order (src/m32_stdio.c) */
+static void test_positional(void)
+{
+    put_str(DATA + 0x1200, "two");
+    m32_wr(DATA + 0x1210, 7);                       /* %1$d */
+    m32_wr(DATA + 0x1214, DATA + 0x1200);           /* %2$s */
+    const double pi = 3.25;
+    memcpy(m32_h(DATA + 0x1218), &pi, 8);           /* %3$.*1$f */
+    uint64_t slots[8] = { 0 };
+    int n = m32_printf_slots("%2$s %1$d %3$.*1$f", DATA + 0x1210, slots, 8, "test");
+    double d;
+    memcpy(&d, &slots[2], 8);
+    check("positional printf arguments in position order", n == 3 && slots[0] == 7 &&
+                                                           !strcmp((const char *)(uintptr_t)slots[1], "two") && d == 3.25);
+    check("positional and sequential arguments mixed are refused", m32_printf_slots("%1$d %d", DATA + 0x1210, slots, 8, "test") == -1);
+    check("a position no conversion takes is refused", m32_printf_slots("%2$d", DATA + 0x1210, slots, 8, "test") == -1);
+}
+
+/* NSCreateMapTable with Foundation's own callbacks, as a guest that copied NSNonOwnedPointerMapKeyCallBacks has
+ * them: handles of host functions (src/m32_objc.c) */
+static void test_map_table(void)
+{
+    if (!dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_LAZY | RTLD_GLOBAL))
+        return;
+    const uint64_t *keycb = (const uint64_t *)dlsym(RTLD_DEFAULT, "NSNonOwnedPointerMapKeyCallBacks");
+    const uint64_t *valcb = (const uint64_t *)dlsym(RTLD_DEFAULT, "NSNonOwnedPointerMapValueCallBacks");
+    void (*insert)(void *, const void *, const void *) = (void (*)(void *, const void *, const void *))dlsym(RTLD_DEFAULT, "NSMapInsert");
+    void *(*get)(void *, const void *) = (void *(*)(void *, const void *))dlsym(RTLD_DEFAULT, "NSMapGet");
+    if (!keycb || !valcb || !insert || !get)
+        return;
+    uint32_t a[10];
+    for (int i = 0; i < 5; i++)
+        a[i] = keycb[i] ? m32_handle((void *)(uintptr_t)keycb[i]) : 0;
+    a[5] = 0;
+    for (int i = 0; i < 3; i++)
+        a[6 + i] = valcb[i] ? m32_handle((void *)(uintptr_t)valcb[i]) : 0;
+    a[9] = 4;
+    uint32_t t = call("_NSCreateMapTable", 10, a);
+    check("NSCreateMapTable with callbacks by value", t != 0);
+    if (!t)
+        return;
+    insert(m32_host(t), m32_h(DATA + 0x1300), m32_h(DATA + 0x1304));
+    check("... makes a table that keeps what goes in", get(m32_host(t), m32_h(DATA + 0x1300)) == m32_h(DATA + 0x1304));
+}
+
 /* GWorlds: their pixels and PixMap in guest memory, pens, fills, clipping, the origin and CopyBits */
 static void test_quickdraw(void)
 {
@@ -579,6 +664,8 @@ static void test_fonts(void)
     check("FMGetFontFamilyInstanceFromFont goes back", call("_FMGetFontFamilyInstanceFromFont", 3, back) == 0 &&
                                                        *(int16_t *)m32_h(DATA + 0xf40) == 21);
     check("GetAppFont and GetSysFont", call("_GetAppFont", 0, NULL) == 1 && call("_GetSysFont", 0, NULL) == 0);
+    uint32_t ats = call("_FMGetATSFontFamilyRefFromFontFamily", 1, (uint32_t[]){ (uint32_t)(uint16_t)menlo });
+    check("an ATS family and back", ats != 0 && (int16_t)call("_FMGetFontFamilyFromATSFontFamilyRef", 1, (uint32_t[]){ ats }) == menlo);
     uint32_t theme[5] = { 1 /* kThemeSmallSystemFont */, 0, DATA + 0xf50, DATA + 0xf60, DATA + 0xf64 };
     check("GetThemeFont: the small system font", call("_GetThemeFont", 5, theme) == 0 && *(uint8_t *)m32_h(DATA + 0xf50) > 0 &&
                                                  *(int16_t *)m32_h(DATA + 0xf60) == 11);
@@ -805,6 +892,7 @@ int main(int argc, char **argv)
     if (ocerz_mem_init(0, M32_WINDOW) != OCERZ_OK ||
         ocerz_map_fixed(STACK - 0x10000, 0x10000 + 0x10000, PROT_READ | PROT_WRITE) != OCERZ_OK ||
         ocerz_map_fixed(DATA, 0x10000, PROT_READ | PROT_WRITE) != OCERZ_OK ||
+        ocerz_map_fixed(CODE, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) != OCERZ_OK ||
         ocerz_map_fixed(M32_HANDLE_LO, M32_HANDLE_HI - M32_HANDLE_LO, PROT_READ | PROT_WRITE) != OCERZ_OK) {
         fprintf(stderr, "test_m32: cannot set up the window\n");
         return 2;
@@ -832,6 +920,9 @@ int main(int argc, char **argv)
     test_raw_syscalls();
     test_quickdraw();
     test_fonts();
+    test_tsearch();
+    test_positional();
+    test_map_table();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }
