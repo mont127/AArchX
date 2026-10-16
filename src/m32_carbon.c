@@ -32,6 +32,10 @@
  * An EventRecord is 16 bytes on i386 (what, message, when, where, modifiers at 0, 2, 6, 10, 14, packed to 2) and 20
  * on arm64, whose message is a long: WaitNextEvent, GetNextEvent (WaitNextEvent that does not sleep, on arm64),
  * EventAvail, ConvertEventRefToEventRecord and AEProcessAppleEvent copy it across.
+ *
+ * The Text Encoding Converter's ConvertFromUnicodeToText and ConvertFromTextToUnicode take ByteCounts, ItemCounts and
+ * ByteOffset arrays, longs on arm64, and ConvertFromUnicodeToPString and ConvertFromPStringToUnicode a ByteCount
+ * each: they are widened in and narrowed out.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -376,7 +380,72 @@ static int sp_AEProcessAppleEvent(struct OcerzVM *vm, OcerzCPU *cpu)
     return ret_value(cpu, fn ? (uint32_t)(int32_t)fn(&r) : (uint32_t)-50);
 }
 
+/* ---- the Text Encoding Converter ---- */
+
+typedef int32_t (*TecConvert)(void *, unsigned long, const void *, uint32_t, unsigned long, const unsigned long *,
+                              unsigned long *, unsigned long *, unsigned long, unsigned long *, unsigned long *, void *);
+
+/* (info, ByteCount srcLen, src, OptionBits, ItemCount offsets, const ByteOffset in[], ItemCount *outOffsets,
+ * ByteOffset out[], ByteCount outLen, ByteCount *read, ByteCount *written, out) */
+static int tec_convert(OcerzCPU *cpu, const char *name)
+{
+    TecConvert fn = (TecConvert)carbon_fn(name);
+    uint32_t n = m32_arg(cpu, 4);
+    if (!fn || n > 65536)
+        return ret_value(cpu, (uint32_t)-50);
+    unsigned long *in = n ? calloc(n, sizeof *in) : NULL, *out = n ? calloc(n, sizeof *out) : NULL;
+    for (uint32_t i = 0; in && m32_arg(cpu, 5) && i < n; i++)
+        in[i] = m32_rd(m32_arg(cpu, 5) + 4 * i);
+    unsigned long out_count = 0, read = 0, written = 0;
+    uint32_t src = m32_arg(cpu, 2), dst = m32_arg(cpu, 11);
+    int32_t st = fn(m32_host(m32_arg(cpu, 0)), m32_arg(cpu, 1), src ? m32_h(src) : NULL, m32_arg(cpu, 3), n,
+                    m32_arg(cpu, 5) ? in : NULL, &out_count, m32_arg(cpu, 7) ? out : NULL, m32_arg(cpu, 8), &read,
+                    &written, dst ? m32_h(dst) : NULL);
+    if (m32_arg(cpu, 6))
+        m32_wr(m32_arg(cpu, 6), (uint32_t)out_count);
+    for (uint32_t i = 0; out && m32_arg(cpu, 7) && i < out_count && i < n; i++)
+        m32_wr(m32_arg(cpu, 7) + 4 * i, (uint32_t)out[i]);
+    if (m32_arg(cpu, 9))
+        m32_wr(m32_arg(cpu, 9), (uint32_t)read);
+    if (m32_arg(cpu, 10))
+        m32_wr(m32_arg(cpu, 10), (uint32_t)written);
+    free(in);
+    free(out);
+    return ret_value(cpu, (uint32_t)st);
+}
+static int sp_ConvertFromUnicodeToText(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; return tec_convert(cpu, "ConvertFromUnicodeToText"); }
+static int sp_ConvertFromTextToUnicode(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; return tec_convert(cpu, "ConvertFromTextToUnicode"); }
+
+/* ConvertFromUnicodeToPString(UnicodeToTextInfo, ByteCount, ConstUniCharPtr, Str255) */
+static int sp_ConvertFromUnicodeToPString(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int32_t (*fn)(void *, unsigned long, const void *, void *) = (int32_t (*)(void *, unsigned long, const void *, void *))carbon_fn("ConvertFromUnicodeToPString");
+    uint32_t src = m32_arg(cpu, 2), dst = m32_arg(cpu, 3);
+    return ret_value(cpu, fn ? (uint32_t)fn(m32_host(m32_arg(cpu, 0)), m32_arg(cpu, 1), src ? m32_h(src) : NULL,
+                                            dst ? m32_h(dst) : NULL) : (uint32_t)-50);
+}
+
+/* ConvertFromPStringToUnicode(TextToUnicodeInfo, ConstStr255Param, ByteCount outLen, ByteCount *written, UniChar *) */
+static int sp_ConvertFromPStringToUnicode(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int32_t (*fn)(void *, const void *, unsigned long, unsigned long *, void *) =
+        (int32_t (*)(void *, const void *, unsigned long, unsigned long *, void *))carbon_fn("ConvertFromPStringToUnicode");
+    unsigned long written = 0;
+    uint32_t src = m32_arg(cpu, 1), dst = m32_arg(cpu, 4);
+    int32_t st = fn ? fn(m32_host(m32_arg(cpu, 0)), src ? m32_h(src) : NULL, m32_arg(cpu, 2), &written,
+                         dst ? m32_h(dst) : NULL) : -50;
+    if (m32_arg(cpu, 3))
+        m32_wr(m32_arg(cpu, 3), (uint32_t)written);
+    return ret_value(cpu, (uint32_t)st);
+}
+
 const M32SpecialEntry m32_carbon_specials[] = {
+    { "_ConvertFromUnicodeToText", sp_ConvertFromUnicodeToText },
+    { "_ConvertFromTextToUnicode", sp_ConvertFromTextToUnicode },
+    { "_ConvertFromUnicodeToPString", sp_ConvertFromUnicodeToPString },
+    { "_ConvertFromPStringToUnicode", sp_ConvertFromPStringToUnicode },
     { "_GetEventParameter", sp_GetEventParameter }, { "_SetEventParameter", sp_SetEventParameter },
     { "_WaitNextEvent", sp_WaitNextEvent }, { "_GetNextEvent", sp_GetNextEvent }, { "_EventAvail", sp_EventAvail },
     { "_ConvertEventRefToEventRecord", sp_ConvertEventRefToEventRecord },

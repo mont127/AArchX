@@ -1413,6 +1413,8 @@ static const M32SpecialEntry g_specials[] = {
     { "__exit", sp__exit },
     { "__Exit", sp__exit },
     { "___cxa_atexit", sp_ok0 },   /* ponytail: C++ static destructors do not run at exit */
+    { "___cxa_finalize", sp_ok0 },   /* nor at an image's unloading: nothing was registered */
+    { "___keymgr_dwarf2_register_sections", sp_ok0 },   /* GCC's crt3 offering its EH frames; m32_unwind finds them */
     { "dyld_stub_binder", sp_stub_binder }, { "__tlv_bootstrap", m32_tlv_trap },
     { NULL, NULL }
 };
@@ -1421,7 +1423,8 @@ static const M32SpecialEntry *const g_tables[] = { g_specials, m32_stdio_special
                                                    m32_dyld_specials, m32_objc_specials, m32_block_specials,
                                                    m32_exc_specials, m32_zlib_specials, m32_unwind_specials,
                                                    m32_gl_specials, m32_audio_specials, m32_atsu_specials,
-                                                   m32_qd_specials, m32_agl_specials, m32_carbon_specials };
+                                                   m32_qd_specials, m32_agl_specials, m32_carbon_specials,
+                                                   m32_controls_specials };
 
 static M32Special find_special(const char *name)
 {

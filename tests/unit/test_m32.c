@@ -545,6 +545,144 @@ static void test_float_arrays(void)
     call("_DisposeGWorld", 1, (uint32_t[]){ gw });
 }
 
+static uint32_t pstr(uint32_t g, const char *s)
+{
+    size_t n = strlen(s);
+    *(uint8_t *)m32_h(g) = (uint8_t)n;
+    memcpy(m32_h(g + 1), s, n);
+    return g;
+}
+
+/* QuickDraw's and the Font Manager's font families, on CoreText (src/m32_atsu.c) */
+static void test_fonts(void)
+{
+    uint32_t id = DATA + 0xf00;
+    call("_GetFNum", 2, (uint32_t[]){ pstr(DATA + 0xf10, "Helvetica"), id });
+    check("GetFNum: Helvetica is classic 21", *(int16_t *)m32_h(id) == 21);
+    call("_GetFNum", 2, (uint32_t[]){ pstr(DATA + 0xf10, "geneva"), id });
+    check("... Geneva 3, whatever its case", *(int16_t *)m32_h(id) == 3);
+    *(int16_t *)m32_h(id) = 99;
+    call("_GetFNum", 2, (uint32_t[]){ pstr(DATA + 0xf10, "No Such Family Q9"), id });
+    check("... a family the system lacks, 0", *(int16_t *)m32_h(id) == 0);
+    int16_t menlo = (int16_t)call("_FMGetFontFamilyFromName", 1, (uint32_t[]){ pstr(DATA + 0xf10, "Menlo") });
+    check("FMGetFontFamilyFromName gives another family an ID from 1024", menlo >= 1024 &&
+          (int16_t)call("_FMGetFontFamilyFromName", 1, (uint32_t[]){ pstr(DATA + 0xf10, "Menlo") }) == menlo);
+    check("FMGetFontFamilyFromName: kInvalidFontFamily", (int16_t)call("_FMGetFontFamilyFromName", 1,
+                                                                       (uint32_t[]){ pstr(DATA + 0xf10, "No Such Family Q9") }) == -1);
+    call("_FMGetFontFamilyName", 2, (uint32_t[]){ (uint32_t)(uint16_t)menlo, DATA + 0xf20 });
+    check("FMGetFontFamilyName", !memcmp(m32_h(DATA + 0xf20), "\x05Menlo", 6));
+    check("FMGetFontFamilyName of no family", (int16_t)call("_FMGetFontFamilyName", 2, (uint32_t[]){ 777, DATA + 0xf20 }) == -985);
+    uint32_t inst[4] = { 21, 1 /* bold */, DATA + 0xf30, DATA + 0xf34 };
+    check("FMGetFontFromFontFamilyInstance: Helvetica Bold", call("_FMGetFontFromFontFamilyInstance", 4, inst) == 0 &&
+                                                            m32_rd(DATA + 0xf30) >= 0x10000 && (*(int16_t *)m32_h(DATA + 0xf34) & 1));
+    uint32_t back[3] = { m32_rd(DATA + 0xf30), DATA + 0xf40, DATA + 0xf44 };
+    check("FMGetFontFamilyInstanceFromFont goes back", call("_FMGetFontFamilyInstanceFromFont", 3, back) == 0 &&
+                                                       *(int16_t *)m32_h(DATA + 0xf40) == 21);
+    check("GetAppFont and GetSysFont", call("_GetAppFont", 0, NULL) == 1 && call("_GetSysFont", 0, NULL) == 0);
+    uint32_t theme[5] = { 1 /* kThemeSmallSystemFont */, 0, DATA + 0xf50, DATA + 0xf60, DATA + 0xf64 };
+    check("GetThemeFont: the small system font", call("_GetThemeFont", 5, theme) == 0 && *(uint8_t *)m32_h(DATA + 0xf50) > 0 &&
+                                                 *(int16_t *)m32_h(DATA + 0xf60) == 11);
+    call("_GetFNum", 2, (uint32_t[]){ DATA + 0xf50, id });
+    check("... whose name GetFNum knows as the system font", *(int16_t *)m32_h(id) == 0);
+    /* ATSUI: a copied style, and the unjustified bounds of a line laid out in it */
+    uint32_t st = DATA + 0xf70, cp = DATA + 0xf74;
+    call("_ATSUCreateStyle", 1, (uint32_t[]){ st });
+    check("ATSUCreateAndCopyStyle", call("_ATSUCreateAndCopyStyle", 2, (uint32_t[]){ m32_rd(st), cp }) == 0 && m32_rd(cp) != 0 &&
+                                    m32_rd(cp) != m32_rd(st));
+    const uint16_t hello[5] = { 'H', 'e', 'l', 'l', 'o' };
+    memcpy(m32_h(DATA + 0xf80), hello, sizeof hello);
+    m32_wr(DATA + 0xf90, 5);
+    m32_wr(DATA + 0xf94, m32_rd(cp));
+    uint32_t mk[8] = { DATA + 0xf80, 0, 5, 5, 1, DATA + 0xf90, DATA + 0xf94, DATA + 0xf98 };
+    call("_ATSUCreateTextLayoutWithTextPtr", 8, mk);
+    uint32_t ub[7] = { m32_rd(DATA + 0xf98), 0, 5, DATA + 0xfa0, DATA + 0xfa4, DATA + 0xfa8, DATA + 0xfac };
+    check("ATSUGetUnjustifiedBounds", call("_ATSUGetUnjustifiedBounds", 7, ub) == 0 && (int32_t)m32_rd(DATA + 0xfa4) > 10 << 16 &&
+                                      (int32_t)m32_rd(DATA + 0xfa8) > 4 << 16);
+    /* the Text Encoding Converter, its longs narrowed: Unicode to MacRoman */
+    void *create = dlsym(RTLD_DEFAULT, "CreateUnicodeToTextInfoByEncoding");
+    void *info = NULL;
+    if (create)
+        ((int32_t (*)(uint32_t, void **))create)(0 /* kTextEncodingMacRoman */, &info);
+    const uint16_t cafe[4] = { 'c', 'a', 'f', 0xe9 };
+    memcpy(m32_h(DATA + 0xfb0), cafe, sizeof cafe);
+    uint32_t tec[12] = { m32_handle(info), 8, DATA + 0xfb0, 0, 0, 0, 0, 0, 16, DATA + 0xfc0, DATA + 0xfc4, DATA + 0xfd0 };
+    check("ConvertFromUnicodeToText", info && call("_ConvertFromUnicodeToText", 12, tec) == 0 && m32_rd(DATA + 0xfc0) == 8 &&
+                                      m32_rd(DATA + 0xfc4) == 4 && !memcmp(m32_h(DATA + 0xfd0), "caf\x8e", 4));
+}
+
+/* menus and controls arm64 HIToolbox dropped (src/m32_controls.c) */
+static void test_menus_controls(uint32_t w)
+{
+    uint32_t mo = DATA + 0x1000;
+    cross(CARBON, "_CreateNewMenu", 3, (uint32_t[]){ 300, 0, mo });
+    uint32_t menu = m32_rd(mo);
+    void *(*cfs)(void *, const char *, uint32_t) = (void *(*)(void *, const char *, uint32_t))dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+    uint32_t text = m32_handle(cfs(NULL, "Load ROM", 0x08000100));
+    cross(CARBON, "_AppendMenuItemTextWithCFString", 5, (uint32_t[]){ menu, text, 0, FOUR('l','o','a','d'), 0 });
+    cross(CARBON, "_DisableMenuCommand", 2, (uint32_t[]){ menu, FOUR('l','o','a','d') });
+    check("a disabled command", (call("_IsMenuCommandEnabled", 2, (uint32_t[]){ menu, FOUR('l','o','a','d') }) & 0xff) == 0);
+    call("_EnableMenuCommand", 2, (uint32_t[]){ menu, FOUR('l','o','a','d') });
+    check("EnableMenuCommand", (call("_IsMenuCommandEnabled", 2, (uint32_t[]){ menu, FOUR('l','o','a','d') }) & 0xff) == 1);
+    call("_SetItemCmd", 3, (uint32_t[]){ menu, 1, 'O' });
+    call("_GetItemCmd", 3, (uint32_t[]){ menu, 1, DATA + 0x1010 });
+    check("SetItemCmd and GetItemCmd", *(int16_t *)m32_h(DATA + 0x1010) == 'O');
+    cross(CARBON, "_CreateNewMenu", 3, (uint32_t[]){ 301, 0, mo });
+    uint32_t sub = m32_rd(mo);
+    cross(CARBON, "_InsertMenu", 2, (uint32_t[]){ sub, (uint32_t)-1 /* kInsertHierarchicalMenu */ });
+    check("SetMenuItemHierarchicalID", call("_SetMenuItemHierarchicalID", 3, (uint32_t[]){ menu, 1, 301 }) == 0);
+    call("_GetMenuItemHierarchicalID", 3, (uint32_t[]){ menu, 1, DATA + 0x1014 });
+    check("GetMenuItemHierarchicalID", *(int16_t *)m32_h(DATA + 0x1014) == 301);
+    uint32_t mine = m32_handle(calloc(1, 64));   /* a menu bar the program made itself, as Kega Fusion does */
+    call("_SetMenuBar", 1, (uint32_t[]){ mine });
+    call("_DisposeMenuBar", 1, (uint32_t[]){ mine });
+    uint32_t bar = call("_GetMenuBar", 0, NULL);
+    check("GetMenuBar", bar != 0);
+    call("_SetMenuBar", 1, (uint32_t[]){ bar });
+    call("_DisposeMenuBar", 1, (uint32_t[]){ bar });
+
+    /* a push button: its reference value, 32-bit value, region and hit part */
+    uint32_t r = qd_rect(DATA + 0x1020, 20, 30, 40, 130);
+    uint32_t title = m32_handle(cfs(NULL, "Push", 0x08000100));
+    check("CreatePushButtonControl", cross(CARBON, "_CreatePushButtonControl", 4, (uint32_t[]){ w, r, title, DATA + 0x1030 }) == 0);
+    uint32_t button = m32_rd(DATA + 0x1030);
+    call("_SetControlReference", 2, (uint32_t[]){ button, 0xcafe1234 });
+    check("SetControlReference and GetControlReference", call("_GetControlReference", 1, (uint32_t[]){ button }) == 0xcafe1234);
+    call("_SetControl32BitMaximum", 2, (uint32_t[]){ button, 1000 });
+    call("_SetControl32BitValue", 2, (uint32_t[]){ button, 1 });
+    check("the 32-bit value and maximum", call("_GetControl32BitMaximum", 1, (uint32_t[]){ button }) == 1000 &&
+                                          call("_GetControl32BitValue", 1, (uint32_t[]){ button }) == 1);
+    void *(*newrgn)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "NewRgn");
+    void (*bounds)(void *, int16_t *) = (void (*)(void *, int16_t *))dlsym(RTLD_DEFAULT, "GetRegionBounds");
+    void *rgn = newrgn();
+    int16_t rb[4] = { 0, 0, 0, 0 };
+    check("GetControlRegion", call("_GetControlRegion", 3, (uint32_t[]){ button, (uint32_t)-1, m32_handle(rgn) }) == 0);
+    bounds(rgn, rb);
+    check("... is the control's frame in the window", rb[0] == 20 && rb[1] == 30 && rb[2] == 40 && rb[3] == 130);
+    check("TestControl inside the button", (int16_t)call("_TestControl", 2, (uint32_t[]){ button, 30u | 80u << 16 }) != 0 &&
+                                           (int16_t)call("_TestControl", 2, (uint32_t[]){ button, 5u | 5u << 16 }) == 0);
+    check("FindControl finds it", (int16_t)call("_FindControl", 3, (uint32_t[]){ 30u | 80u << 16, w, DATA + 0x1034 }) != 0 &&
+                                  m32_rd(DATA + 0x1034) == button);
+    check("IsControlEnabled", (call("_IsControlEnabled", 1, (uint32_t[]){ button }) & 0xff) == 1);
+    /* a user pane keeps the procedures the program hands it */
+    check("CreateUserPaneControl", call("_CreateUserPaneControl", 4, (uint32_t[]){ w, qd_rect(DATA + 0x1040, 50, 10, 90, 60), 0,
+                                                                                  DATA + 0x1050 }) == 0 && m32_rd(DATA + 0x1050));
+    uint32_t pane = m32_rd(DATA + 0x1050);
+    m32_wr(DATA + 0x1060, 0x00123450);
+    check("SetControlData(kControlUserPaneDrawProcTag)", (int16_t)cross(CARBON, "_SetControlData", 5,
+                                                         (uint32_t[]){ pane, 0, FOUR('d','r','a','w'), 4, DATA + 0x1060 }) == 0);
+    m32_wr(DATA + 0x1064, 0);
+    cross(CARBON, "_GetControlData", 6, (uint32_t[]){ pane, 0, FOUR('d','r','a','w'), 4, DATA + 0x1064, 0 });
+    check("GetControlData gives the procedure back", m32_rd(DATA + 0x1064) == 0x00123450);
+    check("a pane with no hit-test procedure is hit inside", (int16_t)call("_TestControl", 2, (uint32_t[]){ pane, 70u | 20u << 16 }) == 1 &&
+                                                             (int16_t)call("_TestControl", 2, (uint32_t[]){ pane, 20u | 70u << 16 }) == 0);
+    m32_wr(DATA + 0x1060, 0);
+    cross(CARBON, "_SetControlData", 5, (uint32_t[]){ pane, 0, FOUR('d','r','a','w'), 4, DATA + 0x1060 });
+    uint32_t root = DATA + 0x1070;
+    cross(CARBON, "_GetRootControl", 2, (uint32_t[]){ w, root });
+    call("_CountSubControls", 2, (uint32_t[]){ m32_rd(root), DATA + 0x1074 });
+    check("CountSubControls", *(uint16_t *)m32_h(DATA + 0x1074) >= 2);
+}
+
 static void test_carbon(void)
 {
     void *(*session)(void) = (void *(*)(void))dlsym(dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
@@ -657,6 +795,7 @@ static void test_carbon(void)
     test_agl(port);
     test_event_params(w, port);
     test_float_arrays();
+    test_menus_controls(w);
     cross(CARBON, "_DisposeWindow", 1, v);
     check("DisposeWindow takes the window's port with it", call("_IsValidPort", 1, pt) == 0);
 }
@@ -692,6 +831,7 @@ int main(int argc, char **argv)
     test_nslogv();
     test_raw_syscalls();
     test_quickdraw();
+    test_fonts();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

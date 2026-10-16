@@ -56,6 +56,10 @@ M32Special m32_carbon_special(const char *symbol);      /* src/m32_carbon.c: the
 extern const M32SpecialEntry m32_carbon_specials[]; /* src/m32_carbon.c: Carbon event parameters */
 uint32_t m32_qd_window_port(void *window);             /* src/m32_qd.c: a window's QuickDraw port, made if need be */
 uint32_t m32_qd_current_port(void);                    /* the current QuickDraw port, or 0 */
+void m32_qd_set_current_port(uint32_t port);           /* SetPort, for host code calling guest drawing */
+void m32_qd_quiet(int on);                              /* drawing asks no view to redraw while on (a view drawing) */
+void m32_qd_show_window_rect(void *window, void *cg_context, double x, double y, double w, double h);   /* port pixels */
+extern const M32SpecialEntry m32_controls_specials[]; /* src/m32_controls.c: menus and controls arm64 dropped */
 void m32_qd_window_gone(void *window);                 /* src/m32_qd.c: DisposeWindow drops the window's port */
 void *m32_qd_port_window(uint32_t port);               /* a QuickDraw port's host window, or NULL */
 int m32_qd_port_pixels(uint32_t port, int *w, int *h, uint32_t *rowbytes, uint32_t *pixels);   /* a GWorld's */

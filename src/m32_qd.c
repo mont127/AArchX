@@ -364,9 +364,10 @@ static OSStatus window_draw(EventHandlerCallRef next, EventRef ev, void *data)
 }
 
 /* after drawing into a window's port: the content view draws the port, now and whenever it redraws */
+static int g_quiet;
 static void port_changed(QdPort *p)
 {
-    if (!p->window)
+    if (!p->window || g_quiet)
         return;
     if (!p->view) {
         HIViewRef content = NULL;
@@ -455,6 +456,40 @@ uint32_t m32_qd_window_port(void *window)
 }
 
 uint32_t m32_qd_current_port(void) { return g_cur ? g_cur->guest : 0; }
+
+void m32_qd_set_current_port(uint32_t port)
+{
+    QdPort *p = port_of(port);
+    if (p || !port)
+        g_cur = p;
+}
+
+/* a user pane's draw procedure draws into its window's port from inside the pane's own draw: asking the content view
+ * to redraw then would draw again at every frame */
+void m32_qd_quiet(int on) { g_quiet += on ? 1 : -1; }
+
+/* the window port's pixels at content_rect (QuickDraw's local coordinates), drawn into a view's context whose
+ * origin is that rectangle's top left (an HIView's, flipped) */
+void m32_qd_show_window_rect(void *window, void *cg_context, double x, double y, double w, double h)
+{
+    CGRect r = CGRectMake(x, y, w, h);
+    QdPort *p = window ? port_by_window((WindowRef)window) : NULL;
+    CGContextRef c = cg_context;
+    if (!p || !p->ctx || !c)
+        return;
+    CGImageRef whole = CGBitmapContextCreateImage_(p->ctx);
+    CGImageRef part = whole ? CGImageCreateWithImageInRect_(whole, r) : NULL;
+    if (part) {
+        CGContextSaveGState_(c);
+        CGContextTranslateCTM_(c, 0, r.size.height);
+        CGContextScaleCTM_(c, 1, -1);
+        CGContextDrawImage_(c, CGRectMake(0, 0, r.size.width, r.size.height), part);
+        CGContextRestoreGState_(c);
+        CGImageRelease_(part);
+    }
+    if (whole)
+        CGImageRelease_(whole);
+}
 
 static int qd_GetWindowPort(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; QdPort *p = window_port(A(0)); RET(p ? p->guest : 0); }
 static int qd_SetPortWindowPort(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; QdPort *p = window_port(A(0)); if (p) g_cur = p; RET(0); }

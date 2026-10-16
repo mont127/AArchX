@@ -14,6 +14,11 @@
  *   records   ATSLayoutRecords (14 bytes on i386, packed to 2) for the glyphs and a terminator, in guest memory
  *   glyphs    ideal and screen metrics from CoreText's advances and bounding boxes
  *
+ *   families  QuickDraw's and the Font Manager's font families: 0 and 1, the system and application fonts, are
+ *             Lucida Grande, the classic IDs (Geneva 3, Monaco 4, Times 20, Helvetica 21, Courier 22 and
+ *             the rest) their families, and any other family a program names gets an ID from 1024; an FMFont is the
+ *             ATSFontRef above.  Theme fonts are the system font at Aqua's sizes.
+ *
  * ponytail: the ATSUI covered is what Source's COSXFont uses; other attribute tags are accepted and ignored, other
  * direct-access selectors refused.  CoreText's layout is not ATSUI's to the pixel.
  */
@@ -40,6 +45,8 @@ enum { NO_ERR = 0, PARAM_ERR = -50, FNF_ERR = -43, INVALID_FONT = -8796, INVALID
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"   /* CTFontManagerRegisterGraphicsFont: data, not a URL */
 #define HOST(fn) static __typeof__(fn) *fn##_
+HOST(CFStringCreateWithPascalString); HOST(CFStringGetPascalString); HOST(CTFontCreateUIFontForLanguage);
+HOST(CTFontGetSymbolicTraits); HOST(CFStringCreateWithCString);
 HOST(CFStringCreateWithCharacters); HOST(CFStringCompare); HOST(CFRelease); HOST(CFDataCreate);
 HOST(CFAttributedStringCreateMutable); HOST(CFAttributedStringReplaceString); HOST(CFAttributedStringSetAttribute);
 HOST(CFArrayGetCount); HOST(CFArrayGetValueAtIndex); HOST(CFNumberCreate);
@@ -65,6 +72,8 @@ static void load(void)
     void *cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_LAZY | RTLD_LOCAL);
     int ok = ct && cg && cf;
 #define L(h, fn) ok &= (fn##_ = (__typeof__(fn) *)dlsym(h, #fn)) != NULL
+    L(cf, CFStringCreateWithPascalString); L(cf, CFStringGetPascalString); L(ct, CTFontCreateUIFontForLanguage);
+    L(ct, CTFontGetSymbolicTraits); L(cf, CFStringCreateWithCString);
     L(cf, CFStringCreateWithCharacters); L(cf, CFStringCompare); L(cf, CFRelease); L(cf, CFDataCreate);
     L(cf, CFAttributedStringCreateMutable); L(cf, CFAttributedStringReplaceString); L(cf, CFAttributedStringSetAttribute);
     L(cf, CFArrayGetCount); L(cf, CFArrayGetValueAtIndex); L(cf, CFNumberCreate);
@@ -156,6 +165,216 @@ static uint32_t find(CFStringRef name, int postscript_only)
     return id;
 }
 static int sp_ATSFontFindFromName(struct OcerzVM *vm, OcerzCPU *cpu) { RET(find(m32_host(A(0)), 0)); }
+
+/* ---- font families: QuickDraw's and the Font Manager's IDs ---- */
+
+enum { FAMILY_BASE = 1024, INVALID_FAMILY = -1, FM_INVALID_FAMILY_ERR = -985, FM_INVALID_FONT_ERR = -986 };
+static const char *const g_classic[] = { [2] = "New York", [3] = "Geneva", [4] = "Monaco", [20] = "Times",
+                                         [21] = "Helvetica", [22] = "Courier", [23] = "Symbol" };
+static CFStringRef g_families[256];
+static int g_nfamilies;
+
+/* Lucida Grande, the system font of the Macs these programs were written for and still installed; the UI font's
+ * hidden family (.AppleSystemUIFont), which CoreText warns about when it is asked for by name, only without it */
+static CFStringRef system_family(void)
+{
+    static CFStringRef name;
+    if (!name && ready()) {
+        CFStringRef lucida = CFStringCreateWithCString_(NULL, "Lucida Grande", kCFStringEncodingMacRoman);
+        CTFontRef f = CTFontCreateWithName_(lucida, 13, NULL);
+        CFStringRef fam = f ? CTFontCopyFamilyName_(f) : NULL;
+        release(f);
+        if (fam && CFStringCompare_(fam, lucida, 0) == kCFCompareEqualTo) {
+            name = fam;
+        } else {
+            release(fam);
+            CTFontRef ui = CTFontCreateUIFontForLanguage_(kCTFontUIFontSystem, 13, NULL);
+            name = ui ? CTFontCopyFamilyName_(ui) : NULL;
+            release(ui);
+        }
+        release(lucida);
+    }
+    return name;
+}
+
+/* the family's name, or NULL; not retained */
+static CFStringRef family_name(int id)
+{
+    static CFStringRef classic[sizeof g_classic / sizeof g_classic[0]];
+    if (id == 0 || id == 1)
+        return system_family();
+    if (id > 1 && id < (int)(sizeof g_classic / sizeof g_classic[0]) && g_classic[id]) {
+        if (!classic[id])
+            classic[id] = CFStringCreateWithCString_(NULL, g_classic[id], kCFStringEncodingMacRoman);
+        return classic[id];
+    }
+    CFStringRef n = NULL;
+    pthread_mutex_lock(&g_font_lock);
+    if (id >= FAMILY_BASE && id - FAMILY_BASE < g_nfamilies)
+        n = g_families[id - FAMILY_BASE];
+    pthread_mutex_unlock(&g_font_lock);
+    return n;
+}
+
+/* a family the system has: its ID, given out once; INVALID_FAMILY otherwise */
+static int family_id(CFStringRef name)
+{
+    if (!name || !ready())
+        return INVALID_FAMILY;
+    CFStringRef sys = system_family();
+    if (sys && CFStringCompare_(name, sys, kCFCompareCaseInsensitive) == kCFCompareEqualTo)
+        return 0;
+    for (int i = 2; i < (int)(sizeof g_classic / sizeof g_classic[0]); i++) {
+        CFStringRef c = g_classic[i] ? family_name(i) : NULL;
+        if (c && CFStringCompare_(name, c, kCFCompareCaseInsensitive) == kCFCompareEqualTo)
+            return i;
+    }
+    pthread_mutex_lock(&g_font_lock);
+    for (int i = 0; i < g_nfamilies; i++)
+        if (CFStringCompare_(name, g_families[i], kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
+            pthread_mutex_unlock(&g_font_lock);
+            return FAMILY_BASE + i;
+        }
+    pthread_mutex_unlock(&g_font_lock);
+    CTFontRef f = CTFontCreateWithName_(name, 12, NULL);
+    CFStringRef real = f ? CTFontCopyFamilyName_(f) : NULL;
+    release(f);
+    if (!real || CFStringCompare_(real, name, kCFCompareCaseInsensitive) != kCFCompareEqualTo) {
+        release(real);
+        return INVALID_FAMILY;
+    }
+    pthread_mutex_lock(&g_font_lock);
+    int id = INVALID_FAMILY;
+    if (g_nfamilies < 256) {
+        g_families[g_nfamilies] = real;
+        id = FAMILY_BASE + g_nfamilies++;
+    } else {
+        release(real);
+    }
+    pthread_mutex_unlock(&g_font_lock);
+    return id;
+}
+
+static CFStringRef pascal_in(uint32_t g)
+{
+    return g && ready() ? CFStringCreateWithPascalString_(NULL, m32_h(g), kCFStringEncodingMacRoman) : NULL;
+}
+static void pascal_out(CFStringRef s, uint32_t g)
+{
+    if (!g || !ready())
+        return;
+    *(uint8_t *)m32_h(g) = 0;
+    if (s)
+        CFStringGetPascalString_(s, m32_h(g), 256, kCFStringEncodingMacRoman);
+}
+
+/* GetFNum(ConstStr255Param name, short *familyID): 0 for a name the system has no family of */
+static int sp_GetFNum(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    CFStringRef n = pascal_in(A(0));
+    int id = family_id(n);
+    release(n);
+    if (A(1))
+        *(int16_t *)m32_h(A(1)) = (int16_t)(id < 0 ? 0 : id);
+    RET(0);
+}
+static int sp_FMGetFontFamilyFromName(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    CFStringRef n = pascal_in(A(0));
+    int id = family_id(n);
+    release(n);
+    RET((uint32_t)(int32_t)id);
+}
+static int sp_FMGetFontFamilyName(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    CFStringRef n = ready() ? family_name((int16_t)A(0)) : NULL;
+    pascal_out(n, A(1));
+    RET(n ? NO_ERR : (uint32_t)FM_INVALID_FAMILY_ERR);
+}
+static int sp_GetFontName(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    pascal_out(ready() ? family_name((int16_t)A(0)) : NULL, A(1));
+    RET(0);
+}
+
+/* FMGetFontFromFontFamilyInstance(FMFontFamily, FMFontStyle, FMFont *, FMFontStyle *intrinsic): the family's font in
+ * the style (bold 1, italic 2) CoreText has, and the style it has of its own */
+static int sp_FMGetFontFromFontFamilyInstance(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    CFStringRef n = ready() ? family_name((int16_t)A(0)) : NULL;
+    CTFontRef f = n ? CTFontCreateWithName_(n, 12, NULL) : NULL;
+    if (!f)
+        RET((uint32_t)FM_INVALID_FAMILY_ERR);
+    int style = (int16_t)A(1);
+    CTFontSymbolicTraits want = (style & 1 ? kCTFontTraitBold : 0) | (style & 2 ? kCTFontTraitItalic : 0);
+    CTFontRef styled = want ? CTFontCreateCopyWithSymbolicTraits_(f, 12, NULL, want, want) : NULL;
+    if (styled) {
+        release(f);
+        f = styled;
+    }
+    CTFontSymbolicTraits has = CTFontGetSymbolicTraits_(f);
+    uint32_t id = font_id(CTFontCopyPostScriptName_(f));
+    release(f);
+    if (A(2))
+        m32_wr(A(2), id);
+    if (A(3))
+        *(int16_t *)m32_h(A(3)) = (int16_t)((has & kCTFontTraitBold ? 1 : 0) | (has & kCTFontTraitItalic ? 2 : 0));
+    RET(id ? NO_ERR : (uint32_t)FM_INVALID_FONT_ERR);
+}
+
+/* FMGetFontFamilyInstanceFromFont(FMFont, FMFontFamily *, FMFontStyle *) */
+static int sp_FMGetFontFamilyInstanceFromFont(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    CTFontRef f = ready() ? font_at(A(0), 12) : NULL;
+    if (!f)
+        RET((uint32_t)FM_INVALID_FONT_ERR);
+    CFStringRef fam = CTFontCopyFamilyName_(f);
+    CTFontSymbolicTraits has = CTFontGetSymbolicTraits_(f);
+    int id = family_id(fam);
+    release(fam);
+    release(f);
+    if (A(1))
+        *(int16_t *)m32_h(A(1)) = (int16_t)id;
+    if (A(2))
+        *(int16_t *)m32_h(A(2)) = (int16_t)((has & kCTFontTraitBold ? 1 : 0) | (has & kCTFontTraitItalic ? 2 : 0));
+    RET(NO_ERR);
+}
+
+static int sp_identity(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(A(0)); }
+static int sp_GetAppFont(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(1); }
+static int sp_GetSysFont(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
+static int sp_GetDefFontSize(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(12); }
+
+/* GetThemeFont(ThemeFontID, ScriptCode, Str255 name, SInt16 *size, Style *style): the system font at Aqua's sizes */
+static int sp_GetThemeFont(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static const struct { int id, size, bold; } k[] = {
+        { 0, 13, 0 }, { 1, 11, 0 }, { 2, 11, 1 }, { 3, 12, 0 }, { 4, 13, 1 }, { 5, 13, 0 }, { 6, 10, 0 },
+        { 100, 14, 0 }, { 101, 14, 0 }, { 102, 14, 0 }, { 103, 14, 0 }, { 104, 13, 0 }, { 105, 13, 0 },
+        { 106, 11, 0 }, { 107, 13, 1 }, { 108, 11, 0 }, { 109, 9, 0 },
+    };
+    int id = (int16_t)A(0), size = 13, bold = 0;
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (k[i].id == id) {
+            size = k[i].size;
+            bold = k[i].bold;
+        }
+    if (!ready())
+        RET(PARAM_ERR);
+    pascal_out(system_family(), A(2));
+    if (A(3))
+        *(int16_t *)m32_h(A(3)) = (int16_t)size;
+    if (A(4))
+        *(uint8_t *)m32_h(A(4)) = (uint8_t)bold;
+    RET(NO_ERR);
+}
 static int sp_ATSFontFindFromPostScriptName(struct OcerzVM *vm, OcerzCPU *cpu) { RET(find(m32_host(A(0)), 1)); }
 
 /* activation: the font's bytes are copied (a game frees its buffer at once) and registered for this process; the
@@ -262,6 +481,20 @@ static int sp_ATSUCreateStyle(struct OcerzVM *vm, OcerzCPU *cpu)   /* (ATSUStyle
     s->size = 12;
     if (A(0))
         m32_wr(A(0), m32_handle(s));
+    RET(NO_ERR);
+}
+static int sp_ATSUCreateAndCopyStyle(struct OcerzVM *vm, OcerzCPU *cpu)   /* (ATSUStyle src, ATSUStyle *) */
+{
+    (void)vm;
+    AtsuStyle *s = calloc(1, sizeof *s), *src = m32_host(A(0));
+    if (!s || !ready())
+        RET(PARAM_ERR);
+    if (src)
+        *s = *src;
+    else
+        s->size = 12;
+    if (A(1))
+        m32_wr(A(1), m32_handle(s));
     RET(NO_ERR);
 }
 static int sp_ATSUDisposeStyle(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -401,6 +634,26 @@ static CTLineRef make_line(const AtsuLayout *l, uint32_t from, uint32_t count)
 }
 
 /* ATSUDrawText(layout, lineOffset, lineLength, Fixed x, Fixed y): the baseline at (x, y) in the layout's CGContext */
+/* ATSUGetUnjustifiedBounds(layout, lineStart, lineLength, ATSUTextMeasurement *before, *after, *ascent, *descent):
+ * the line's typographic width and height, Fixed */
+static int sp_ATSUGetUnjustifiedBounds(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = m32_host(A(0));
+    if (!l)
+        RET(INVALID_LAYOUT);
+    uint32_t from = A(1) == 0xffffffffu ? l->offset : A(1), count = A(2) == 0xffffffffu ? l->offset + l->length - from : A(2);
+    CTLineRef line = make_line(l, from, count);
+    CGFloat ascent = 0, descent = 0, leading = 0;
+    double width = line ? CTLineGetTypographicBounds_(line, &ascent, &descent, &leading) : 0;
+    release(line);
+    const double v[4] = { 0, width, ascent, descent };
+    for (int i = 0; i < 4; i++)
+        if (A(3 + i))
+            m32_wr(A(3 + i), (uint32_t)(int32_t)lround(v[i] * 65536.0));
+    RET(NO_ERR);
+}
+
 static int sp_ATSUDrawText(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     AtsuLayout *l = m32_host(A(0));
@@ -577,6 +830,14 @@ const M32SpecialEntry m32_atsu_specials[] = {
     { "_ATSFontGetHorizontalMetrics", sp_ATSFontGetHorizontalMetrics },
     { "_ATSFontGetVerticalMetrics", sp_ATSFontGetVerticalMetrics },
     { "_ATSUCreateStyle", sp_ATSUCreateStyle }, { "_ATSUDisposeStyle", sp_ATSUDisposeStyle },
+    { "_ATSUCreateAndCopyStyle", sp_ATSUCreateAndCopyStyle }, { "_ATSUGetUnjustifiedBounds", sp_ATSUGetUnjustifiedBounds },
+    { "_GetFNum", sp_GetFNum }, { "_FMGetFontFamilyFromName", sp_FMGetFontFamilyFromName },
+    { "_FMGetFontFamilyName", sp_FMGetFontFamilyName }, { "_GetFontName", sp_GetFontName },
+    { "_FMGetFontFromFontFamilyInstance", sp_FMGetFontFromFontFamilyInstance },
+    { "_FMGetFontFamilyInstanceFromFont", sp_FMGetFontFamilyInstanceFromFont },
+    { "_FMGetATSFontRefFromFont", sp_identity }, { "_FMGetFontFromATSFontRef", sp_identity },
+    { "_GetAppFont", sp_GetAppFont }, { "_GetSysFont", sp_GetSysFont }, { "_GetDefFontSize", sp_GetDefFontSize },
+    { "_GetThemeFont", sp_GetThemeFont },
     { "_ATSUSetAttributes", sp_ATSUSetAttributes },
     { "_ATSUCreateTextLayoutWithTextPtr", sp_ATSUCreateTextLayoutWithTextPtr },
     { "_ATSUDisposeTextLayout", sp_ATSUDisposeTextLayout },
