@@ -5032,7 +5032,46 @@ static int insn_stack_only(const X86Insn *in)
 }
 
 static const X86Insn *g_cur_insns;
+static int g_cur_insns_n;
 static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
+/*
+ * The Wine guards' view of a block's writes, a guest register at a time,
+ * built in one backward pass the first time the block asks about the
+ * register: from instruction k on, the first that may write it (g_wtab_wr,
+ * n when none does) and wine_base_min_disp's answer (g_wtab_md).  Each
+ * operand was a scan of the block before it.
+ */
+static const X86Insn *g_wtab_insns;
+static int g_wtab_n;
+static uint16_t g_wtab_built;
+static int16_t g_wtab_wr[16][JIT_MAX_BLOCK_INSNS + 1], g_wtab_md[16][JIT_MAX_BLOCK_INSNS + 1];
+static int wtab_reg(unsigned r)
+{
+    int n = g_cur_insns_n;
+    if (!g_cur_insns || r > 15 || n < 0 || n > JIT_MAX_BLOCK_INSNS) return 0;
+    if (g_wtab_insns != g_cur_insns || g_wtab_n != n) { g_wtab_insns = g_cur_insns; g_wtab_n = n; g_wtab_built = 0; }
+    if (g_wtab_built & (1u << r)) return 1;
+    int16_t wr = (int16_t)n, md = 0;
+    g_wtab_wr[r][n] = wr; g_wtab_md[r][n] = md;
+    for (int k = n - 1; k >= 0; k--) {
+        const X86Insn *in = &g_cur_insns[k];
+        if (insn_may_write_gpr(in, r)) { wr = (int16_t)k; md = 0; }
+        for (int o = 0; o < in->nops && o < 3; o++) {
+            const X86Operand *m = &in->ops[o];
+            if (m->kind == OCERZ_OPK_MEM && !m->riprel && m->base == r && m->index == OCERZ_REG_NONE &&
+                m->disp < md && m->disp >= -256)
+                md = (int16_t)m->disp;
+        }
+        g_wtab_wr[r][k] = wr; g_wtab_md[r][k] = md;
+    }
+    g_wtab_built |= (uint16_t)(1u << r);
+    return 1;
+}
+/* No instruction of the block before the current one may write r */
+static int wtab_unwritten(unsigned r)
+{
+    return wtab_reg(r) && g_wtab_wr[r][0] >= g_cur_insn_idx;
+}
 /*
  * The Wine layout's guard on an address in a register.  The question is
  * which side of 12 GB the address is on: below it the address takes
@@ -5058,10 +5097,8 @@ static int wine_guard_expects_high(const X86Insn *insn)
         if (insn->ops[k].kind == OCERZ_OPK_MEM) { m = &insn->ops[k]; break; }
     if (!m || m->riprel || (m->base > 15 && m->base != OCERZ_REG_NONE) || (m->index > 15 && m->index != OCERZ_REG_NONE))
         return 0;
-    for (int i = 0; i < g_cur_insn_idx; i++) {
-        if (m->base != OCERZ_REG_NONE && insn_may_write_gpr(&g_cur_insns[i], m->base)) return 0;
-        if (m->index != OCERZ_REG_NONE && insn_may_write_gpr(&g_cur_insns[i], m->index)) return 0;
-    }
+    if (m->base != OCERZ_REG_NONE && !wtab_unwritten(m->base)) return 0;
+    if (m->index != OCERZ_REG_NONE && !wtab_unwritten(m->index)) return 0;
     uint64_t v = (uint64_t)m->disp;
     if (m->base != OCERZ_REG_NONE) v += g_xlat_cpu->gpr[m->base];
     if (m->index != OCERZ_REG_NONE) v += g_xlat_cpu->gpr[m->index] << (m->scale & 3);
@@ -5976,25 +6013,14 @@ static void ea_cache_step(const X86Insn *in, const X86Insn *prev)
  */
 static int32_t wine_base_min_disp(unsigned greg, int from)
 {
-    int32_t mn = 0;
-    for (int k = from; k >= 0 && k < g_cur_insns_n; k++) {
-        const X86Insn *in = &g_cur_insns[k];
-        for (int o = 0; o < in->nops && o < 3; o++) {
-            const X86Operand *m = &in->ops[o];
-            if (m->kind == OCERZ_OPK_MEM && !m->riprel && m->base == greg && m->index == OCERZ_REG_NONE &&
-                m->disp < mn && m->disp >= -256)
-                mn = (int32_t)m->disp;
-        }
-        if (insn_may_write_gpr(in, greg)) break;
-    }
-    return mn;
+    if (from < 0 || from >= g_cur_insns_n || !wtab_reg(greg)) return 0;
+    return g_wtab_md[greg][from];
 }
 /* 1 or 0 for the side greg was on at translation, -1 when the block has written it since */
 static int wine_base_expects_high(unsigned greg)
 {
     if (!g_xlat_cpu || !g_cur_insns || g_cur_insn_idx < 0 || greg > 15) return -1;
-    for (int i = 0; i < g_cur_insn_idx; i++)
-        if (insn_may_write_gpr(&g_cur_insns[i], greg)) return -1;
+    if (!wtab_unwritten(greg)) return -1;
     return g_xlat_cpu->gpr[greg] >= OCERZ_LOW_LIMIT;
 }
 static int wine_base_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int size, int unscaled_ok, int32_t *disp_out)
@@ -6025,8 +6051,7 @@ static int wine_base_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, in
     for (const uint32_t *w = reuse ? g_wb.after : b->p; reuse && w < b->p; w++)
         if (a64_word_may_write_x15(*w) || (*w & 0xfc000000u) == 0x94000000u || (*w & 0xfffffc1fu) == 0xd63f0000u)
             reuse = 0;
-    for (int k = g_wb.idx; reuse && k < g_cur_insn_idx; k++)
-        if (insn_may_write_gpr(&g_cur_insns[k], op->base)) reuse = 0;
+    if (reuse && (!wtab_reg(op->base) || g_wtab_wr[op->base][g_wb.idx] < g_cur_insn_idx)) reuse = 0;
     if (!reuse) {
         if (ENV_ON("OCERZ_WLIM_CHECK")) {
             a64_mov_imm64(b, JTT, OCERZ_LOW_LIMIT);
@@ -22985,6 +23010,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             else leaf_lowp = &leaf_low;
         }
     }
+    g_wtab_insns = NULL;
     lazy_rsp_scan(blk->insns, n);
     nzcv_regen_scan(blk->insns, n);
     int regen_after = -1, regen_k = -1;
