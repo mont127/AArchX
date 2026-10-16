@@ -722,6 +722,7 @@ typedef struct DynImage {
     uint64_t file_dev;
     uint64_t file_ino;
     struct SymIndex *symidx;
+    struct SymIndex *symtab_ix;   /* image_symtab_resolve's index, built on first use */
 } DynImage;
 
 #define DYN_DIMG_MAX 2048   /* VLC 2.2 alone loads 301 plugins */
@@ -4654,9 +4655,12 @@ uint64_t ocerz_dlopen_from(struct OcerzVM *vm, const char *hostpath, int mode, u
     return r;
 }
 
-static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
+/* Every defined external symbol in the whole table, inserted in table order so
+   that linear probing finds a duplicated name's first entry first, value kept
+   unslid.  An image without a symbol table gets an empty index, so a miss on
+   it is remembered too. */
+static SymIndex *symtab_all_build(const uint8_t *mh)
 {
-    const uint8_t *mh = img->slice;
     uint32_t ncmds = rd32(mh + 16);
     const uint8_t *lc = mh + sizeof(struct mach_header_64);
     uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
@@ -4670,10 +4674,30 @@ static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
         }
         lc += rd32(lc + 4);
     }
-    if (!symoff || !nsyms || !stroff)
-        return 0;
+    SymIndex *ix = (SymIndex *)calloc(1, sizeof *ix);
+    if (!ix || !symoff || !nsyms || !stroff)
+        return ix;
     const uint8_t *nl = mh + symoff;
-    const char *strs = (const char *)(mh + stroff);
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < nsyms; i++) {
+        const uint8_t *e = nl + (uint64_t)i * 16;
+        uint32_t strx = rd32(e);
+        uint8_t ntype = e[4];
+        if (strx != 0 && strx < strsize && (ntype & 0x0e) == 0x0e && (ntype & 0x01))
+            count++;
+    }
+    if (!count)
+        return ix;
+    uint32_t cap = 64;
+    while (cap < count * 2u)
+        cap <<= 1;
+    ix->ent = calloc(cap, sizeof *ix->ent);
+    if (!ix->ent) {
+        free(ix);
+        return NULL;
+    }
+    ix->cap = cap;
+    ix->strtab = (const char *)(mh + stroff);
     for (uint32_t i = 0; i < nsyms; i++) {
         const uint8_t *e = nl + (uint64_t)i * 16;
         uint32_t strx = rd32(e);
@@ -4682,8 +4706,39 @@ static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
             continue;
         if ((ntype & 0x0e) != 0x0e || !(ntype & 0x01))
             continue;
-        if (strcmp(strs + strx, sym) == 0)
-            return rd64(e + 8) + img->slide;
+        uint32_t h = symidx_hash(ix->strtab + strx) & (cap - 1);
+        while (ix->ent[h].stroff)
+            h = (h + 1) & (cap - 1);
+        ix->ent[h].stroff = strx;
+        ix->ent[h].value = rd64(e + 8);
+        ix->n++;
+    }
+    return ix;
+}
+
+static pthread_mutex_t g_symtab_ix_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t image_symtab_resolve(DynImage *img, const char *sym)
+{
+    SymIndex *ix = __atomic_load_n(&img->symtab_ix, __ATOMIC_ACQUIRE);
+    if (!ix) {
+        pthread_mutex_lock(&g_symtab_ix_lock);
+        ix = img->symtab_ix;
+        if (!ix) {
+            ix = symtab_all_build(img->slice);
+            __atomic_store_n(&img->symtab_ix, ix, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_symtab_ix_lock);
+        if (!ix)
+            return 0;
+    }
+    if (!ix->cap)
+        return 0;
+    uint32_t h = symidx_hash(sym) & (ix->cap - 1);
+    while (ix->ent[h].stroff) {
+        if (strcmp(ix->strtab + ix->ent[h].stroff, sym) == 0)
+            return ix->ent[h].value + img->slide;
+        h = (h + 1) & (ix->cap - 1);
     }
     return 0;
 }
