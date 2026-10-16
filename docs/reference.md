@@ -49,6 +49,7 @@ Wine and Steam start many processes, and a setting is usually wanted in one of t
 | `OCERZ_STRACE_EXE=<text>` | trace system calls only in the processes whose command line matches |
 | `OCERZ_NOJIT_EXE=<text>` | interpret only the processes whose command line matches |
 | `OCERZ_STDERR_FILE=<file>` | append every process's standard error to one file |
+| `OCERZ_ABORT_REPORT=1` | an abort names the host frames it came from and the guest instruction its thread was at |
 
 ### Keeping translations
 

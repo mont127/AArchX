@@ -381,6 +381,170 @@ static void test_quickdraw(void)
     call("_SetGWorld", 2, s);
 }
 
+/* AGL on a window's QuickDraw port: the context draws into the window (src/m32_agl.c) */
+static void test_agl(uint32_t port)
+{
+    const uint32_t attrs[] = { 4 /* AGL_RGBA */, 5 /* AGL_DOUBLEBUFFER */, 0 };
+    memcpy(m32_h(DATA + 0xc00), attrs, sizeof attrs);
+    uint32_t pf = call("_aglChoosePixelFormat", 3, (uint32_t[]){ 0, 0, DATA + 0xc00 });
+    check("aglChoosePixelFormat", pf != 0);
+    uint32_t ctx = call("_aglCreateContext", 2, (uint32_t[]){ pf, 0 });
+    check("aglCreateContext", ctx != 0);
+    check("aglSetDrawable on a window's port", (call("_aglSetDrawable", 2, (uint32_t[]){ ctx, port }) & 0xff) == 1);
+    check("aglGetDrawable answers the port", call("_aglGetDrawable", 1, (uint32_t[]){ ctx }) == port);
+    check("aglSetCurrentContext", (call("_aglSetCurrentContext", 1, (uint32_t[]){ ctx }) & 0xff) == 1 &&
+                                  call("_aglGetCurrentContext", 0, NULL) == ctx);
+    void (*clear_color)(float, float, float, float) = (void (*)(float, float, float, float))dlsym(RTLD_DEFAULT, "glClearColor");
+    void (*clear)(uint32_t) = (void (*)(uint32_t))dlsym(RTLD_DEFAULT, "glClear");
+    void (*read)(int, int, int, int, uint32_t, uint32_t, void *) =
+        (void (*)(int, int, int, int, uint32_t, uint32_t, void *))dlsym(RTLD_DEFAULT, "glReadPixels");
+    void (*viewport)(uint32_t, int *) = (void (*)(uint32_t, int *))dlsym(RTLD_DEFAULT, "glGetIntegerv");
+    int vp[4] = { 0, 0, 0, 0 };
+    uint8_t px[4] = { 0, 0, 0, 0 };
+    if (clear_color && clear && read && viewport) {
+        viewport(0x0BA2 /* GL_VIEWPORT */, vp);
+        clear_color(0, 1, 0, 1);
+        clear(0x4000 /* GL_COLOR_BUFFER_BIT */);
+        read(5, 5, 1, 1, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */, px);
+    }
+    check("the context draws into the window's content", vp[2] == 400 && vp[3] == 200 && px[0] == 0 && px[1] == 0xff);
+    const uint32_t rect[4] = { 0, 0, 100, 50 };
+    memcpy(m32_h(DATA + 0xc20), rect, sizeof rect);
+    check("aglSetInteger(AGL_BUFFER_RECT)", (call("_aglSetInteger", 3, (uint32_t[]){ ctx, 202, DATA + 0xc20 }) & 0xff) == 1);
+    m32_wr(DATA + 0xc30, 0xffffffff);
+    check("aglGetInteger(AGL_SWAP_INTERVAL)", (call("_aglGetInteger", 3, (uint32_t[]){ ctx, 222, DATA + 0xc30 }) & 0xff) == 1 &&
+                                              m32_rd(DATA + 0xc30) != 0xffffffff);
+    check("aglGetCGLContext", (call("_aglGetCGLContext", 2, (uint32_t[]){ ctx, DATA + 0xc40 }) & 0xff) == 1 &&
+                              m32_rd(DATA + 0xc40) != 0);
+    call("_aglSwapBuffers", 1, (uint32_t[]){ ctx });
+    check("aglSetDrawable(NULL) detaches", (call("_aglSetDrawable", 2, (uint32_t[]){ ctx, 0 }) & 0xff) == 1 &&
+                                           call("_aglGetDrawable", 1, (uint32_t[]){ ctx }) == 0);
+    call("_aglSetCurrentContext", 1, (uint32_t[]){ 0 });
+    check("aglDestroyContext", (call("_aglDestroyContext", 1, (uint32_t[]){ ctx }) & 0xff) == 1);
+    call("_aglDestroyPixelFormat", 1, (uint32_t[]){ pf });
+    check("aglGetError", call("_aglGetError", 0, NULL) == 0);
+}
+
+#define FOUR(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
+
+/* Carbon event parameters cross in their i386 layouts; UPPs are their functions; EventRecords are 16 bytes */
+static void test_event_params(uint32_t w, uint32_t port)
+{
+    check("New...UPP hands back its function", call("_NewEventHandlerUPP", 1, (uint32_t[]){ 0x1234 }) == 0x1234 &&
+                                               call("_NewControlUserPaneDrawUPP", 1, (uint32_t[]){ 0x5678 }) == 0x5678);
+    check("Dispose...UPP does nothing", call("_DisposeNavEventUPP", 1, (uint32_t[]){ 0x1234 }) == 0 &&
+                                        m32_special("_NewWindowsBitmap") == NULL);
+    void *hi = dlopen(CARBON, RTLD_LAZY);
+    int32_t (*create)(void *, uint32_t, uint32_t, double, uint32_t, void **) =
+        (int32_t (*)(void *, uint32_t, uint32_t, double, uint32_t, void **))dlsym(hi, "CreateEvent");
+    void *(*root)(void *) = (void *(*)(void *))dlsym(hi, "HIViewGetRoot");
+    void *ev = NULL;
+    create(NULL, FOUR('c','n','t','l'), 4 /* kEventControlDraw */, 0, 0, &ev);
+    uint32_t gev = m32_handle(ev);
+    /* a ControlRef: a 4-byte handle in, the same out */
+    void *view = root(m32_host(w));
+    m32_wr(DATA + 0xd00, m32_handle(view));
+    check("SetEventParameter(typeControlRef)", call("_SetEventParameter", 5, (uint32_t[]){ gev, FOUR('-','-','-','-'),
+                                                FOUR('c','t','r','l'), 4, DATA + 0xd00 }) == 0);
+    m32_wr(DATA + 0xd10, 0);
+    uint32_t get[7] = { gev, FOUR('-','-','-','-'), FOUR('c','t','r','l'), DATA + 0xd20, 4, DATA + 0xd24, DATA + 0xd10 };
+    check("GetEventParameter(typeControlRef) gives the handle back", call("_GetEventParameter", 7, get) == 0 &&
+                                                                      m32_rd(DATA + 0xd10) == m32_handle(view) &&
+                                                                      m32_rd(DATA + 0xd24) == 4);
+    uint32_t wild[7] = { gev, FOUR('-','-','-','-'), FOUR('*','*','*','*'), DATA + 0xd20, 4, DATA + 0xd24, DATA + 0xd10 };
+    check("... and with typeWildCard", call("_GetEventParameter", 7, wild) == 0 && m32_rd(DATA + 0xd10) == m32_handle(view) &&
+                                       m32_rd(DATA + 0xd20) == FOUR('c','t','r','l'));
+    /* the draw event's GrafPtr, which 64-bit Carbon has none of: the control's window's port */
+    uint32_t gp[7] = { gev, FOUR('g','r','f','p'), FOUR('g','r','f','p'), 0, 4, 0, DATA + 0xd30 };
+    check("GetEventParameter(typeGrafPtr) is the window's QuickDraw port", call("_GetEventParameter", 7, gp) == 0 &&
+                                                                         m32_rd(DATA + 0xd30) == port);
+    /* an HIPoint: two floats on i386 */
+    const float pt[2] = { 12.5f, -3.25f };
+    memcpy(m32_h(DATA + 0xd40), pt, sizeof pt);
+    call("_SetEventParameter", 5, (uint32_t[]){ gev, FOUR('m','l','o','c'), FOUR('h','i','p','t'), 8, DATA + 0xd40 });
+    float back[2] = { 0, 0 };
+    int32_t (*host_get)(void *, uint32_t, uint32_t, uint32_t *, unsigned long, unsigned long *, void *) =
+        (int32_t (*)(void *, uint32_t, uint32_t, uint32_t *, unsigned long, unsigned long *, void *))dlsym(hi, "GetEventParameter");
+    double hd[2] = { 0, 0 };
+    host_get(ev, FOUR('m','l','o','c'), FOUR('h','i','p','t'), NULL, sizeof hd, NULL, hd);
+    uint32_t gpt[7] = { gev, FOUR('m','l','o','c'), FOUR('h','i','p','t'), 0, 8, DATA + 0xd24, DATA + 0xd50 };
+    call("_GetEventParameter", 7, gpt);
+    memcpy(back, m32_h(DATA + 0xd50), sizeof back);
+    check("an HIPoint crosses as doubles and comes back as floats", hd[0] == 12.5 && hd[1] == -3.25 && back[0] == 12.5f &&
+                                                                    back[1] == -3.25f && m32_rd(DATA + 0xd24) == 8);
+    /* an HICommand: its MenuRef at 8, its index at 12 */
+    const uint32_t cmd[4] = { 1, FOUR('q','u','i','t'), m32_handle(view), 7 };
+    memcpy(m32_h(DATA + 0xd60), cmd, sizeof cmd);
+    call("_SetEventParameter", 5, (uint32_t[]){ gev, FOUR('-','-','-','-'), FOUR('h','c','m','d'), 16, DATA + 0xd60 });
+    memset(m32_h(DATA + 0xd70), 0, 16);
+    call("_GetEventParameter", 7, (uint32_t[]){ gev, FOUR('-','-','-','-'), FOUR('h','c','m','d'), 0, 16, 0, DATA + 0xd70 });
+    check("an HICommand crosses", !memcmp(m32_h(DATA + 0xd60), m32_h(DATA + 0xd70), 14));
+    /* an EventRecord from a key event: what, then a 4-byte message at 2 */
+    void *down = NULL;
+    create(NULL, FOUR('k','e','y','b'), 1 /* kEventRawKeyDown */, 0, 0, &down);
+    int32_t (*host_set)(void *, uint32_t, uint32_t, unsigned long, const void *) =
+        (int32_t (*)(void *, uint32_t, uint32_t, unsigned long, const void *))dlsym(hi, "SetEventParameter");
+    const char ch = 'a';
+    const uint32_t zero = 0;
+    host_set(down, FOUR('k','c','h','r'), FOUR('T','E','X','T'), 1, &ch);
+    host_set(down, FOUR('k','c','o','d'), FOUR('m','a','g','n'), 4, &zero);
+    host_set(down, FOUR('k','m','o','d'), FOUR('m','a','g','n'), 4, &zero);
+    memset(m32_h(DATA + 0xd80), 0xee, 16);
+    check("ConvertEventRefToEventRecord", (call("_ConvertEventRefToEventRecord", 2, (uint32_t[]){ m32_handle(down), DATA + 0xd80 }) & 0xff) == 1);
+    uint16_t what;
+    uint32_t message;
+    memcpy(&what, m32_h(DATA + 0xd80), 2);
+    memcpy(&message, m32_h(DATA + 0xd82), 4);
+    check("... in i386's 16 bytes: keyDown, 'a'", what == 3 /* keyDown */ && message == 'a');
+    void (*release)(const void *) = (void (*)(const void *))dlsym(RTLD_DEFAULT, "CFRelease");
+    release(ev);
+    release(down);
+
+    /* GetAvailableWindowPositioningBounds: what HIToolbox gives for the main display */
+    int32_t (*avail)(uint32_t, int, CGRect *) = (int32_t (*)(uint32_t, int, CGRect *))dlsym(hi, "HIWindowGetAvailablePositioningBounds");
+    uint32_t (*main_id)(void) = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "CGMainDisplayID");
+    CGRect ab;
+    avail(main_id(), 1, &ab);
+    int16_t ar[4] = { 0, 0, 0, 0 };
+    check("GetAvailableWindowPositioningBounds", call("_GetAvailableWindowPositioningBounds", 2,
+                                                      (uint32_t[]){ call("_GetMainDevice", 0, NULL), DATA + 0xd90 }) == 0);
+    memcpy(ar, m32_h(DATA + 0xd90), 8);
+    check("... the display less its menu bar and Dock", ar[0] == (int16_t)ab.origin.y && ar[1] == (int16_t)ab.origin.x &&
+                                                        ar[2] == (int16_t)(ab.origin.y + ab.size.height) &&
+                                                        ar[3] == (int16_t)(ab.origin.x + ab.size.width));
+}
+
+/* CGFloat arrays: floats on i386, doubles on the host (src/m32_cross.c, g_float_arrays) */
+static void test_float_arrays(void)
+{
+    const char *CG = "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics";
+    void *(*rgb)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+    const double *(*components)(void *) = (const double *(*)(void *))dlsym(RTLD_DEFAULT, "CGColorGetComponents");
+    uint32_t space = m32_handle(rgb());
+    const float c[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+    memcpy(m32_h(DATA + 0xe00), c, sizeof c);
+    uint32_t color = cross(CG, "_CGColorCreate", 2, (uint32_t[]){ space, DATA + 0xe00 });
+    const double *hc = color ? components(m32_host(color)) : NULL;
+    check("CGColorCreate takes its components as floats", hc && hc[0] == 0.25 && hc[1] == 0.5 && hc[2] == 0.75 && hc[3] == 1.0);
+    /* two rectangles filled into a bitmap: both, not the first alone */
+    uint32_t a[6] = { DATA + 0xe10, 32, qd_rect(DATA + 0xe20, 0, 0, 16, 64), 0, 0, 0 };
+    call("_NewGWorld", 6, a);
+    uint32_t gw = m32_rd(DATA + 0xe10), q[2] = { gw, DATA + 0xe30 };
+    call("_SetGWorld", 2, (uint32_t[]){ gw, 0 });
+    call("_EraseRect", 1, (uint32_t[]){ qd_rect(DATA + 0xe20, 0, 0, 16, 64) });
+    call("_QDBeginCGContext", 2, q);
+    uint32_t ctx = m32_rd(DATA + 0xe30);
+    const float rects[8] = { 0, 0, 4, 4, 40, 0, 4, 4 };   /* CoreGraphics' coordinates: from the bottom left */
+    memcpy(m32_h(DATA + 0xe40), rects, sizeof rects);
+    cross(CG, "_CGContextSetRGBFillColor", 5, (uint32_t[]){ ctx, 0x3f800000 /* 1.0f */, 0, 0, 0x3f800000 });
+    cross(CG, "_CGContextFillRects", 3, (uint32_t[]){ ctx, DATA + 0xe40, 2 });
+    call("_QDEndCGContext", 2, q);
+    uint32_t pmh = call("_GetGWorldPixMap", 1, (uint32_t[]){ gw });
+    check("CGContextFillRects fills every rectangle", qd_pixel(pmh, 1, 14) == 0xff0000 && qd_pixel(pmh, 41, 14) == 0xff0000 &&
+                                                      qd_pixel(pmh, 20, 14) == 0xffffff);
+    call("_DisposeGWorld", 1, (uint32_t[]){ gw });
+}
+
 static void test_carbon(void)
 {
     void *(*session)(void) = (void *(*)(void))dlsym(dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
@@ -490,6 +654,9 @@ static void test_carbon(void)
     check("SetClip and GetClip", (cross(APPSERVICES, "_EqualRgn", 2, (uint32_t[]){ rgn, clip }) & 0xff) == 1);
     cross(APPSERVICES, "_DisposeRgn", 1, (uint32_t[]){ rgn });
     cross(APPSERVICES, "_DisposeRgn", 1, (uint32_t[]){ clip });
+    test_agl(port);
+    test_event_params(w, port);
+    test_float_arrays();
     cross(CARBON, "_DisposeWindow", 1, v);
     check("DisposeWindow takes the window's port with it", call("_IsValidPort", 1, pt) == 0);
 }

@@ -13,6 +13,7 @@
  * through a pointer, W/V one signed/unsigned long written through a pointer, Q a pointer to data whose layouts
  * differ (only a handle may pass; guest memory there needs a special).
  */
+#include <dlfcn.h>
 #include <malloc/malloc.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -346,7 +347,94 @@ typedef struct Writeback {
     uint32_t guest;           /* where the guest's value lives */
     uint64_t *cell;           /* the host cell the callee wrote */
     const M32Type *gt, *ht;   /* R: the structure's two layouts */
+    uint32_t n;               /* F: how many CGFloats */
 } Writeback;
+
+/*
+ * Arrays of CGFloats, and of the structures made of them (CGPoint, CGSize, CGRect), are floats on i386 and doubles on
+ * arm64.  A notation says only that an argument points at data laid out differently (Q) or at one such structure
+ * (r, R), so these say how long each array is: a fixed count, the value of a count argument (its stack word), the
+ * components of a color space argument and alpha, or a CFArray's count; times the CGFloats of one element.  The
+ * array crosses as a host copy of doubles, and an output array (out) is copied back as floats.  Kega Fusion's
+ * CGColorCreate handed CoreGraphics its floats as doubles; CGContextFillRects crossed its first rectangle only.
+ * OCERZ_NO_M32_FLOAT_ARRAYS=1 crosses them as before.
+ */
+typedef struct FloatArray {
+    const char *name;
+    int8_t arg, per, count_word, space_word, array_word, fixed, out;
+} FloatArray;
+static const FloatArray g_float_arrays[] = {
+    { "_CGColorCreate", 1, 1, -1, 0, -1, 0, 0 },
+    { "_CGColorCreateWithPattern", 2, 1, -1, 0, -1, 0, 0 },
+    { "_CGContextSetFillColor", 1, 1, -1, -1, -1, 5, 0 },   /* the fill space's components and alpha, at most 5 */
+    { "_CGContextSetStrokeColor", 1, 1, -1, -1, -1, 5, 0 },
+    { "_CGContextSetFillPattern", 2, 1, -1, -1, -1, 5, 0 },
+    { "_CGContextSetStrokePattern", 2, 1, -1, -1, -1, 5, 0 },
+    { "_CGContextSetLineDash", 2, 1, 3, -1, -1, 0, 0 },
+    { "_CGContextStrokeLineSegments", 1, 2, 2, -1, -1, 0, 0 },
+    { "_CGContextAddLines", 1, 2, 2, -1, -1, 0, 0 },
+    { "_CGContextFillRects", 1, 4, 2, -1, -1, 0, 0 },
+    { "_CGContextClipToRects", 1, 4, 2, -1, -1, 0, 0 },
+    { "_CGContextAddRects", 1, 4, 2, -1, -1, 0, 0 },
+    { "_CGContextShowGlyphsAtPositions", 2, 2, 3, -1, -1, 0, 0 },
+    { "_CGContextShowGlyphsWithAdvances", 2, 2, 3, -1, -1, 0, 0 },
+    { "_CGPathAddLines", 2, 2, 3, -1, -1, 0, 0 },
+    { "_CGPathAddRects", 2, 4, 3, -1, -1, 0, 0 },
+    { "_CGPathCreateCopyByDashingPath", 3, 1, 4, -1, -1, 0, 0 },
+    { "_CGGradientCreateWithColorComponents", 1, 1, 3, 0, -1, 0, 0 },
+    { "_CGGradientCreateWithColorComponents", 2, 1, 3, -1, -1, 0, 0 },
+    { "_CGGradientCreateWithColors", 2, 1, -1, -1, 1, 0, 0 },
+    { "_CGColorSpaceCreateCalibratedRGB", 0, 1, -1, -1, -1, 3, 0 },
+    { "_CGColorSpaceCreateCalibratedRGB", 1, 1, -1, -1, -1, 3, 0 },
+    { "_CGColorSpaceCreateCalibratedRGB", 2, 1, -1, -1, -1, 3, 0 },
+    { "_CGColorSpaceCreateCalibratedRGB", 3, 1, -1, -1, -1, 9, 0 },
+    { "_CGColorSpaceCreateCalibratedGray", 0, 1, -1, -1, -1, 3, 0 },
+    { "_CGColorSpaceCreateCalibratedGray", 1, 1, -1, -1, -1, 3, 0 },
+    { "_CGColorSpaceCreateLab", 0, 1, -1, -1, -1, 3, 0 },
+    { "_CGColorSpaceCreateLab", 1, 1, -1, -1, -1, 3, 0 },
+    { "_CGColorSpaceCreateLab", 2, 1, -1, -1, -1, 4, 0 },
+    { "_CGColorSpaceCreateICCBased", 1, 2, 0, -1, -1, 0, 0 },
+    { "_CGFunctionCreate", 2, 2, 1, -1, -1, 0, 0 },
+    { "_CGFunctionCreate", 4, 2, 3, -1, -1, 0, 0 },
+    { "_CTFontGetAdvancesForGlyphs", 3, 2, 4, -1, -1, 0, 1 },
+    { "_CTFontGetBoundingRectsForGlyphs", 3, 4, 4, -1, -1, 0, 1 },
+    { "_CTFontGetVerticalTranslationsForGlyphs", 2, 2, 3, -1, -1, 0, 1 },
+};
+
+/* how many CGFloats argument arg of export name points at, from the guest's other arguments at esp; 0: no rule */
+static int float_array_count(const char *name, int arg, uint32_t esp, int *out)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_FLOAT_ARRAYS") != NULL;
+    if (off)
+        return 0;
+    for (size_t r = 0; r < sizeof g_float_arrays / sizeof g_float_arrays[0]; r++) {
+        const FloatArray *f = &g_float_arrays[r];
+        if (f->arg != arg || strcmp(f->name, name))
+            continue;
+        *out = f->out;
+        if (f->fixed)
+            return f->fixed;
+        uint64_t n = (uint64_t)f->per;
+        if (f->count_word >= 0)
+            n *= m32_rd(esp + 4 + 4 * (uint32_t)f->count_word);
+        if (f->space_word >= 0 || f->array_word >= 0) {
+            static size_t (*components)(void *);
+            static long (*count)(void *);
+            if (!components) {
+                components = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "CGColorSpaceGetNumberOfComponents");
+                count = (long (*)(void *))dlsym(RTLD_DEFAULT, "CFArrayGetCount");
+            }
+            void *obj = m32_host(m32_rd(esp + 4 + 4 * (uint32_t)(f->space_word >= 0 ? f->space_word : f->array_word)));
+            if (!obj || !components || !count)
+                return 0;
+            n *= f->space_word >= 0 ? components(obj) + 1 : (uint64_t)count(obj);
+        }
+        return n > 0 && n <= 1u << 20 ? (int)n : 0;
+    }
+    return 0;
+}
 
 static pthread_mutex_t g_sig_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -677,6 +765,8 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
     hc.scratch_used = 0;
     Writeback wb[16];
     int nwb = 0;
+    double *floats[4];
+    int nfloats = 0;
     uint32_t ap = (uint32_t)cpu->gpr[OCERZ_RSP] + 4, sret = 0;
     int pop = 0;
     if (g->ret.cls == '{' && !(m32_struct_in_regs(&g->ret))) {
@@ -723,12 +813,28 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             put_int(&hc, (uint64_t)(uintptr_t)m32_callback((uint32_t)raw, ga->cb, ha->cb), 8);
             continue;
         }
+        if ((ga->cls == 'Q' || ga->cls == 'r' || ga->cls == 'R') && raw && nfloats < 4 && nwb < 16) {
+            int out = 0, n = float_array_count(e->name, i, (uint32_t)cpu->gpr[OCERZ_RSP], &out);
+            if (n) {
+                double *d = malloc(sizeof *d * (size_t)n);
+                const float *src = (const float *)m32_h((uint32_t)raw);
+                for (int k = 0; d && k < n; k++)
+                    d[k] = src[k];
+                if (d) {
+                    floats[nfloats++] = d;
+                    if (out)
+                        wb[nwb++] = (Writeback){ 'F', (uint32_t)raw, (uint64_t *)d, NULL, NULL, (uint32_t)n };
+                }
+                put_int(&hc, (uint64_t)(uintptr_t)d, 8);
+                continue;
+            }
+        }
         if (ga->cls == 'R' || ga->cls == 'r') {   /* copy in, and back out when the callee may write it */
             uint8_t *hs = raw ? scratch(&hc, ha->ssize) : NULL;
             if (hs) {
                 struct_in(ga, ha, m32_h((uint32_t)raw), hs, e->name, i);
                 if (ga->cls == 'R' && nwb < 16)
-                    wb[nwb++] = (Writeback){ 'R', (uint32_t)raw, (uint64_t *)hs, ga, ha };
+                    wb[nwb++] = (Writeback){ 'R', (uint32_t)raw, (uint64_t *)hs, ga, ha, 0 };
             }
             put_int(&hc, (uint64_t)(uintptr_t)hs, 8);
             continue;
@@ -739,7 +845,7 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
                 uint32_t cur = ga->cls == 'S' ? (uint32_t)(int32_t)*(int16_t *)m32_h((uint32_t)raw) : m32_rd((uint32_t)raw);
                 *cell = ga->cls == 'P' ? (uint64_t)(uintptr_t)m32_host(cur)
                       : ga->cls == 'W' || ga->cls == 'S' ? (uint64_t)(int64_t)(int32_t)cur : cur;
-                wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell, NULL, NULL };
+                wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell, NULL, NULL, 0 };
             }
             put_int(&hc, (uint64_t)(uintptr_t)cell, 8);
             continue;
@@ -797,8 +903,11 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
                              h->ret.cls == '{' && !m32_is_hfa(&h->ret) && h->ret.size > 16 ? big : NULL, out_x, out_v, &exc);
     ocerz_bridge_lower(&frame);
     m32_refresh_data();
-    if (exc)   /* the host raised: the guest's innermost @try gets it */
+    if (exc) {   /* the host raised: the guest's innermost @try gets it */
+        for (int i = 0; i < nfloats; i++)
+            free(floats[i]);
         return m32_objc_guest_throw(cpu, m32_objc_to_guest(exc));
+    }
     m32_save_errno(cpu);
     static int log_gl = -1, log_nan = -1, log_stat = -1;
     if (log_gl < 0) {
@@ -825,6 +934,13 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             log_cfdesc((void *)(uintptr_t)out_x[0]);
     }
     for (int i = 0; i < nwb; i++) {
+        if (wb[i].cls == 'F') {
+            float *dst = (float *)m32_h(wb[i].guest);
+            const double *d = (const double *)wb[i].cell;
+            for (uint32_t k = 0; k < wb[i].n; k++)
+                dst[k] = (float)d[k];
+            continue;
+        }
         if (wb[i].cls == 'R') {
             struct_out(wb[i].gt, wb[i].ht, (const uint8_t *)wb[i].cell, m32_h(wb[i].guest));
             continue;
@@ -835,6 +951,8 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
         else
             m32_wr(wb[i].guest, wb[i].cls == 'P' ? m32_handle((void *)(uintptr_t)v) : (uint32_t)v);
     }
+    for (int i = 0; i < nfloats; i++)
+        free(floats[i]);
     const M32Type *gr = &g->ret, *hr = &h->ret;
     if (gr->cls == 'v') {
         m32_ret(cpu, (uint32_t)cpu->gpr[OCERZ_RAX], (uint32_t)cpu->gpr[OCERZ_RDX], 0);

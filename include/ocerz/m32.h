@@ -52,7 +52,14 @@ int m32_dyld_entry(struct OcerzVM *vm, OcerzCPU *cpu);                   /* the 
 uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint64_t off);   /* src/m32_libsystem.c */
 void m32_selfload_begin(const char *path);                                 /* m32_run, before the program starts */
 void *m32_carbon_wrap(const char *symbol, void *fn);   /* src/m32_carbon.c: the host function an export calls */
+M32Special m32_carbon_special(const char *symbol);      /* src/m32_carbon.c: the UPP calls, by name pattern */
+extern const M32SpecialEntry m32_carbon_specials[]; /* src/m32_carbon.c: Carbon event parameters */
+uint32_t m32_qd_window_port(void *window);             /* src/m32_qd.c: a window's QuickDraw port, made if need be */
+uint32_t m32_qd_current_port(void);                    /* the current QuickDraw port, or 0 */
 void m32_qd_window_gone(void *window);                 /* src/m32_qd.c: DisposeWindow drops the window's port */
+void *m32_qd_port_window(uint32_t port);               /* a QuickDraw port's host window, or NULL */
+int m32_qd_port_pixels(uint32_t port, int *w, int *h, uint32_t *rowbytes, uint32_t *pixels);   /* a GWorld's */
+extern const M32SpecialEntry m32_agl_specials[];    /* src/m32_agl.c: AGL on the arm64 AGL, ports as drawables */
 int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap);   /* a trap made from inside a block */
 uint32_t m32_export_special(const char *name, M32Special fn);
 /* the Steam bridge (src/m32_steam.c): a steamclient.dylib with no i386 slice opens as the host's own */

@@ -239,6 +239,25 @@ static void port_free(QdPort *p)
     pthread_mutex_unlock(&g_lock);
 }
 
+/* a port's host window, or its pixels for a GWorld's: AGL draws into either (src/m32_agl.c) */
+void *m32_qd_port_window(uint32_t port)
+{
+    QdPort *p = port_of(port);
+    return p && p->window ? (void *)p->win : NULL;
+}
+
+int m32_qd_port_pixels(uint32_t port, int *w, int *h, uint32_t *rowbytes, uint32_t *pixels)
+{
+    QdPort *p = port_of(port);
+    if (!p || p->window || !p->ctx)
+        return 0;
+    *w = p->w;
+    *h = p->h;
+    *rowbytes = p->rowbytes;
+    *pixels = p->pixels;
+    return 1;
+}
+
 /* DisposeWindow takes the window's port with it (src/m32_carbon.c calls this first) */
 void m32_qd_window_gone(void *window)
 {
@@ -412,9 +431,8 @@ static void draw_image(CGContextRef c, CGImageRef img, QdRect r)
 
 /* ---- GetPort, SetPort and the window's port ---- */
 
-static QdPort *window_port(uint32_t gwin)
+static QdPort *port_for_window(WindowRef w)
 {
-    WindowRef w = (WindowRef)m32_host(gwin);
     if (!w || !ready())
         return NULL;
     QdPort *p = port_by_window(w);
@@ -426,6 +444,17 @@ static QdPort *window_port(uint32_t gwin)
     }
     return p;
 }
+
+static QdPort *window_port(uint32_t gwin) { return port_for_window((WindowRef)m32_host(gwin)); }
+
+/* for Carbon events (src/m32_carbon.c): a window's port, and the current one */
+uint32_t m32_qd_window_port(void *window)
+{
+    QdPort *p = port_for_window((WindowRef)window);
+    return p ? p->guest : 0;
+}
+
+uint32_t m32_qd_current_port(void) { return g_cur ? g_cur->guest : 0; }
 
 static int qd_GetWindowPort(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; QdPort *p = window_port(A(0)); RET(p ? p->guest : 0); }
 static int qd_SetPortWindowPort(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; QdPort *p = window_port(A(0)); if (p) g_cur = p; RET(0); }
@@ -1204,6 +1233,51 @@ static int qd_GetQDGlobalsScreenBits(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(A(0));
 }
 
+/* the display a GDHandle of ours stands for, else the main one */
+static CGDirectDisplayID display_of(uint32_t gdh)
+{
+    for (uint32_t d = devices(); d; d = m32_rd(m32_rd(d) + GD_NEXT))
+        if (d == gdh)
+            return m32_rd(m32_rd(d) + GDEVICE_BYTES);
+    return CGMainDisplayID_();
+}
+
+/* GetAvailableWindowPositioningBounds(GDHandle, Rect *): the display less its menu bar and Dock, in global
+ * coordinates, as HIWindowGetAvailablePositioningBounds gives it; Kega Fusion sized its window from it, and from the
+ * garbage an unanswered call left, AppKit refused to make the window's surface */
+static int available_bounds(uint32_t gdh, QdRect *r)
+{
+    static OSStatus (*avail)(CGDirectDisplayID, int, CGRect *);
+    if (!avail)
+        avail = (OSStatus (*)(CGDirectDisplayID, int, CGRect *))dlsym(RTLD_DEFAULT, "HIWindowGetAvailablePositioningBounds");
+    CGRect b;
+    if (!ready() || !avail || avail(display_of(gdh), 1 /* kHICoordSpace72DPIGlobal */, &b) != noErr)
+        return PARAM_ERR;
+    *r = (QdRect){ (int16_t)b.origin.y, (int16_t)b.origin.x, (int16_t)(b.origin.y + b.size.height),
+                   (int16_t)(b.origin.x + b.size.width) };
+    return NO_ERR;
+}
+
+static int qd_GetAvailableWindowPositioningBounds(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    QdRect r;
+    int err = available_bounds(A(0), &r);
+    if (!err)
+        wr_rect(A(1), r);
+    RET((uint32_t)(int32_t)err);
+}
+
+static int qd_GetAvailableWindowPositioningRegion(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    QdRect r;
+    int err = available_bounds(A(0), &r);
+    if (!err && A(1))
+        RectRgn_(m32_host(A(1)), &r);
+    RET((uint32_t)(int32_t)err);
+}
+
 static int qd_SysBeep(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; if (ready() && NSBeep_) NSBeep_(); RET(0); }
 
 const M32SpecialEntry m32_qd_specials[] = {
@@ -1244,6 +1318,8 @@ const M32SpecialEntry m32_qd_specials[] = {
     { "_SetGDevice", qd_SetGDevice }, { "_GetNextDevice", qd_GetNextDevice }, { "_GetGDevPixMap", qd_GetGDevPixMap },
     { "_TestDeviceAttribute", qd_TestDeviceAttribute }, { "_QDGetCGDirectDisplayID", qd_QDGetCGDirectDisplayID },
     { "_GetQDGlobalsScreenBits", qd_GetQDGlobalsScreenBits },
+    { "_GetAvailableWindowPositioningBounds", qd_GetAvailableWindowPositioningBounds },
+    { "_GetAvailableWindowPositioningRegion", qd_GetAvailableWindowPositioningRegion },
     { "_SysBeep", qd_SysBeep }, { "_KillPicture", qd_Ok0 },
     { NULL, NULL }
 };

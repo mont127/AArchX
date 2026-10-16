@@ -348,6 +348,7 @@
 #include "ocerz/m32.h"
 
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -1961,6 +1962,32 @@ static FILE *diag_stream(void)
     return f ? f : stderr;
 }
 
+/* OCERZ_ABORT_REPORT=1: an abort, which host code reaches without a word (an assertion in a framework, an uncaught
+ * exception with its log gone), names the host frames it came from and the guest instruction its thread was at, then
+ * aborts as before. */
+static void abort_report(int sig, siginfo_t *si, void *ctx)
+{
+    (void)si;
+    (void)ctx;
+    FILE *out = diag_stream();
+    void *frames[48];
+    int n = backtrace(frames, 48);
+    OcerzCPU *cpu = ocerz_vm_current_cpu();
+    fprintf(out, "ocerz: abort on thread %u, guest rip %#llx\n", (unsigned)pthread_mach_thread_np(pthread_self()),
+            cpu ? (unsigned long long)cpu->rip : 0ull);
+    for (int i = 1; i < n; i++) {
+        Dl_info di;
+        if (dladdr(frames[i], &di) && di.dli_fname)
+            fprintf(out, "ocerz:   %s %s+%#lx\n", strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname,
+                    di.dli_sname ? di.dli_sname : "?", (unsigned long)((char *)frames[i] - (char *)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)));
+        else
+            fprintf(out, "ocerz:   %p\n", frames[i]);
+    }
+    fflush(out);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
     static __thread volatile int depth;
@@ -3486,6 +3513,13 @@ void ocerz_vm_install_handlers(OcerzVM *vm)
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
     sigaction(SIGSYS, &sa, NULL);
+    if (getenv("OCERZ_ABORT_REPORT")) {
+        struct sigaction ab;
+        memset(&ab, 0, sizeof ab);
+        ab.sa_sigaction = abort_report;
+        ab.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        sigaction(SIGABRT, &ab, NULL);
+    }
 
     struct sigaction as;
     memset(&as, 0, sizeof as);
