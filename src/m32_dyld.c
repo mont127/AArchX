@@ -1081,11 +1081,20 @@ static int sp_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* A function m32 cannot call - no declaration to cross it by, or a shape it cannot carry - is not there to dlsym: a
+ * program probing for an optional function takes its own fallback, where the trap would answer 0.  cairo's Quartz
+ * backend asks for CGContextGetType that way and, given the trap, took every bitmap context for some other kind
+ * (OCERZ_NO_M32_DLSYM_NULL=1 hands out the traps again).  Data stays: its placeholder stands for the host variable. */
 static uint32_t system_symbol(const char *lib, const char *sym)
 {
+    static int traps = -1;
+    if (traps < 0)
+        traps = getenv("OCERZ_NO_M32_DLSYM_NULL") != NULL;
     uint32_t v = m32_export(lib, sym);
     uint32_t id = v - (uint32_t)OCERZ_DYLDAPI_LO;
     M32Export *e = v - OCERZ_DYLDAPI_LO < OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO ? m32_export_by_id(id) : NULL;
+    if (e && e->kind == M32_EX_BAD && !e->data && !traps)
+        return 0;
     return e && e->kind == M32_EX_UNRESOLVED ? 0 : v;
 }
 

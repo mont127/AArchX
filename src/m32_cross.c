@@ -348,7 +348,98 @@ typedef struct Writeback {
     uint64_t *cell;           /* the host cell the callee wrote */
     const M32Type *gt, *ht;   /* R: the structure's two layouts */
     uint32_t n;               /* F: how many CGFloats */
+    const struct Packed *pk;  /* K: the structure's steps */
 } Writeback;
+
+/*
+ * Structures the notation cannot describe.  HIToolbox's theme structures are packed to 2, and some hold a union, so
+ * sdkgen gave the arguments that point at them Q and they crossed as the guest's bytes.  Most are laid out alike on
+ * both (a button's draw info is 30 bytes on each, measured with clang -arch i386 and -arch arm64); these are not, as
+ * their CGFloats, longs and CF references widen.  Each is a run of steps: b copies bytes, F widens floats to doubles,
+ * L words to longs, P handles to host pointers.  Firefox 3.6 draws its scroll bars with HIThemeDrawTrack, whose
+ * HIThemeTrackDrawInfo has its HIRect after six bytes: crossed, HIToolbox read its floats as doubles and everything
+ * after them 16 bytes off.  An output structure (out) is copied back.  OCERZ_NO_M32_PACKED=1 crosses them as before.
+ */
+typedef struct Packed { const char *steps; uint16_t gsize, hsize; } Packed;
+static const Packed k_track = { "b6F4b26", 48, 64 },      /* HIThemeTrackDrawInfo */
+                    k_menu = { "b6L1F1b4F2", 26, 42 },    /* HIThemeMenuDrawInfo */
+                    k_text = { "b32P1", 36, 40 },         /* HIThemeTextInfo: truncationHappened comes back */
+                    k_window = { "b14F2", 22, 30 },       /* HIThemeWindowDrawInfo */
+                    k_sbtrack = { "b6F1", 10, 14 },       /* HIScrollBarTrackInfo */
+                    k_title = { "b10F1", 14, 18 };        /* HIThemeMenuTitleDrawInfo */
+static const struct { const char *name; int8_t arg, out; const Packed *p; } g_packed[] = {
+    { "_HIThemeDrawTrack", 0, 0, &k_track }, { "_HIThemeDrawTrackTickMarks", 0, 0, &k_track },
+    { "_HIThemeGetScrollBarTrackRect", 1, 0, &k_track }, { "_HIThemeGetTrackBounds", 0, 0, &k_track },
+    { "_HIThemeGetTrackDragRect", 0, 0, &k_track }, { "_HIThemeGetTrackLiveValue", 0, 0, &k_track },
+    { "_HIThemeGetTrackPartBounds", 0, 0, &k_track }, { "_HIThemeGetTrackParts", 0, 0, &k_track },
+    { "_HIThemeGetTrackThumbPositionFromBounds", 0, 0, &k_track },
+    { "_HIThemeGetTrackThumbPositionFromOffset", 0, 0, &k_track }, { "_HIThemeGetTrackThumbShape", 0, 0, &k_track },
+    { "_HIThemeHitTestTrack", 0, 0, &k_track },
+    { "_HIThemeDrawMenuBackground", 1, 0, &k_menu }, { "_HIThemeGetMenuBackgroundShape", 1, 0, &k_menu },
+    { "_HIThemeDrawTextBox", 2, 1, &k_text }, { "_HIThemeGetTextDimensions", 2, 1, &k_text },
+    { "_HIThemeDrawWindowFrame", 1, 0, &k_window }, { "_HIThemeDrawTitleBarWidget", 1, 0, &k_window },
+    { "_HIThemeGetWindowRegionHit", 1, 0, &k_window }, { "_HIThemeGetWindowShape", 1, 0, &k_window },
+    { "_HIThemeHitTestScrollBarArrows", 1, 0, &k_sbtrack }, { "_HIThemeDrawMenuTitle", 2, 0, &k_title },
+};
+
+static const Packed *packed_layout(const char *name, int arg, int *out)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_PACKED") != NULL;
+    for (size_t i = 0; !off && i < sizeof g_packed / sizeof g_packed[0]; i++)
+        if (g_packed[i].arg == arg && !strcmp(g_packed[i].name, name)) {
+            *out = g_packed[i].out;
+            return g_packed[i].p;
+        }
+    return NULL;
+}
+
+/* guest bytes to host (in) or back (!in), step by step */
+static void packed_copy(const Packed *p, uint8_t *g, uint8_t *h, int in)
+{
+    for (const char *s = p->steps; *s;) {
+        char op = *s++;
+        unsigned n = 0;
+        while (*s >= '0' && *s <= '9')
+            n = n * 10 + (unsigned)(*s++ - '0');
+        for (unsigned k = 0; k < (op == 'b' ? 1 : n); k++) {
+            uint32_t w = 0;
+            uint64_t x = 0;
+            if (op == 'b') {
+                memcpy(in ? h : g, in ? g : h, n);
+                g += n;
+                h += n;
+                continue;
+            }
+            if (in) {
+                memcpy(&w, g, 4);
+                if (op == 'F') {
+                    float f;
+                    memcpy(&f, &w, 4);
+                    double d = f;
+                    memcpy(&x, &d, 8);
+                } else {
+                    x = op == 'P' ? (uint64_t)(uintptr_t)m32_host(w) : w;
+                }
+                memcpy(h, &x, 8);
+            } else {
+                memcpy(&x, h, 8);
+                if (op == 'F') {
+                    double d;
+                    memcpy(&d, &x, 8);
+                    float f = (float)d;
+                    memcpy(&w, &f, 4);
+                } else {
+                    w = op == 'P' ? m32_handle((void *)(uintptr_t)x) : (uint32_t)x;
+                }
+                memcpy(g, &w, 4);
+            }
+            g += 4;
+            h += 8;
+        }
+    }
+}
 
 /*
  * Arrays of CGFloats, and of the structures made of them (CGPoint, CGSize, CGRect), are floats on i386 and doubles on
@@ -396,6 +487,12 @@ static const FloatArray g_float_arrays[] = {
     { "_CGColorSpaceCreateICCBased", 1, 2, 0, -1, -1, 0, 0 },
     { "_CGFunctionCreate", 2, 2, 1, -1, -1, 0, 0 },
     { "_CGFunctionCreate", 4, 2, 3, -1, -1, 0, 0 },
+    { "_CGFontGetGlyphBBoxes", 3, 4, 2, -1, -1, 0, 1 },
+    { "_HIThemeGetTextDimensions", 3, 1, -1, -1, -1, 1, 1 },   /* width, height and baseline */
+    { "_HIThemeGetTextDimensions", 4, 1, -1, -1, -1, 1, 1 },
+    { "_HIThemeGetTextDimensions", 5, 1, -1, -1, -1, 1, 1 },
+    { "_HIThemeGetTrackThumbPositionFromBounds", 2, 1, -1, -1, -1, 1, 1 },   /* HIThemeTrackPosition, a CGFloat */
+    { "_HIThemeGetTrackThumbPositionFromOffset", 2, 1, -1, -1, -1, 1, 1 },
     { "_CTFontGetAdvancesForGlyphs", 3, 2, 4, -1, -1, 0, 1 },
     { "_CTFontGetBoundingRectsForGlyphs", 3, 4, 4, -1, -1, 0, 1 },
     { "_CTFontGetVerticalTranslationsForGlyphs", 2, 2, 3, -1, -1, 0, 1 },
@@ -813,6 +910,18 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             put_int(&hc, (uint64_t)(uintptr_t)m32_callback((uint32_t)raw, ga->cb, ha->cb), 8);
             continue;
         }
+        int pk_out = 0;
+        const Packed *pk = ga->cls == 'Q' && raw ? packed_layout(e->name, i, &pk_out) : NULL;
+        if (pk) {
+            uint8_t *hs = scratch(&hc, pk->hsize);
+            if (hs) {
+                packed_copy(pk, m32_h((uint32_t)raw), hs, 1);
+                if (pk_out && nwb < 16)
+                    wb[nwb++] = (Writeback){ 'K', (uint32_t)raw, (uint64_t *)hs, NULL, NULL, 0, pk };
+            }
+            put_int(&hc, (uint64_t)(uintptr_t)hs, 8);
+            continue;
+        }
         if ((ga->cls == 'Q' || ga->cls == 'r' || ga->cls == 'R') && raw && nfloats < 4 && nwb < 16) {
             int out = 0, n = float_array_count(e->name, i, (uint32_t)cpu->gpr[OCERZ_RSP], &out);
             if (n) {
@@ -823,7 +932,7 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
                 if (d) {
                     floats[nfloats++] = d;
                     if (out)
-                        wb[nwb++] = (Writeback){ 'F', (uint32_t)raw, (uint64_t *)d, NULL, NULL, (uint32_t)n };
+                        wb[nwb++] = (Writeback){ 'F', (uint32_t)raw, (uint64_t *)d, NULL, NULL, (uint32_t)n, NULL };
                 }
                 put_int(&hc, (uint64_t)(uintptr_t)d, 8);
                 continue;
@@ -834,7 +943,7 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             if (hs) {
                 struct_in(ga, ha, m32_h((uint32_t)raw), hs, e->name, i);
                 if (ga->cls == 'R' && nwb < 16)
-                    wb[nwb++] = (Writeback){ 'R', (uint32_t)raw, (uint64_t *)hs, ga, ha, 0 };
+                    wb[nwb++] = (Writeback){ 'R', (uint32_t)raw, (uint64_t *)hs, ga, ha, 0, NULL };
             }
             put_int(&hc, (uint64_t)(uintptr_t)hs, 8);
             continue;
@@ -845,7 +954,7 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
                 uint32_t cur = ga->cls == 'S' ? (uint32_t)(int32_t)*(int16_t *)m32_h((uint32_t)raw) : m32_rd((uint32_t)raw);
                 *cell = ga->cls == 'P' ? (uint64_t)(uintptr_t)m32_host(cur)
                       : ga->cls == 'W' || ga->cls == 'S' ? (uint64_t)(int64_t)(int32_t)cur : cur;
-                wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell, NULL, NULL, 0 };
+                wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell, NULL, NULL, 0, NULL };
             }
             put_int(&hc, (uint64_t)(uintptr_t)cell, 8);
             continue;
@@ -904,6 +1013,15 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
     ocerz_bridge_lower(&frame);
     m32_refresh_data();
     if (exc) {   /* the host raised: the guest's innermost @try gets it */
+        static int log_throws = -1;
+        if (log_throws < 0)
+            log_throws = getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "throws");
+        if (log_throws) {
+            void m32_describe_exception(void *exception, char *buf, unsigned long size);   /* src/m32_catch.m */
+            char what[512];
+            m32_describe_exception(exc, what, sizeof what);
+            fprintf(stderr, "ocerz: m32: %s raised %s (caller %#x)\n", e->name, what, m32_rd((uint32_t)cpu->gpr[OCERZ_RSP]));
+        }
         for (int i = 0; i < nfloats; i++)
             free(floats[i]);
         return m32_objc_guest_throw(cpu, m32_objc_to_guest(exc));
@@ -943,6 +1061,10 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
         }
         if (wb[i].cls == 'R') {
             struct_out(wb[i].gt, wb[i].ht, (const uint8_t *)wb[i].cell, m32_h(wb[i].guest));
+            continue;
+        }
+        if (wb[i].cls == 'K') {
+            packed_copy(wb[i].pk, m32_h(wb[i].guest), (uint8_t *)wb[i].cell, 0);
             continue;
         }
         uint64_t v = *wb[i].cell;

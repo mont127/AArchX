@@ -1107,11 +1107,57 @@ static int system_font(OcerzCPU *cpu, void *hself, const char *name)
     return 1;
 }
 
+/* -[NSView getRectsBeingDrawn:(const NSRect **)rects count:(NSInteger *)count] hands back AppKit's own array, valid
+ * while drawRect: runs: a host pointer to NSRects of doubles.  Crossed, the guest got that pointer cut to 32 bits, and
+ * Firefox 3.6's drawRect: read its rectangles from there and faulted.  The rectangles are copied, as floats, into a
+ * guest array kept per thread and grown as needed. */
+static int rects_being_drawn(OcerzCPU *cpu, void *hself, Class super_cls, SEL hs, const char *name)
+{
+    if (strcmp(name, "getRectsBeingDrawn:count:"))
+        return 0;
+    static __thread uint32_t buf, cap;
+    typedef struct { double x, y, w, h; } HostRect;   /* NSRect on arm64 */
+    const HostRect *r = NULL;
+    long n = 0;
+    if (super_cls) {
+        struct objc_super sup = { hself, super_cls };
+        ((void (*)(struct objc_super *, SEL, const HostRect **, long *))objc_msgSendSuper)(&sup, hs, &r, &n);
+    } else {
+        ((void (*)(id, SEL, const HostRect **, long *))M32_MSGSEND)(hself, hs, &r, &n);
+    }
+    if (!r || n < 0 || n > 1 << 20)
+        n = 0;
+    if ((uint32_t)n > cap) {
+        if (buf)
+            m32_free(buf);
+        buf = m32_malloc(16 * (uint32_t)n);
+        cap = buf ? (uint32_t)n : 0;
+        if (!buf)
+            n = 0;
+    }
+    float *f = n ? m32_h(buf) : NULL;
+    for (long i = 0; i < n; i++) {
+        f[4 * i] = (float)r[i].x;
+        f[4 * i + 1] = (float)r[i].y;
+        f[4 * i + 2] = (float)r[i].w;
+        f[4 * i + 3] = (float)r[i].h;
+    }
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP];   /* self, _cmd, rects, count */
+    if (rd(esp + 12))
+        m32_wr(rd(esp + 12), n ? buf : 0);
+    if (rd(esp + 16))
+        m32_wr(rd(esp + 16), (uint32_t)n);
+    m32_ret(cpu, 0, 0, 0);
+    return 1;
+}
+
 static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, uint32_t gsel, uint32_t gtypes, int is_super)
 {
     SEL hs = m32_sel_host(gsel);
     const char *name = sel_getName(hs);
     if (!is_super && system_font(cpu, hself, name))
+        return OCERZ_STEP_OK;
+    if (rects_being_drawn(cpu, hself, is_super ? super_cls : NULL, hs, name))
         return OCERZ_STEP_OK;
     int is_class = object_isClass(hself);
     Class lookup_cls = super_cls ? super_cls : object_getClass(hself);

@@ -159,12 +159,17 @@ static void dispatch(unsigned slot, const uint64_t *x, const uint64_t *v, const 
         log_cb = getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "callbacks");
     if (log_cb)
         fprintf(stderr, "ocerz: m32: callback slot %u -> guest %#x %s (%d words)\n", slot, cb->fn, cb->gnote, nw);
+    const M32Type *gr = &g->ret, *hr = &h->ret;
+    uint32_t sret = 0;   /* a structure i386 returns through memory: its address goes first */
+    if (gr->cls == '{' && !m32_struct_in_regs(gr) && nw < 16 && (sret = m32_malloc(gr->size ? gr->size : 4))) {
+        memmove(words + 1, words, sizeof *words * (size_t)nw++);
+        words[0] = sret;
+    }
     uint32_t edx = 0;
     double st0 = 0;
     uint64_t fpcr = ocerz_abi_round_swap(OCERZ_ABI_ROUND_NEAREST);
     uint32_t eax = m32_call(vm, cb->fn, words, nw, &edx, &st0);
     ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
-    const M32Type *gr = &g->ret, *hr = &h->ret;
     switch (gr->cls) {
     case 'v':
         break;
@@ -180,14 +185,43 @@ static void dispatch(unsigned slot, const uint64_t *x, const uint64_t *v, const 
     case 'l': case 'L':
         out_x[0] = eax | (uint64_t)edx << 32;
         break;
-    case '{':
-        m32_log_once("structure results from guest callbacks are not supported:", cb->gnote);
+    case '{': {
+        /* i386 Darwin: up to 8 bytes in EAX:EDX, a lone float or double in ST0, the rest through sret; arm64: an
+         * HFA in v0-v3, up to 16 bytes in x0 and x1, the rest at x8.  AppKit asks a window delegate written in
+         * i386 code windowWillResize:toSize:, an NSSize. */
+        uint8_t gbuf[256] = { 0 }, hbuf[256] = { 0 };
+        if (sret) {
+            memcpy(gbuf, m32_h(sret), gr->size);
+            m32_free(sret);
+        } else if (gr->n == 1 && (gr->mcls[0] == 'f' || gr->mcls[0] == 'd')) {
+            float f = (float)st0;
+            if (gr->mcls[0] == 'f')
+                memcpy(gbuf, &f, 4);
+            else
+                memcpy(gbuf, &st0, 8);
+        } else {
+            memcpy(gbuf, &eax, 4);
+            memcpy(gbuf + 4, &edx, 4);
+        }
+        for (int k = 0; k < gr->n && k < hr->n; k++) {
+            uint64_t raw = 0;
+            memcpy(&raw, gbuf + gr->moff[k], gr->msize[k]);
+            uint64_t hv = m32_scalar_in(gr->mcls[k], hr->mcls[k], raw, cb->gnote, -1);
+            memcpy(hbuf + hr->moff[k], &hv, hr->msize[k]);
+        }
+        if (m32_is_hfa(hr))
+            for (int k = 0; k < hr->n; k++)
+                memcpy(&out_v[k], hbuf + hr->moff[k], hr->msize[k]);
+        else if (hr->size <= 16)
+            memcpy(out_x, hbuf, hr->size);
+        else if (x8)
+            memcpy(x8, hbuf, hr->size);
         break;
+    }
     default:
         out_x[0] = m32_scalar_in(gr->cls, hr->cls, eax, "callback result", -1);
         break;
     }
-    (void)x8;
 }
 
 void *m32_callback(uint32_t guest_fn, const char *guest_sig, const char *host_sig)

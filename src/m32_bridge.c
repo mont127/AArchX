@@ -233,8 +233,15 @@ uint32_t m32_export(const char *lib, const char *name)
     e->name = strdup(name);
     e->special = m32_special(name);
     e->kind = e->special ? M32_EX_SPECIAL : M32_EX_UNRESOLVED;
+    /* GNU libiconv's own names, which Apple's libiconv exported beside iconv's until Apple silicon (Firefox 3.6) */
+    static const char *const iconv_names[][2] = { { "_libiconv", "_iconv" }, { "_libiconv_open", "_iconv_open" },
+                                                  { "_libiconv_close", "_iconv_close" } };
+    const char *as = name;
+    for (size_t i = 0; i < sizeof iconv_names / sizeof iconv_names[0]; i++)
+        if (!strcmp(name, iconv_names[i][0]))
+            as = iconv_names[i][1];
     M32DbRec r;
-    if (!e->special && m32_db_lookup(lib, name, &r)) {
+    if (!e->special && m32_db_lookup(lib, as, &r)) {
         e->variant = r.variant;
         e->host_symbol = r.host_symbol;
         if (r.kind == M32_DB_FN) {

@@ -781,6 +781,170 @@ static void test_sF(void)
 }
 
 /* menus and controls arm64 HIToolbox dropped (src/m32_controls.c) */
+/* i386 functions the CoreGraphics callback tests hand over, assembled with clang -target i386 (at CODE + 0x200):
+ *   0x00 applier(info, element): info[0]++, info[1] += element->type, info[2 + n] = element->points[0].x
+ *   0x1d evaluate(info, in, out): out[0] = in[0] * 0.5f
+ *   0x3b counter(info, ...): (*info)++
+ *   0x42 size(void): {1.5f, 2.5f} in EAX:EDX
+ *   0x4d rect(sret): {1, 2, 3, 4} through the hidden pointer, popped with ret $4 */
+static const uint8_t k_cg_code[] = {
+    0x8b, 0x44, 0x24, 0x04, 0x8b, 0x4c, 0x24, 0x08, 0x8b, 0x10, 0xff, 0x00, 0x53, 0x8b, 0x19, 0x01, 0x58, 0x04, 0x8b,
+    0x49, 0x04, 0x8b, 0x19, 0x89, 0x5c, 0x90, 0x08, 0x5b, 0xc3, 0x8b, 0x44, 0x24, 0x08, 0x8b, 0x4c, 0x24, 0x0c, 0xf3,
+    0x0f, 0x10, 0x00, 0xba, 0x00, 0x00, 0x00, 0x3f, 0x66, 0x0f, 0x6e, 0xca, 0xf3, 0x0f, 0x59, 0xc1, 0xf3, 0x0f, 0x11,
+    0x01, 0xc3, 0x8b, 0x44, 0x24, 0x04, 0xff, 0x00, 0xc3, 0xb8, 0x00, 0x00, 0xc0, 0x3f, 0xba, 0x00, 0x00, 0x20, 0x40,
+    0xc3, 0x8b, 0x44, 0x24, 0x04, 0xc7, 0x00, 0x00, 0x00, 0x80, 0x3f, 0xc7, 0x40, 0x04, 0x00, 0x00, 0x00, 0x40, 0xc7,
+    0x40, 0x08, 0x00, 0x00, 0x40, 0x40, 0xc7, 0x40, 0x0c, 0x00, 0x00, 0x80, 0x40, 0xc2, 0x04, 0x00 };
+enum { CG_CODE = CODE + 0x200, APPLIER = CG_CODE, EVALUATE = CG_CODE + 0x1d, COUNTER = CG_CODE + 0x3b,
+       SIZE_FN = CG_CODE + 0x42, RECT_FN = CG_CODE + 0x4d };
+
+static uint32_t float_word(float f)
+{
+    uint32_t w;
+    memcpy(&w, &f, 4);
+    return w;
+}
+
+static void *host_fn(const char *name)
+{
+    void *f = dlsym(RTLD_DEFAULT, name);
+    check(name, f != NULL);
+    return f;
+}
+
+/* CoreGraphics' callbacks, path elements and the private calls cairo uses (src/m32_cg.c, src/m32_atsu.c), and
+ * structures a guest callback returns (src/m32_callback.c) */
+static void test_cg(void)
+{
+    memcpy(m32_h(CG_CODE), k_cg_code, sizeof k_cg_code);
+    void *(*cfstr)(void *, const char *, uint32_t) = (void *(*)(void *, const char *, uint32_t))host_fn("CFStringCreateWithCString");
+    void *(*font_named)(void *) = (void *(*)(void *))host_fn("CGFontCreateWithFontName");
+    int (*ascent)(void *) = (int (*)(void *))host_fn("CGFontGetAscent");
+    CGRect (*path_box)(void *) = (CGRect (*)(void *))host_fn("CGPathGetBoundingBox");
+    void *font = font_named(cfstr(NULL, "Helvetica", 0x08000100));
+    check("Helvetica as a CGFont", font != NULL);
+    uint32_t f = m32_handle(font);
+    /* CGFontGetGlyphsForUnichars: two characters, two glyphs, and glyph 0 for none */
+    const uint16_t chars[3] = { 'H', 'i', 0xFFFF };
+    memcpy(m32_h(DATA + 0x2000), chars, sizeof chars);
+    memset(m32_h(DATA + 0x2010), 0xff, 6);
+    call("_CGFontGetGlyphsForUnichars", 4, (uint32_t[]){ f, DATA + 0x2000, DATA + 0x2010, 3 });
+    const uint16_t *glyphs = m32_h(DATA + 0x2010);
+    check("CGFontGetGlyphsForUnichars", glyphs[0] && glyphs[1] && glyphs[0] != glyphs[1] && glyphs[2] == 0);
+    /* CGFontGetHMetrics: a guest pointer to {ascent, descent, leading} in font units */
+    uint32_t m = call("_CGFontGetHMetrics", 1, (uint32_t[]){ f });
+    check("CGFontGetHMetrics", m && (int32_t)m32_rd(m) == ascent(font) && (int32_t)m32_rd(m + 4) < 0);
+    /* CGFontGetGlyphPath: the outline at an em of 1, scaled by the transform's six floats */
+    const float twice[6] = { 2, 0, 0, 2, 0, 0 };
+    memcpy(m32_h(DATA + 0x2020), twice, sizeof twice);
+    uint32_t p1 = call("_CGFontGetGlyphPath", 4, (uint32_t[]){ f, 0, 0, glyphs[0] });
+    uint32_t p2 = call("_CGFontGetGlyphPath", 4, (uint32_t[]){ f, DATA + 0x2020, 0, glyphs[0] });
+    CGRect b1 = p1 ? path_box(m32_host(p1)) : (CGRect){ { 0, 0 }, { 0, 0 } }, b2 = p2 ? path_box(m32_host(p2)) : (CGRect){ { 0, 0 }, { 0, 0 } };
+    check("CGFontGetGlyphPath at an em of 1", b1.size.width > 0.3 && b1.size.width < 1.5 && b1.size.height > 0.3);
+    check("CGFontGetGlyphPath through the transform", b2.size.width > 1.9 * b1.size.width && b2.size.width < 2.1 * b1.size.width);
+    /* CGPathApply: the guest applier sees each element as {type, points}, its points as floats */
+    void *(*mk_path)(void) = (void *(*)(void))host_fn("CGPathCreateMutable");
+    void (*move)(void *, const void *, double, double) = (void (*)(void *, const void *, double, double))host_fn("CGPathMoveToPoint");
+    void (*line)(void *, const void *, double, double) = (void (*)(void *, const void *, double, double))host_fn("CGPathAddLineToPoint");
+    void (*curve)(void *, const void *, double, double, double, double, double, double) =
+        (void (*)(void *, const void *, double, double, double, double, double, double))host_fn("CGPathAddCurveToPoint");
+    void (*close_path)(void *) = (void (*)(void *))host_fn("CGPathCloseSubpath");
+    void *path = mk_path();
+    move(path, NULL, 1, 2);
+    line(path, NULL, 3, 4);
+    curve(path, NULL, 5, 6, 7, 8, 9, 10);
+    close_path(path);
+    memset(m32_h(DATA + 0x2040), 0, 32);
+    call("_CGPathApply", 3, (uint32_t[]){ m32_handle(path), DATA + 0x2040, APPLIER });
+    const float *xs = m32_h(DATA + 0x2048);
+    check("CGPathApply hands the guest each element", m32_rd(DATA + 0x2040) == 4 && m32_rd(DATA + 0x2044) == 0 + 1 + 3 + 4 &&
+                                                       xs[0] == 1 && xs[1] == 3 && xs[2] == 5);
+    /* CGFunctionCreate: a gray axial shading 0 to 0.5 across 16 pixels, evaluated by guest code */
+    void *(*gray)(void) = (void *(*)(void))host_fn("CGColorSpaceCreateDeviceGray");
+    void *(*axial)(void *, CGPoint, CGPoint, void *, bool, bool) = (void *(*)(void *, CGPoint, CGPoint, void *, bool, bool))host_fn("CGShadingCreateAxial");
+    void *(*bitmap)(void *, size_t, size_t, size_t, size_t, void *, uint32_t) =
+        (void *(*)(void *, size_t, size_t, size_t, size_t, void *, uint32_t))host_fn("CGBitmapContextCreate");
+    void (*draw_shading)(void *, void *) = (void (*)(void *, void *))host_fn("CGContextDrawShading");
+    const float unit[2] = { 0, 1 };
+    memcpy(m32_h(DATA + 0x2080), unit, sizeof unit);
+    memcpy(m32_h(DATA + 0x2088), unit, sizeof unit);
+    m32_wr(DATA + 0x2090, 0);   /* CGFunctionCallbacks: version, evaluate, releaseInfo */
+    m32_wr(DATA + 0x2094, EVALUATE);
+    m32_wr(DATA + 0x2098, 0);
+    uint32_t fn = call("_CGFunctionCreate", 6, (uint32_t[]){ 0, 1, DATA + 0x2080, 1, DATA + 0x2088, DATA + 0x2090 });
+    check("CGFunctionCreate", fn != 0);
+    uint8_t px[16] = { 0 };
+    void *ctx = bitmap(px, 16, 1, 8, 16, gray(), 0);
+    void *sh = fn ? axial(gray(), CGPointMake(0, 0), CGPointMake(16, 0), m32_host(fn), false, false) : NULL;
+    if (ctx && sh)
+        draw_shading(ctx, sh);
+    check("a CGFunction evaluated by guest code", px[0] < 16 && px[15] > 100 && px[15] < 140 && px[8] > px[4]);
+    /* CGPatternCreate: the guest's draw callback runs when the pattern fills, its release when the pattern goes */
+    void *(*pattern_space)(void *) = (void *(*)(void *))host_fn("CGColorSpaceCreatePattern");
+    void (*fill_space)(void *, void *) = (void (*)(void *, void *))host_fn("CGContextSetFillColorSpace");
+    void (*fill_pattern)(void *, void *, const double *) = (void (*)(void *, void *, const double *))host_fn("CGContextSetFillPattern");
+    void (*fill_rect)(void *, CGRect) = (void (*)(void *, CGRect))host_fn("CGContextFillRect");
+    void (*release)(const void *) = (void (*)(const void *))host_fn("CFRelease");
+    m32_wr(DATA + 0x20a0, 0);   /* draws */
+    m32_wr(DATA + 0x20b0, 0);   /* CGPatternCallbacks */
+    m32_wr(DATA + 0x20b4, COUNTER);
+    m32_wr(DATA + 0x20b8, COUNTER);
+    uint32_t pa[16] = { DATA + 0x20a0, 0, 0, float_word(4), float_word(4), float_word(1), 0, 0, float_word(1), 0, 0,
+                        float_word(4), float_word(4), 0, 1, DATA + 0x20b0 };
+    uint32_t pat = call("_CGPatternCreate", 16, pa);
+    check("CGPatternCreate", pat != 0);
+    if (pat && ctx) {
+        const double alpha = 1;
+        fill_space(ctx, pattern_space(NULL));
+        fill_pattern(ctx, m32_host(pat), &alpha);
+        fill_rect(ctx, CGRectMake(0, 0, 16, 1));
+    }
+    uint32_t draws = m32_rd(DATA + 0x20a0);
+    check("a pattern's guest draw callback", draws > 0);
+    if (pat)
+        release(m32_host(pat));   /* the context's fill keeps it until the fill changes */
+    /* CGContextSetCompositeOperation and CGContextSetCTM, cairo's private calls */
+    void (*set_gray)(void *, double, double) = (void (*)(void *, double, double))host_fn("CGContextSetGrayFillColor");
+    CGAffineTransform (*get_ctm)(void *) = (CGAffineTransform (*)(void *))host_fn("CGContextGetCTM");
+    if (ctx) {
+        fill_space(ctx, gray());
+        set_gray(ctx, 1, 1);
+        check("a pattern's guest release callback", !pat || m32_rd(DATA + 0x20a0) == draws + 1);
+        fill_rect(ctx, CGRectMake(0, 0, 16, 1));
+        call("_CGContextSetCompositeOperation", 2, (uint32_t[]){ m32_handle(ctx), 0 });   /* clear */
+        fill_rect(ctx, CGRectMake(0, 0, 8, 1));
+        check("CGContextSetCompositeOperation: clear", px[2] == 0 && px[12] == 255);
+        call("_CGContextSetCTM", 7, (uint32_t[]){ m32_handle(ctx), float_word(2), 0, 0, float_word(3), float_word(5), float_word(7) });
+        CGAffineTransform t = get_ctm(ctx);
+        check("CGContextSetCTM", t.a == 2 && t.d == 3 && t.tx == 5 && t.ty == 7 && t.b == 0 && t.c == 0);
+    }
+    /* structures returned by guest callbacks: in EAX:EDX, and through a hidden pointer (a callback finds the guest
+     * through the process's VM, as in a real run) */
+    ocerz_vm_install_handlers(&g_vm);
+    CGSize (*size_fn)(void) = (CGSize (*)(void))m32_callback(SIZE_FN, "{ff}()", "{dd}()");
+    CGSize sz = size_fn ? size_fn() : (CGSize){ 0, 0 };
+    check("a structure a guest callback returns in EAX:EDX", sz.width == 1.5 && sz.height == 2.5);
+    CGRect (*rect_fn)(void) = (CGRect (*)(void))m32_callback(RECT_FN, "{{ff}{ff}}()", "{{dd}{dd}}()");
+    CGRect r = rect_fn ? rect_fn() : (CGRect){ { 0, 0 }, { 0, 0 } };
+    check("a structure a guest callback returns through memory", r.origin.x == 1 && r.origin.y == 2 && r.size.width == 3 && r.size.height == 4);
+}
+
+/* libcrypto's MD5 on CommonCrypto, LaunchServices' private scheme handler (src/m32_libsystem.c, src/m32_carbon.c) */
+static void test_removed_calls(void)
+{
+    uint32_t c = DATA + 0x2100, digest = DATA + 0x2180;
+    put_str(DATA + 0x21a0, "abc");
+    call("_MD5_Init", 1, (uint32_t[]){ c });
+    call("_MD5_Update", 3, (uint32_t[]){ c, DATA + 0x21a0, 3 });
+    call("_MD5_Final", 2, (uint32_t[]){ digest, c });
+    static const uint8_t abc[16] = { 0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72 };
+    check("MD5 of abc", !memcmp(m32_h(digest), abc, 16));
+    void *(*cfstr)(void *, const char *, uint32_t) = (void *(*)(void *, const char *, uint32_t))host_fn("CFStringCreateWithCString");
+    m32_wr(DATA + 0x21b0, 0xdeadbeef);
+    int32_t st = (int32_t)call("__LSCopyDefaultSchemeHandlerURL", 2, (uint32_t[]){ m32_handle(cfstr(NULL, "http", 0x08000100)), DATA + 0x21b0 });
+    uint32_t app = m32_rd(DATA + 0x21b0);
+    check("_LSCopyDefaultSchemeHandlerURL answers a URL or none", (st == 0 && app != 0) || (st == -10814 && app == 0));
+}
+
 static void test_menus_controls(uint32_t w)
 {
     uint32_t mo = DATA + 0x1000;
@@ -970,6 +1134,49 @@ static void test_carbon(void)
     check("DisposeWindow takes the window's port with it", call("_IsValidPort", 1, pt) == 0);
 }
 
+/* through the databases: theme structures packed to 2 (src/m32_cross.c), GNU libiconv's names (src/m32_bridge.c), and
+ * dlsym of a function m32 cannot call (src/m32_dyld.c) */
+static void test_db_shapes(void)
+{
+    /* HIThemeTrackDrawInfo, i386: version, kind, HIRect of floats at 6, min, max, value, reserved, attributes,
+     * enableState, filler, then the scroll bar's viewsize and pressState at 42 */
+    uint8_t ti[48] = { 0 };
+    const float bounds[4] = { 10, 20, 15, 200 };
+    const int32_t range[4] = { 0, 100, 50, 0 };
+    const uint16_t show_thumb = 4;   /* kThemeTrackShowThumb */
+    const int32_t viewsize = 10;
+    memcpy(ti + 6, bounds, 16);
+    memcpy(ti + 22, range, 16);
+    memcpy(ti + 38, &show_thumb, 2);
+    memcpy(ti + 42, &viewsize, 4);
+    memcpy(m32_h(DATA + 0x3000), ti, sizeof ti);
+    memset(m32_h(DATA + 0x3040), 0, 16);
+    uint32_t st = cross(CARBON, "_HIThemeGetTrackBounds", 2, (uint32_t[]){ DATA + 0x3000, DATA + 0x3040 });
+    const float *tb = m32_h(DATA + 0x3040);
+    check("HIThemeGetTrackBounds reads the i386 HIThemeTrackDrawInfo", st == 0 && tb[2] > 0 && tb[3] > 100 &&   /* about the bounds */
+          tb[0] >= 8 && tb[0] + tb[2] <= 27 && tb[1] >= 18 && tb[1] + tb[3] <= 222);
+    /* HIThemeTextInfo, i386: 36 bytes, the font reference last; the dimensions come back as floats */
+    void *(*cfstr)(void *, const char *, uint32_t) = (void *(*)(void *, const char *, uint32_t))host_fn("CFStringCreateWithCString");
+    memset(m32_h(DATA + 0x3080), 0, 36);
+    m32_wr(DATA + 0x3084, 1);   /* kThemeStateActive */
+    memset(m32_h(DATA + 0x30c0), 0, 12);
+    st = cross(CARBON, "_HIThemeGetTextDimensions", 6, (uint32_t[]){ m32_handle(cfstr(NULL, "Hello", 0x08000100)), 0,
+                                                                      DATA + 0x3080, DATA + 0x30c0, DATA + 0x30c4, DATA + 0x30c8 });
+    const float *dim = m32_h(DATA + 0x30c0);
+    check("HIThemeGetTextDimensions", st == 0 && dim[0] > 10 && dim[0] < 200 && dim[1] > 5 && dim[1] < 50);
+    /* libiconv_open and libiconv_close are iconv_open and iconv_close */
+    put_str(DATA + 0x3100, "ISO-8859-1");
+    put_str(DATA + 0x3110, "UTF-8");
+    uint32_t cd = cross("/usr/lib/libiconv.2.dylib", "_libiconv_open", 2, (uint32_t[]){ DATA + 0x3100, DATA + 0x3110 });
+    check("libiconv_open", cd != 0 && cd != 0xffffffffu);
+    check("libiconv_close", cross("/usr/lib/libiconv.2.dylib", "_libiconv_close", 1, (uint32_t[]){ cd }) == 0);
+    /* dlsym: NULL for a function no declaration lets m32 call, so the program takes its own fallback */
+    put_str(DATA + 0x3120, "CGContextGetType");
+    put_str(DATA + 0x3140, "CGFontGetGlyphPath");
+    check("dlsym of a function m32 cannot call", call("_dlsym", 2, (uint32_t[]){ 0xfffffffeu, DATA + 0x3120 }) == 0);
+    check("dlsym of a special", call("_dlsym", 2, (uint32_t[]){ 0xfffffffeu, DATA + 0x3140 }) != 0);
+}
+
 int main(int argc, char **argv)
 {
     if (ocerz_mem_init(0, M32_WINDOW) != OCERZ_OK ||
@@ -993,6 +1200,7 @@ int main(int argc, char **argv)
         }
         setenv("OCERZ_APIDB32", db, 0);   /* unless the caller named one */
         test_carbon();
+        test_db_shapes();
         printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
         return g_failures != 0;
     }
@@ -1008,6 +1216,8 @@ int main(int argc, char **argv)
     test_map_table();
     test_font_tables();
     test_sF();
+    test_cg();
+    test_removed_calls();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

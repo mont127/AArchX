@@ -1343,7 +1343,33 @@ static int sp_keymgr_unlock(struct OcerzVM *vm, OcerzCPU *cpu)
     return RETV_PLAIN(0);
 }
 
+/* libcrypto 0.9.7's MD5_Init, MD5_Update and MD5_Final: the library is gone from Apple silicon, and CommonCrypto's
+ * CC_MD5 calls do the same with a context of the same layout (92 bytes: four state words, the bit count's two, a
+ * 64-byte block, its fill), so the guest's context is used where it is.  Firefox 3.6 links them. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include <CommonCrypto/CommonDigest.h>
+static int sp_MD5_Init(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    return RETV_PLAIN(m32_arg(cpu, 0) ? CC_MD5_Init(m32_h(m32_arg(cpu, 0))) : 0);
+}
+static int sp_MD5_Update(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t c = m32_arg(cpu, 0), d = m32_arg(cpu, 1), n = m32_arg(cpu, 2);
+    return RETV_PLAIN(c && (d || !n) ? CC_MD5_Update(m32_h(c), d ? m32_h(d) : "", n) : 0);
+}
+static int sp_MD5_Final(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t md = m32_arg(cpu, 0), c = m32_arg(cpu, 1);
+    return RETV_PLAIN(md && c ? CC_MD5_Final(m32_h(md), m32_h(c)) : 0);
+}
+#pragma clang diagnostic pop
+
 static const M32SpecialEntry g_specials[] = {
+    { "_MD5_Init", sp_MD5_Init }, { "_MD5_Update", sp_MD5_Update }, { "_MD5_Final", sp_MD5_Final },
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
     { "__keymgr_get_and_lock_processwide_ptr_2", sp_keymgr_get_lock_2 },
     { "__keymgr_get_and_lock_processwide_ptr", sp_keymgr_get_lock },
@@ -1437,7 +1463,8 @@ static const M32SpecialEntry *const g_tables[] = { g_specials, m32_stdio_special
                                                    m32_exc_specials, m32_zlib_specials, m32_unwind_specials,
                                                    m32_gl_specials, m32_audio_specials, m32_atsu_specials,
                                                    m32_qd_specials, m32_agl_specials, m32_carbon_specials,
-                                                   m32_controls_specials, m32_tsearch_specials };
+                                                   m32_controls_specials, m32_tsearch_specials,
+                                                   m32_cg_specials };
 
 static M32Special find_special(const char *name)
 {
