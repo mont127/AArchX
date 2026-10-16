@@ -2102,21 +2102,30 @@ int ocerz_protect(uint64_t gaddr, uint64_t len, int prot)
     map_lock_acquire();
     MemRegion *r = region_for_range(round_down(lo), round_up(hi));
     int rc = r ? OCERZ_OK : OCERZ_ENOMEM;
+    uint32_t seen[64];
+    const size_t seen_cap = sizeof seen / sizeof seen[0];
+    size_t n = 0;
+    uint8_t shared = 0;
     for (uint64_t p = lo; rc == OCERZ_OK && p < hi;
-         p += OCERZ_GUEST_PAGE) {
+         p += OCERZ_GUEST_PAGE, n++) {
         uint32_t state = slot_load(r, slot_index(r, p));
         if (!slot_is_data(state))
             rc = OCERZ_ENOMEM;
-        uint8_t shared = shared_load(r, pg_index(r, p));
+        if (p == lo || !(p & (OCERZ_HOST_PAGE - 1)))
+            shared = shared_load(r, pg_index(r, p));
         if ((shared & MEM_SHARED_PHYSICAL) &&
             !(shared & shared_slot_bit(p)) && prot != PROT_NONE)
             rc = OCERZ_EUNSUP;
+        if (n < seen_cap)
+            seen[n] = slot_owner(state);
     }
     if (rc == OCERZ_OK) {
-        for (uint64_t p = lo; p < hi; p += OCERZ_GUEST_PAGE) {
+        n = 0;
+        for (uint64_t p = lo; p < hi; p += OCERZ_GUEST_PAGE, n++) {
             size_t i = slot_index(r, p);
-            uint32_t state = slot_load(r, i);
-            slot_store(r, i, slot_data_state(slot_owner(state), prot));
+            uint32_t owner = n < seen_cap ? seen[n]
+                                          : slot_owner(slot_load(r, i));
+            slot_store(r, i, slot_data_state(owner, prot));
         }
         rc = sync_host_range_locked(r, lo, hi);
     }
