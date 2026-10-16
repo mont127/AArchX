@@ -14,6 +14,8 @@
  */
 #include <CoreGraphics/CoreGraphics.h>
 #include <dlfcn.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -27,6 +29,7 @@
 #include "ocerz/flags.h"
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
+#include "ocerz/m32_objc.h"
 #include "ocerz/mem.h"
 #include "ocerz/vm.h"
 
@@ -697,6 +700,86 @@ static void test_fonts(void)
                                       m32_rd(DATA + 0xfc4) == 4 && !memcmp(m32_h(DATA + 0xfd0), "caf\x8e", 4));
 }
 
+/* what Firefox 3.6 needed of fonts: tables, platform fonts, glyph info and bounds, and Lucida Grande as the system font */
+static void test_font_tables(void)
+{
+    uint32_t lucida = DATA + 0x1400;
+    void *(*cfs)(void *, const char *, uint32_t) = (void *(*)(void *, const char *, uint32_t))dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+    uint32_t font = call("_ATSFontFindFromPostScriptName", 2, (uint32_t[]){ m32_handle(cfs(NULL, "LucidaGrande", 0x08000100)), 0 });
+    check("ATSFontFindFromPostScriptName(LucidaGrande)", font >= 0x10000);
+    uint32_t t[6] = { font, FOUR('h','e','a','d'), 0, 0, 0, DATA + 0x1410 };
+    check("ATSFontGetTable sizes a table", call("_ATSFontGetTable", 6, t) == 0 && m32_rd(DATA + 0x1410) >= 54);
+    uint32_t r[6] = { font, FOUR('h','e','a','d'), 12, 4, DATA + 0x1420, DATA + 0x1410 };
+    uint8_t magic[4];
+    check("... and reads it from an offset", call("_ATSFontGetTable", 6, r) == 0 && m32_rd(DATA + 0x1410) == 4);
+    memcpy(magic, m32_h(DATA + 0x1420), 4);
+    check("... 'head''s magic number", magic[0] == 0x5f && magic[1] == 0x0f && magic[2] == 0x3c && magic[3] == 0xf5);
+    m32_wr(lucida, font);
+    uint32_t cg = call("_CGFontCreateWithPlatformFont", 1, (uint32_t[]){ lucida });
+    void *(*psname)(void *) = (void *(*)(void *))dlsym(RTLD_DEFAULT, "CGFontCopyPostScriptName");
+    int (*get)(void *, char *, long, uint32_t) = (int (*)(void *, char *, long, uint32_t))dlsym(RTLD_DEFAULT, "CFStringGetCString");
+    char name[64] = "";
+    if (cg)
+        get(psname(m32_host(cg)), name, sizeof name, 0x08000100);
+    check("CGFontCreateWithPlatformFont makes the font without ATS", cg && !strcmp(name, "LucidaGrande"));
+    /* glyph info and bounds of "Hi" in a style of that font */
+    uint32_t st = DATA + 0x1430;
+    call("_ATSUCreateStyle", 1, (uint32_t[]){ st });
+    check("ATSUSetFontFeatures is accepted", call("_ATSUSetFontFeatures", 4, (uint32_t[]){ m32_rd(st), 0, 0, 0 }) == 0);
+    const uint16_t hi[2] = { 'H', 'i' };
+    memcpy(m32_h(DATA + 0x1440), hi, sizeof hi);
+    m32_wr(DATA + 0x1450, 2);
+    m32_wr(DATA + 0x1454, m32_rd(st));
+    call("_ATSUCreateTextLayoutWithTextPtr", 8, (uint32_t[]){ DATA + 0x1440, 0, 2, 2, 1, DATA + 0x1450, DATA + 0x1454, DATA + 0x1458 });
+    uint32_t layout = m32_rd(DATA + 0x1458);
+    m32_wr(DATA + 0x1460, 0);
+    call("_ATSUGetGlyphInfo", 5, (uint32_t[]){ layout, 0, 2, DATA + 0x1460, 0 });
+    uint32_t need = m32_rd(DATA + 0x1460);
+    check("ATSUGetGlyphInfo sizes its array", need == 8 + 2 * 28);
+    uint32_t arr = DATA + 0x1500;
+    m32_wr(DATA + 0x1460, need);
+    check("ATSUGetGlyphInfo", call("_ATSUGetGlyphInfo", 5, (uint32_t[]){ layout, 0, 2, DATA + 0x1460, arr }) == 0);
+    float x0, x1;
+    memcpy(&x0, m32_h(arr + 8 + 20), 4);
+    memcpy(&x1, m32_h(arr + 8 + 28 + 20), 4);
+    check("... two glyphs, their characters, style and advancing positions",
+          m32_rd(arr) == layout && m32_rd(arr + 4) == 2 && m32_rd(arr + 8 + 8) == 0 && m32_rd(arr + 8 + 28 + 8) == 1 &&
+          m32_rd(arr + 8 + 12) == m32_rd(st) && x0 == 0 && x1 > 3);
+    uint32_t gb[9] = { layout, 10u << 16, 50u << 16, 0, 2, 0, 1, DATA + 0x1600, DATA + 0x1640 };
+    check("ATSUGetGlyphBounds", call("_ATSUGetGlyphBounds", 9, gb) == 0 && m32_rd(DATA + 0x1640) == 1);
+    int32_t trap[8];
+    memcpy(trap, m32_h(DATA + 0x1600), sizeof trap);
+    check("... a box about the baseline at (10, 50)", trap[0] == 10 << 16 && trap[1] < 50 << 16 && trap[5] > 50 << 16 &&
+                                                     trap[2] > trap[0]);
+    /* +[NSFont systemFontOfSize:] from i386 code is Lucida Grande */
+    if (!dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_LAZY | RTLD_GLOBAL))
+        return;
+    uint32_t cls = m32_class_guest(objc_getClass("NSFont")), sel = m32_sel_guest(sel_registerName("systemFontOfSize:"));
+    const float size = 12;
+    uint32_t sizew;
+    memcpy(&sizew, &size, 4);
+    uint32_t f = call("_objc_msgSend", 3, (uint32_t[]){ cls, sel, sizew });
+    void *(*send)(void *, void *) = (void *(*)(void *, void *))objc_msgSend;
+    double (*send_d)(void *, void *) = (double (*)(void *, void *))objc_msgSend;
+    void *hf = f ? m32_objc_to_host(f) : NULL;
+    name[0] = 0;
+    if (hf)
+        get(send(hf, sel_registerName("fontName")), name, sizeof name, 0x08000100);
+    check("systemFontOfSize: is Lucida Grande for i386 code", !strcmp(name, "LucidaGrande") &&
+                                                              send_d(hf, sel_registerName("pointSize")) == 12);
+}
+
+/* code built against the 10.4 SDK writes stdout as &__sF[1] */
+static void test_sF(void)
+{
+    uint32_t sf = m32_special_data("___sF", NULL);
+    extern FILE *__stdinp, *__stdoutp, *__stderrp;
+    check("__sF is three FILEs standing for the host's streams", sf && m32_host(sf) == (void *)__stdinp &&
+                                                                 m32_host(sf + 88) == (void *)__stdoutp &&
+                                                                 m32_host(sf + 176) == (void *)__stderrp &&
+                                                                 *(int16_t *)m32_h(sf + 88 + 14) == 1);
+}
+
 /* menus and controls arm64 HIToolbox dropped (src/m32_controls.c) */
 static void test_menus_controls(uint32_t w)
 {
@@ -923,6 +1006,8 @@ int main(int argc, char **argv)
     test_tsearch();
     test_positional();
     test_map_table();
+    test_font_tables();
+    test_sF();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

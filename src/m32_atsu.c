@@ -46,7 +46,8 @@ enum { NO_ERR = 0, PARAM_ERR = -50, FNF_ERR = -43, INVALID_FONT = -8796, INVALID
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"   /* CTFontManagerRegisterGraphicsFont: data, not a URL */
 #define HOST(fn) static __typeof__(fn) *fn##_
 HOST(CFStringCreateWithPascalString); HOST(CFStringGetPascalString); HOST(CTFontCreateUIFontForLanguage);
-HOST(CTFontGetSymbolicTraits); HOST(CFStringCreateWithCString);
+HOST(CTFontGetSymbolicTraits); HOST(CFStringCreateWithCString); HOST(CTFontCopyTable); HOST(CFDataGetLength);
+HOST(CFDataGetBytePtr);
 HOST(CFStringCreateWithCharacters); HOST(CFStringCompare); HOST(CFRelease); HOST(CFDataCreate);
 HOST(CFAttributedStringCreateMutable); HOST(CFAttributedStringReplaceString); HOST(CFAttributedStringSetAttribute);
 HOST(CFArrayGetCount); HOST(CFArrayGetValueAtIndex); HOST(CFNumberCreate);
@@ -73,7 +74,8 @@ static void load(void)
     int ok = ct && cg && cf;
 #define L(h, fn) ok &= (fn##_ = (__typeof__(fn) *)dlsym(h, #fn)) != NULL
     L(cf, CFStringCreateWithPascalString); L(cf, CFStringGetPascalString); L(ct, CTFontCreateUIFontForLanguage);
-    L(ct, CTFontGetSymbolicTraits); L(cf, CFStringCreateWithCString);
+    L(ct, CTFontGetSymbolicTraits); L(cf, CFStringCreateWithCString); L(ct, CTFontCopyTable);
+    L(cf, CFDataGetLength); L(cf, CFDataGetBytePtr);
     L(cf, CFStringCreateWithCharacters); L(cf, CFStringCompare); L(cf, CFRelease); L(cf, CFDataCreate);
     L(cf, CFAttributedStringCreateMutable); L(cf, CFAttributedStringReplaceString); L(cf, CFAttributedStringSetAttribute);
     L(cf, CFArrayGetCount); L(cf, CFArrayGetValueAtIndex); L(cf, CFNumberCreate);
@@ -371,6 +373,46 @@ static int sp_FMGetATSFontFamilyRefFromFontFamily(struct OcerzVM *vm, OcerzCPU *
     RET(n && find_family ? find_family(n, 0) : 0);
 }
 
+/* CGFontCreateWithPlatformFont(void *platformFontReference): a pointer to an ATSFontRef.  CoreGraphics asks ATS for
+ * it, and ATS stops in Crash__Please_File_a_Radar_against_ATS, which puts up an alert and waits (Firefox 3.6 sat there
+ * with no window).  A font of ours is made from its PostScript name instead; any other answers NULL. */
+static int sp_CGFontCreateWithPlatformFont(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static void *(*by_name)(CFStringRef);
+    if (!by_name)
+        by_name = (void *(*)(CFStringRef))dlsym(RTLD_DEFAULT, "CGFontCreateWithFontName");
+    uint32_t id = A(0) ? m32_rd(A(0)) : 0;
+    CFStringRef ps = NULL;
+    pthread_mutex_lock(&g_font_lock);
+    if (id >= FONT_BASE && id - FONT_BASE < (uint32_t)g_nfonts)
+        ps = g_fonts[id - FONT_BASE];
+    pthread_mutex_unlock(&g_font_lock);
+    RET(ps && by_name && ready() ? m32_handle(by_name(ps)) : 0);
+}
+
+/* ATSFontGetTable(ATSFontRef, FourCharCode tag, ByteOffset, ByteCount size, void *buffer, ByteCount *actual): the
+ * table CoreText has for a font of ours, its size alone without a buffer.  Crossed, ATS answered paramErr for every
+ * one of our ATSFontRefs, and Firefox 3.6, reading each font's 'name' table, found no usable font and aborted. */
+static int sp_ATSFontGetTable(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    CTFontRef f = ready() ? font_at(A(0), 12) : NULL;
+    CFDataRef t = f ? CTFontCopyTable_(f, (CTFontTableTag)A(1), kCTFontTableOptionNoOptions) : NULL;
+    release(f);
+    if (!t)
+        RET((uint32_t)-50);
+    uint32_t len = (uint32_t)CFDataGetLength_(t), off = A(2), size = A(3), n = 0;
+    if (A(4) && off < len) {
+        n = len - off < size ? len - off : size;
+        memcpy(m32_h(A(4)), CFDataGetBytePtr_(t) + off, n);
+    }
+    if (A(5))
+        m32_wr(A(5), A(4) ? n : len);
+    release(t);
+    RET(NO_ERR);
+}
+
 static int sp_identity(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(A(0)); }
 static int sp_GetAppFont(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(1); }
 static int sp_GetSysFont(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
@@ -658,7 +700,6 @@ static CTLineRef make_line(const AtsuLayout *l, uint32_t from, uint32_t count)
     return line;
 }
 
-/* ATSUDrawText(layout, lineOffset, lineLength, Fixed x, Fixed y): the baseline at (x, y) in the layout's CGContext */
 /* ATSUGetUnjustifiedBounds(layout, lineStart, lineLength, ATSUTextMeasurement *before, *after, *ascent, *descent):
  * the line's typographic width and height, Fixed */
 static int sp_ATSUGetUnjustifiedBounds(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -679,6 +720,99 @@ static int sp_ATSUGetUnjustifiedBounds(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(NO_ERR);
 }
 
+/* the guest's ATSUStyle for character at (absolute), from the layout's runs */
+static uint32_t style_at(const AtsuLayout *l, uint32_t at)
+{
+    uint32_t start = l->offset;
+    for (uint32_t r = 0; r < l->runs; r++) {
+        uint32_t len = l->run_len[r] == 0xffffffffu ? l->offset + l->length - start : l->run_len[r];
+        if (at >= start && at < start + len)
+            return l->run_style[r] ? m32_handle(l->run_style[r]) : 0;
+        start += len;
+    }
+    return 0;
+}
+
+/* ATSUGetGlyphInfo(layout, lineStart, lineLength, ByteCount *size, ATSUGlyphInfoArray *): i386 {layout, numGlyphs}
+ * then 28-byte ATSUGlyphInfos {glyphID @0, layoutFlags @4, charIndex @8, style @12, deltaY @16, idealX @20, screenX
+ * @24, caretX @26}; with no array, the size it takes */
+static int sp_ATSUGetGlyphInfo(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = m32_host(A(0));
+    if (!l || !A(3))
+        RET(INVALID_LAYOUT);
+    uint32_t from = A(1) == 0xffffffffu ? l->offset : A(1), count = A(2) == 0xffffffffu ? l->offset + l->length - from : A(2);
+    CTLineRef line = make_line(l, from, count);
+    CFArrayRef runs = line ? CTLineGetGlyphRuns_(line) : NULL;
+    long nruns = runs ? CFArrayGetCount_(runs) : 0, n = 0;
+    for (long r = 0; r < nruns; r++)
+        n += CTRunGetGlyphCount_(CFArrayGetValueAtIndex_(runs, r));
+    uint32_t need = 8 + 28 * (uint32_t)n, have = m32_rd(A(3)), out = A(4);
+    m32_wr(A(3), need);
+    if (!out) {
+        release(line);
+        RET(NO_ERR);
+    }
+    uint32_t fit = have >= 8 ? (have - 8) / 28 : 0, k = 0;
+    m32_wr(out, A(0));
+    for (long r = 0; r < nruns && k < fit; r++) {
+        CTRunRef run = CFArrayGetValueAtIndex_(runs, r);
+        long rn = CTRunGetGlyphCount_(run);
+        CGGlyph *glyphs = calloc((size_t)rn + 1, sizeof *glyphs);
+        CGPoint *pos = calloc((size_t)rn + 1, sizeof *pos);
+        CFIndex *idx = calloc((size_t)rn + 1, sizeof *idx);
+        CTRunGetGlyphs_(run, CFRangeMake(0, rn), glyphs);
+        CTRunGetPositions_(run, CFRangeMake(0, rn), pos);
+        CTRunGetStringIndices_(run, CFRangeMake(0, rn), idx);
+        for (long i = 0; i < rn && k < fit; i++, k++) {
+            uint32_t d = out + 8 + 28 * k, ci = from + (uint32_t)idx[i];
+            float x = (float)pos[i].x, dy = 0;
+            int16_t sx = (int16_t)lround(pos[i].x);
+            memset(m32_h(d), 0, 28);
+            memcpy(m32_h(d), &glyphs[i], 2);
+            m32_wr(d + 8, ci);
+            m32_wr(d + 12, style_at(l, ci));
+            memcpy(m32_h(d + 16), &dy, 4);
+            memcpy(m32_h(d + 20), &x, 4);
+            memcpy(m32_h(d + 24), &sx, 2);
+            memcpy(m32_h(d + 26), &sx, 2);
+        }
+        free(glyphs);
+        free(pos);
+        free(idx);
+    }
+    m32_wr(out + 4, k);
+    release(line);
+    RET(NO_ERR);
+}
+
+/* ATSUGetGlyphBounds(layout, Fixed x, Fixed y, start, length, UInt16 type, ItemCount max, ATSTrapezoid bounds[],
+ * ItemCount *actual): one trapezoid, the run's typographic box about its baseline at (x, y), y growing down */
+static int sp_ATSUGetGlyphBounds(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = m32_host(A(0));
+    if (!l)
+        RET(INVALID_LAYOUT);
+    uint32_t from = A(3) == 0xffffffffu ? l->offset : A(3), count = A(4) == 0xffffffffu ? l->offset + l->length - from : A(4);
+    CTLineRef line = make_line(l, from, count);
+    CGFloat ascent = 0, descent = 0;
+    double width = line ? CTLineGetTypographicBounds_(line, &ascent, &descent, NULL) : 0;
+    release(line);
+    double x = (int32_t)A(1) / 65536.0, y = (int32_t)A(2) / 65536.0;
+    const double pt[8] = { x, y - ascent, x + width, y - ascent, x + width, y + descent, x, y + descent };
+    if (A(6) >= 1 && A(7))
+        for (int i = 0; i < 8; i++)
+            m32_wr(A(7) + 4 * (uint32_t)i, (uint32_t)(int32_t)lround(pt[i] * 65536.0));
+    if (A(8))
+        m32_wr(A(8), A(6) >= 1 ? 1 : 0);
+    RET(NO_ERR);
+}
+
+static int sp_ATSUSetFontFeatures(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(NO_ERR); }   /* ponytail: ignored */
+
+/* ATSUDrawText(layout, lineOffset, lineLength, Fixed x, Fixed y): the baseline at (x, y) in the layout's CGContext */
 static int sp_ATSUDrawText(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     AtsuLayout *l = m32_host(A(0));
@@ -864,7 +998,9 @@ const M32SpecialEntry m32_atsu_specials[] = {
     { "_FMGetFontFamilyFromATSFontFamilyRef", sp_FMGetFontFamilyFromATSFontFamilyRef },
     { "_FMGetATSFontFamilyRefFromFontFamily", sp_FMGetATSFontFamilyRefFromFontFamily },
     { "_GetAppFont", sp_GetAppFont }, { "_GetSysFont", sp_GetSysFont }, { "_GetDefFontSize", sp_GetDefFontSize },
-    { "_GetThemeFont", sp_GetThemeFont },
+    { "_GetThemeFont", sp_GetThemeFont }, { "_CGFontCreateWithPlatformFont", sp_CGFontCreateWithPlatformFont },
+    { "_ATSFontGetTable", sp_ATSFontGetTable }, { "_ATSUGetGlyphInfo", sp_ATSUGetGlyphInfo },
+    { "_ATSUGetGlyphBounds", sp_ATSUGetGlyphBounds }, { "_ATSUSetFontFeatures", sp_ATSUSetFontFeatures },
     { "_ATSUSetAttributes", sp_ATSUSetAttributes },
     { "_ATSUCreateTextLayoutWithTextPtr", sp_ATSUCreateTextLayoutWithTextPtr },
     { "_ATSUDisposeTextLayout", sp_ATSUDisposeTextLayout },

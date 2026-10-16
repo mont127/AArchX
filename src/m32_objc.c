@@ -1069,10 +1069,50 @@ static int objects_send(struct OcerzVM *vm, OcerzCPU *cpu, Method m, M32Export *
 }
 
 /* self_at: the guest stack word holding the receiver (1, or 2 after a stret pointer); super: the objc_super */
+/* The system font a 32-bit program asks AppKit for is Lucida Grande, the system font of the Macs it was written for
+ * and still installed: today's is .AppleSystemUIFont, a family no font list carries, and Firefox 3.6, looking the
+ * default font up in the list NSFontManager gave it, found no usable font and aborted.  +[NSFont systemFontOfSize:]
+ * and its siblings answer Lucida Grande at the size asked, bold for boldSystemFontOfSize: (OCERZ_NO_M32_LUCIDA=1
+ * leaves them to AppKit). */
+static int system_font(OcerzCPU *cpu, void *hself, const char *name)
+{
+    static const char *const sels[] = { "systemFontOfSize:", "boldSystemFontOfSize:", "userFontOfSize:",
+                                        "messageFontOfSize:", "labelFontOfSize:", "menuFontOfSize:",
+                                        "menuBarFontOfSize:", "controlContentFontOfSize:", "titleBarFontOfSize:",
+                                        "toolTipsFontOfSize:", "paletteFontOfSize:" };
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_LUCIDA") != NULL;
+    Class font_cls = objc_getClass("NSFont");
+    if (off || hself != (void *)font_cls)
+        return 0;
+    size_t i = 0;
+    while (i < sizeof sels / sizeof sels[0] && strcmp(sels[i], name))
+        i++;
+    if (i == sizeof sels / sizeof sels[0])
+        return 0;
+    float size;
+    uint32_t w = rd((uint32_t)cpu->gpr[OCERZ_RSP] + 12);   /* self, _cmd, then the CGFloat size, a float on i386 */
+    memcpy(&size, &w, 4);
+    if (size <= 0)
+        size = i == 4 ? 10 : 13;
+    id (*make)(Class, SEL, id, double) = (id (*)(Class, SEL, id, double))M32_MSGSEND;
+    id (*str)(Class, SEL, const char *) = (id (*)(Class, SEL, const char *))M32_MSGSEND;
+    id fname = str(objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"),
+                   i == 1 ? "LucidaGrande-Bold" : "LucidaGrande");
+    id f = make(font_cls, sel_registerName("fontWithName:size:"), fname, size);
+    if (!f)
+        return 0;
+    m32_ret(cpu, m32_objc_to_guest(f), 0, 0);
+    return 1;
+}
+
 static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, uint32_t gsel, uint32_t gtypes, int is_super)
 {
     SEL hs = m32_sel_host(gsel);
     const char *name = sel_getName(hs);
+    if (!is_super && system_font(cpu, hself, name))
+        return OCERZ_STEP_OK;
     int is_class = object_isClass(hself);
     Class lookup_cls = super_cls ? super_cls : object_getClass(hself);
     Method m = class_getInstanceMethod(lookup_cls, hs);

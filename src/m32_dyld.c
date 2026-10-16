@@ -1033,14 +1033,10 @@ static void run_add_image_callbacks(struct OcerzVM *vm, int from, int cb_from, i
         }
 }
 
-static int sp_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
+/* the handle of the image at name, loaded (and its dependencies, initializers and add-image callbacks run) unless
+ * only_loaded; 0 with dlerror set when it cannot be */
+static uint32_t dl_open(struct OcerzVM *vm, const char *name, int only_loaded)
 {
-    uint32_t pg = m32_arg(cpu, 0);
-    if (!pg) {
-        m32_ret(cpu, RTLD_DEFAULT32, 0, 0);   /* dlopen(NULL): the program */
-        return OCERZ_STEP_OK;
-    }
-    const char *name = m32_h(pg);
     char path[1024];
     pthread_mutex_lock(&g_dl_lock);
     uint32_t handle = 0;
@@ -1055,6 +1051,8 @@ static int sp_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
         M32Image *img = find_loaded(path);
         if (img)
             handle = img->base;
+        else if (only_loaded)
+            set_dlerror("dlopen(%s): not loaded", name);
         else {
             int from = m32_nimages;
             img = m32_image_load(path, 0);
@@ -1073,7 +1071,13 @@ static int sp_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
         }
     }
     pthread_mutex_unlock(&g_dl_lock);
-    m32_ret(cpu, handle, 0, 0);
+    return handle;
+}
+
+static int sp_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t pg = m32_arg(cpu, 0);
+    m32_ret(cpu, pg ? dl_open(vm, m32_h(pg), 0) : RTLD_DEFAULT32, 0, 0);   /* dlopen(NULL): the program */
     return OCERZ_STEP_OK;
 }
 
@@ -1085,11 +1089,9 @@ static uint32_t system_symbol(const char *lib, const char *sym)
     return e && e->kind == M32_EX_UNRESOLVED ? 0 : v;
 }
 
-static int sp_dlsym(struct OcerzVM *vm, OcerzCPU *cpu)
+/* the address of sym (its linker name, "_" first) in the image whose handle is h, or 0 */
+static uint32_t dl_sym(uint32_t h, const char *sym)
 {
-    uint32_t h = m32_arg(cpu, 0), sp = m32_arg(cpu, 1);
-    char sym[512];
-    snprintf(sym, sizeof sym, "_%s", sp ? (const char *)m32_h(sp) : "");
     uint32_t v = 0;
     if (h == RTLD_DEFAULT32 || h == RTLD_NEXT32 || h == RTLD_SELF32 || h == RTLD_MAIN32) {
         for (int i = 0; !v && i < m32_nimages; i++)
@@ -1103,6 +1105,15 @@ static int sp_dlsym(struct OcerzVM *vm, OcerzCPU *cpu)
             if (m32_images[i]->base == h)
                 v = lookup_in(m32_images[i], sym, 0);
     }
+    return v;
+}
+
+static int sp_dlsym(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t h = m32_arg(cpu, 0), sp = m32_arg(cpu, 1);
+    char sym[512];
+    snprintf(sym, sizeof sym, "_%s", sp ? (const char *)m32_h(sp) : "");
+    uint32_t v = dl_sym(h, sym);
     if (!v)
         set_dlerror("dlsym: symbol %s not found", sym + 1);
     if (!v && getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "dlsym"))   /* OCERZ_M32LOG=dlsym: lookups that found nothing */
@@ -1112,6 +1123,64 @@ static int sp_dlsym(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 
 static int sp_dlclose(struct OcerzVM *vm, OcerzCPU *cpu) { m32_ret(cpu, 0, 0, 0); return OCERZ_STEP_OK; }
+
+/* dyld's older API, NSModule: NSAddImage and NSLookupSymbolInImage are dlopen and dlsym on m32's own loader (crossed
+ * to the host's dyld, they loaded nothing an i386 program can run, and Firefox 3.6's XPCOM glue, which finds XUL this
+ * way, gave up).  Symbol names come with their leading underscore; an NSSymbol is the symbol's address (as the
+ * NSSymbol calls below have it), and an NSObjectFileImage a guest copy of the bundle's path, which NSLinkModule
+ * opens. */
+enum { ADDIMAGE_RETURN_ONLY_IF_LOADED = 0x4 };
+static void ret32(OcerzCPU *cpu, uint32_t v) { m32_ret(cpu, v, 0, 0); }
+static int sp_NSAddImage(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t p = m32_arg(cpu, 0);
+    ret32(cpu, p ? dl_open(vm, m32_h(p), (m32_arg(cpu, 1) & ADDIMAGE_RETURN_ONLY_IF_LOADED) != 0) : 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSLookupSymbolInImage(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t h = m32_arg(cpu, 0), n = m32_arg(cpu, 1);
+    ret32(cpu, h && n ? dl_sym(h, m32_h(n)) : 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSLinkEditError(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static uint32_t empty;
+    if (!empty)
+        empty = m32_static_alloc(4, 4);
+    for (int i = 0; i < 2; i++)
+        if (m32_arg(cpu, i))
+            m32_wr(m32_arg(cpu, i), 0);
+    for (int i = 2; i < 4; i++)
+        if (m32_arg(cpu, i))
+            m32_wr(m32_arg(cpu, i), empty);
+    ret32(cpu, 0);
+    return OCERZ_STEP_OK;
+}
+/* NSCreateObjectFileImageFromFile(const char *path, NSObjectFileImage *) -> NSObjectFileImageSuccess (1), or
+ * NSObjectFileImageAccess (5) for a file that is not there */
+static int sp_NSCreateObjectFileImageFromFile(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t p = m32_arg(cpu, 0), out = m32_arg(cpu, 1);
+    if (!p || access(m32_h(p), R_OK) != 0) {
+        ret32(cpu, 5);
+        return OCERZ_STEP_OK;
+    }
+    if (out)
+        m32_wr(out, m32_strdup_host(m32_h(p)));
+    ret32(cpu, 1);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSLinkModule(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t ofi = m32_arg(cpu, 0);
+    ret32(cpu, ofi ? dl_open(vm, m32_h(ofi), 0) : 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSTrue(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; ret32(cpu, 1); return OCERZ_STEP_OK; }
 
 static int sp_dlerror(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -1291,6 +1360,11 @@ const M32SpecialEntry m32_dyld_specials[] = {
     { "__dyld_func_lookup", sp_dyld_func_lookup },
     { "_dlopen", sp_dlopen }, { "_dlsym", sp_dlsym }, { "_dlclose", sp_dlclose }, { "_dlerror", sp_dlerror },
     { "_dladdr", sp_dladdr },
+    { "_NSAddImage", sp_NSAddImage }, { "_NSLookupSymbolInImage", sp_NSLookupSymbolInImage },
+    { "_NSLinkEditError", sp_NSLinkEditError },
+    { "_NSCreateObjectFileImageFromFile", sp_NSCreateObjectFileImageFromFile }, { "_NSLinkModule", sp_NSLinkModule },
+    { "_NSLookupSymbolInModule", sp_NSLookupSymbolInImage }, { "_NSUnLinkModule", sp_NSTrue },
+    { "_NSDestroyObjectFileImage", sp_NSTrue },
     { "_NSIsSymbolNameDefined", sp_NSIsSymbolNameDefined }, { "_NSLookupAndBindSymbol", sp_NSLookupAndBindSymbol },
     { "_NSAddressOfSymbol", sp_NSAddressOfSymbol }, { "_NSModuleForSymbol", sp_NSModuleForSymbol },
     { "_NSLibraryNameForModule", sp_NSLibraryNameForModule },

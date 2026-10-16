@@ -873,6 +873,19 @@ uint32_t m32_special_data(const char *symbol, void *host_var)
         m32_wr(g, m32_objc_to_guest(*(void **)host_var));
         return g;
     }
+    /* code built against the 10.4 SDK writes stdin, stdout and stderr as &__sF[0..2]: three i386 __sFILEs (88 bytes)
+     * in a row, each aliased to the host's stream as m32_file's twins are (Firefox 3.6's setbuf(stdout) handed libc
+     * an address in an array that was not there).  The host's own streams, not ocerz's stderr (include/ocerz/types.h) */
+    if (!strcmp(symbol, "___sF")) {
+        extern FILE *__stdinp, *__stdoutp, *__stderrp;
+        FILE *std[3] = { __stdinp, __stdoutp, __stderrp };
+        uint32_t g = m32_static_alloc(3 * 88, 4);
+        for (uint32_t i = 0; i < 3; i++) {
+            m32_alias(g + 88 * i, std[i]);
+            *(int16_t *)m32_h(g + 88 * i + 14) = (int16_t)fileno(std[i]);
+        }
+        return g;
+    }
     if (!strcmp(symbol, "___stack_chk_guard")) {
         uint32_t g = m32_static_alloc(4, 4);
         m32_wr(g, arc4random() | 0xff000000u);   /* a canary with a NUL-free top byte */
