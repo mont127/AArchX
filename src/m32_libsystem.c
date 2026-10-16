@@ -1439,12 +1439,46 @@ static const M32SpecialEntry *const g_tables[] = { g_specials, m32_stdio_special
                                                    m32_qd_specials, m32_agl_specials, m32_carbon_specials,
                                                    m32_controls_specials, m32_tsearch_specials };
 
-static M32Special find_special(const char *name)
+/* every table's entries by name, open-addressed and built once; the first entry of a name in table order is kept,
+ * the one a scan of the tables would have found */
+static const M32SpecialEntry **g_special_ix;
+static uint32_t g_special_mask;
+static pthread_once_t g_special_once = PTHREAD_ONCE_INIT;
+
+static uint32_t special_hash(const char *s)
 {
+    uint32_t h = 2166136261u;
+    while (*s)
+        h = (h ^ (uint8_t)*s++) * 16777619u;
+    return h;
+}
+
+static void special_index(void)
+{
+    uint32_t n = 0, cap = 64;
     for (size_t t = 0; t < sizeof g_tables / sizeof g_tables[0]; t++)
         for (const M32SpecialEntry *e = g_tables[t]; e->name; e++)
-            if (!strcmp(e->name, name))
-                return e->fn;
+            n++;
+    while (cap < n * 2)
+        cap <<= 1;
+    g_special_ix = calloc(cap, sizeof *g_special_ix);
+    g_special_mask = cap - 1;
+    for (size_t t = 0; t < sizeof g_tables / sizeof g_tables[0]; t++)
+        for (const M32SpecialEntry *e = g_tables[t]; e->name; e++) {
+            uint32_t i = special_hash(e->name) & g_special_mask;
+            while (g_special_ix[i] && strcmp(g_special_ix[i]->name, e->name))
+                i = (i + 1) & g_special_mask;
+            if (!g_special_ix[i])
+                g_special_ix[i] = e;
+        }
+}
+
+static M32Special find_special(const char *name)
+{
+    pthread_once(&g_special_once, special_index);
+    for (uint32_t i = special_hash(name) & g_special_mask; g_special_ix[i]; i = (i + 1) & g_special_mask)
+        if (!strcmp(g_special_ix[i]->name, name))
+            return g_special_ix[i]->fn;
     return NULL;
 }
 

@@ -106,6 +106,50 @@ static M32Export *g_exports[M32_ID_LIMIT];
 static uint32_t g_next = M32_ID_FIRST;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* the exports' ids by name and, for host functions, by host_fn: open-addressed, 0 empty (ids start at
+ * M32_ID_FIRST), at most half full, under g_lock.  An id goes in as it is published, so ids of one key lie along its
+ * probe in id order and a probe finds what a scan of g_exports in id order would; a name keeps its first export. */
+#define M32_IX_CAP 0x20000u
+_Static_assert(M32_ID_LIMIT <= 0x10000 && 2 * M32_ID_LIMIT <= M32_IX_CAP, "export ids fit the indexes");
+static uint16_t g_by_name[M32_IX_CAP], g_by_fn[M32_IX_CAP];
+
+static uint32_t name_hash(const char *s)
+{
+    uint32_t h = 2166136261u;
+    while (*s)
+        h = (h ^ (uint8_t)*s++) * 16777619u;
+    return h;
+}
+
+static uint32_t fn_hash(const void *fn)
+{
+    return (uint32_t)(((uint64_t)(uintptr_t)fn * 0x9e3779b97f4a7c15ull) >> 40);
+}
+
+/* the slot holding name's id, or the empty one where it would go */
+static uint16_t *name_slot(const char *name)
+{
+    for (uint32_t i = name_hash(name);; i++) {
+        uint16_t *s = &g_by_name[i & (M32_IX_CAP - 1)];
+        if (!*s || !strcmp(g_exports[*s]->name, name))
+            return s;
+    }
+}
+
+static void publish(uint32_t id, M32Export *e)
+{
+    g_exports[id] = e;
+    uint16_t *s = name_slot(e->name);
+    if (!*s)
+        *s = (uint16_t)id;
+    if (e->kind == M32_EX_FN && e->gnote && e->host_fn) {
+        uint32_t i = fn_hash(e->host_fn);
+        while (g_by_fn[i & (M32_IX_CAP - 1)])
+            i++;
+        g_by_fn[i & (M32_IX_CAP - 1)] = (uint16_t)id;
+    }
+}
+
 typedef struct Seen { struct Seen *next; char key[]; } Seen;
 static Seen *g_seen;
 
@@ -133,9 +177,9 @@ uint32_t m32_export_hostfn(void *fn, const char *gnote, const char *hnote)
     if (!fn)
         return 0;
     pthread_mutex_lock(&g_lock);
-    for (uint32_t id = M32_ID_FIRST; id < g_next; id++) {
+    for (uint32_t i = fn_hash(fn), id; (id = g_by_fn[i & (M32_IX_CAP - 1)]); i++) {
         M32Export *x = g_exports[id];
-        if (x->host_fn == fn && x->kind == M32_EX_FN && x->gnote && !strcmp(x->gnote, gnote) && !strcmp(x->hnote, hnote)) {
+        if (x->host_fn == fn && !strcmp(x->gnote, gnote) && !strcmp(x->hnote, hnote)) {
             pthread_mutex_unlock(&g_lock);
             return M32_TRAP(id);
         }
@@ -154,7 +198,7 @@ uint32_t m32_export_hostfn(void *fn, const char *gnote, const char *hnote)
     e->gnote = strdup(gnote);
     e->hnote = strdup(hnote);
     uint32_t id = g_next++;
-    g_exports[id] = e;
+    publish(id, e);
     pthread_mutex_unlock(&g_lock);
     return M32_TRAP(id);
 }
@@ -208,7 +252,7 @@ uint32_t m32_export_special(const char *name, M32Special fn)
     e->special = fn;
     e->kind = M32_EX_SPECIAL;
     uint32_t id = g_next++;
-    g_exports[id] = e;
+    publish(id, e);
     pthread_mutex_unlock(&g_lock);
     return M32_TRAP(id);
 }
@@ -217,12 +261,12 @@ uint32_t m32_export_special(const char *name, M32Special fn)
 uint32_t m32_export(const char *lib, const char *name)
 {
     pthread_mutex_lock(&g_lock);
-    for (uint32_t id = M32_ID_FIRST; id < g_next; id++)
-        if (!strcmp(g_exports[id]->name, name)) {
-            uint32_t data = g_exports[id]->data;   /* a variable is its guest address, every time */
-            pthread_mutex_unlock(&g_lock);
-            return data ? data : M32_TRAP(id);
-        }
+    uint32_t found = *name_slot(name);
+    if (found) {
+        uint32_t data = g_exports[found]->data;   /* a variable is its guest address, every time */
+        pthread_mutex_unlock(&g_lock);
+        return data ? data : M32_TRAP(found);
+    }
     if (g_next >= M32_ID_LIMIT) {
         pthread_mutex_unlock(&g_lock);
         fprintf(stderr, "ocerz: m32: out of export ids at %s\n", name);
@@ -302,7 +346,7 @@ uint32_t m32_export(const char *lib, const char *name)
         m32_alias(e->data, hv);
         addr = e->data;
     }
-    g_exports[id] = e;   /* published after it is complete */
+    publish(id, e);   /* published after it is complete */
     pthread_mutex_unlock(&g_lock);
     if (m32_log_imports) {
         static const char *const kinds[] = { "unresolved", "special", "fn", "needs a special", "data" };
