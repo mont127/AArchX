@@ -3011,13 +3011,20 @@ static uint8_t *vmmap_pad_take(uint64_t lo, uint64_t n)
     uint8_t *b = (uint8_t *)malloc((size_t)n);
     if (!b)
         return NULL;
-    for (uint64_t i = 0; i < n; i++) {
-        if (!ocerz_addr_readable(lo + i) && !ocerz_cache_region((uintptr_t)(lo + i))) {
+    for (uint64_t i = 0; i < n;) {
+        uint64_t a = lo + i;
+        uint64_t c = OCERZ_GUEST_PAGE_SIZE - (a & (OCERZ_GUEST_PAGE_SIZE - 1));
+        if (c > n - i)
+            c = n - i;
+        if (!ocerz_addr_readable(a) &&
+            !(ocerz_cache_region((uintptr_t)a) && ocerz_cache_region((uintptr_t)(a + c - 1)))) {
             free(b);
             return NULL;
         }
-        b[i] = (uint8_t)ocerz_ld(lo + i, 1);
+        memcpy(b + i, ocerz_g2h(a), (size_t)c);
+        i += c;
     }
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
     return b;
 }
 
