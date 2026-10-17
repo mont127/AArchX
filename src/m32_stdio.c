@@ -46,6 +46,14 @@ void m32_save_errno(OcerzCPU *cpu)
     m32_wr(errno_slot(), (uint32_t)e);
 }
 
+/* Before a call: the host's errno is the guest's, so a call that sets no errno leaves the guest's as it was, as on a
+ * Mac.  m32_save_errno after it had copied whatever the host's errno last was: libvorbisfile clears errno, reads, and
+ * takes 0 bytes with a non-zero errno for a read error, and SuperTuxKart's music never loaded. */
+void m32_load_errno(void)
+{
+    errno = (int)m32_rd(errno_slot());
+}
+
 static int sp___error(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     m32_ret(cpu, errno_slot(), 0, 0);

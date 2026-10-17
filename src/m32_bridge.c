@@ -364,6 +364,7 @@ int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu)
         ocerz_vm_request_exit(vm, 134);
         return OCERZ_STEP_EXIT;
     }
+    m32_load_errno();
     /* OCERZ_M32_CALLLOG=<name part>[|<part>...]: the matching imports' first argument words, caller and eax after */
     static const char *calllog = (const char *)1;
     if (calllog == (const char *)1)

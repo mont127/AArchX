@@ -151,6 +151,7 @@ OcerzCPU *m32_thread_attach(struct OcerzVM *vm);   /* a 32-bit guest cpu for a t
 extern int m32_started;                              /* the main cpu is running (before: loader calls use it) */
 int m32_tlv_trap(struct OcerzVM *vm, OcerzCPU *cpu);   /* src/m32_thread.c */
 void m32_save_errno(OcerzCPU *cpu);
+void m32_load_errno(void);   /* before a call: the host's errno is the guest's (src/m32_stdio.c) */
 uint32_t m32_special_data(const char *symbol, void *host_var);   /* guest variable for a special data import, or 0 */
 void m32_refresh_data(void);   /* re-read host pointer variables that changed (NSApp) */
 

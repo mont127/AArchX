@@ -1229,6 +1229,15 @@ static void test_db_shapes(void)
     void *hfont = dlsym(dlopen(glut, RTLD_LAZY), "glutBitmapHelvetica12");
     uint32_t gfont = m32_export(glut, "_glutBitmapHelvetica12");
     check("GLUT's font variable is the host's", hfont && gfont && m32_host(gfont) == hfont);
+    /* errno: a call that sets none leaves the guest's as it was, whatever the host's last was (libvorbisfile) */
+    const char *libsystem = "/usr/lib/libSystem.B.dylib";
+    uint32_t slot = call("___error", 0, NULL);
+    m32_wr(slot, 0);
+    errno = ENOENT;
+    cross(libsystem, "_getpid", 0, NULL);
+    check("a call that sets no errno leaves the guest's", m32_rd(slot) == 0);
+    cross(libsystem, "_close", 1, (uint32_t[]){ 0xffffffffu });
+    check("a call that fails sets the guest's errno", m32_rd(slot) == EBADF);
 }
 
 int main(int argc, char **argv)
