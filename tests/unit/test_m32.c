@@ -1134,6 +1134,55 @@ static void test_carbon(void)
     check("DisposeWindow takes the window's port with it", call("_IsValidPort", 1, pt) == 0);
 }
 
+/* what SDL 1.2's Quartz code needs (AssaultCube): no KCHR from the Script Manager, the CPS process calls, and
+ * NSBitmapImageRep planes in guest memory (src/m32_carbon.c, src/m32_libsystem.c, src/m32_objc.c) */
+static void test_sdl_shims(void)
+{
+    check("GetScriptManagerVariable(smKCHRCache) is no KCHR", call("_GetScriptManagerVariable", 1, (uint32_t[]){ 38 }) == 0);
+    memset(m32_h(DATA + 0x2200), 0, 8);
+    check("CPSGetCurrentProcess", call("_CPSGetCurrentProcess", 1, (uint32_t[]){ DATA + 0x2200 }) == 0 &&
+                                  (m32_rd(DATA + 0x2200) || m32_rd(DATA + 0x2204)));
+    if (!dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_LAZY | RTLD_GLOBAL))
+        return;
+    void *(*send)(void *, void *) = (void *(*)(void *, void *))objc_msgSend;
+    void *(*send_s)(void *, void *, const char *) = (void *(*)(void *, void *, const char *))objc_msgSend;
+    void *rep = send(objc_getClass("NSBitmapImageRep"), sel_registerName("alloc"));
+    void *space = send_s(objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), "NSDeviceWhiteColorSpace");
+    uint32_t init = m32_sel_guest(sel_registerName("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:"
+                                                   "samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"));
+    /* SDL's cursor: 16 x 16, one bit per sample, white and alpha planes, no planes given */
+    uint32_t r = call("_objc_msgSend", 12, (uint32_t[]){ m32_objc_to_guest(rep), init, 0, 16, 16, 1, 2, 1, 1,
+                                                         m32_objc_to_guest(space), 2, 0 });
+    void *hr = r ? m32_objc_to_host(r) : NULL;
+    check("initWithBitmapDataPlanes: with no planes", hr != NULL);
+    if (!hr)
+        return;
+    memset(m32_h(DATA + 0x2240), 0xff, 20);
+    call("_objc_msgSend", 3, (uint32_t[]){ r, m32_sel_guest(sel_registerName("getBitmapDataPlanes:")), DATA + 0x2240 });
+    uint32_t p0 = m32_rd(DATA + 0x2240), p1 = m32_rd(DATA + 0x2244);
+    check("getBitmapDataPlanes: answers planes in guest memory", p0 && !m32_is_handle(p0) && p1 == p0 + 32 &&
+                                                                 m32_rd(DATA + 0x2248) == 0);
+    if (!p0 || m32_is_handle(p0))
+        return;
+    memset(m32_h(p0), 0xaa, 32);
+    const uint8_t *data = send(hr, sel_registerName("bitmapData"));
+    check("the rep draws from the guest's plane", data == m32_h(p0) && data[0] == 0xaa);
+    /* the default output audio unit through the Component Manager, as OpenAL finds it (src/m32_audio.c) */
+    const uint32_t desc[5] = { 'auou', 'def ', 'appl', 0, 0 };
+    memcpy(m32_h(DATA + 0x2280), desc, sizeof desc);
+    uint32_t comp = call("_FindNextComponent", 2, (uint32_t[]){ 0, DATA + 0x2280 });
+    check("FindNextComponent finds the default output unit", comp != 0);
+    check("CountComponents", call("_CountComponents", 1, (uint32_t[]){ DATA + 0x2280 }) >= 1);
+    m32_wr(DATA + 0x22a0, 0);
+    check("OpenAComponent", comp && call("_OpenAComponent", 2, (uint32_t[]){ comp, DATA + 0x22a0 }) == 0 && m32_rd(DATA + 0x22a0));
+    uint32_t inst = m32_rd(DATA + 0x22a0);
+    check("CallComponentVersion", inst && call("_CallComponentVersion", 1, (uint32_t[]){ inst }) != 0);
+    memset(m32_h(DATA + 0x22c0), 0, 20);
+    check("GetComponentInfo", call("_GetComponentInfo", 5, (uint32_t[]){ comp, DATA + 0x22c0, 0, 0, 0 }) == 0 &&
+                              m32_rd(DATA + 0x22c0) == 'auou');
+    check("CloseComponent", inst && call("_CloseComponent", 1, (uint32_t[]){ inst }) == 0);
+}
+
 /* through the databases: theme structures packed to 2 (src/m32_cross.c), GNU libiconv's names (src/m32_bridge.c), and
  * dlsym of a function m32 cannot call (src/m32_dyld.c) */
 static void test_db_shapes(void)
@@ -1175,6 +1224,11 @@ static void test_db_shapes(void)
     put_str(DATA + 0x3140, "CGFontGetGlyphPath");
     check("dlsym of a function m32 cannot call", call("_dlsym", 2, (uint32_t[]){ 0xfffffffeu, DATA + 0x3120 }) == 0);
     check("dlsym of a special", call("_dlsym", 2, (uint32_t[]){ 0xfffffffeu, DATA + 0x3140 }) != 0);
+    /* a pointer variable's address stands for the host's: GLUT_BITMAP_HELVETICA_12 is &glutBitmapHelvetica12 */
+    const char *glut = "/System/Library/Frameworks/GLUT.framework/Versions/A/GLUT";
+    void *hfont = dlsym(dlopen(glut, RTLD_LAZY), "glutBitmapHelvetica12");
+    uint32_t gfont = m32_export(glut, "_glutBitmapHelvetica12");
+    check("GLUT's font variable is the host's", hfont && gfont && m32_host(gfont) == hfont);
 }
 
 int main(int argc, char **argv)
@@ -1218,6 +1272,7 @@ int main(int argc, char **argv)
     test_sF();
     test_cg();
     test_removed_calls();
+    test_sdl_shims();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

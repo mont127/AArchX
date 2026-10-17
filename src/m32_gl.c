@@ -381,7 +381,38 @@ CGL_CTX_CALL(CGLSetCurrentContext)
 CGL_CTX_CALL(CGLLockContext)
 CGL_CTX_CALL(CGLUnlockContext)
 
+/* glutInit(int *argcp, char **argv): GLUT reads the whole argument vector and takes its own options out of it, and the
+ * guest's vector holds 4-byte pointers; crossed, GLUT read argv[0] alone right.  The host gets a vector of its own, and
+ * the guest's count and vector come back without what GLUT took. */
+static int sp_glutInit(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static void (*init)(int *, char **);
+    if (!init)
+        init = (void (*)(int *, char **))ocerz_bridge_host_symbol("/System/Library/Frameworks/GLUT.framework/Versions/A/GLUT",
+                                                                  "glutInit");
+    uint32_t pargc = m32_arg(cpu, 0), argv = m32_arg(cpu, 1);
+    int argc = pargc ? (int32_t)m32_rd(pargc) : 0, was = argc;
+    if (argc < 0 || argc > 4096 || !argv)
+        argc = was = 0;
+    char **hv = calloc((size_t)argc + 1, sizeof *hv);
+    for (int i = 0; hv && i < argc; i++)
+        hv[i] = m32_rd(argv + 4 * (uint32_t)i) ? m32_h(m32_rd(argv + 4 * (uint32_t)i)) : NULL;
+    if (init && hv)
+        init(&argc, hv);
+    for (int i = 0; hv && i < argc && i < was; i++)
+        m32_wr(argv + 4 * (uint32_t)i, m32_handle(hv[i]));
+    if (hv && argc < was)
+        m32_wr(argv + 4 * (uint32_t)argc, 0);
+    if (pargc && hv)
+        m32_wr(pargc, (uint32_t)argc);
+    free(hv);
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 const M32SpecialEntry m32_gl_specials[] = {
+    { "_glutInit", sp_glutInit },
     { "_CGLSetCurrentContext", sp_CGLSetCurrentContext }, { "_CGLLockContext", sp_CGLLockContext },
     { "_CGLUnlockContext", sp_CGLUnlockContext },
     { "_CGLSetParameter", sp_CGLSetParameter },

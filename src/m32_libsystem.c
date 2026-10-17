@@ -89,6 +89,33 @@ static int sp_SetFrontProcess(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* CoreGraphics' private process calls SDL 1.2's main makes a program started outside a bundle a foreground app with:
+ * CPSGetCurrentProcess is GetCurrentProcess (a CPSProcessSerNum is a ProcessSerialNumber), CPSEnableForegroundOperation
+ * TransformProcessType to a foreground application, and CPSSetFrontProcess SetFrontProcess.  m32 had no declaration
+ * for them and answered 0 without doing anything, so such a program stayed in the background without a menu bar. */
+static int sp_CPSGetCurrentProcess(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static short (*current)(void *);
+    if (!current)
+        current = (short (*)(void *))dlsym(RTLD_DEFAULT, "GetCurrentProcess");
+    uint32_t psn = m32_arg(cpu, 0);
+    m32_ret(cpu, psn && current ? (uint32_t)(int32_t)current(m32_h(psn)) : (uint32_t)-50, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_CPSEnableForegroundOperation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static int32_t (*transform)(const void *, uint32_t);
+    if (!transform)
+        transform = (int32_t (*)(const void *, uint32_t))dlsym(RTLD_DEFAULT, "TransformProcessType");
+    uint32_t psn = m32_arg(cpu, 0);
+    if (psn && transform)
+        transform(m32_h(psn), 1);   /* kProcessTransformToForegroundApplication; already one is no error to SDL */
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 static int sp_ok0(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     m32_ret(cpu, 0, 0, 0);
@@ -1448,7 +1475,9 @@ static const M32SpecialEntry g_specials[] = {
     { "_signal", sp_signal }, { "_sigaction", sp_sigaction }, { "_sigaltstack", sp_ok0 },
     { "___bzero", sp_bzero }, { "_bzero", sp_bzero }, { "___stack_chk_fail", sp_stack_chk_fail },
     { "_exit", sp_exit },
-    { "_SetFrontProcess", sp_SetFrontProcess },
+    { "_SetFrontProcess", sp_SetFrontProcess }, { "_CPSSetFrontProcess", sp_SetFrontProcess },
+    { "_CPSGetCurrentProcess", sp_CPSGetCurrentProcess }, { "__CPSGetCurrentProcess", sp_CPSGetCurrentProcess },
+    { "_CPSEnableForegroundOperation", sp_CPSEnableForegroundOperation },
     { "__exit", sp__exit },
     { "__Exit", sp__exit },
     { "___cxa_atexit", sp_ok0 },   /* ponytail: C++ static destructors do not run at exit */

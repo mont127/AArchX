@@ -1151,6 +1151,72 @@ static int rects_being_drawn(OcerzCPU *cpu, void *hself, Class super_cls, SEL hs
     return 1;
 }
 
+/* NSBitmapImageRep's planes, which a program writes its pixels into: initWithBitmapDataPlanes:... with NULL planes
+ * had AppKit allocate them in host memory, and getBitmapDataPlanes: handed the guest those addresses (SDL 1.2 writes
+ * its cursors that way; AssaultCube faulted on the first).  The planes now live in guest memory: the guest's own,
+ * passed as host pointers (the guest's array holds 4-byte ones), or, for NULL, ones m32 allocates for the rep, and
+ * getBitmapDataPlanes: answers their guest addresses.  ponytail: m32's planes are never freed (AppKit does not free
+ * planes it was given); programs make a handful, for cursors and icons. */
+static int bitmap_planes(OcerzCPU *cpu, void *hself, Class super_cls, SEL hs, const char *name)
+{
+    static const char init10[] = "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:"
+                                 "isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:";
+    static const char init11[] = "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:"
+                                 "isPlanar:colorSpaceName:bitmapFormat:bytesPerRow:bitsPerPixel:";
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP];   /* self, _cmd, then the arguments, a word each */
+#define ARG(i) rd(esp + 12 + 4 * (i))
+    if (!strcmp(name, "getBitmapDataPlanes:")) {
+        unsigned char *planes[5] = { 0 };
+        if (super_cls) {
+            struct objc_super sup = { hself, super_cls };
+            ((void (*)(struct objc_super *, SEL, unsigned char **))objc_msgSendSuper)(&sup, hs, planes);
+        } else {
+            ((void (*)(id, SEL, unsigned char **))M32_MSGSEND)(hself, hs, planes);
+        }
+        for (int i = 0; ARG(0) && i < 5; i++)
+            m32_wr(ARG(0) + 4 * (uint32_t)i, m32_handle(planes[i]));
+        m32_ret(cpu, 0, 0, 0);
+        return 1;
+    }
+    int fmt = !strcmp(name, init11);
+    if (!fmt && strcmp(name, init10))
+        return 0;
+    long w = (int32_t)ARG(1), h = (int32_t)ARG(2), bps = (int32_t)ARG(3), spp = (int32_t)ARG(4);
+    BOOL alpha = (BOOL)(ARG(5) & 0xff), planar = (BOOL)(ARG(6) & 0xff);
+    id space = m32_objc_to_host(ARG(7));
+    unsigned long format = fmt ? ARG(8) : 0;
+    long bpr = (int32_t)ARG(8 + fmt), bpp = (int32_t)ARG(9 + fmt);
+    unsigned char *planes[5] = { 0 };
+    if (ARG(0)) {
+        for (int i = 0; i < 5; i++)
+            planes[i] = rd(ARG(0) + 4 * (uint32_t)i) ? m32_h(rd(ARG(0) + 4 * (uint32_t)i)) : NULL;
+    } else if (w > 0 && h > 0 && bps > 0 && spp > 0 && spp <= 5 && w <= 16384 && h <= 16384) {
+        long pixel_bits = bpp ? bpp : bps * (planar ? 1 : spp);
+        if (!bpr)
+            bpr = (w * pixel_bits + 7) / 8;
+        long n = planar ? spp : 1;
+        uint32_t g = bpr > 0 ? m32_malloc((uint32_t)(n * bpr * h)) : 0;
+        if (g) {
+            memset(m32_h(g), 0, (size_t)(n * bpr * h));
+            for (long i = 0; i < n; i++)
+                planes[i] = m32_h(g + (uint32_t)(i * bpr * h));
+        }
+    }
+    id r;
+    if (fmt) {
+        id (*f)(id, SEL, unsigned char **, long, long, long, long, BOOL, BOOL, id, unsigned long, long, long) =
+            (id (*)(id, SEL, unsigned char **, long, long, long, long, BOOL, BOOL, id, unsigned long, long, long))M32_MSGSEND;
+        r = f(hself, hs, planes, w, h, bps, spp, alpha, planar, space, format, bpr, bpp);
+    } else {
+        id (*f)(id, SEL, unsigned char **, long, long, long, long, BOOL, BOOL, id, long, long) =
+            (id (*)(id, SEL, unsigned char **, long, long, long, long, BOOL, BOOL, id, long, long))M32_MSGSEND;
+        r = f(hself, hs, planes, w, h, bps, spp, alpha, planar, space, bpr, bpp);
+    }
+#undef ARG
+    m32_ret(cpu, m32_objc_to_guest(r), 0, 0);
+    return 1;
+}
+
 static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, uint32_t gsel, uint32_t gtypes, int is_super)
 {
     SEL hs = m32_sel_host(gsel);
@@ -1158,6 +1224,8 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
     if (!is_super && system_font(cpu, hself, name))
         return OCERZ_STEP_OK;
     if (rects_being_drawn(cpu, hself, is_super ? super_cls : NULL, hs, name))
+        return OCERZ_STEP_OK;
+    if (!is_super && bitmap_planes(cpu, hself, NULL, hs, name))
         return OCERZ_STEP_OK;
     int is_class = object_isClass(hself);
     Class lookup_cls = super_cls ? super_cls : object_getClass(hself);

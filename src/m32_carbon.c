@@ -476,8 +476,21 @@ static int sp_LSCopyDefaultSchemeHandlerURL(struct OcerzVM *vm, OcerzCPU *cpu)
     return ret_value(cpu, app ? 0 : (uint32_t)-10814);
 }
 
+/* GetScriptManagerVariable(short selector) -> long: smKCHRCache (38) is the address of the keyboard's KCHR, a pointer
+ * the long holds, which the i386 int cut to 32 bits; SDL 1.2 handed it to KeyTranslate, which faulted in HIToolbox
+ * (AssaultCube).  It answers 0, no KCHR, as on a Mac with Unicode layouts alone, and callers use their own key
+ * tables; the other selectors are numbers and pass through. */
+static int sp_GetScriptManagerVariable(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    long (*fn)(short) = (long (*)(short))carbon_fn("GetScriptManagerVariable");
+    short sel = (short)m32_arg(cpu, 0);
+    return ret_value(cpu, sel == 38 || !fn ? 0 : (uint32_t)fn(sel));
+}
+
 const M32SpecialEntry m32_carbon_specials[] = {
     { "__LSCopyDefaultSchemeHandlerURL", sp_LSCopyDefaultSchemeHandlerURL },
+    { "_GetScriptManagerVariable", sp_GetScriptManagerVariable },
     { "_ConvertFromUnicodeToText", sp_ConvertFromUnicodeToText },
     { "_ConvertFromTextToUnicode", sp_ConvertFromTextToUnicode },
     { "_ConvertFromUnicodeToPString", sp_ConvertFromUnicodeToPString },

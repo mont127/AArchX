@@ -11,6 +11,7 @@
  * ponytail: one scratch block per callback, grown on the I/O thread when a larger buffer list arrives; contexts are
  * never freed (an app sets a handful).
  */
+#include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -139,7 +140,14 @@ typedef struct { void *proc; uint32_t user; } QueueOut;
 
 static void *at(const char *sym)
 {
-    return ocerz_bridge_host_symbol(AT_LIB, sym);
+    void *f = ocerz_bridge_host_symbol(AT_LIB, sym);
+    if (!f) {   /* the bridge not set up (test_m32): the framework itself */
+        static void *lib;
+        if (!lib)
+            lib = dlopen(AT_LIB, RTLD_LAZY | RTLD_LOCAL);
+        f = lib ? dlsym(lib, sym) : NULL;
+    }
+    return f;
 }
 static uint32_t queue_guest(void *host)
 {
@@ -287,7 +295,137 @@ static int sp_NewMovieFromFile(struct OcerzVM *vm, OcerzCPU *cpu)   /* (Movie *,
     RET(QT_UNIMP);
 }
 
+/* The Component Manager calls 32-bit programs find their audio units with (FindNextComponent for the default output,
+ * then OpenAComponent): on Apple silicon the Component Manager no longer lists audio units, which are AudioComponents,
+ * so SuperTuxKart's OpenAL found no output and played nothing ("Could not open the default sound device").  Its
+ * ComponentDescription is an AudioComponentDescription, word for word, and an AudioComponentInstance is the AudioUnit
+ * the AudioUnit calls take, so a description the AudioComponent registry answers is answered from it; anything else
+ * is the host's Component Manager.  The components and instances made this way are remembered, for the calls that
+ * take them.  (Crossed, a Component was taken for a pointer to a one-word structure and copied.) */
+static void *g_ac[256];   /* AudioComponents and AudioComponentInstances handed out */
+static int g_nac;
+static pthread_mutex_t g_aclock = PTHREAD_MUTEX_INITIALIZER;
+static void ac_note(void *p)
+{
+    pthread_mutex_lock(&g_aclock);
+    int i = 0;
+    while (i < g_nac && g_ac[i] != p)
+        i++;
+    if (i == g_nac && g_nac < 256)
+        g_ac[g_nac++] = p;
+    pthread_mutex_unlock(&g_aclock);
+}
+static int ac_known(void *p)
+{
+    int found = 0;
+    pthread_mutex_lock(&g_aclock);
+    for (int i = 0; p && i < g_nac && !found; i++)
+        found = g_ac[i] == p;
+    pthread_mutex_unlock(&g_aclock);
+    return found;
+}
+static void *cm(const char *sym) { return dlsym(RTLD_DEFAULT, sym); }
+
+/* FindNextComponent(Component prev, ComponentDescription *looking) */
+static int sp_FindNextComponent(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    void *(*find_ac)(void *, const void *) = at("AudioComponentFindNext");
+    void *(*find)(void *, const void *) = cm("FindNextComponent");
+    void *prev = m32_host(m32_arg(cpu, 0)), *c = NULL;
+    const void *desc = m32_arg(cpu, 1) ? m32_h(m32_arg(cpu, 1)) : NULL;
+    if (find_ac && (!prev || ac_known(prev)) && (c = find_ac(prev, desc)))
+        ac_note(c);
+    else if (find && (!prev || !ac_known(prev)))
+        c = find(prev, desc);
+    RET(m32_handle(c));
+}
+/* CountComponents(ComponentDescription *looking) */
+static int sp_CountComponents(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t (*count_ac)(const void *) = at("AudioComponentCount");
+    long (*count)(const void *) = cm("CountComponents");
+    const void *desc = m32_arg(cpu, 0) ? m32_h(m32_arg(cpu, 0)) : NULL;
+    uint32_t n = count_ac ? count_ac(desc) : 0;
+    RET(n ? n : count ? (uint32_t)count(desc) : 0);
+}
+static void *open_component(void *c, int32_t *err)
+{
+    int32_t (*new_ac)(void *, void **) = at("AudioComponentInstanceNew");
+    int32_t (*open)(void *, void **) = cm("OpenAComponent");
+    void *inst = NULL;
+    *err = -50;
+    if (ac_known(c) && new_ac)
+        *err = new_ac(c, &inst);
+    else if (c && open)
+        *err = open(c, &inst);
+    if (*err)
+        inst = NULL;
+    else if (ac_known(c))
+        ac_note(inst);
+    return inst;
+}
+/* OpenComponent(Component) -> ComponentInstance */
+static int sp_OpenComponent(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int32_t err;
+    RET(m32_handle(open_component(m32_host(m32_arg(cpu, 0)), &err)));
+}
+/* OpenAComponent(Component, ComponentInstance *) -> OSErr */
+static int sp_OpenAComponent(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int32_t err;
+    void *inst = open_component(m32_host(m32_arg(cpu, 0)), &err);
+    if (m32_arg(cpu, 1))
+        m32_wr(m32_arg(cpu, 1), m32_handle(inst));
+    RET((uint32_t)(int32_t)(int16_t)err);
+}
+/* CloseComponent(ComponentInstance) -> OSErr */
+static int sp_CloseComponent(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int32_t (*dispose_ac)(void *) = at("AudioComponentInstanceDispose");
+    int16_t (*close)(void *) = cm("CloseComponent");
+    void *inst = m32_host(m32_arg(cpu, 0));
+    int32_t r = ac_known(inst) && dispose_ac ? dispose_ac(inst) : close && inst ? close(inst) : -50;
+    RET((uint32_t)(int32_t)(int16_t)r);
+}
+/* CallComponentVersion(ComponentInstance) -> long */
+static int sp_CallComponentVersion(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    void *(*component_of)(void *) = at("AudioComponentInstanceGetComponent");
+    int32_t (*version_ac)(void *, uint32_t *) = at("AudioComponentGetVersion");
+    long (*version)(void *) = cm("CallComponentVersion");
+    void *inst = m32_host(m32_arg(cpu, 0));
+    uint32_t v = 0;
+    if (ac_known(inst) && component_of && version_ac)
+        version_ac(component_of(inst), &v);
+    else if (inst && version)
+        v = (uint32_t)version(inst);
+    RET(v);
+}
+/* GetComponentInfo(Component, ComponentDescription *, Handle name, Handle info, Handle icon): an audio unit's
+ * description; its name, info and icon handles are left as they are, and another component is invalidComponentID */
+static int sp_GetComponentInfo(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int32_t (*describe_ac)(void *, void *) = at("AudioComponentGetDescription");
+    void *c = m32_host(m32_arg(cpu, 0));
+    if (!ac_known(c))
+        RET((uint32_t)(int32_t)-3000);
+    int32_t r = describe_ac && m32_arg(cpu, 1) ? describe_ac(c, m32_h(m32_arg(cpu, 1))) : -50;
+    RET((uint32_t)(int32_t)(int16_t)r);
+}
+
 const M32SpecialEntry m32_audio_specials[] = {
+    { "_FindNextComponent", sp_FindNextComponent }, { "_CountComponents", sp_CountComponents },
+    { "_OpenComponent", sp_OpenComponent }, { "_OpenAComponent", sp_OpenAComponent },
+    { "_CloseComponent", sp_CloseComponent }, { "_CallComponentVersion", sp_CallComponentVersion },
+    { "_GetComponentInfo", sp_GetComponentInfo },
     { "_AudioUnitSetProperty", sp_AudioUnitSetProperty },
     { "_AudioQueueNewOutput", sp_AudioQueueNewOutput }, { "_AudioQueueAllocateBuffer", sp_AudioQueueAllocateBuffer },
     { "_AudioQueueEnqueueBuffer", sp_AudioQueueEnqueueBuffer }, { "_AudioQueueDispose", sp_AudioQueueDispose },

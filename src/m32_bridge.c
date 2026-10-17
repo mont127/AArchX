@@ -75,6 +75,9 @@ static void m32_fill_data(M32Export *e)
     if (obj || !strcmp(e->data_kind, "ptr")) {
         void *v = *(void **)e->host_fn;
         m32_wr(e->data, obj ? m32_objc_to_guest(v) : m32_handle(v));
+        /* the variable's address stands for the host's: GLUT's fonts are the addresses of its font variables
+         * (GLUT_BITMAP_HELVETICA_12 is &glutBitmapHelvetica12), which GLUT compares with its own */
+        m32_alias(e->data, e->host_fn);
         if (g_nlive < 512) {
             g_live_seen[g_nlive] = v;
             g_live[g_nlive++] = e;

@@ -705,6 +705,20 @@ static M32Image *find_loaded(const char *path)
     return NULL;
 }
 
+/* A program's own OpenAL library is the system's.  A bundled one (SuperTuxKart's is Apple's old open-source OpenAL)
+ * mixes as i386 code, crossing into an AUGraph and called back into the guest for every buffer; the OpenAL macOS ships
+ * is the same C API, crossed like any other library, and mixes natively (AssaultCube plays through it).  A bundled
+ * libopenal*.dylib or OpenAL.framework becomes it (OCERZ_NO_M32_SYSTEM_OPENAL=1 loads the program's own). */
+#define SYSTEM_OPENAL "/System/Library/Frameworks/OpenAL.framework/Versions/A/OpenAL"
+static int bundled_openal(const char *path)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_SYSTEM_OPENAL") != NULL;
+    const char *base = strrchr(path, '/');
+    return !off && base && (!strncmp(base + 1, "libopenal", 9) || strstr(path, "/OpenAL.framework/"));
+}
+
 /* load every guest dependency of img, recursively; returns -1 when a required one is missing */
 static int load_deps(M32Image *img)
 {
@@ -715,6 +729,10 @@ static int load_deps(M32Image *img)
                 continue;
             fprintf(stderr, "ocerz: m32: %s: cannot find %s\n", img->path, img->deps[i]);
             return -1;
+        }
+        if (path[0] && bundled_openal(path)) {
+            img->deps[i] = strdup(SYSTEM_OPENAL);
+            path[0] = 0;
         }
         if (!path[0]) {   /* system: open it now, so the classes of one used only for them (WebKit) exist */
             ocerz_bridge_host_library(img->deps[i]);
@@ -796,10 +814,25 @@ static uint32_t nlist_lookup(M32Image *img, const char *name)
     return 0;
 }
 
+/* whether img is one of our runtime's GCC support libraries (runtime/guest32/usr/lib/libgcc_*) */
+static int guest_libgcc(const M32Image *img)
+{
+    guest32_root();
+    size_t n = strlen(g_guest32_root);
+    const char *base = strrchr(img->path, '/');
+    return n && !strncmp(img->path, g_guest32_root, n) && base && !strncmp(base + 1, "libgcc_", 7);
+}
+
 static uint32_t lookup_in(M32Image *img, const char *name, int depth)
 {
     if (depth > 8)
         return 0;
+    /* One unwinder for every frame: a program built with Apple's GCC imports _Unwind_Resume and the rest from
+     * libgcc_s, which our runtime's GCC libraries answer with their own unwinder, while libstdc++'s throw goes through
+     * m32's (src/m32_unwind.c), and the two do not know each other's state: SuperTuxKart aborted inside libgcc's
+     * unwinder after its first throw.  GCC's arithmetic helpers stay where they are. */
+    if (!strncmp(name, "__Unwind_", 9) && guest_libgcc(img) && m32_special(name))
+        return m32_export("/usr/lib/libSystem.B.dylib", name);
     uint32_t v = img->export_size ? trie_lookup(img, name, depth) : nlist_lookup(img, name);
     for (int i = 0; !v && i < img->ndeps; i++)   /* LC_REEXPORT_DYLIB */
         if (img->dep_reexport[i])
