@@ -127,33 +127,35 @@ static uint64_t leaf_isinff(uint32_t bits) { return (bits & 0x7fffffffu) == 0x7f
 static uint64_t leaf_isnanf(uint32_t bits) { return (bits & 0x7fffffffu) > 0x7f800000u; }
 
 static const M32Leaf g_leaves[] = {
-    { "_pthread_self", (void *)leaf_pthread_self, 0, 0, M32_LEAF_I32, 0, 0, 0 },
-    { "___isinff", (void *)leaf_isinff, 1, 0, M32_LEAF_I32, 0, 0, 0 },
-    { "___isnanf", (void *)leaf_isnanf, 1, 0, M32_LEAF_I32, 0, 0, 0 },
-    { "_CGLSetCurrentContext", (void *)leaf_CGLSetCurrentContext, 1, 0, M32_LEAF_I32, 1, 0, 0 },
-    { "_CGLLockContext", (void *)leaf_CGLLockContext, 1, 0, M32_LEAF_I32, 1, 0, 0 },
-    { "_CGLUnlockContext", (void *)leaf_CGLUnlockContext, 1, 0, M32_LEAF_I32, 1, 0, 0 },
-    { "_CGLGetCurrentContext", (void *)leaf_CGLGetCurrentContext, 0, 0, M32_LEAF_I32, 1, 0, 0 },
-    { "_memcpy", (void *)leaf_memmove, 3, 3, M32_LEAF_ARG0, 0, 0, 0 },
-    { "_memmove", (void *)leaf_memmove, 3, 3, M32_LEAF_ARG0, 0, 0, 0 },
-    { "_memset", (void *)leaf_memset, 3, 1, M32_LEAF_ARG0, 0, 0, 0 },
-    { "___bzero", (void *)leaf_bzero, 2, 1, M32_LEAF_VOID, 0, 0, 0 },
-    { "_bzero", (void *)leaf_bzero, 2, 1, M32_LEAF_VOID, 0, 0, 0 },
-    { "_memcmp", (void *)leaf_memcmp, 3, 3, M32_LEAF_I32, 0, 0, 0 },
-    { "_strlen", (void *)leaf_strlen, 1, 1, M32_LEAF_I32, 0, 0, 0 },
-    { "_wcscmp", (void *)leaf_wcscmp, 2, 3, M32_LEAF_I32, 0, 0, 0 },
-    { "_pthread_getspecific", (void *)leaf_getspecific, 1, 0, M32_LEAF_I32, 0, 0, 0 },
-    { "_pthread_setspecific", (void *)leaf_setspecific, 2, 0, M32_LEAF_I32, 0, 0, 0 },
-    { "_mach_absolute_time", (void *)leaf_now, 0, 0, M32_LEAF_I64, 0, 0, 0 },
-    { "_UpTime", (void *)leaf_now, 0, 0, M32_LEAF_I64, 0, 0, 0 },
-    { "___tolower", (void *)leaf_tolower, 1, 0, M32_LEAF_I32, 0, 0, 0 },
-    { "_OSMemoryBarrier", NULL, 0, 0, M32_LEAF_VOID, 0, 0, 0 },   /* the JIT emits the barrier itself */
+    { "_pthread_self", (void *)leaf_pthread_self, 0, 0, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "___isinff", (void *)leaf_isinff, 1, 0, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "___isnanf", (void *)leaf_isnanf, 1, 0, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "_CGLSetCurrentContext", (void *)leaf_CGLSetCurrentContext, 1, 0, M32_LEAF_I32, 1, 0, 0, 0, 0 },
+    { "_CGLLockContext", (void *)leaf_CGLLockContext, 1, 0, M32_LEAF_I32, 1, 0, 0, 0, 0 },
+    { "_CGLUnlockContext", (void *)leaf_CGLUnlockContext, 1, 0, M32_LEAF_I32, 1, 0, 0, 0, 0 },
+    { "_CGLGetCurrentContext", (void *)leaf_CGLGetCurrentContext, 0, 0, M32_LEAF_I32, 1, 0, 0, 0, 0 },
+    { "_memcpy", (void *)leaf_memmove, 3, 3, M32_LEAF_ARG0, 0, 0, 0, 0, 0 },
+    { "_memmove", (void *)leaf_memmove, 3, 3, M32_LEAF_ARG0, 0, 0, 0, 0, 0 },
+    { "_memset", (void *)leaf_memset, 3, 1, M32_LEAF_ARG0, 0, 0, 0, 0, 0 },
+    { "___bzero", (void *)leaf_bzero, 2, 1, M32_LEAF_VOID, 0, 0, 0, 0, 0 },
+    { "_bzero", (void *)leaf_bzero, 2, 1, M32_LEAF_VOID, 0, 0, 0, 0, 0 },
+    { "_memcmp", (void *)leaf_memcmp, 3, 3, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "_strlen", (void *)leaf_strlen, 1, 1, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "_wcscmp", (void *)leaf_wcscmp, 2, 3, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "_pthread_getspecific", (void *)leaf_getspecific, 1, 0, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "_pthread_setspecific", (void *)leaf_setspecific, 2, 0, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "_mach_absolute_time", (void *)leaf_now, 0, 0, M32_LEAF_I64, 0, 0, 0, 0, 0 },
+    { "_UpTime", (void *)leaf_now, 0, 0, M32_LEAF_I64, 0, 0, 0, 0, 0 },
+    { "___tolower", (void *)leaf_tolower, 1, 0, M32_LEAF_I32, 0, 0, 0, 0, 0 },
+    { "_OSMemoryBarrier", NULL, 0, 0, M32_LEAF_VOID, 0, 0, 0, 0, 0 },   /* the JIT emits the barrier itself */
 };
 
 /* any GL function whose guest and host notations agree and that takes 32-bit integers, booleans and pointers and
  * returns an integer or nothing (glEnable, glBindTexture, glVertexAttribPointer, glDrawRangeElementsBaseVertex,
- * glProgramLocalParameters4fvEXT...).  All integers: the host function itself is the leaf; with pointers or
- * booleans: through m32_leaf_tramp.  Floats, 64-bit values and anything with a special keep the crossing. */
+ * glProgramLocalParameters4fvEXT...), through m32_leaf_tramp: it clears FPCR.AH, which translated code runs with, for
+ * the call (host_fp), as m32_trap does for every crossing.  Called straight, Apple's GL engine ran with it and
+ * Nexuiz's benchmark demo faulted in gleRunVertexSubmitImmediate.  Floats, 64-bit values and anything with a special
+ * keep the crossing. */
 static M32Leaf g_gl[8192];
 static const M32Leaf *gl_leaf(uint32_t id, const M32Export *e)
 {
@@ -176,8 +178,8 @@ static const M32Leaf *gl_leaf(uint32_t id, const M32Export *e)
         return NULL;
     if (!g_gl[id].fn)
         g_gl[id] = (M32Leaf){ e->name, e->host_fn, (uint8_t)k, (uint8_t)ptrs,
-                              (uint8_t)(e->gnote[0] == 'v' ? M32_LEAF_VOID : M32_LEAF_I32), 1, (uint8_t)(ptrs || bytes),
-                              (uint8_t)bytes };
+                              (uint8_t)(e->gnote[0] == 'v' ? M32_LEAF_VOID : M32_LEAF_I32), 1, 1, (uint8_t)bytes, 1,
+                              (uint8_t)e->gl_ptr };
     return &g_gl[id];
 }
 
@@ -185,12 +187,21 @@ uint64_t m32_leaf_tramp(const M32Leaf *l, uint64_t a0, uint64_t a1, uint64_t a2,
                         uint64_t a5, uint64_t a6)
 {
     uint64_t a[7] = { a0, a1, a2, a3, a4, a5, a6 };
+    int buffer_offsets = l->gl == M32_GL_ARRAY || l->gl == M32_GL_ELEMENT;
     for (int k = 0; k < l->nargs; k++) {
-        if (l->ptrs >> k & 1) a[k] = (uint64_t)(uintptr_t)m32_host((uint32_t)a[k]);
+        if (l->ptrs >> k & 1)
+            a[k] = buffer_offsets ? m32_gl_ptr(l->gl, (uint32_t)a[k]) : (uint64_t)(uintptr_t)m32_host((uint32_t)a[k]);
         else if (l->bytes >> k & 1) a[k] &= 0xff;
     }
+    if (l->gl == M32_GL_BIND || l->gl == M32_GL_BIND_VAO)
+        m32_gl_bound(l->gl, (uint32_t)a[0], (uint32_t)a[1]);
     typedef uint64_t (*F7)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-    return ((F7)l->fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    if (!l->host_fp)
+        return ((F7)l->fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    uint64_t fpcr = ocerz_afp_host();
+    uint64_t r = ((F7)l->fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    ocerz_afp_restore(fpcr);
+    return r;
 }
 
 const M32Leaf *m32_leaf_for(uint32_t trap)

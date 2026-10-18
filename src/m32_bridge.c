@@ -167,6 +167,35 @@ M32Export *m32_export_by_id(uint32_t id)
     return id < M32_ID_LIMIT ? g_exports[id] : NULL;
 }
 
+/* A function pointer to an export (dlsym's, a GL extension's) is its trap, and a call through it jumped into the trap
+ * window, which sent the call back to the run loop: out of translated code and in again, every call.  DarkPlaces
+ * calls all of OpenGL that way, a quarter of a million calls a second.  The JIT translates a trap as the import stub
+ * it stands for, `jmp [slot]` with this slot holding the trap, so the call crosses (or runs as a leaf) from inside a
+ * block and chains back like any other (src/jit.c, OCERZ_NO_M32_TRAP_BLOCKS=1 turns it off).  0: not an export's. */
+static uint32_t g_trap_slots[M32_ID_LIMIT];
+
+uint32_t m32_trap_slot(uint64_t trap)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_TRAP_BLOCKS") != NULL;
+    uint64_t id = trap - OCERZ_DYLDAPI_LO;
+    if (off || id < M32_ID_FIRST || id >= M32_ID_LIMIT)
+        return 0;
+    uint32_t slot = __atomic_load_n(&g_trap_slots[id], __ATOMIC_ACQUIRE);
+    if (slot)
+        return slot;
+    pthread_mutex_lock(&g_lock);
+    M32Export *e = g_exports[id];
+    if (!g_trap_slots[id] && e && e->kind != M32_EX_DATA && (slot = m32_static_alloc(4, 4)) != 0) {
+        m32_wr(slot, (uint32_t)trap);
+        __atomic_store_n(&g_trap_slots[id], slot, __ATOMIC_RELEASE);
+    }
+    slot = g_trap_slots[id];
+    pthread_mutex_unlock(&g_lock);
+    return slot;
+}
+
 /* OCERZ_M32_HUD=<overlay dylib>: an FPS overlay (simpleoverlay, whose exported fake_dlsym hands back its
  * CGLFlushDrawable wrapper) is loaded here rather than through DYLD_INSERT_LIBRARIES, which every child process
  * inherits (Batman then ran a shell and quit); each frame the guest presents is drawn on before the real flush.
@@ -234,6 +263,7 @@ uint32_t m32_export(const char *lib, const char *name)
     M32Export *e = calloc(1, sizeof *e);
     e->lib = strdup(lib ? lib : "(flat)");
     e->name = strdup(name);
+    e->gl_ptr = m32_gl_ptr_kind(name);
     e->special = m32_special(name);
     e->kind = e->special ? M32_EX_SPECIAL : M32_EX_UNRESOLVED;
     /* GNU libiconv's own names, which Apple's libiconv exported beside iconv's until Apple silicon (Firefox 3.6) */

@@ -1304,6 +1304,33 @@ static void test_queues(void)
     check("pthread_rwlockattr_getpshared", m32_rd(ps) == 1);
 }
 
+/* OpenGL's buffer objects: with one bound, a gl*Pointer's or a glDraw*Elements' pointer is an offset into it and
+ * crosses as it is (src/m32_gl.c); and a function pointer to an export is its trap, which the JIT translates as the
+ * stub it stands for, through a slot holding the trap (src/m32_bridge.c) */
+static void test_gl_buffers(void)
+{
+    check("gl*Pointer and glDraw*Elements are recognised", m32_gl_ptr_kind("_glTexCoordPointer") == M32_GL_ARRAY &&
+          m32_gl_ptr_kind("_glVertexAttribPointerARB") == M32_GL_ARRAY &&
+          m32_gl_ptr_kind("_glDrawRangeElements") == M32_GL_ELEMENT && m32_gl_ptr_kind("_glBindBufferARB") == M32_GL_BIND &&
+          m32_gl_ptr_kind("_glBindVertexArrayAPPLE") == M32_GL_BIND_VAO && m32_gl_ptr_kind("_glEnable") == M32_GL_NONE &&
+          m32_gl_ptr_kind("_strlen") == M32_GL_NONE);
+    check("no buffer bound: a pointer is a guest address", m32_gl_ptr(M32_GL_ARRAY, 0x1f350) == (uint64_t)(uintptr_t)m32_h(0x1f350) &&
+          m32_gl_ptr(M32_GL_ELEMENT, 0x1f350) == (uint64_t)(uintptr_t)m32_h(0x1f350));
+    m32_gl_bound(M32_GL_BIND, 0x8892, 0x80);   /* GL_ARRAY_BUFFER */
+    check("an array buffer bound: a gl*Pointer's is an offset", m32_gl_ptr(M32_GL_ARRAY, 0x1f350) == 0x1f350 &&
+          m32_gl_ptr(M32_GL_ELEMENT, 0x40) == (uint64_t)(uintptr_t)m32_h(0x40));
+    m32_gl_bound(M32_GL_BIND, 0x8893, 0x7f);   /* GL_ELEMENT_ARRAY_BUFFER */
+    check("an element buffer bound: indices are an offset", m32_gl_ptr(M32_GL_ELEMENT, 0x40) == 0x40);
+    m32_gl_bound(M32_GL_BIND, 0x8892, 0);
+    m32_gl_bound(M32_GL_BIND, 0x8893, 0);
+    check("unbound again: guest addresses", m32_gl_ptr(M32_GL_ARRAY, 0x1f350) == (uint64_t)(uintptr_t)m32_h(0x1f350) &&
+          m32_gl_ptr(M32_GL_ELEMENT, 0x40) == (uint64_t)(uintptr_t)m32_h(0x40));
+    uint32_t trap = m32_export("/usr/lib/libSystem.B.dylib", "_strlen");
+    uint32_t slot = trap ? m32_trap_slot(trap) : 0;
+    check("an export's trap has a slot holding it", slot && m32_rd(slot) == trap && m32_trap_slot(trap) == slot);
+    check("... and the window's other traps have none", m32_trap_slot(OCERZ_DYLDAPI_LO + 1) == 0);
+}
+
 /* what Adium's frameworks needed of m32's dyld: rpaths that are directories relative to the loader, and images
  * fixed up and initialized after their dependencies (src/m32_dyld.c) */
 static void test_image_order(void)
@@ -1692,6 +1719,7 @@ int main(int argc, char **argv)
     test_game_libs();
     test_image_order();
     test_queues();
+    test_gl_buffers();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

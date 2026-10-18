@@ -75,11 +75,19 @@ uint32_t m32_steam_dlsym(uint32_t handle, const char *sym);
  * them (bit k: argument k) passed as host addresses.  simd: the host code it calls may use SIMD registers, so the
  * JIT saves the guest's xmm around it.  tramp: called as m32_leaf_tramp(leaf, raw arguments...), which converts the
  * pointer arguments with m32_host as m32_cross does and masks the byte ones before calling fn */
-typedef struct M32Leaf { const char *name; void *fn; uint8_t nargs, ptrs, ret, simd, tramp, bytes; } M32Leaf;
+typedef struct M32Leaf { const char *name; void *fn; uint8_t nargs, ptrs, ret, simd, tramp, bytes, host_fp, gl; } M32Leaf;
 uint64_t m32_leaf_tramp(const M32Leaf *l, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                         uint64_t a5, uint64_t a6);
 enum { M32_LEAF_I32, M32_LEAF_I64, M32_LEAF_ARG0, M32_LEAF_VOID };
 const M32Leaf *m32_leaf_for(uint32_t trap);
+uint32_t m32_trap_slot(uint64_t trap);   /* src/m32_bridge.c: a guest word holding the trap, for a trap's block, or 0 */
+
+/* vertex and element arrays in buffer objects (src/m32_gl.c): with a buffer bound, a gl*Pointer's or a glDraw*Elements'
+ * pointer is an offset into it and crosses as it is */
+enum { M32_GL_NONE, M32_GL_ARRAY, M32_GL_ELEMENT, M32_GL_BIND, M32_GL_BIND_VAO };
+int m32_gl_ptr_kind(const char *name);
+uint64_t m32_gl_ptr(int kind, uint32_t guest_ptr);
+void m32_gl_bound(int kind, uint32_t target, uint32_t buffer);   /* after glBindBuffer(target, buffer), glBindVertexArray */
 
 static inline void *m32_h(uint32_t g) { return (void *)(uintptr_t)(ocerz_guest_base + g); }
 static inline uint32_t m32_rd(uint32_t g) { uint32_t v; memcpy(&v, m32_h(g), 4); return v; }
@@ -110,6 +118,7 @@ typedef struct M32Export {
     int gsize, hsize;
     char *data_kind;
     int file_ret;             /* returns a FILE *: the guest gets m32_file's twin */
+    int gl_ptr;               /* M32_GL_*: a GL call whose pointer may be a buffer offset, or that binds one */
 } M32Export;
 enum { M32_EX_UNRESOLVED, M32_EX_SPECIAL, M32_EX_FN, M32_EX_BAD, M32_EX_DATA };
 

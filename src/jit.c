@@ -1077,8 +1077,21 @@ static uint32_t g_tc_nbytes;
 static int g_tc_dbar;
 static int g_tc_rec;
 static int g_tc_learned;
+/* the block being translated is an m32 trap's: `jmp [slot]` (m32_trap_slot), whose fast call has no fallback that
+ * jumps to the trap again */
+static int g_trap_block;
+
 static int jit_decode(uint64_t pc, X86Insn *out, int mode32)
 {
+    if (mode32 && pc - OCERZ_DYLDAPI_LO < (uint64_t)(OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO)) {
+        uint32_t slot = m32_active ? m32_trap_slot(pc) : 0;
+        if (!slot)
+            return OCERZ_EUNSUP;
+        const uint8_t stub[6] = { 0xff, 0x25, (uint8_t)slot, (uint8_t)(slot >> 8), (uint8_t)(slot >> 16),
+                                  (uint8_t)(slot >> 24) };
+        g_tc_bad = 1;   /* nothing in guest memory to cache it by */
+        return ocerz_decode_mode(stub, sizeof stub, pc, out, 1);
+    }
     const uint8_t *code = (const uint8_t *)ocerz_g2h(pc);
     int rc = ocerz_decode_mode(code, 15, pc, out, mode32);
     if (rc == OCERZ_OK && g_tc_rec) {
@@ -17897,11 +17910,13 @@ static void emit_dispatch_stub(OcerzJit *jit, int mode32)
         to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 1, JT0, 0);
     }
     a64_ldr(&b, 8, JT1, 1, RIP_OFF);
-    a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_LO);
-    a64_sub_reg(&b, 1, JTT, JT1, JTU, 0);
-    a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO);
-    a64_subs_reg(&b, 1, A64_ZR, JTT, JTU, 0);
-    to_ret[nr++] = a64_label(&b); a64_bcond(&b, A64_CC, 0);
+    if (!(mode32 && m32_active && !getenv("OCERZ_NO_M32_TRAP_BLOCKS"))) {   /* m32: a trap's block is looked up too */
+        a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_LO);
+        a64_sub_reg(&b, 1, JTT, JT1, JTU, 0);
+        a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO);
+        a64_subs_reg(&b, 1, A64_ZR, JTT, JTU, 0);
+        to_ret[nr++] = a64_label(&b); a64_bcond(&b, A64_CC, 0);
+    }
     if (mode32) {
         int ok = a64_try_orr_imm(&b, 1, JT1, JT1, JIT_KEY_M32);
         assert(ok && "JIT_KEY_M32 must encode as a logical immediate");
@@ -18656,30 +18671,62 @@ static void emit_bridge_fastcall(A64Buf *b, const X86Insn *insns, int i,
  * such calls a frame (OpenGL, CGL, the clock), each one through the run loop
  * and the trap lookup before.  OCERZ_NO_M32_FASTCALL=1 turns it off.
  */
+/* A trap's block (g_trap_block) whose call cannot be made from inside it hands the trap to the run loop as before:
+ * rip at the trap and OCERZ_EUNSUP, which leaves the dispatch stub (it would find this very block again) for the run
+ * loop, whose interpreter step dispatches the trap.  Its `jmp [slot]` would come back here too. */
+static void emit_trap_exit(A64Buf *b, uint64_t trap, uint32_t **epi_sites, int *n_epi)
+{
+    a64_mov_imm64(b, JT1, trap);
+    a64_str(b, 8, JT1, 20, RIP_OFF);
+    a64_mov_imm64(b, 0, (uint64_t)(int64_t)OCERZ_EUNSUP);
+    epi_sites[*n_epi] = a64_label(b);
+    a64_b(b, 0);
+    (*n_epi)++;
+}
+
+static int emit_bridge_fastcall32_body(A64Buf *b, const X86Insn *insns, int i, uint32_t **epi_sites, int *n_epi);
+
 static void emit_bridge_fastcall32(A64Buf *b, const X86Insn *insns, int i,
                                    uint32_t **epi_sites, int *n_epi)
 {
+    if (!emit_bridge_fastcall32_body(b, insns, i, epi_sites, n_epi) && g_trap_block)
+        emit_trap_exit(b, insns[i].rip, epi_sites, n_epi);
+}
+
+/* m32 crosses into arm64 frameworks in either mode (it has no x86 shared cache to use), so its fast calls do not wait
+ * for -native as the x86_64 bridge's do: started without it, a 32-bit program made every call through the run loop */
+static int m32_fastcall_enabled(void)
+{
+    static int en = -1;
+    if (en < 0)
+        en = !getenv("OCERZ_NO_BRIDGE_FASTCALL") && !getenv("OCERZ_NO_M32_FASTCALL");
+    return en;
+}
+
+static int emit_bridge_fastcall32_body(A64Buf *b, const X86Insn *insns, int i,
+                                       uint32_t **epi_sites, int *n_epi)
+{
     const X86Insn *insn = &insns[i];
-    if (!bridge_fastcall_enabled() || !g_xlat_mode32 || !m32_active || ENV_ON("OCERZ_NO_M32_FASTCALL"))
-        return;
+    if (!m32_fastcall_enabled() || !g_xlat_mode32 || !m32_active)
+        return 0;
     if (insn->op != OCERZ_OP_JMP || insn->nops != 1 || insn->seg != OCERZ_SEG_NONE)
-        return;
+        return 0;
     const X86Operand *o = &insn->ops[0];
     if (o->kind != OCERZ_OPK_MEM || o->riprel || o->size != 4 || o->base != OCERZ_REG_NONE ||
         o->index != OCERZ_REG_NONE)
-        return;
+        return 0;
     uint32_t slot = (uint32_t)o->disp;
     if (!ocerz_addr_readable(slot) || !ocerz_addr_readable(slot + 3))
-        return;
+        return 0;
     uint32_t trap = (uint32_t)ocerz_ld(slot, 4);
     if (trap < OCERZ_DYLDAPI_LO + M32_ID_FIRST || trap >= OCERZ_DYLDAPI_LO + M32_ID_LIMIT)
-        return;
+        return 0;
     static int no_blret = -1;
     if (no_blret < 0) no_blret = getenv("OCERZ_NO_BLRET") ? 1 : 0;
     int fast3 = g_pin_class == 3 && pin_slot(OCERZ_RSP) >= 0 && stack_plain_access_ok() &&
                 jgb_usable() && !stack_guard_needed();
     if (!fast3 || !ras_body_only() || !host_ras_enabled() || no_blret)
-        return;
+        return 0;
 
     l0_flush_all(b);
     a64_mov_imm64(b, JT1, (uint64_t)slot + ocerz_guest_base);
@@ -18763,7 +18810,9 @@ static void emit_bridge_fastcall32(A64Buf *b, const X86Insn *insns, int i,
         a64_b(b, 0);
         (*n_epi)++;
         a64_patch_bcond(to_plain, a64_label(b));
-        return;
+        if (g_trap_block)
+            emit_trap_exit(b, insn->rip, epi_sites, n_epi);
+        return 1;
     }
     a64_ldr(b, 8, JT0, 20, JIT_FP_OFF);
     a64_add_imm(b, 1, JTT, 31, 0);
@@ -18824,6 +18873,9 @@ static void emit_bridge_fastcall32(A64Buf *b, const X86Insn *insns, int i,
     uint32_t *plain = a64_label(b);
     a64_patch_bcond(to_plain, plain);
     a64_patch_bcond(to_deep, plain);
+    if (g_trap_block)
+        emit_trap_exit(b, insn->rip, epi_sites, n_epi);
+    return 1;
 }
 
 static int emit_indirect_call(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
@@ -22085,9 +22137,10 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_tc_ndlog = 0;
     g_tc_nbytes = 0;
     g_tc_dbar = 0;
+    g_trap_block = mode32 && rip - OCERZ_DYLDAPI_LO < (uint64_t)(OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO);
     if (tcm != OCERZ_TC_OFF)
         tc_log_init();
-    if ((tcm == OCERZ_TC_ON || tcm == OCERZ_TC_VERIFY) && tc_usable(jit) && tc_keepable(rip)) {
+    if ((tcm == OCERZ_TC_ON || tcm == OCERZ_TC_VERIFY) && tc_usable(jit) && tc_keepable(rip) && !g_trap_block) {
         g_tc_rec = 1;
         g_tc_key = tc_key(rip, mode32);
         uint64_t jk = jit_key(rip, mode32);
@@ -26362,7 +26415,8 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     g_trip_jit = vm->jit;
     trip_note(cpu->rip);
-    if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO))
+    if (cpu->rip - OCERZ_DYLDAPI_LO < (OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO) &&
+        !(cpu->mode32 && m32_active && m32_trap_slot(cpu->rip)))
         return OCERZ_EUNSUP;
     { static int sl = -1; if (sl < 0) sl = getenv("OCERZ_STEPLOG") ? 1 : 0; if (sl) steplog(cpu); }
     OcerzJit *jit = vm->jit;

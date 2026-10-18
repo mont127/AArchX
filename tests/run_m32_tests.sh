@@ -29,4 +29,12 @@ for n in "${names[@]}"; do
   if [ "$out" == "$(cat tests/m32/$n.expected)" ]; then echo "PASS $n"
   else echo "FAIL $n"; diff <(echo "$out") tests/m32/$n.expected | head -20; tail -5 "$log/m32-$n.err"; fail=1; fi
 done
+# an i386 program started without -native runs in native mode all the same (src/main.c): its NaN results come from
+# translated checks, not FPCR.AH, whose writes cost every call into the host
+if [ ${#names[@]} -eq 0 ] || [ $# -eq 0 ]; then
+  vlog=$(cd tests/m32/bin && perl -e "alarm 60; exec @ARGV" ../../../ocerz -v ./ret42 2>&1 >/dev/null)
+  if [[ "$vlog" == *"NaN results come from translated checks"* ]]; then
+    echo "PASS native-by-default"
+  else echo "FAIL native-by-default"; fail=1; fi
+fi
 exit $fail

@@ -1051,7 +1051,8 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             put_int(&hc, (uint64_t)(uintptr_t)cell, 8);
             continue;
         }
-        uint64_t v = m32_scalar_in(ga->cls, ha->cls, raw, e->name, i);
+        uint64_t v = (e->gl_ptr == M32_GL_ARRAY || e->gl_ptr == M32_GL_ELEMENT) && ga->cls == 'p'
+                         ? m32_gl_ptr(e->gl_ptr, (uint32_t)raw) : m32_scalar_in(ga->cls, ha->cls, raw, e->name, i);
         if (ha->cls == 'f' || ha->cls == 'd')
             put_fp(&hc, v, ha->size);
         else
@@ -1119,6 +1120,8 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
         return m32_objc_guest_throw(cpu, m32_objc_to_guest(exc));
     }
     m32_save_errno(cpu);
+    if (e->gl_ptr == M32_GL_BIND || e->gl_ptr == M32_GL_BIND_VAO)
+        m32_gl_bound(e->gl_ptr, m32_rd((uint32_t)cpu->gpr[OCERZ_RSP] + 4), m32_rd((uint32_t)cpu->gpr[OCERZ_RSP] + 8));
     static int log_gl = -1, log_nan = -1, log_stat = -1;
     if (log_gl < 0) {
         log_gl = getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "glerr");

@@ -478,6 +478,14 @@ int main(int argc, char **argv)
     int script = run_launch_script(load_path, argv, i);
     if (script >= 0)
         return script;
+    /* An i386 program has no x86 shared cache to map and crosses into arm64 frameworks on every call, so it runs in
+     * native mode unless asked otherwise.  Cache mode's NaN results from FPCR.AH cost it two FPCR writes per call
+     * (about 17 ns on an M5), more than the checks they save: Nexuiz's benchmark demo took 8% more cycles. */
+    if (!mode_from_flag && !(getenv("OCERZ_MODE") && *getenv("OCERZ_MODE")) && ocerz_mode != OCERZ_MODE_NATIVE &&
+        ocerz_peek_dynamic(load_path) == -2 && m32_is_i386(load_path)) {
+        ocerz_mode = OCERZ_MODE_NATIVE;
+        ocerz_afp_enable();
+    }
 
     apply_wine_defaults(load_path);
 
