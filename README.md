@@ -33,8 +33,9 @@ Mac's own arm64 frameworks, so they need no x86 system libraries at all.
 ## Highlights
 
 - **Real software runs.** Cocoa applications such as Safari and Discord, the
-  macOS Steam client and games launched from it, Ollama, and Wine, including
-  32-bit Windows programs through WoW64.
+  macOS Steam client and games launched from it, 32-bit Mac games and apps that
+  current macOS cannot run at all, Ollama, and Wine, including 32-bit Windows
+  programs through WoW64.
 - **Fast where it counts.** Guest registers live in arm64 registers, flags are
   computed only where they are read, blocks are chained into superblocks, and
   hot string and memory routines run as hand-written arm64. Translations are
@@ -44,7 +45,7 @@ Mac's own arm64 frameworks, so they need no x86 system libraries at all.
   the Mac's own arm64 frameworks instead.
 - **Correct before fast.** The interpreter is the reference: every guest test
   runs both interpreted and translated and the two must match byte for byte,
-  and 20,033 i386 cases are compared register by register.
+  and 40,044 i386 sequences are compared register by register.
 
 ## Install
 
@@ -118,6 +119,9 @@ make apis
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
 | Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window |
 | Batman: Arkham Asylum, a 32-bit Mac game | plays through m32 at about 61 fps, launched from Steam and signed in to it (October 2026) |
+| Other 32-bit Mac games | Left 4 Dead 2 and Call of Duty: Modern Warfare 3 from Steam; AssaultCube, SuperTuxKart, Neverball, Battle for Wesnoth, Teeworlds and Nexuiz (October 2026) |
+| 32-bit Mac apps | Adium, VLC 1.1.12 and Kega Fusion open their windows (October 2026) |
+| Older Intel apps, native mode | Transmission, Sequel Pro, HandBrake and VLC 2.2 open their windows (October 2026) |
 | Counter-Strike 2, under Wine with D3DMetal | reaches its window, then stops on an error Rosetta does not hit |
 | Photoshop | stops during startup |
 
@@ -179,13 +183,14 @@ contributors.
 
 | Gate | Result |
 | --- | --- |
-| x86-64 guest suite, interpreted and translated | 131 / 131 |
-| x86-64 differential, interpreter against JIT | 97 / 97 |
-| i386 differential | 20,033 / 20,033 |
-| dynamic-linking suite | 113 / 113 |
+| x86-64 guest suite, interpreted and translated | 134 / 134 |
+| x86-64 differential, interpreter against JIT | 100 / 100 |
+| i386 differential, in each of two memory layouts | 40,044 / 40,044 |
+| dynamic-linking suite | 406 / 406 |
 | native-mode suite | 87 / 87 |
+| 32-bit (m32) programs | 79 / 79, one more skipped without a Steam database |
 
-Counted on macOS 27 in September 2026. [Testing](docs/testing.md) says what
+Counted on macOS 27 in October 2026. [Testing](docs/testing.md) says what
 each gate proves and lists the component suites.
 
 ## Limitations
