@@ -6,6 +6,7 @@
  * included) is applied at load, so dyld_stub_binder is never reached and each __la_symbol_ptr holds its final
  * target from the first call on.
  */
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <mach-o/fat.h>
@@ -668,6 +669,32 @@ static void rpath_dir(const M32Image *img, const char *rp, char *out, size_t out
     }
 }
 
+/* A leaf name alone, as DarkPlaces asks for zlib ("libz.dylib"), is looked for as dyld looks: in
+ * DYLD_FALLBACK_LIBRARY_PATH, by default ~/lib, /usr/local/lib and /usr/lib.  An i386 image there is the guest's; one
+ * in /usr/lib is a system library, bridged, if the host has it.  Nexuiz found no zlib and read none of its data. */
+static int fallback_path(const char *name, char *out, size_t outlen)
+{
+    char def[1100], cand[2048];
+    const char *home = getenv("HOME"), *fb = getenv("DYLD_FALLBACK_LIBRARY_PATH");
+    snprintf(def, sizeof def, "%s/lib:/usr/local/lib:/usr/lib", home ? home : "");
+    for (const char *d = fb && *fb ? fb : def; d && *d; d = strchr(d, ':') ? strchr(d, ':') + 1 : NULL) {
+        size_t n = strcspn(d, ":");
+        if (!n)
+            continue;
+        snprintf(cand, sizeof cand, "%.*s/%s", (int)n, d, name);
+        if (!strncmp(cand, "/usr/lib/", 9)) {
+            void *h = dlopen(cand, RTLD_LAZY | RTLD_LOCAL);
+            if (h) {
+                out[0] = 0;   /* a system library */
+                (void)outlen;
+                return 0;
+            }
+        } else if (file_exists(cand) && (slices(cand) & 1) && realpath(cand, out))
+            return 0;
+    }
+    return -1;
+}
+
 /* expand @executable_path, @loader_path and @rpath; out is empty when the name is a system library */
 int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t outlen)
 {
@@ -676,6 +703,11 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
     /* as dyld does, a library's leaf name in the DYLD_LIBRARY_PATH directories first (Valve's hl2.sh points it at the
      * game's bin); only an i386 image counts, so the host's own libraries on that path are passed over */
     const char *dl = getenv("DYLD_LIBRARY_PATH"), *leaf = strrchr(name, '/');
+    char bare[1024];
+    if (!leaf && name[0] != '@') {   /* a leaf name alone ("libz.dylib") */
+        snprintf(bare, sizeof bare, "/%s", name);
+        leaf = bare;
+    }
     for (const char *d = dl; d && *d && leaf; d = strchr(d, ':') ? strchr(d, ':') + 1 : NULL) {
         size_t n = strcspn(d, ":");
         snprintf(buf, sizeof buf, "%.*s%s", (int)n, d, leaf);
@@ -714,6 +746,8 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
     }
     if (file_exists(buf) && realpath(buf, out))
         return 0;
+    if (!strchr(name, '/') && name[0] != '@')
+        return fallback_path(name, out, outlen);
     return -1;
 }
 

@@ -237,6 +237,88 @@ static int sp_rwlock_tryrdlock(struct OcerzVM *vm, OcerzCPU *cpu) { RETI(pthread
 static int sp_rwlock_trywrlock(struct OcerzVM *vm, OcerzCPU *cpu) { RETI(pthread_rwlock_trywrlock(rwlock_of(m32_arg(cpu, 0)))); }
 static int sp_rwlock_unlock(struct OcerzVM *vm, OcerzCPU *cpu) { RETI(pthread_rwlock_unlock(rwlock_of(m32_arg(cpu, 0)))); }
 
+/* pthread_rwlockattr_t is 16 bytes on i386 and 24 on arm64, and rwlock_init above makes its lock without one: the
+ * attribute lives in the guest's bytes, its process-shared setting in word 1 (2, PTHREAD_PROCESS_PRIVATE, unset). */
+static int sp_rwlockattr_init(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t a = m32_arg(cpu, 0);
+    if (a) {
+        memset(m32_h(a), 0, 16);
+        m32_wr(a, 0x52574c41u);   /* 'RWLA', i386's signature */
+        m32_wr(a + 4, 2);
+    }
+    RETI(0);
+}
+static int sp_rwlockattr_setpshared(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t a = m32_arg(cpu, 0), v = m32_arg(cpu, 1);
+    if (v != 1 && v != 2)
+        RETI(EINVAL);
+    if (a)
+        m32_wr(a + 4, v);
+    RETI(0);
+}
+static int sp_rwlockattr_getpshared(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t a = m32_arg(cpu, 0), out = m32_arg(cpu, 1);
+    if (out)
+        m32_wr(out, a && m32_rd(a + 4) == 1 ? 1 : 2);
+    RETI(0);
+}
+
+/* OSAtomicEnqueue/Dequeue (a LIFO: head, generation) and OSAtomicFifoEnqueue/Dequeue (head, tail, spare) link the
+ * guest's own elements through a 4-byte pointer at offset in each.  Crossed, the host copied the head in and out,
+ * which is not atomic, and wrote 8-byte host addresses into the elements.  They run on the guest's words, under one
+ * lock. */
+static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int sp_OSAtomicEnqueue(struct OcerzVM *vm, OcerzCPU *cpu)   /* (OSQueueHead *, void *new, size_t offset) */
+{
+    uint32_t q = m32_arg(cpu, 0), item = m32_arg(cpu, 1), off = m32_arg(cpu, 2);
+    pthread_mutex_lock(&g_queue_lock);
+    m32_wr(item + off, m32_rd(q));
+    m32_wr(q, item);
+    m32_wr(q + 4, m32_rd(q + 4) + 1);
+    pthread_mutex_unlock(&g_queue_lock);
+    RETI(0);
+}
+static int sp_OSAtomicDequeue(struct OcerzVM *vm, OcerzCPU *cpu)   /* (OSQueueHead *, size_t offset) */
+{
+    uint32_t q = m32_arg(cpu, 0), off = m32_arg(cpu, 1);
+    pthread_mutex_lock(&g_queue_lock);
+    uint32_t item = m32_rd(q);
+    if (item) {
+        m32_wr(q, m32_rd(item + off));
+        m32_wr(q + 4, m32_rd(q + 4) + 1);
+    }
+    pthread_mutex_unlock(&g_queue_lock);
+    RETI(item);
+}
+static int sp_OSAtomicFifoEnqueue(struct OcerzVM *vm, OcerzCPU *cpu)   /* (OSFifoQueueHead *, void *new, offset) */
+{
+    uint32_t q = m32_arg(cpu, 0), item = m32_arg(cpu, 1), off = m32_arg(cpu, 2);
+    pthread_mutex_lock(&g_queue_lock);
+    m32_wr(item + off, 0);
+    uint32_t tail = m32_rd(q + 4);
+    m32_wr(tail ? tail + off : q, item);
+    m32_wr(q + 4, item);
+    pthread_mutex_unlock(&g_queue_lock);
+    RETI(0);
+}
+static int sp_OSAtomicFifoDequeue(struct OcerzVM *vm, OcerzCPU *cpu)   /* (OSFifoQueueHead *, size_t offset) */
+{
+    uint32_t q = m32_arg(cpu, 0), off = m32_arg(cpu, 1);
+    pthread_mutex_lock(&g_queue_lock);
+    uint32_t item = m32_rd(q);
+    if (item) {
+        m32_wr(q, m32_rd(item + off));
+        if (!m32_rd(q))
+            m32_wr(q + 4, 0);
+    }
+    pthread_mutex_unlock(&g_queue_lock);
+    RETI(item);
+}
+
 /* ---- once: word 1 of the 8-byte pthread_once_t is 1 when done ---- */
 static pthread_mutex_t g_once_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 static int sp_once(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -472,6 +554,11 @@ const M32SpecialEntry m32_thread_specials[] = {
     { "_pthread_rwlock_rdlock", sp_rwlock_rdlock }, { "_pthread_rwlock_wrlock", sp_rwlock_wrlock },
     { "_pthread_rwlock_tryrdlock", sp_rwlock_tryrdlock }, { "_pthread_rwlock_trywrlock", sp_rwlock_trywrlock },
     { "_pthread_rwlock_unlock", sp_rwlock_unlock },
+    { "_pthread_rwlockattr_init", sp_rwlockattr_init }, { "_pthread_rwlockattr_destroy", sp_ok },
+    { "_pthread_rwlockattr_setpshared", sp_rwlockattr_setpshared },
+    { "_pthread_rwlockattr_getpshared", sp_rwlockattr_getpshared },
+    { "_OSAtomicEnqueue", sp_OSAtomicEnqueue }, { "_OSAtomicDequeue", sp_OSAtomicDequeue },
+    { "_OSAtomicFifoEnqueue", sp_OSAtomicFifoEnqueue }, { "_OSAtomicFifoDequeue", sp_OSAtomicFifoDequeue },
     { "_pthread_once", sp_once },
     { "_pthread_attr_init", sp_attr_init }, { "_pthread_attr_destroy", sp_ok },
     { "_pthread_attr_setstacksize", sp_attr_setstacksize }, { "_pthread_attr_getstacksize", sp_attr_getstacksize },

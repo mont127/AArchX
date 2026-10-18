@@ -1273,6 +1273,37 @@ static void test_game_libs(void)
     }
 }
 
+/* OSAtomic's queues link the guest's elements through its own 4-byte pointers, and a pthread_rwlockattr_t is the
+ * guest's 16 bytes (src/m32_thread.c) */
+static void test_queues(void)
+{
+    uint32_t lifo = DATA + 0x4400, fifo = DATA + 0x4410, e = DATA + 0x4420;   /* elements: {payload, link} */
+    memset(m32_h(lifo), 0, 32);
+    for (uint32_t i = 0; i < 3; i++) {
+        m32_wr(e + 8 * i, i + 1);
+        call("_OSAtomicEnqueue", 3, (uint32_t[]){ lifo, e + 8 * i, 4 });
+    }
+    uint32_t a = call("_OSAtomicDequeue", 2, (uint32_t[]){ lifo, 4 }), b = call("_OSAtomicDequeue", 2, (uint32_t[]){ lifo, 4 });
+    check("OSAtomicDequeue is last in, first out", a == e + 16 && b == e + 8);
+    call("_OSAtomicDequeue", 2, (uint32_t[]){ lifo, 4 });
+    check("... and empty after", call("_OSAtomicDequeue", 2, (uint32_t[]){ lifo, 4 }) == 0);
+    for (uint32_t i = 0; i < 3; i++)
+        call("_OSAtomicFifoEnqueue", 3, (uint32_t[]){ fifo, e + 8 * i, 4 });
+    a = call("_OSAtomicFifoDequeue", 2, (uint32_t[]){ fifo, 4 });
+    b = call("_OSAtomicFifoDequeue", 2, (uint32_t[]){ fifo, 4 });
+    uint32_t c = call("_OSAtomicFifoDequeue", 2, (uint32_t[]){ fifo, 4 });
+    check("OSAtomicFifoDequeue is first in, first out", a == e && b == e + 8 && c == e + 16 &&
+          call("_OSAtomicFifoDequeue", 2, (uint32_t[]){ fifo, 4 }) == 0 && m32_rd(fifo + 4) == 0);
+    uint32_t attr = DATA + 0x4460, ps = DATA + 0x4474;
+    m32_wr(attr + 16, 0xabcdu);
+    check("pthread_rwlockattr_init in the guest's 16 bytes", call("_pthread_rwlockattr_init", 1, (uint32_t[]){ attr }) == 0 &&
+          m32_rd(attr + 16) == 0xabcdu);
+    call("_pthread_rwlockattr_setpshared", 2, (uint32_t[]){ attr, 1 });
+    m32_wr(ps, 0);
+    call("_pthread_rwlockattr_getpshared", 2, (uint32_t[]){ attr, ps });
+    check("pthread_rwlockattr_getpshared", m32_rd(ps) == 1);
+}
+
 /* what Adium's frameworks needed of m32's dyld: rpaths that are directories relative to the loader, and images
  * fixed up and initialized after their dependencies (src/m32_dyld.c) */
 static void test_image_order(void)
@@ -1322,6 +1353,14 @@ static void test_image_order(void)
         at[order[i] == &a ? 0 : order[i] == &b ? 1 : order[i] == &c ? 2 : 3] = i;
     check("images in dependency order", n == 4 && at[2] < at[1] && at[1] < at[0] && at[3] >= 0);
     m32_nimages = from;
+    /* a leaf name alone is found as dyld finds it, /usr/lib last: DarkPlaces dlopens "libz.dylib" */
+    put_str(DATA + 0x4500, "libz.dylib");
+    put_str(DATA + 0x4520, "inflateInit2_");
+    put_str(DATA + 0x4540, "libm32_no_such_library.dylib");
+    uint32_t z = call("_dlopen", 2, (uint32_t[]){ DATA + 0x4500, 9 });
+    check("dlopen of a leaf name finds the system library", z != 0 &&
+          call("_dlsym", 2, (uint32_t[]){ z, DATA + 0x4520 }) != 0);
+    check("... and not one that is nowhere", call("_dlopen", 2, (uint32_t[]){ DATA + 0x4540, 9 }) == 0);
 }
 
 void *objc_autoreleasePoolPush(void);
@@ -1588,6 +1627,23 @@ static void test_db_shapes(void)
     check("a call that sets no errno leaves the guest's", m32_rd(slot) == 0);
     cross(libsystem, "_close", 1, (uint32_t[]){ 0xffffffffu });
     check("a call that fails sets the guest's errno", m32_rd(slot) == EBADF);
+    /* Carbon's structures packed to 2: an AEDesc is {DescType, pointer}, 8 bytes on i386 and 12 on arm64, the
+     * pointer at 4 on both ("R{2up}", tools/sdkgen) */
+    M32Sig *packed = m32_sig_parse("v(R{2up})", 0);
+    check("a packed host structure's layout", packed && packed->arg[0].ssize == 12 && packed->arg[0].moff[1] == 4);
+    free(packed);
+    const char *cs = "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices";
+    uint32_t desc = DATA + 0x3200, word = DATA + 0x3210;
+    m32_wr(word, 0x12345678u);
+    memset(m32_h(desc), 0xff, 12);
+    int16_t aerr = (int16_t)cross(cs, "_AECreateDesc", 4, (uint32_t[]){ 'type', word, 4, desc });
+    check("AECreateDesc fills an i386 AEDesc", aerr == 0 && m32_rd(desc) == 'type' && m32_rd(desc + 4) &&
+          m32_rd(desc + 8) == 0xffffffffu);
+    check("AEGetDescDataSize reads it", cross(cs, "_AEGetDescDataSize", 1, (uint32_t[]){ desc }) == 4);
+    m32_wr(DATA + 0x3214, 0);
+    cross(cs, "_AEGetDescData", 3, (uint32_t[]){ desc, DATA + 0x3214, 4 });
+    check("AEGetDescData", m32_rd(DATA + 0x3214) == 0x12345678u);
+    check("AEDisposeDesc", cross(cs, "_AEDisposeDesc", 1, (uint32_t[]){ desc }) == 0 && m32_rd(desc + 4) == 0);
 }
 
 int main(int argc, char **argv)
@@ -1635,6 +1691,7 @@ int main(int argc, char **argv)
     test_sdl_shims();
     test_game_libs();
     test_image_order();
+    test_queues();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

@@ -46,9 +46,12 @@ static int scalar_size(char c, int guest)
 
 static const char *parse_type(const char *s, int guest, M32Type *t);
 
-/* flatten one structure's members into t, laying them out for the guest or the host */
+/* flatten one structure's members into t, laying them out for the guest or the host.  A digit first is the most
+ * any member is aligned to: "{2up}" is a structure declared under #pragma pack(2), as Carbon's AEDesc is, whose
+ * arm64 pointer sits at offset 4 (tools/sdkgen) */
 static const char *parse_members(const char *s, int guest, M32Type *t, uint32_t *off, uint32_t *align)
 {
+    uint32_t cap = *s >= '1' && *s <= '8' ? (uint32_t)(*s++ - '0') : 0;
     while (*s && *s != '}') {
         if (*s == '{') {
             uint32_t inner_off = 0, inner_align = 1;
@@ -56,7 +59,8 @@ static const char *parse_members(const char *s, int guest, M32Type *t, uint32_t 
             const char *e = parse_members(s + 1, guest, &sub, &inner_off, &inner_align);
             if (!e || *e != '}')
                 return NULL;
-            *off = (*off + inner_align - 1) & ~(inner_align - 1);
+            uint32_t place = cap && inner_align > cap ? cap : inner_align;
+            *off = (*off + place - 1) & ~(place - 1);
             for (int i = 0; i < sub.n; i++) {
                 if (t->n >= M32_MAX_MEMBERS)
                     return NULL;
@@ -66,8 +70,8 @@ static const char *parse_members(const char *s, int guest, M32Type *t, uint32_t 
                 t->n++;
             }
             *off += (inner_off + inner_align - 1) & ~(inner_align - 1);
-            if (inner_align > *align)
-                *align = inner_align;
+            if (place > *align)
+                *align = place;
             s = e + 1;
             continue;
         }
@@ -85,6 +89,8 @@ static const char *parse_members(const char *s, int guest, M32Type *t, uint32_t 
         if (size <= 0 || t->n >= M32_MAX_MEMBERS)
             return NULL;
         uint32_t a = guest && size == 8 ? 4 : (uint32_t)size;
+        if (cap && a > cap)
+            a = cap;
         *off = (*off + a - 1) & ~(a - 1);
         t->mcls[t->n] = c;
         t->msize[t->n] = (uint8_t)size;
@@ -1009,6 +1015,11 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
                 put_int(&hc, (uint64_t)(uintptr_t)d, 8);
                 continue;
             }
+        }
+        if ((ga->cls == 'R' || ga->cls == 'r') && ha->cls != 'R' && ha->cls != 'r') {   /* no host layout to copy to */
+            m32_log_once("a structure pointer with no host layout crosses as the guest's bytes:", e->name);
+            put_int(&hc, (uint64_t)(uintptr_t)m32_host((uint32_t)raw), 8);
+            continue;
         }
         if (ga->cls == 'R' || ga->cls == 'r') {   /* copy in, and back out when the callee may write it */
             uint8_t *hs = raw ? scratch(&hc, ha->ssize) : NULL;
