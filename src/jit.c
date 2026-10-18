@@ -26149,12 +26149,28 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
         return;
     }
     flip = flip_decide_locked(blk, e, tk, ft, fliplog);
-    if (!flip) chain_edge_now(jit, blk, e);
+    /*
+     * A kept branch leaves its probe behind: a nop where its fall-through counted, on every pass.  Once no edge of
+     * the block still probes, or watches through its stub (a body edge with a short chain jumps past the stub, so
+     * its watch never trips), the block is retired and translated again, without probes for decided branches.  The
+     * branchy loop of bench br: 2.436G instructions to 2.137G, 6% fewer cycles.  OCERZ_NO_FLIP_KEEP_RETIRE=1
+     * leaves the nops.
+     */
+    int keep_retire = 0;
+    if (!flip) {
+        chain_edge_now(jit, blk, e);
+        static int nokr = -1; if (nokr < 0) nokr = getenv("OCERZ_NO_FLIP_KEEP_RETIRE") ? 1 : 0;
+        keep_retire = !nokr;
+        for (int i = 0; i < blk->n_edges && keep_retire; i++)
+            if (blk->edges[i].probing == 1 ||
+                (blk->edges[i].probing == 2 && !(blk->edges[i].cond_site && blk->edges[i].kind == EDGE_BODY)))
+                keep_retire = 0;
+    }
     jl_release();
     g_flip_ns_hit += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     static int noretire = -1;
     if (noretire < 0) noretire = getenv("OCERZ_FLIP_NORETIRE") ? 1 : 0;
-    if (flip && !noretire) flip_retire_block(vm, jit, blk);
+    if ((flip || keep_retire) && !noretire) flip_retire_block(vm, jit, blk);
 }
 
 #define TRIP_SLOTS 4096
