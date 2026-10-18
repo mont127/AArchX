@@ -165,7 +165,7 @@ How to get it:
 
 ```sh
 make -j
-./ocerz version        # AArchX 0.7.3
+./ocerz version        # AArchX 0.8
 ```
 
 The build is C11 with `-arch arm64 -O2`, takes well under a minute, and has no
