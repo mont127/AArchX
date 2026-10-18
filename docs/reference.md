@@ -136,6 +136,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_MOVFUSE=1` | do not fold a `mov` into a following shift |
 | `OCERZ_NO_BRIDGE_FASTCALL=1` | in native mode, reach every bridged call through the trap and the dispatcher instead of calling it from inside the translated block |
 | `OCERZ_NO_CHEAP_CALLBACK=1` | when native code calls guest code, clear the host signal mask on every call and save it with the recovery point, as 0.8 did (three system calls a callback), instead of only on a thread's outermost guest call |
+| `OCERZ_NO_OBJC_SEND_CACHE=1` | in native mode, decide every objc_msgSend in full (implementation, signature, selector checks) instead of reusing what the thread decided for the same class, selector and implementation |
 | `OCERZ_NO_COMPACT=1` | keep every block's decoded instructions after translation |
 | `OCERZ_NO_JIT_FLUSH=1` | when the translation arena fills, run everything translated after that in the interpreter instead of starting the arena again |
 
