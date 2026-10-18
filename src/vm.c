@@ -2303,7 +2303,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             g_cur_cpu->sig_last_fault = gaddr;
             g_cur_cpu->sig_repeat = 0;
         }
-        int looping = ++g_cur_cpu->sig_repeat > OCERZ_SIG_MAX_REPEAT;
+        /* A fault at one address again and again is a loop only under Wine, whose foreign workers fault on a
+         * dispatcher state they cannot repair.  Any other program with a handler is entitled to fault there as
+         * often as it likes: a garbage collector's write barrier or a safepoint poll protects a page, takes the
+         * fault, unprotects it and goes on, and a Mac delivers every one of them. */
+        int looping = ++g_cur_cpu->sig_repeat > OCERZ_SIG_MAX_REPEAT && ocerz_wine_process;
 
         int no_wine_teb = g_cur_cpu->sig_altstack_sp == 0;
         if (!no_wine_teb) {
