@@ -68,6 +68,29 @@ static void map_put(Map *m, uint64_t k, uint32_t v)
     m->val[i] = v;
 }
 
+/* linear probing's deletion: later keys of the same run move back into the hole */
+static void map_del(Map *m, uint64_t k)
+{
+    if (!m->cap)
+        return;
+    uint32_t i = mix(k) & (m->cap - 1);
+    while (m->key[i] && m->key[i] != k)
+        i = (i + 1) & (m->cap - 1);
+    if (!m->key[i])
+        return;
+    m->key[i] = 0;
+    m->n--;
+    for (uint32_t j = (i + 1) & (m->cap - 1); m->key[j]; j = (j + 1) & (m->cap - 1)) {
+        uint32_t home = mix(m->key[j]) & (m->cap - 1);
+        if (((j - home) & (m->cap - 1)) >= ((j - i) & (m->cap - 1))) {   /* the hole lies between home and j */
+            m->key[i] = m->key[j];
+            m->val[i] = m->val[j];
+            m->key[j] = 0;
+            i = j;
+        }
+    }
+}
+
 int m32_is_handle(uint32_t g)
 {
     return g >= M32_HANDLE_LO && g < M32_HANDLE_LO + 8 * g_ncells && !(g & 7);
@@ -139,17 +162,46 @@ uint32_t m32_handle_twin_lookup(void *host)
     return v;
 }
 
+static uint32_t *g_alias_free;   /* g_alias_host slots m32_unalias gave back */
+static uint32_t g_nfree, g_free_cap;
+
 void m32_alias(uint32_t g, void *host)
 {
     pthread_mutex_lock(&g_lock);
-    if (g_nalias == g_alias_cap) {
-        g_alias_cap = g_alias_cap ? g_alias_cap * 2 : 1024;
-        g_alias_host = realloc(g_alias_host, g_alias_cap * sizeof *g_alias_host);
+    uint32_t slot;
+    if (g_nfree)
+        slot = g_alias_free[--g_nfree];
+    else {
+        if (g_nalias == g_alias_cap) {
+            g_alias_cap = g_alias_cap ? g_alias_cap * 2 : 1024;
+            g_alias_host = realloc(g_alias_host, g_alias_cap * sizeof *g_alias_host);
+        }
+        slot = g_nalias++;
     }
-    g_alias_host[g_nalias] = host;
-    map_put(&g_alias, g, g_nalias++);
+    g_alias_host[slot] = host;
+    uint32_t old;
+    if (map_get(&g_alias, g, &old) && g_nfree < g_free_cap)   /* g stood for another host object: that slot is free */
+        g_alias_free[g_nfree++] = old;
+    map_put(&g_alias, g, slot);
     map_put(&g_alias_rev, (uint64_t)(uintptr_t)host, g);
     g_have_alias = 1;
+    pthread_mutex_unlock(&g_lock);
+}
+
+void m32_unalias(uint32_t g, void *host)
+{
+    pthread_mutex_lock(&g_lock);
+    uint32_t v, slot;
+    if (map_get(&g_alias_rev, (uint64_t)(uintptr_t)host, &v) && v == g)
+        map_del(&g_alias_rev, (uint64_t)(uintptr_t)host);
+    if (map_get(&g_alias, g, &slot) && g_alias_host[slot] == host) {
+        map_del(&g_alias, g);
+        if (g_nfree == g_free_cap) {
+            g_free_cap = g_free_cap ? g_free_cap * 2 : 1024;
+            g_alias_free = realloc(g_alias_free, g_free_cap * sizeof *g_alias_free);
+        }
+        g_alias_free[g_nfree++] = slot;
+    }
     pthread_mutex_unlock(&g_lock);
 }
 

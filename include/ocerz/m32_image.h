@@ -55,6 +55,7 @@ typedef struct M32Image {
 
 extern M32Image *m32_images[M32_MAX_IMAGES];
 extern int m32_nimages;
+int m32_dep_order(int from, M32Image **out);   /* m32_images[from..], each after its dependencies (src/m32_dyld.c) */
 
 M32Image *m32_image_load(const char *path, int is_main);
 M32Image *m32_load_program(const char *path);          /* main image and its guest dependencies, not yet fixed up */

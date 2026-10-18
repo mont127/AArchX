@@ -133,6 +133,7 @@ uint32_t m32_handle(void *host);          /* NULL->0, in window->offset, twin->g
 void *m32_host(uint32_t g);               /* 0->NULL, handle->host, alias->host, else the window address */
 int m32_is_handle(uint32_t g);
 void m32_alias(uint32_t g, void *host);   /* guest-resident object g stands for host */
+void m32_unalias(uint32_t g, void *host); /* host is gone (or g is): neither stands for the other any more */
 uint32_t m32_handle_count(void);
 uint32_t m32_cstring(const char *host);   /* guest copy of a host C string (in-window strings stay put) */
 uint32_t m32_handle_twin_lookup(void *host);   /* the guest object aliased to host, or 0 */

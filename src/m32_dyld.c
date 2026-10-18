@@ -649,6 +649,25 @@ static int file_exists(const char *p)
     return stat(p, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+/* an LC_RPATH entry, a directory: @executable_path and @loader_path expanded as text.  m32_resolve_path resolves
+ * files only, and a directory rpath (Adium's @executable_path/../Frameworks) came back unexpanded, so no @rpath
+ * library of it was found */
+static void rpath_dir(const M32Image *img, const char *rp, char *out, size_t outlen)
+{
+    if (!strncmp(rp, "@executable_path/", 17)) {
+        snprintf(out, outlen, "%s/%s", g_exe_dir, rp + 17);
+    } else if (!strncmp(rp, "@loader_path/", 13)) {
+        char dir[1024];
+        snprintf(dir, sizeof dir, "%s", img->path);
+        char *slash = strrchr(dir, '/');
+        if (slash)
+            *slash = 0;
+        snprintf(out, outlen, "%s/%s", dir, rp + 13);
+    } else {
+        snprintf(out, outlen, "%s", rp);
+    }
+}
+
 /* expand @executable_path, @loader_path and @rpath; out is empty when the name is a system library */
 int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t outlen)
 {
@@ -677,9 +696,7 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
             const M32Image *img = pass == 0 ? loader : (m32_nimages ? m32_images[0] : NULL);
             for (int i = 0; img && i < img->nrpath; i++) {
                 char rp[1024], cand[2048];
-                m32_resolve_path(img, img->rpath[i], rp, sizeof rp);
-                if (!rp[0])
-                    snprintf(rp, sizeof rp, "%s", img->rpath[i]);
+                rpath_dir(img, img->rpath[i], rp, sizeof rp);
                 snprintf(cand, sizeof cand, "%s/%s", rp, name + 7);
                 if (file_exists(cand) && realpath(cand, out))
                     return 0;
@@ -966,11 +983,42 @@ M32Image *m32_adopt_program(uint32_t mh, const char *path)
     return img;
 }
 
+/* m32_images[from..] in dependency order, each after every image it depends on, as dyld binds and initializes them.
+ * Reverse load order is not that: Adium's executable loads AIUtilities as its own dependency before Adium.framework,
+ * which needs it, so Adium.framework's classes were set up first and their superclasses from AIUtilities were
+ * missing. */
+static void dep_visit(M32Image *img, int from, M32Image **out, int *n, M32Image **seen, int *nseen)
+{
+    for (int i = 0; i < *nseen; i++)
+        if (seen[i] == img)
+            return;
+    int mine = 0;
+    for (int i = from; i < m32_nimages && !mine; i++)
+        mine = m32_images[i] == img;
+    if (!mine || *nseen >= M32_MAX_IMAGES)
+        return;
+    seen[(*nseen)++] = img;
+    for (int k = 0; k < img->ndeps; k++)
+        if (img->dep_img[k])
+            dep_visit(img->dep_img[k], from, out, n, seen, nseen);
+    out[(*n)++] = img;
+}
+
+int m32_dep_order(int from, M32Image **out)
+{
+    static M32Image *seen[M32_MAX_IMAGES];
+    int n = 0, nseen = 0;
+    for (int i = m32_nimages - 1; i >= from; i--)
+        dep_visit(m32_images[i], from, out, &n, seen, &nseen);
+    return n;
+}
+
 int m32_fixup_all(int from)
 {
-    int bad = 0;
-    for (int i = m32_nimages - 1; i >= from; i--)
-        bad += m32_image_fixup(m32_images[i]);
+    static M32Image *order[M32_MAX_IMAGES];
+    int bad = 0, n = m32_dep_order(from, order);
+    for (int i = 0; i < n; i++)
+        bad += m32_image_fixup(order[i]);
     return bad;
 }
 
@@ -1098,8 +1146,10 @@ static uint32_t dl_open(struct OcerzVM *vm, const char *name, int only_loaded)
                 m32_fixup_all(from);
                 uint32_t init_args[5] = { m32_rd(m32_argc_var), m32_rd(m32_argv_var), m32_rd(m32_environ_var), 0, 0 };
                 pthread_mutex_unlock(&g_dl_lock);
-                for (int i = m32_nimages - 1; i >= from; i--)
-                    m32_run_initializers(vm, m32_images[i], init_args);
+                static M32Image *order[M32_MAX_IMAGES];
+                int n = m32_dep_order(from, order);
+                for (int i = 0; i < n; i++)
+                    m32_run_initializers(vm, order[i], init_args);
                 run_add_image_callbacks(vm, from, 0, g_nadd_image_cb);
                 pthread_mutex_lock(&g_dl_lock);
                 handle = img->base;

@@ -140,8 +140,10 @@ int m32_start_program(struct OcerzVM *vm, M32Image *img, uint32_t sp, const char
     m32_wr(m32_environ_var, envp_g);
     const char *base = strrchr(path, '/');
     m32_wr(m32_progname_var, m32_cstring(base ? base + 1 : path));
-    for (int i = m32_nimages - 1; i >= 0 && !vm->exited; i--)
-        m32_run_initializers(vm, m32_images[i], init_args);
+    static M32Image *order[M32_MAX_IMAGES];
+    int n = m32_dep_order(0, order);   /* dependencies first */
+    for (int i = 0; i < n && !vm->exited; i++)
+        m32_run_initializers(vm, order[i], init_args);
     if (vm->exited)
         return vm->exit_code;
     m32_started = 1;

@@ -10,8 +10,9 @@
  * EDX:EAX, ST0, or through the hidden structure pointer, which the i386 callee pops.
  *
  * Guest-only classes: s is a C string (a host result outside the window is copied into it), P one pointer written
- * through a pointer, W/V one signed/unsigned long written through a pointer, Q a pointer to data whose layouts
- * differ (only a handle may pass; guest memory there needs a special).
+ * through a pointer, W/V one signed/unsigned long written through a pointer, O one object (an id) read and written
+ * through a pointer and E one the callee only writes there, G an AppKit tag (a number standing for the host's), Q a
+ * pointer to data whose layouts differ (only a handle may pass; guest memory there needs a special).
  */
 #include <dlfcn.h>
 #include <malloc/malloc.h>
@@ -36,7 +37,8 @@ static int scalar_size(char c, int guest)
     case 'h': case 'H': return 2;
     case 'i': case 'u': case 'f': return 4;
     case 'l': case 'L': case 'T': case 'd': return 8;
-    case 'p': case 's': case 'P': case 'Q': case 'W': case 'V': case 'S': case 'c': case 'k': case '@': case '#': case ':':
+    case 'p': case 's': case 'P': case 'Q': case 'W': case 'V': case 'S': case 'O': case 'E': case 'G': case 'c': case 'k':
+    case '@': case '#': case ':':
         return guest ? 4 : 8;
     default: return -1;
     }
@@ -257,6 +259,60 @@ static double dbits(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
 static uint64_t bitsd(double d) { uint64_t v; memcpy(&v, &d, 8); return v; }
 static uint32_t bitsf(float f) { uint32_t v; memcpy(&v, &f, 4); return v; }
 
+/* AppKit's tags (NSTrackingRectTag, NSToolTipTag) are 64-bit values, and a 32-bit program keeps them in an
+ * NSInteger: Adium's contact list removed a truncated one and AppKit raised "an invalid NSTrackingRectTag ...
+ * Truncated the NSTrackingRectTag to 32bit".  The guest gets a small number for each (class G), and the host its
+ * own tag back for it. */
+static uint64_t *g_tags;   /* guest number n is g_tags[n - 1]; 0 is a free slot */
+static uint32_t g_ntags, g_tag_cap;
+static pthread_mutex_t g_tag_lock = PTHREAD_MUTEX_INITIALIZER;
+
+uint32_t m32_tag_guest(uint64_t host)
+{
+    if (!host)
+        return 0;
+    pthread_mutex_lock(&g_tag_lock);
+    uint32_t free_at = 0, n = 0;
+    for (uint32_t i = 0; i < g_ntags && !n; i++) {
+        if (g_tags[i] == host)
+            n = i + 1;
+        else if (!g_tags[i] && !free_at)
+            free_at = i + 1;
+    }
+    if (!n && !free_at && g_ntags == g_tag_cap) {
+        uint32_t cap = g_tag_cap ? g_tag_cap * 2 : 256;
+        uint64_t *t = realloc(g_tags, cap * sizeof *t);
+        if (t) {
+            g_tags = t;
+            g_tag_cap = cap;
+        }
+    }
+    if (!n && !free_at && g_ntags < g_tag_cap)
+        free_at = ++g_ntags;
+    if (!n && free_at) {
+        g_tags[free_at - 1] = host;
+        n = free_at;
+    }
+    pthread_mutex_unlock(&g_tag_lock);
+    return n;
+}
+
+uint64_t m32_tag_host(uint32_t guest)
+{
+    pthread_mutex_lock(&g_tag_lock);
+    uint64_t h = guest && guest <= g_ntags ? g_tags[guest - 1] : guest;
+    pthread_mutex_unlock(&g_tag_lock);
+    return h;
+}
+
+void m32_tag_free(uint32_t guest)
+{
+    pthread_mutex_lock(&g_tag_lock);
+    if (guest && guest <= g_ntags)
+        g_tags[guest - 1] = 0;
+    pthread_mutex_unlock(&g_tag_lock);
+}
+
 /* one scalar value from guest class g to host class h */
 uint64_t m32_scalar_in(char g, char h, uint64_t raw, const char *fn, int argno)
 {
@@ -266,13 +322,19 @@ uint64_t m32_scalar_in(char g, char h, uint64_t raw, const char *fn, int argno)
     case 'h': raw = (uint64_t)(int64_t)(int16_t)raw; break;
     case 'H': raw = (uint16_t)raw; break;
     case 'i': raw = (uint64_t)(int64_t)(int32_t)raw; break;
-    case 'u': raw = (uint32_t)raw; break;
+    case 'u':
+        raw = (uint32_t)raw;
+        if (h == 'L' && raw == 0x7fffffffu && fn && fn[0] != '_')   /* NSNotFound in a message: the host's is INT64_MAX */
+            raw = INT64_MAX;
+        break;
     case 'f':
         return h == 'd' ? bitsd(fbits((uint32_t)raw)) : (uint32_t)raw;
     case 'd':
         return h == 'f' ? bitsf((float)dbits(raw)) : raw;
     case 'T':
         return ocerz_abi_dtime_to_host(raw);
+    case 'G':
+        return m32_tag_host((uint32_t)raw);
     case 'p': case 's': case 'c':
         return (uint64_t)(uintptr_t)m32_host((uint32_t)raw);
     case '@': return (uint64_t)(uintptr_t)m32_objc_to_host((uint32_t)raw);
@@ -296,12 +358,20 @@ uint64_t m32_scalar_in(char g, char h, uint64_t raw, const char *fn, int argno)
 uint64_t m32_scalar_out(char g, char h, uint64_t raw)
 {
     switch (g) {
+    case 'i': case 'u':   /* NSNotFound and NSIntegerMax are INT64_MAX here and INT32_MAX there; truncated, they read -1 */
+        if ((h == 'l' || h == 'L') && raw == (uint64_t)INT64_MAX)
+            return 0x7fffffffu;
+        if (h == 'l' && raw == (uint64_t)INT64_MIN)   /* NSIntegerMin */
+            return 0x80000000u;
+        return raw;
     case 'f':
         return h == 'd' ? bitsf((float)dbits(raw)) : (uint32_t)raw;
     case 'd':
         return h == 'f' ? bitsd(fbits((uint32_t)raw)) : raw;
     case 'T':
         return ocerz_abi_dtime_to_guest(raw);
+    case 'G':
+        return m32_tag_guest(raw);
     case 'p': case 'Q': case 'c':
         return m32_handle((void *)(uintptr_t)raw);
     case '@': return m32_objc_to_guest((void *)(uintptr_t)raw);
@@ -341,6 +411,8 @@ int m32_struct_in_regs(const M32Type *t)
 {
     return t->size == 1 || t->size == 2 || t->size == 4 || t->size == 8;
 }
+
+#define UNWRITTEN 0x5752495445ull   /* an out object's cell until the callee stores one: odd, so no object */
 
 typedef struct Writeback {
     char cls;
@@ -948,6 +1020,15 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             put_int(&hc, (uint64_t)(uintptr_t)hs, 8);
             continue;
         }
+        if (ga->cls == 'O' || ga->cls == 'E') {   /* a handle is already a host cell */
+            uint64_t *cell = raw && !m32_is_handle((uint32_t)raw) && nwb < 16 ? scratch(&hc, 8) : NULL;
+            if (cell) {   /* an E is only written (NSError *error; is often uninitialized), and kept if it is not */
+                *cell = ga->cls == 'O' ? (uint64_t)(uintptr_t)m32_objc_to_host(m32_rd((uint32_t)raw)) : UNWRITTEN;
+                wb[nwb++] = (Writeback){ 'O', (uint32_t)raw, cell, NULL, NULL, 0, NULL };
+            }
+            put_int(&hc, (uint64_t)(uintptr_t)(cell ? (void *)cell : m32_host((uint32_t)raw)), 8);
+            continue;
+        }
         if (ga->cls == 'P' || ga->cls == 'W' || ga->cls == 'V' || ga->cls == 'S') {
             uint64_t *cell = raw ? scratch(&hc, 8) : NULL;
             if (cell) {
@@ -1068,10 +1149,13 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             continue;
         }
         uint64_t v = *wb[i].cell;
+        if (wb[i].cls == 'O' && v == UNWRITTEN)
+            continue;
         if (wb[i].cls == 'S')
             *(int16_t *)m32_h(wb[i].guest) = (int16_t)v;
         else
-            m32_wr(wb[i].guest, wb[i].cls == 'P' ? m32_handle((void *)(uintptr_t)v) : (uint32_t)v);
+            m32_wr(wb[i].guest, wb[i].cls == 'P' ? m32_handle((void *)(uintptr_t)v)
+                              : wb[i].cls == 'O' ? m32_objc_to_guest((void *)(uintptr_t)v) : (uint32_t)v);
     }
     for (int i = 0; i < nfloats; i++)
         free(floats[i]);

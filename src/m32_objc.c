@@ -236,6 +236,52 @@ void *m32_objc_to_host(uint32_t g)
     return m32_h(g);                      /* a guest object the host only passes around */
 }
 
+/* A pair's twin lives as long as its host object.  Each twin m32 makes hangs a reaper on its host object as an
+ * associated object; the host releases it as the object is destroyed, and the reaper takes the alias back and frees
+ * the twin.  Kept, the alias outlived the object: the next object malloc placed at that address answered the dead
+ * one's twin, isa and all.  Adium's AICachedUserIconSource -init releases a second instance and returns the shared
+ * one; an AutoHyperlinks scanner allocated where that instance had been got its twin, ran the icon source's -init
+ * and came back as the icon source (OCERZ_NO_M32_REAP=1 keeps every twin). */
+typedef struct Reap { uint32_t guest; void *host; } Reap;
+static Class g_reaper;
+static char g_reap_key;
+
+static void reaper_dealloc(id self, SEL cmd)
+{
+    Reap *r = (Reap *)object_getIndexedIvars(self);
+    m32_unalias(r->guest, r->host);
+    m32_free(r->guest);
+    struct objc_super sup = { self, class_getSuperclass(g_reaper) };
+    ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, cmd);
+}
+
+static void make_reaper(void)
+{
+    Class c = objc_allocateClassPair(objc_getClass("NSObject"), "M32TwinReaper", 0);
+    if (!c)
+        return;
+    class_addMethod(c, sel_registerName("dealloc"), (IMP)reaper_dealloc, "v@:");
+    objc_registerClassPair(c);
+    g_reaper = c;
+}
+
+static void reap_with(void *host, uint32_t twin)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_REAP") != NULL;
+    if (off)
+        return;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, make_reaper);
+    id r = g_reaper ? class_createInstance(g_reaper, sizeof(Reap)) : nil;
+    if (!r)
+        return;
+    *(Reap *)object_getIndexedIvars(r) = (Reap){ twin, host };
+    objc_setAssociatedObject((id)host, &g_reap_key, r, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ((void (*)(id, SEL))M32_MSGSEND)(r, sel_registerName("release"));
+}
+
 uint32_t m32_objc_to_guest(void *h)
 {
     if (!h)
@@ -257,6 +303,7 @@ uint32_t m32_objc_to_guest(void *h)
         uint32_t twin = m32_calloc(1, size < 4 ? 4 : size);
         m32_wr(twin, gc);
         m32_alias(twin, h);
+        reap_with(h, twin);
         return twin;
     }
     g = m32_handle(h);
@@ -435,11 +482,12 @@ static void remember_image(Class hc, uint32_t g)
  * of the guest's: Sparkle's update prompt binds its nib to two BOOL ivars, and KVC raised valueForUndefinedKey:.
  * The pair answers valueForUndefinedKey: and setValue:forUndefinedKey: from the guest ivar named key or _key in the
  * guest twin, a number boxed or unboxed by its type, an object converted (and, set, retained, the old one released),
- * and the superclass's answer, which raises, for any other key (OCERZ_NO_M32_KVC=1 leaves them out). */
-static uint32_t guest_ivar(uint32_t cls, const char *key, const char **type)
+ * and the superclass's answer, which raises, for any other key (OCERZ_NO_M32_KVC=1 leaves them out, and the nib
+ * outlets below). */
+static uint32_t guest_ivar(uint32_t cls, const char *key, const char **type, int exact)
 {
     char under[256];
-    snprintf(under, sizeof under, "_%s", key);
+    snprintf(under, sizeof under, exact ? "%s" : "_%s", key);
     for (uint32_t c = cls; c && is_guest_class(c); c = rd(c + OC_SUPER)) {
         uint32_t list = rd(c + OC_IVARS), n = list ? rd(list) : 0;
         for (uint32_t i = 0; i < n && i < 4096; i++) {
@@ -488,7 +536,7 @@ static id kvc_get(id self, SEL cmd, id key)
 {
     const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
     const char *k = key ? utf8(key, sel_registerName("UTF8String")) : NULL, *type = NULL;
-    uint32_t g = m32_objc_to_guest(self), off = k && g ? guest_ivar(rd(g + OC_ISA), k, &type) : 0;
+    uint32_t g = m32_objc_to_guest(self), off = k && g ? guest_ivar(rd(g + OC_ISA), k, &type, 0) : 0;
     if (!off)
         return kvc_super(self, cmd, key, NULL, 0);
     uint32_t at = g + off - 1;
@@ -502,7 +550,7 @@ static void kvc_set(id self, SEL cmd, id value, id key)
 {
     const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
     const char *k = key ? utf8(key, sel_registerName("UTF8String")) : NULL, *type = NULL;
-    uint32_t g = m32_objc_to_guest(self), off = k && g ? guest_ivar(rd(g + OC_ISA), k, &type) : 0;
+    uint32_t g = m32_objc_to_guest(self), off = k && g ? guest_ivar(rd(g + OC_ISA), k, &type, 0) : 0;
     if (!off) {
         kvc_super(self, cmd, value, key, 1);
         return;
@@ -530,6 +578,52 @@ static void kvc_set(id self, SEL cmd, id value, id key)
     case 'd': { double d = value ? dd(value, sel_registerName("doubleValue")) : 0; memcpy(m32_h(at), &d, 8); break; }
     default: kvc_super(self, cmd, value, key, 1); break;
     }
+}
+
+/* A nib outlet whose owner has no setter is set straight into the instance variable of that name, retained (what
+ * AppKit's NSNibOutletConnector does), and a paired host class has none of the guest's: every such outlet of a guest
+ * owner stayed nil.  Sparkle's update prompt shrinks its window by its moreInfoView's height, and with that nil the
+ * prompt opened 0 high, a modal window no one could see.  The connector sets the guest twin's ivar itself when its
+ * source is a pair without the setter. */
+static void (*g_establish)(id, SEL);
+
+static void outlet_establish(id self, SEL cmd)
+{
+    id (*msg)(id, SEL) = (id (*)(id, SEL))M32_MSGSEND;
+    BOOL (*responds)(id, SEL, SEL) = (BOOL (*)(id, SEL, SEL))M32_MSGSEND;
+    const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
+    id src = msg(self, sel_registerName("source")), dst = msg(self, sel_registerName("destination"));
+    id label = msg(self, sel_registerName("label"));
+    const char *k = label ? utf8(label, sel_registerName("UTF8String")) : NULL, *type = NULL;
+    uint32_t g = src && k && *k ? m32_objc_to_guest(src) : 0, off = 0;
+    if (g && !m32_is_handle(g) && guest_class_of(g) && is_guest_class(rd(g + OC_ISA))) {
+        char setter[300];
+        snprintf(setter, sizeof setter, "set%c%s:", k[0] >= 'a' && k[0] <= 'z' ? k[0] - 32 : k[0], k + 1);
+        if (!responds(src, sel_registerName("respondsToSelector:"), sel_registerName(setter)))
+            off = guest_ivar(rd(g + OC_ISA), k, &type, 1);
+    }
+    if (!off || type[0] != '@') {
+        g_establish(self, cmd);
+        return;
+    }
+    uint32_t at = g + off - 1;
+    id old = (id)m32_objc_to_host(rd(at));
+    if (dst)
+        msg(dst, sel_registerName("retain"));
+    m32_wr(at, m32_objc_to_guest(dst));
+    if (old)
+        msg(old, sel_registerName("release"));
+}
+
+static void hook_outlets(void)   /* once AppKit is loaded */
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    Class c = g_establish ? NULL : objc_getClass("NSNibOutletConnector");
+    Method m = c ? class_getInstanceMethod(c, sel_registerName("establishConnection")) : NULL;
+    if (m)
+        g_establish = (void (*)(id, SEL))method_setImplementation(m, (IMP)outlet_establish);
+    pthread_mutex_unlock(&lock);
 }
 
 static void ensure_pair(uint32_t g)
@@ -580,6 +674,8 @@ static void ensure_pair(uint32_t g)
     if (!getenv("OCERZ_NO_M32_KVC")) {   /* class_addMethod leaves a guest class's own versions be */
         class_addMethod(hc, sel_registerName("valueForUndefinedKey:"), (IMP)kvc_get, "@@:@");
         class_addMethod(hc, sel_registerName("setValue:forUndefinedKey:"), (IMP)kvc_set, "v@:@@");
+        if (!g_establish)
+            hook_outlets();
     }
     objc_registerClassPair(hc);
     map_put(&g_host_of, g, (uint64_t)(uintptr_t)hc);
@@ -593,6 +689,58 @@ static void ensure_pair(uint32_t g)
 
 typedef struct Loads { struct Loads *next; M32Image *img; int nc, ncat; uint32_t v[]; } Loads;
 static Loads *g_loads;
+
+/* An image's protocols (__OBJC,__protocol: old_protocol {isa, name, protocol_list, instance_methods, class_methods},
+ * 20 bytes each) get host twins of the same name, adopting the same protocols, and each guest protocol is aliased to its
+ * twin.  @protocol(X) in i386 code is the guest structure: handed to conformsToProtocol:, libobjc read it as its own
+ * protocol_t and faulted (Adium), and a paired class could adopt only the protocols the host already had.  The host
+ * one is used where it exists.  ponytail: method descriptions are not copied; conformance is what is checked. */
+/* register made[i] after the protocols it adopts that this image makes too: the host refuses to add a protocol still
+ * under construction.  A registered one is cleared from made. */
+static void register_protocol(uint32_t base, Protocol **made, uint32_t n, uint32_t i, int depth)
+{
+    Protocol *p = made[i];
+    if (!p || depth > 64)
+        return;
+    made[i] = NULL;   /* visited: a cycle ends here */
+    for (uint32_t pl = rd(base + 20 * i + 8); pl; pl = rd(pl))
+        for (uint32_t k = 0, np = rd(pl + 4); k < np && k < 256; k++) {
+            uint32_t sub = rd(pl + 8 + 4 * k), nm = sub ? rd(sub + 4) : 0;
+            const char *name = nm ? (const char *)m32_h(nm) : NULL;
+            if (!name)
+                continue;
+            for (uint32_t j = 0; j < n; j++)   /* adopted from this image: registered first */
+                if (made[j] && !strcmp(protocol_getName(made[j]), name))
+                    register_protocol(base, made, n, j, depth + 1);
+            Protocol *q = objc_getProtocol(name);
+            if (q && q != p)
+                protocol_addProtocol(p, q);
+        }
+    objc_registerProtocol(p);
+}
+
+static void host_protocols(M32Image *img, uint32_t slide)
+{
+    const M32Sect *ps = m32_section(img, "__OBJC", "__protocol");
+    if (!ps)
+        return;
+    uint32_t n = ps->size / 20;
+    Protocol **made = calloc(n ? n : 1, sizeof *made);
+    for (uint32_t i = 0; made && i < n; i++) {   /* make them all first: they adopt each other in any order */
+        uint32_t g = ps->addr + slide + 20 * i, nm = rd(g + 4);
+        const char *name = nm ? (const char *)m32_h(nm) : NULL;
+        if (!name || !*name)
+            continue;
+        Protocol *p = objc_getProtocol(name);
+        if (!p && (p = objc_allocateProtocol(name)))
+            made[i] = p;
+        if (p)
+            m32_alias(g, p);
+    }
+    for (uint32_t i = 0; made && i < n; i++)
+        register_protocol(ps->addr + slide, made, n, i, 0);
+    free(made);
+}
 
 void m32_objc_load(M32Image *img)
 {
@@ -609,6 +757,7 @@ void m32_objc_load(M32Image *img)
             if (s)
                 m32_wr(a, sel_intern((const char *)m32_h(s), s));
         }
+    host_protocols(img, slide);
     uint32_t classes[4096], cats[1024];
     int nc = 0, ncat = 0;
     for (uint32_t o = 0; mods && o + 16 <= mods->size; o += 16) {
@@ -815,10 +964,21 @@ static int on_main(Class cls, const char *sel)
     return 0;
 }
 
+/* the messages whose NSInteger is one of AppKit's tags (class G in src/m32_cross.c): 1 their result, 2 their first
+ * argument, removed */
+static int tag_message(const char *sel)
+{
+    if (!strcmp(sel, "addTrackingRect:owner:userData:assumeInside:") || !strcmp(sel, "addToolTipRect:owner:userData:") ||
+        !strcmp(sel, "trackingNumber"))
+        return 1;
+    return !strcmp(sel, "removeTrackingRect:") || !strcmp(sel, "removeToolTip:") ? 2 : 0;
+}
+
 static M32Export *send_export(const char *sel, const char *genc, const char *henc, int super, int main)
 {
     char key[2100];
-    snprintf(key, sizeof key, "%s|%s|%d|%s", genc, henc, super, main ? sel : "");
+    int tag = tag_message(sel);
+    snprintf(key, sizeof key, "%s|%s|%d|%s", genc, henc, super, main || tag || strchr(genc, '^') ? sel : "");
     uint64_t h = hash_str(key), v;
     LOCK();
     for (;; h += 2) {
@@ -833,6 +993,11 @@ static M32Export *send_export(const char *sel, const char *genc, const char *hen
     char gn[1024], hn[1024];
     M32Export *e = NULL;
     if (!m32_encoding_notation(genc, 1, gn, sizeof gn) && !m32_encoding_notation(henc, 0, hn, sizeof hn)) {
+        if (strchr(genc, '^'))
+            m32_notation_pointers(sel, genc, henc, gn, sizeof gn, hn, sizeof hn);
+        char *t = tag == 1 ? gn : tag == 2 && !strncmp(strchr(gn, '(') ? strchr(gn, '(') : "", "(@:", 3) ? strchr(gn, '(') + 3 : NULL;
+        if (t && (*t == 'i' || *t == 'u'))
+            *t = 'G';
         e = calloc(1, sizeof *e);
         e->lib = strdup(key);
         e->name = strdup(sel);
@@ -1217,6 +1382,33 @@ static int bitmap_planes(OcerzCPU *cpu, void *hself, Class super_cls, SEL hs, co
     return 1;
 }
 
+/* NSArray's sortUsingFunction:context:, sortedArrayUsingFunction:context: and sortedArrayUsingFunction:context:hint:
+ * take a C comparator, NSInteger (*)(id, id, void *), which a method encoding spells only as ^?.  Crossed as a pointer,
+ * CoreFoundation's merge sort jumped into guest code (Adium sorting its contact list at launch).  The comparator
+ * becomes a callback; the context passes through and comes back to it as the guest's. */
+static int function_sort(OcerzCPU *cpu, void *hself, Class super_cls, SEL hs, const char *name)
+{
+    int sorted = !strcmp(name, "sortedArrayUsingFunction:context:"),
+        hint = !strcmp(name, "sortedArrayUsingFunction:context:hint:");
+    if (!sorted && !hint && strcmp(name, "sortUsingFunction:context:"))
+        return 0;
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP], fn = rd(esp + 12), ctx = rd(esp + 16);
+    void *cmp = fn ? m32_callback(fn, "i(@@p)", "l(@@p)") : NULL;
+    void *hctx = ctx ? m32_h(ctx) : NULL;   /* guest memory: the callback hands the comparator ctx back */
+    id hint_data = hint ? m32_objc_to_host(rd(esp + 20)) : nil, r = nil;
+    struct objc_super sup = { hself, super_cls };
+    if (hint && super_cls)
+        r = ((id (*)(struct objc_super *, SEL, void *, void *, id))objc_msgSendSuper)(&sup, hs, cmp, hctx, hint_data);
+    else if (hint)
+        r = ((id (*)(id, SEL, void *, void *, id))M32_MSGSEND)(hself, hs, cmp, hctx, hint_data);
+    else if (super_cls)
+        r = ((id (*)(struct objc_super *, SEL, void *, void *))objc_msgSendSuper)(&sup, hs, cmp, hctx);
+    else
+        r = ((id (*)(id, SEL, void *, void *))M32_MSGSEND)(hself, hs, cmp, hctx);
+    m32_ret(cpu, sorted || hint ? m32_objc_to_guest(r) : 0, 0, 0);
+    return 1;
+}
+
 static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super_cls, uint32_t gsel, uint32_t gtypes, int is_super)
 {
     SEL hs = m32_sel_host(gsel);
@@ -1226,6 +1418,8 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
     if (rects_being_drawn(cpu, hself, is_super ? super_cls : NULL, hs, name))
         return OCERZ_STEP_OK;
     if (!is_super && bitmap_planes(cpu, hself, NULL, hs, name))
+        return OCERZ_STEP_OK;
+    if (function_sort(cpu, hself, is_super ? super_cls : NULL, hs, name))
         return OCERZ_STEP_OK;
     int is_class = object_isClass(hself);
     Class lookup_cls = super_cls ? super_cls : object_getClass(hself);
@@ -1270,7 +1464,10 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
         return objects_send(vm, cpu, m, e);
     if (!strcmp(name, "setWantsBestResolutionOpenGLSurface:"))
         chose_hidpi(hself, 1);
+    uint32_t removed = tag_message(name) == 2 ? rd((uint32_t)cpu->gpr[OCERZ_RSP] + 12) : 0;
     int r = m32_cross(vm, cpu, e);
+    if (removed)
+        m32_tag_free(removed);
     if (!strcmp(name, "initWithFrame:pixelFormat:") && is_kind(lookup_cls, "NSOpenGLView"))   /* attaches its own */
         legacy_drawable(m32_objc_to_host((uint32_t)cpu->gpr[OCERZ_RAX]));
     return r;
@@ -1343,11 +1540,18 @@ static int send(struct OcerzVM *vm, OcerzCPU *cpu, int self_at)
                      gc ? (tw != m32_h(a) ? object_getClassName((id)tw) : "") : "");
             if (gc)
                 strncat(what[k], ")", sizeof what[k] - strlen(what[k]) - 1);
+            BOOL (*kind)(id, SEL, Class) = (BOOL (*)(id, SEL, Class))M32_MSGSEND;
+            const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))M32_MSGSEND;
+            const char *sv = ha && kind((id)ha, sel_registerName("isKindOfClass:"), objc_getClass("NSString"))
+                                 ? utf8((id)ha, sel_registerName("UTF8String")) : NULL;
+            if (sv)   /* a string: it, or its last characters (a path's end tells most) */
+                snprintf(what[k] + strlen(what[k]), sizeof what[k] - strlen(what[k]), " \"%s%s\"", strlen(sv) > 64 ? "..." : "",
+                         strlen(sv) > 64 ? sv + strlen(sv) - 61 : sv);
         }
-        fprintf(stderr, "ocerz: m32: sendlog [t%u] %s to %#x (%p %s) args %#x %s, %#x %s, %#x %s from %#x\n",
+        fprintf(stderr, "ocerz: m32: sendlog [t%u] %s to %#x (%p %s) args %#x %s, %#x %s, %#x %s, %#x, %#x from %#x\n",
                 (unsigned)pthread_mach_thread_np(pthread_self()), (const char *)m32_h(sel), self, h,
                 h ? object_getClassName((id)h) : "", rd(esp + 12), what[0], rd(esp + 16), what[1], rd(esp + 20), what[2],
-                rd(esp));
+                rd(esp + 24), rd(esp + 28), rd(esp));
         int r = host_send(vm, cpu, h, NULL, sel, 0, 0);
         uint32_t ret = (uint32_t)cpu->gpr[OCERZ_RAX];
         fprintf(stderr, "ocerz: m32: sendlog   -> %#x (%p %s)\n", ret, m32_is_handle(ret) ? m32_host(ret) : NULL,
@@ -1458,20 +1662,23 @@ static uint32_t hostfn_export(void *fn, const char *genc, const char *henc)
     return m32_export_hostfn(fn, gn, hn);
 }
 
-static int sp_method_getImplementation(struct OcerzVM *vm, OcerzCPU *cpu)
+/* a method's implementation as the guest calls it: a guest method's own, or a host one's as an export */
+static uint32_t method_imp(uint32_t m)
 {
-    uint32_t m = m32_arg(cpu, 0);
-    if (!m) RET(0);
-    if (!m32_is_handle(m)) RET(rd(m + 8));
+    if (!m)
+        return 0;
+    if (!m32_is_handle(m))
+        return rd(m + 8);
     Method hm = m32_host(m);
     const char *henc = method_getTypeEncoding(hm);
     char buf[1024];
-    RET(hostfn_export((void *)method_getImplementation(hm), guess_guest(henc, buf, sizeof buf), henc));
+    return hostfn_export((void *)method_getImplementation(hm), guess_guest(henc, buf, sizeof buf), henc);
 }
-static int sp_method_setImplementation(struct OcerzVM *vm, OcerzCPU *cpu)
+/* sets it, answering the old one */
+static uint32_t method_set(uint32_t m, uint32_t imp)
 {
-    uint32_t m = m32_arg(cpu, 0), imp = m32_arg(cpu, 1);
-    if (!m) RET(0);
+    if (!m)
+        return 0;
     if (!m32_is_handle(m)) {   /* a guest method: edit it in place, and the paired host method with it */
         uint32_t old = rd(m + 8);
         m32_wr(m + 8, imp);
@@ -1479,16 +1686,39 @@ static int sp_method_setImplementation(struct OcerzVM *vm, OcerzCPU *cpu)
         free(g_cache.e);
         memset(&g_cache, 0, sizeof g_cache);
         UNLOCK();
-        RET(old);
+        return old;
     }
     Method hm = m32_host(m);
     const char *henc = method_getTypeEncoding(hm);
     char buf[1024], gn[1024], hn[1024];
     const char *genc = guess_guest(henc, buf, sizeof buf);
-    if (m32_encoding_notation(genc, 1, gn, sizeof gn) || m32_encoding_notation(henc, 0, hn, sizeof hn)) RET(0);
+    if (m32_encoding_notation(genc, 1, gn, sizeof gn) || m32_encoding_notation(henc, 0, hn, sizeof hn))
+        return 0;
     IMP nw = (IMP)m32_callback(imp, gn, hn);
     IMP old = nw ? method_setImplementation(hm, nw) : NULL;
-    RET(old ? m32_export_hostfn((void *)old, gn, hn) : 0);
+    return old ? m32_export_hostfn((void *)old, gn, hn) : 0;
+}
+static int sp_method_getImplementation(struct OcerzVM *vm, OcerzCPU *cpu) { RET(method_imp(m32_arg(cpu, 0))); }
+static int sp_method_setImplementation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    RET(method_set(m32_arg(cpu, 0), m32_arg(cpu, 1)));
+}
+/* method_exchangeImplementations(m1, m2): either may be a guest method or a handle to a host one.  Crossed, the host
+ * runtime took a guest method for its own and faulted (Adium swizzles at launch).  Two host methods swap in the host
+ * runtime; otherwise each gets the other's implementation as the guest calls it. */
+static int sp_method_exchangeImplementations(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t m1 = m32_arg(cpu, 0), m2 = m32_arg(cpu, 1);
+    if (!m1 || !m2)
+        RET(0);
+    if (m32_is_handle(m1) && m32_is_handle(m2)) {
+        method_exchangeImplementations(m32_host(m1), m32_host(m2));
+        RET(0);
+    }
+    uint32_t i1 = method_imp(m1), i2 = method_imp(m2);
+    method_set(m1, i2);
+    method_set(m2, i1);
+    RET(0);
 }
 static int sp_method_getTypeEncoding(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -1683,6 +1913,7 @@ const M32SpecialEntry m32_objc_specials[] = {
     { "_sel_getName", sp_sel_getName }, { "_class_respondsToSelector", sp_class_respondsToSelector },
     { "_class_getInstanceMethod", sp_class_getInstanceMethod }, { "_class_getClassMethod", sp_class_getClassMethod },
     { "_method_getImplementation", sp_method_getImplementation },
+    { "_method_exchangeImplementations", sp_method_exchangeImplementations },
     { "_method_setImplementation", sp_method_setImplementation },
     { "_method_getTypeEncoding", sp_method_getTypeEncoding }, { "_method_getName", sp_method_getName },
     { "_NSClassFromString", sp_NSClassFromString }, { "_NSStringFromClass", sp_NSStringFromClass },

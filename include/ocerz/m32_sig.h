@@ -30,5 +30,8 @@ int m32_is_hfa(const M32Type *t);
 int m32_struct_in_regs(const M32Type *t);                  /* i386 Darwin returns it in EAX:EDX or ST0 */
 uint64_t m32_scalar_in(char g, char h, uint64_t raw, const char *fn, int argno);   /* guest value -> host */
 uint64_t m32_scalar_out(char g, char h, uint64_t raw);                             /* host value -> guest */
+uint32_t m32_tag_guest(uint64_t host);   /* class G: a 64-bit AppKit tag's number for the guest */
+uint64_t m32_tag_host(uint32_t guest);
+void m32_tag_free(uint32_t guest);       /* after the tag is removed */
 
 #endif

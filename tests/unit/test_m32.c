@@ -25,12 +25,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "ocerz/flags.h"
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
+#include "ocerz/m32_image.h"
 #include "ocerz/m32_objc.h"
+#include "ocerz/m32_sig.h"
 #include "ocerz/mem.h"
 #include "ocerz/vm.h"
 
@@ -1270,6 +1273,224 @@ static void test_game_libs(void)
     }
 }
 
+/* what Adium's frameworks needed of m32's dyld: rpaths that are directories relative to the loader, and images
+ * fixed up and initialized after their dependencies (src/m32_dyld.c) */
+static void test_image_order(void)
+{
+    char dir[] = "/tmp/test_m32_rpath.XXXXXX", path[PATH_MAX], want[PATH_MAX], got[PATH_MAX];
+    if (mkdtemp(dir)) {
+        snprintf(path, sizeof path, "%s/MacOS", dir);   /* MacOS/.. resolves only through a directory */
+        mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/Frameworks", dir);
+        mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/Frameworks/X.framework", dir);
+        mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/Frameworks/X.framework/X", dir);
+        close(open(path, O_CREAT | O_WRONLY, 0644));
+        static M32Image loader;
+        snprintf(loader.path, sizeof loader.path, "%s/MacOS/prog", dir);
+        loader.rpath[0] = "@loader_path/../Frameworks";
+        loader.nrpath = 1;
+        check("@rpath through an @loader_path directory", realpath(path, want) &&
+              m32_resolve_path(&loader, "@rpath/X.framework/X", got, sizeof got) == 0 && !strcmp(got, want));
+        unlink(path);
+        snprintf(path, sizeof path, "%s/Frameworks/X.framework", dir);
+        rmdir(path);
+        snprintf(path, sizeof path, "%s/Frameworks", dir);
+        rmdir(path);
+        snprintf(path, sizeof path, "%s/MacOS", dir);
+        rmdir(path);
+        rmdir(dir);
+    }
+    /* loaded A, C, B, D with A needing B and B needing C: C, B, A in that order, D (independent) where it was */
+    static M32Image a, b, c, d;
+    a.dep_img[0] = &b;
+    a.ndeps = 1;
+    b.dep_img[0] = &c;
+    b.ndeps = 1;
+    int from = m32_nimages;
+    if (from + 4 > M32_MAX_IMAGES)
+        return;
+    m32_images[from] = &a;
+    m32_images[from + 1] = &c;
+    m32_images[from + 2] = &b;
+    m32_images[from + 3] = &d;
+    m32_nimages = from + 4;
+    M32Image *order[M32_MAX_IMAGES];
+    int n = m32_dep_order(from, order), at[4] = { -1, -1, -1, -1 };
+    for (int i = 0; i < n; i++)
+        at[order[i] == &a ? 0 : order[i] == &b ? 1 : order[i] == &c ? 2 : 3] = i;
+    check("images in dependency order", n == 4 && at[2] < at[1] && at[1] < at[0] && at[3] >= 0);
+    m32_nimages = from;
+}
+
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *pool);
+
+/* Adium's Objective-C, crossing to AppKit and Foundation (src/m32_objc.c, src/m32_objc_types.c, src/m32_cross.c):
+ * a guest class paired with a host one, its protocols, its nib outlets and its twins' lifetime; NSNotFound, NSError
+ * and NSRange pointers, AppKit's 64-bit tags; sorting with a guest function; method_exchangeImplementations */
+static void test_objc_pairs(void)
+{
+    if (!dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_LAZY | RTLD_GLOBAL))
+        return;
+    void *pool = objc_autoreleasePoolPush();
+    id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    id (*send1)(id, SEL, const void *) = (id (*)(id, SEL, const void *))objc_msgSend;
+    void (*set)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
+#define SEL_G(s) m32_sel_guest(sel_registerName(s))
+#define STR(s) send1((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), s)
+    /* NSNotFound is INT64_MAX here and INT32_MAX there, in a result and in an NSRange either way */
+    id empty = send((id)objc_getClass("NSArray"), sel_registerName("array")), x = STR("x");
+    check("indexOfObject: answers i386's NSNotFound", call("_objc_msgSend", 3, (uint32_t[]){ m32_objc_to_guest(empty),
+          SEL_G("indexOfObject:"), m32_objc_to_guest(x) }) == 0x7fffffffu);
+    uint32_t loc = call("_objc_msgSend", 3, (uint32_t[]){ m32_objc_to_guest(STR("hello")), SEL_G("rangeOfString:"),
+                                                          m32_objc_to_guest(STR("z")) });
+    check("rangeOfString: answers {NSNotFound, 0}", loc == 0x7fffffffu && (uint32_t)cpu()->gpr[OCERZ_RDX] == 0);
+    uint32_t v = call("_objc_msgSend", 4, (uint32_t[]){ m32_objc_to_guest((id)objc_getClass("NSValue")),
+                                                        SEL_G("valueWithRange:"), 0x7fffffffu, 0 });
+    struct { uint64_t loc, len; } (*range)(id, SEL) = (void *)objc_msgSend;
+    check("... and NSNotFound reaches the host as its own", v && range(m32_objc_to_host(v), sel_registerName("rangeValue")).loc ==
+          (uint64_t)INT64_MAX);
+    /* an NSError ** is a 4-byte guest id, stored only when the callee stores one */
+    char file[] = "/tmp/test_m32_error.XXXXXX";
+    int fd = mkstemp(file);
+    if (fd >= 0) {
+        write(fd, "hi", 2);
+        close(fd);
+    }
+    uint32_t err = DATA + 0x4100, string_cls = m32_objc_to_guest((id)objc_getClass("NSString")),
+             read_sel = SEL_G("stringWithContentsOfFile:encoding:error:");
+    m32_wr(err, 0x11111111u);
+    m32_wr(err + 4, 0x22222222u);
+    uint32_t r = call("_objc_msgSend", 5, (uint32_t[]){ string_cls, read_sel, m32_objc_to_guest(STR("/nonexistent/m32")), 4, err });
+    id e = r ? nil : m32_objc_to_host(m32_rd(err));
+    check("error: answers an NSError in a guest word", !r && e && ((BOOL (*)(id, SEL, Class))objc_msgSend)(e,
+          sel_registerName("isKindOfClass:"), objc_getClass("NSError")) && m32_rd(err + 4) == 0x22222222u);
+    m32_wr(err, 0x33333333u);
+    r = call("_objc_msgSend", 5, (uint32_t[]){ string_cls, read_sel, m32_objc_to_guest(STR(file)), 4, err });
+    check("... and is left alone when the call succeeds", r && m32_rd(err) == 0x33333333u);
+    unlink(file);
+    /* an NSRangePointer: the guest's 8-byte NSRange, written back, its neighbour untouched */
+    id as = send1(send((id)objc_getClass("NSAttributedString"), sel_registerName("alloc")),
+                  sel_registerName("initWithString:"), STR("hello"));
+    uint32_t rp = DATA + 0x4200;
+    m32_wr(rp, 0xffffffffu);
+    m32_wr(rp + 4, 0xffffffffu);
+    m32_wr(rp + 8, 0x44444444u);
+    call("_objc_msgSend", 7, (uint32_t[]){ m32_objc_to_guest(as), SEL_G("attribute:atIndex:longestEffectiveRange:inRange:"),
+                                           m32_objc_to_guest(STR("NSFont")), 0, rp, 0, 5 });
+    check("longestEffectiveRange: fills the i386 NSRange", m32_rd(rp) == 0 && m32_rd(rp + 4) == 5 && m32_rd(rp + 8) == 0x44444444u);
+    /* AppKit's tags: a small number each, the host's own back for it, freed for reuse */
+    uint32_t t1 = m32_tag_guest(0x7a12345678ull), t2 = m32_tag_guest(0x7a9abcdef0ull);
+    check("a 64-bit tag gets a small guest number", t1 && t2 && t1 != t2 && t1 < 0x10000 && m32_tag_guest(0x7a12345678ull) == t1 &&
+          m32_tag_host(t1) == 0x7a12345678ull && m32_tag_host(t2) == 0x7a9abcdef0ull);
+    m32_tag_free(t1);
+    check("... and a removed one's number is reused", m32_tag_guest(0x7a55555555ull) == t1);
+    /* a guest class M32TestOwner : NSObject <M32TestA> with an outlet ivar moreInfoView at 4; M32TestA adopts M32TestB,
+     * which comes after it in __OBJC,__protocol */
+    uint32_t G = DATA + 0x5000, S = G + 0x400;
+    memset(m32_h(G), 0, 0x600);
+    const char *names[] = { "M32TestOwner", "NSObject", "moreInfoView", "@", "M32TestA", "M32TestB" };
+    uint32_t at_name[6];
+    for (int i = 0, off = 0; i < 6; off += (int)strlen(names[i]) + 1, i++) {
+        at_name[i] = S + (uint32_t)off;
+        put_str(at_name[i], names[i]);
+    }
+    uint32_t cls = G, meta = G + 0x40, ivars = G + 0x80, plist = G + 0xa0, apl = G + 0xb0, protos = G + 0xc0,
+             symtab = G + 0x100, module = G + 0x120;
+    m32_wr(ivars, 1);
+    m32_wr(ivars + 4, at_name[2]);
+    m32_wr(ivars + 8, at_name[3]);
+    m32_wr(ivars + 12, 4);
+    m32_wr(protos, 0);                    /* M32TestA: isa, name, protocol_list, instance and class methods */
+    m32_wr(protos + 4, at_name[4]);
+    m32_wr(protos + 8, apl);
+    m32_wr(protos + 20 + 4, at_name[5]);  /* M32TestB */
+    m32_wr(apl + 4, 1);                   /* protocol_list: next, count, list[] */
+    m32_wr(apl + 8, protos + 20);
+    m32_wr(plist + 4, 1);
+    m32_wr(plist + 8, protos);
+    m32_wr(cls + OC_ISA, meta);
+    m32_wr(cls + OC_SUPER, at_name[1]);
+    m32_wr(cls + OC_NAME, at_name[0]);
+    m32_wr(cls + OC_INFO, OC_CLS_CLASS);
+    m32_wr(cls + OC_ISIZE, 8);
+    m32_wr(cls + OC_IVARS, ivars);
+    m32_wr(cls + OC_PROTOCOLS, plist);
+    m32_wr(meta + OC_ISA, at_name[1]);
+    m32_wr(meta + OC_SUPER, at_name[1]);
+    m32_wr(meta + OC_NAME, at_name[0]);
+    m32_wr(meta + OC_INFO, OC_CLS_META);
+    m32_wr(meta + OC_ISIZE, 48);
+    m32_wr(symtab + 8, 1);                /* one class, no categories */
+    m32_wr(symtab + 12, cls);
+    m32_wr(module, 7);
+    m32_wr(module + 4, 16);
+    m32_wr(module + 12, symtab);
+    static M32Image img;
+    snprintf(img.path, sizeof img.path, "/test_m32/objc");
+    img.sect[0] = (M32Sect){ "__OBJC", "__module_info", module, 16, 0, 0, 0, 0 };
+    img.sect[1] = (M32Sect){ "__OBJC", "__protocol", protos, 40, 0, 0, 0, 0 };
+    img.nsect = 2;
+    m32_objc_load(&img);
+    Protocol *pa = objc_getProtocol("M32TestA"), *pb = objc_getProtocol("M32TestB");
+    check("guest protocols get host twins", pa && pb && m32_host(protos) == (void *)pa && protocol_conformsToProtocol(pa, pb));
+    Class hc = m32_class_host(cls);
+    check("the guest class is paired and adopts its protocol", hc && class_getSuperclass(hc) == objc_getClass("NSObject") &&
+          class_conformsToProtocol(hc, pa));
+    if (!hc) {
+        objc_autoreleasePoolPop(pool);
+        return;
+    }
+    id owner = send(send((id)hc, sel_registerName("alloc")), sel_registerName("init"));
+    uint32_t twin = m32_objc_to_guest(owner);
+    check("an instance has a guest twin", twin && !m32_is_handle(twin) && m32_rd(twin) == cls);
+    /* a nib outlet with no setter is the ivar of that name, as NSNibOutletConnector sets it */
+    id view = send((id)objc_getClass("NSObject"), sel_registerName("new")), conn = send((id)objc_getClass("NSNibOutletConnector"),
+                                                                                         sel_registerName("new"));
+    set(conn, sel_registerName("setValue:forKey:"), owner, STR("source"));
+    set(conn, sel_registerName("setValue:forKey:"), view, STR("destination"));
+    set(conn, sel_registerName("setValue:forKey:"), STR("moreInfoView"), STR("label"));
+    send(conn, sel_registerName("establishConnection"));
+    check("a nib outlet sets the guest ivar", m32_rd(twin + 4) == m32_objc_to_guest(view));
+    send(conn, sel_registerName("release"));
+    objc_autoreleasePoolPop(pool);
+    /* the twin goes with its host object: no alias is left for the next object malloc puts there */
+    void *was = (void *)owner;
+    send(owner, sel_registerName("release"));
+    check("a deallocated object's twin is no longer its", m32_handle_twin_lookup(was) == 0 && m32_host(twin) == m32_h(twin));
+    /* sortUsingFunction:context: with a guest comparator: by the ids' values, the order their handles were made in (a
+     * callback finds the guest through the process's VM) */
+    ocerz_vm_install_handlers(&g_vm);
+    static const uint8_t by_id[] = { 0x8b, 0x44, 0x24, 0x04, 0x8b, 0x4c, 0x24, 0x08, 0x39, 0xc8, 0xb8, 0, 0, 0, 0,
+                                     0x0f, 0x97, 0xc0, 0x83, 0xd8, 0x00, 0xc3 };   /* (a > b) - (a < b), unsigned */
+    memcpy(m32_h(CODE + 0x800), by_id, sizeof by_id);
+    id n[3];
+    for (int i = 0; i < 3; i++)
+        n[i] = send1((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), (const char *[]){ "a", "b", "c" }[i]);
+    uint32_t g0 = m32_objc_to_guest(n[0]), g1 = m32_objc_to_guest(n[1]), g2 = m32_objc_to_guest(n[2]);
+    id ma = send((id)objc_getClass("NSMutableArray"), sel_registerName("new"));
+    id (*add)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+    add(ma, sel_registerName("addObject:"), n[1]);
+    add(ma, sel_registerName("addObject:"), n[2]);
+    add(ma, sel_registerName("addObject:"), n[0]);
+    call("_objc_msgSend", 4, (uint32_t[]){ m32_objc_to_guest(ma), SEL_G("sortUsingFunction:context:"), CODE + 0x800, 0 });
+    id (*at)(id, SEL, unsigned long) = (id (*)(id, SEL, unsigned long))objc_msgSend;
+    uint32_t s0 = m32_objc_to_guest(at(ma, sel_registerName("objectAtIndex:"), 0)),
+             s1 = m32_objc_to_guest(at(ma, sel_registerName("objectAtIndex:"), 1)),
+             s2 = m32_objc_to_guest(at(ma, sel_registerName("objectAtIndex:"), 2));
+    check("sortUsingFunction:context: calls the guest's function", s0 == g0 && s1 == g1 && s2 == g2 && g0 < g1 && g1 < g2);
+    /* method_exchangeImplementations of two guest methods {SEL, types, IMP} */
+    uint32_t m1 = DATA + 0x4300, m2 = DATA + 0x4310;
+    m32_wr(m1 + 8, 0x1111u);
+    m32_wr(m2 + 8, 0x2222u);
+    call("_method_exchangeImplementations", 2, (uint32_t[]){ m1, m2 });
+    check("method_exchangeImplementations swaps guest methods", m32_rd(m1 + 8) == 0x2222u && m32_rd(m2 + 8) == 0x1111u);
+#undef SEL_G
+#undef STR
+}
+
 /* through the databases: theme structures packed to 2 (src/m32_cross.c), GNU libiconv's names (src/m32_bridge.c), and
  * dlsym of a function m32 cannot call (src/m32_dyld.c) */
 static void test_db_shapes(void)
@@ -1351,6 +1572,7 @@ int main(int argc, char **argv)
         setenv("OCERZ_APIDB32", db, 0);   /* unless the caller named one */
         test_carbon();
         test_db_shapes();
+        test_objc_pairs();
         printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
         return g_failures != 0;
     }
@@ -1370,6 +1592,7 @@ int main(int argc, char **argv)
     test_removed_calls();
     test_sdl_shims();
     test_game_libs();
+    test_image_order();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }
