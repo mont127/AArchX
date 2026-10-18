@@ -1334,6 +1334,7 @@ static void test_objc_pairs(void)
 {
     if (!dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_LAZY | RTLD_GLOBAL))
         return;
+    ocerz_vm_install_handlers(&g_vm);   /* a callback finds the guest through the process's VM */
     void *pool = objc_autoreleasePoolPush();
     id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
     id (*send1)(id, SEL, const void *) = (id (*)(id, SEL, const void *))objc_msgSend;
@@ -1390,15 +1391,24 @@ static void test_objc_pairs(void)
     /* a guest class M32TestOwner : NSObject <M32TestA> with an outlet ivar moreInfoView at 4; M32TestA adopts M32TestB,
      * which comes after it in __OBJC,__protocol */
     uint32_t G = DATA + 0x5000, S = G + 0x400;
-    memset(m32_h(G), 0, 0x600);
-    const char *names[] = { "M32TestOwner", "NSObject", "moreInfoView", "@", "M32TestA", "M32TestB" };
-    uint32_t at_name[6];
-    for (int i = 0, off = 0; i < 6; off += (int)strlen(names[i]) + 1, i++) {
+    memset(m32_h(G), 0, 0x600);   /* S, the strings, at G + 0x400 */
+    const char *names[] = { "M32TestOwner", "NSObject", "moreInfoView", "@", "M32TestA", "M32TestB",
+                            "validateValue:forKey:error:", "c20@0:4^@8@12^@16" };
+    uint32_t at_name[8];
+    for (int i = 0, off = 0; i < 8; off += (int)strlen(names[i]) + 1, i++) {
         at_name[i] = S + (uint32_t)off;
         put_str(at_name[i], names[i]);
     }
     uint32_t cls = G, meta = G + 0x40, ivars = G + 0x80, plist = G + 0xa0, apl = G + 0xb0, protos = G + 0xc0,
-             symtab = G + 0x100, module = G + 0x120;
+             symtab = G + 0x100, module = G + 0x120, methods = G + 0x140;
+    /* -validateValue:(id *)v forKey:(id)k error:(NSError **)e { id old = *v; *v = k; *e = old; return YES; } */
+    static const uint8_t validate[] = { 0x8b, 0x44, 0x24, 0x0c, 0x8b, 0x4c, 0x24, 0x10, 0x8b, 0x10, 0x89, 0x08, 0x8b,
+                                        0x44, 0x24, 0x14, 0x89, 0x10, 0xb8, 0x01, 0, 0, 0, 0xc3 };
+    memcpy(m32_h(CODE + 0x840), validate, sizeof validate);
+    m32_wr(methods + 4, 1);               /* old_method_list: obsolete, count, {name, types, imp} */
+    m32_wr(methods + 8, at_name[6]);
+    m32_wr(methods + 12, at_name[7]);
+    m32_wr(methods + 16, CODE + 0x840);
     m32_wr(ivars, 1);
     m32_wr(ivars + 4, at_name[2]);
     m32_wr(ivars + 8, at_name[3]);
@@ -1418,6 +1428,7 @@ static void test_objc_pairs(void)
     m32_wr(cls + OC_ISIZE, 8);
     m32_wr(cls + OC_IVARS, ivars);
     m32_wr(cls + OC_PROTOCOLS, plist);
+    m32_wr(cls + OC_METHODS, methods);
     m32_wr(meta + OC_ISA, at_name[1]);
     m32_wr(meta + OC_SUPER, at_name[1]);
     m32_wr(meta + OC_NAME, at_name[0]);
@@ -1454,15 +1465,26 @@ static void test_objc_pairs(void)
     set(conn, sel_registerName("setValue:forKey:"), STR("moreInfoView"), STR("label"));
     send(conn, sel_registerName("establishConnection"));
     check("a nib outlet sets the guest ivar", m32_rd(twin + 4) == m32_objc_to_guest(view));
+    /* the host calling the guest's override with an id * read and written and an NSError ** */
+    id in = STR("in"), key = STR("key"), value = in, error = nil;
+    BOOL ok = ((BOOL (*)(id, SEL, id *, id, id *))objc_msgSend)(owner, sel_registerName("validateValue:forKey:error:"),
+                                                                &value, key, &error);
+    check("a guest method gets guest copies of the host's id pointers", ok && value == key && error == in);
+    /* a guest function the host hands an NSRange *: its i386 copy, written back */
+    static const uint8_t bump[] = { 0x8b, 0x44, 0x24, 0x04, 0xff, 0x00, 0xc7, 0x40, 0x04, 4, 0, 0, 0, 0xc3 };
+    memcpy(m32_h(CODE + 0x880), bump, sizeof bump);
+    void (*bump_fn)(uint64_t *) = (void (*)(uint64_t *))m32_callback(CODE + 0x880, "v(R{uu})", "v(R{LL})");
+    uint64_t hr[2] = { 9, 0 };
+    if (bump_fn)
+        bump_fn(hr);
+    check("a guest function gets an i386 copy of the host's NSRange", hr[0] == 10 && hr[1] == 4);
     send(conn, sel_registerName("release"));
     objc_autoreleasePoolPop(pool);
     /* the twin goes with its host object: no alias is left for the next object malloc puts there */
     void *was = (void *)owner;
     send(owner, sel_registerName("release"));
     check("a deallocated object's twin is no longer its", m32_handle_twin_lookup(was) == 0 && m32_host(twin) == m32_h(twin));
-    /* sortUsingFunction:context: with a guest comparator: by the ids' values, the order their handles were made in (a
-     * callback finds the guest through the process's VM) */
-    ocerz_vm_install_handlers(&g_vm);
+    /* sortUsingFunction:context: with a guest comparator: by the ids' values, the order their handles were made in */
     static const uint8_t by_id[] = { 0x8b, 0x44, 0x24, 0x04, 0x8b, 0x4c, 0x24, 0x08, 0x39, 0xc8, 0xb8, 0, 0, 0, 0,
                                      0x0f, 0x97, 0xc0, 0x83, 0xd8, 0x00, 0xc3 };   /* (a > b) - (a < b), unsigned */
     memcpy(m32_h(CODE + 0x800), by_id, sizeof by_id);
@@ -1487,6 +1509,26 @@ static void test_objc_pairs(void)
     m32_wr(m2 + 8, 0x2222u);
     call("_method_exchangeImplementations", 2, (uint32_t[]){ m1, m2 });
     check("method_exchangeImplementations swaps guest methods", m32_rd(m1 + 8) == 0x2222u && m32_rd(m2 + 8) == 0x1111u);
+    /* the collector's write barriers store, with no collector */
+    m32_wr(DATA + 0x4320, 0);
+    m32_wr(DATA + 0x4328, 0);
+    check("objc_assign_global stores", call("_objc_assign_global", 2, (uint32_t[]){ 0x1234u, DATA + 0x4320 }) == 0x1234u &&
+                                       m32_rd(DATA + 0x4320) == 0x1234u);
+    check("objc_assign_ivar stores at the offset", call("_objc_assign_ivar", 3, (uint32_t[]){ 0x5678u, DATA + 0x4320, 8 }) == 0x5678u &&
+                                                   m32_rd(DATA + 0x4328) == 0x5678u);
+    check("objc_read_weak reads", call("_objc_read_weak", 1, (uint32_t[]){ DATA + 0x4328 }) == 0x5678u);
+    /* GetProcessInformation of this process, an i386 ProcessInfoRec: its name, number and the FSSpec * left alone */
+    uint32_t psn = DATA + 0x4340, info = DATA + 0x4360, pname = DATA + 0x43c0;
+    m32_wr(psn, 0);
+    m32_wr(psn + 4, 2);                   /* kCurrentProcess */
+    memset(m32_h(info), 0, 60);
+    m32_wr(info, 60);
+    m32_wr(info + 4, pname);
+    m32_wr(info + 56, 0x1234u);
+    memset(m32_h(pname), 0, 64);
+    int16_t perr = (int16_t)call("_GetProcessInformation", 2, (uint32_t[]){ psn, info });
+    check("GetProcessInformation fills an i386 ProcessInfoRec", perr == 0 && (m32_rd(info + 8) || m32_rd(info + 12)) &&
+          *(const uint8_t *)m32_h(pname) > 0 && m32_rd(info + 4) == pname && m32_rd(info + 56) == 0x1234u);
 #undef SEL_G
 #undef STR
 }

@@ -408,6 +408,9 @@ static void add_host_methods(Class target, Class lookup_super, uint32_t list)
             m32_log_once("a guest method has an encoding m32 cannot carry:", sel_getName(hs));
             continue;
         }
+        if (ht != gt && strchr(gt, '^'))   /* overriding the host's: an NSError ** or an NSRangePointer the host hands
+                                              * it reaches it as a guest copy (src/m32_callback.c) */
+            m32_notation_pointers(sel_getName(hs), gt, ht, gn, sizeof gn, hn, sizeof hn);
         if (strchr(gn, '(') && strchr(hn, '(') && strlen(strchr(gn, '(')) != strlen(strchr(hn, '('))) {
             char why[1200];
             snprintf(why, sizeof why, "%s guest %s host %s", sel_getName(hs), gt, ht);
@@ -1775,6 +1778,31 @@ static int sp_objc_sync(struct OcerzVM *vm, OcerzCPU *cpu, int enter)
 }
 static int sp_objc_sync_enter(struct OcerzVM *vm, OcerzCPU *cpu) { return sp_objc_sync(vm, cpu, 1); }
 static int sp_objc_sync_exit(struct OcerzVM *vm, OcerzCPU *cpu) { return sp_objc_sync(vm, cpu, 0); }
+/* The garbage collector's write barriers, which code built to support it (-fobjc-gc, Adium) calls for every store of
+ * an object into a global, an ivar or the heap: without the collector they are the stores themselves, on guest
+ * memory.  Unresolved, they answered 0 and stored nothing, and the global stayed nil. */
+static int sp_objc_assign(struct OcerzVM *vm, OcerzCPU *cpu)   /* (id value, id *dest) */
+{
+    uint32_t v = m32_arg(cpu, 0), dest = m32_arg(cpu, 1);
+    if (dest)
+        m32_wr(dest, v);
+    RET(v);
+}
+static int sp_objc_assign_ivar(struct OcerzVM *vm, OcerzCPU *cpu)   /* (id value, id object, ptrdiff_t offset) */
+{
+    uint32_t v = m32_arg(cpu, 0), obj = m32_arg(cpu, 1);
+    if (obj)
+        m32_wr(obj + m32_arg(cpu, 2), v);
+    RET(v);
+}
+static int sp_objc_read_weak(struct OcerzVM *vm, OcerzCPU *cpu) { uint32_t at = m32_arg(cpu, 0); RET(at ? m32_rd(at) : 0); }
+static int sp_objc_memmove_collectable(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t dst = m32_arg(cpu, 0), src = m32_arg(cpu, 1), n = m32_arg(cpu, 2);
+    if (n)
+        memmove(m32_h(dst), m32_h(src), n);
+    RET(dst);
+}
 /* objc_getProperty(self, _cmd, offset, atomic) / objc_setProperty(self, _cmd, offset, newValue, atomic, copy): the
  * ivar is the guest twin's word at offset */
 static int sp_objc_getProperty(struct OcerzVM *vm, OcerzCPU *cpu) { RET(rd(m32_arg(cpu, 0) + m32_arg(cpu, 2))); }
@@ -1914,6 +1942,13 @@ const M32SpecialEntry m32_objc_specials[] = {
     { "_class_getInstanceMethod", sp_class_getInstanceMethod }, { "_class_getClassMethod", sp_class_getClassMethod },
     { "_method_getImplementation", sp_method_getImplementation },
     { "_method_exchangeImplementations", sp_method_exchangeImplementations },
+    { "_objc_assign_global", sp_objc_assign },
+    { "_objc_assign_strongCast", sp_objc_assign },
+    { "_objc_assign_threadlocal", sp_objc_assign },
+    { "_objc_assign_weak", sp_objc_assign },
+    { "_objc_assign_ivar", sp_objc_assign_ivar },
+    { "_objc_read_weak", sp_objc_read_weak },
+    { "_objc_memmove_collectable", sp_objc_memmove_collectable },
     { "_method_setImplementation", sp_method_setImplementation },
     { "_method_getTypeEncoding", sp_method_getTypeEncoding }, { "_method_getName", sp_method_getName },
     { "_NSClassFromString", sp_NSClassFromString }, { "_NSStringFromClass", sp_NSStringFromClass },

@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <stddef.h>
 
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
@@ -380,6 +381,52 @@ static int sp_AEProcessAppleEvent(struct OcerzVM *vm, OcerzCPU *cpu)
     return ret_value(cpu, fn ? (uint32_t)(int32_t)fn(&r) : (uint32_t)-50);
 }
 
+/* GetProcessInformation(const ProcessSerialNumber *, ProcessInfoRec *) -> OSErr.  The i386 ProcessInfoRec is 60 bytes
+ * of 4-byte fields, its processName at 4 and an FSSpec * last (68 with the extended record's two memory totals); the
+ * arm64 one has 8-byte pointers and an FSRef * last.  Crossed as a pointer, HIServices read the guest's record as its
+ * own and followed its characters as a pointer (Adium at launch).  The record crosses field by field; the name is
+ * written into the guest's buffer, and the FSSpec, which 64-bit code has no way to make, is left as it was. */
+#pragma pack(push, 2)   /* as Processes.h declares it: the pointers unaligned, 72 bytes (80 extended) */
+typedef struct HostProcessInfoRec {
+    uint32_t length;
+    uint8_t *name;
+    uint32_t psn[2], type, signature, mode;
+    void *location;
+    uint32_t size, free_mem, launcher[2], launch_date, active_time;
+    void *app_ref;
+    uint32_t temp_total, purgeable_total;   /* ProcessInfoExtendedRec */
+} HostProcessInfoRec;
+#pragma pack(pop)
+_Static_assert(sizeof(HostProcessInfoRec) == 80, "arm64 ProcessInfoExtendedRec");
+
+static int sp_GetProcessInformation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static int16_t (*fn)(const void *, HostProcessInfoRec *);
+    if (!fn)
+        *(void **)&fn = carbon_fn("GetProcessInformation");
+    uint32_t psn = m32_arg(cpu, 0), g = m32_arg(cpu, 1);
+    if (!fn || !g)
+        return ret_value(cpu, (uint32_t)-50);   /* paramErr */
+    int extended = m32_rd(g) >= 68;
+    HostProcessInfoRec r;
+    memset(&r, 0, sizeof r);
+    r.length = extended ? (uint32_t)sizeof r : (uint32_t)offsetof(HostProcessInfoRec, temp_total);
+    r.name = m32_rd(g + 4) ? m32_h(m32_rd(g + 4)) : NULL;
+    int16_t err = fn(psn ? m32_host(psn) : NULL, &r);
+    if (!err) {
+        const uint32_t words[] = { r.psn[0], r.psn[1], r.type, r.signature, r.mode, 0, r.size, r.free_mem, r.launcher[0],
+                                   r.launcher[1], r.launch_date, r.active_time };
+        for (uint32_t i = 0; i < sizeof words / sizeof words[0]; i++)
+            m32_wr(g + 8 + 4 * i, words[i]);
+        if (extended) {
+            m32_wr(g + 60, r.temp_total);
+            m32_wr(g + 64, r.purgeable_total);
+        }
+    }
+    return ret_value(cpu, (uint32_t)(int32_t)err);
+}
+
 /* ---- the Text Encoding Converter ---- */
 
 typedef int32_t (*TecConvert)(void *, unsigned long, const void *, uint32_t, unsigned long, const unsigned long *,
@@ -499,6 +546,7 @@ const M32SpecialEntry m32_carbon_specials[] = {
     { "_WaitNextEvent", sp_WaitNextEvent }, { "_GetNextEvent", sp_GetNextEvent }, { "_EventAvail", sp_EventAvail },
     { "_ConvertEventRefToEventRecord", sp_ConvertEventRefToEventRecord },
     { "_AEProcessAppleEvent", sp_AEProcessAppleEvent },
+    { "_GetProcessInformation", sp_GetProcessInformation },
     { NULL, NULL }
 };
 

@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "ocerz/m32_objc.h"
+#include "ocerz/m32_sig.h"
 #include "ocerz/m32_objcrt.h"
 
 static const char *skip_quals(const char *e)
@@ -167,7 +168,10 @@ static char struct_ptr(const char *e, char *out, size_t n)
     if (e[0] != '^' || e[1] != '{' || !one(e + 1, out, &o, n, 0) || o < 3 || o + 1 >= n)
         return 0;
     out[o] = 0;
-    return cls;
+    int members = 0;   /* a notation's structure holds at most M32_MAX_MEMBERS: a larger one stays a pointer */
+    for (const char *p = out; *p; p++)
+        members += *p != '{' && *p != '}';
+    return members <= M32_MAX_MEMBERS ? cls : 0;
 }
 
 int m32_notation_pointers(const char *sel, const char *genc, const char *henc, char *gn, size_t gsize, char *hn,
