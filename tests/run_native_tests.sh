@@ -574,12 +574,13 @@
 # then protects it again, so every comparison faults once, and a SIGSEGV handler
 # that unprotects the page and returns, so the read is made again and succeeds.
 # In native mode the comparator is a callback from the host's qsort, and each
-# fault jumps back to the callback's recovery point; three hundred recoveries in
-# a row, under both engines and in cache mode, must leave the array sorted and
-# the handler run once per comparison, on the faulting page. Every fault is at
-# the same address, which ocerz once took for a fault loop after sixteen and
-# ended the thread: a garbage collector's barrier or a safepoint poll faults
-# like that, and only Wine's foreign workers really loop.
+# fault jumps back to the callback's recovery point, which is taken without the
+# signal mask and has to put the mask and the signal stack back itself; three
+# hundred recoveries in a row, under both engines and in cache mode, must leave
+# the array sorted and the handler run once per comparison, on the faulting
+# page. Every fault is at the same address, which ocerz once took for a fault
+# loop after sixteen and ended the thread: a garbage collector's barrier or a
+# safepoint poll faults like that, and only Wine's foreign workers really loop.
 #
 # The signal runs are bounded at SIGNAL_TIMEOUT seconds, and a run that times out
 # names the last progress note its fixture wrote. A fixture whose handler was

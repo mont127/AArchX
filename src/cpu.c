@@ -5,7 +5,7 @@
  * which both the JIT's arm64 FP instructions and the interpreter's C-computed
  * SSE ops honour.  x86 and arm64 disagree on the directed encodings - MXCSR 01
  * rounds toward -inf while FPCR 01 rounds toward +inf - so the mapping goes
- * through the fe* constants rather than copying the bits across.  Without it,
+ * through a table rather than copying the bits across.  Without it,
  * divsd/sqrtsd and friends always rounded to nearest whatever mode a program
  * selected with ldmxcsr or fesetround.
  *
@@ -36,7 +36,6 @@
 #include "ocerz/mode.h"
 
 #include <arm_acle.h>
-#include <fenv.h>
 #include <stdlib.h>
 #include <sys/sysctl.h>
 
@@ -83,15 +82,17 @@ void ocerz_afp_restore(uint64_t fpcr)
         __arm_wsr64("fpcr", fpcr);
 }
 
+/* FPCR.RMode for MXCSR.RC: nearest, down, up, toward zero.  FPCR is written only when it changes, which a callback
+ * entering guest code in the mode it already has (nearly every one) never does; fesetround wrote it every time. */
 void ocerz_apply_mxcsr_round(uint32_t mxcsr)
 {
-    static const int fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
-    fesetround(fe[(mxcsr >> 13) & 3]);
-    if (g_afp) {
-        uint64_t fpcr = __arm_rsr64("fpcr");
-        if (!(fpcr & CPU_FPCR_AH))
-            __arm_wsr64("fpcr", fpcr | CPU_FPCR_AH);
-    }
+    static const uint64_t rmode[4] = { 0ull, 0x800000ull, 0x400000ull, 0xc00000ull };
+    uint64_t fpcr = __arm_rsr64("fpcr");
+    uint64_t want = (fpcr & ~0xc00000ull) | rmode[(mxcsr >> 13) & 3];
+    if (g_afp)
+        want |= CPU_FPCR_AH;
+    if (want != fpcr)
+        __arm_wsr64("fpcr", want);
 }
 
 void ocerz_cpu_reset(OcerzCPU *cpu)

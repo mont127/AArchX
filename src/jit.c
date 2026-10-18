@@ -2883,6 +2883,10 @@ static int host_ras_enabled(void)
     if (en < 0) en = getenv("OCERZ_NO_HOST_RAS") ? 0 : 1;
     return en;
 }
+int ocerz_jit_ras_wraps(void)
+{
+    return !host_ras_enabled();
+}
 static void emit_frame_sp_reset(A64Buf *b)
 {
     if (g_pin_class == 3 && host_ras_enabled()) {
