@@ -13807,6 +13807,15 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
                          (s && s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP)))
         return 0;
     if (op == OCERZ_OP_CMPXCHG && (pin_slot(OCERZ_RAX) < 0 || !s || s->kind != OCERZ_OPK_REG || s->high8 || val_slot(s->reg) < 0)) return 0;
+    /*
+     * adc and sbb into memory with their flags dead: the carry in, then the load, the sum and the store.  i386 code
+     * adds 64-bit values to memory as add then adc (DarkPlaces' texture averaging, 11% of its benchmark demo), and
+     * every adc went to the slow path one instruction at a time.  With their flags live, or locked, they still do.
+     */
+    int carry_op = op == OCERZ_OP_ADC || op == OCERZ_OP_SBB;
+    if (carry_op && (need || insn->lock || !s || (s->kind != OCERZ_OPK_REG && s->kind != OCERZ_OPK_IMM) ||
+                     (s->kind == OCERZ_OPK_REG && s->high8) || ENV_ON("OCERZ_NO_ADC_MEM")))
+        return 0;
     if (!mem_native_store_ok()) return 0;
     int atomic = op == OCERZ_OP_XCHG || op == OCERZ_OP_XADD || op == OCERZ_OP_CMPXCHG || insn->lock;
     int is_cmp = op == OCERZ_OP_CMP || op == OCERZ_OP_TEST;
@@ -13815,7 +13824,7 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     int ordered = !g_plain_mem;
 
     int incdec_cf = (op == OCERZ_OP_INC || op == OCERZ_OP_DEC) && need && incdec_cf_live();
-    if (incdec_cf) {
+    if (incdec_cf || carry_op) {   /* CF in, first: the predicate may call out */
         emit_cc_predicate(b, OCERZ_CC_B);
         a64_cset(b, JT1, A64_NE);
         a64_str(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
@@ -13873,6 +13882,11 @@ static int emit_rmw_mem(A64Buf *b, const X86Insn *insn, uint64_t need,
     switch (op) {
     case OCERZ_OP_ADD: case OCERZ_OP_XADD: a64_add_reg(b, sf, JT2, JT0, rs, 0); break;
     case OCERZ_OP_SUB: a64_sub_reg(b, sf, JT2, JT0, rs, 0); break;
+    case OCERZ_OP_ADC: case OCERZ_OP_SBB:
+        a64_ldr(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
+        if (op == OCERZ_OP_ADC) { a64_add_reg(b, sf, JT2, JT0, rs, 0); a64_add_reg(b, sf, JT2, JT2, JTU, 0); }
+        else                    { a64_sub_reg(b, sf, JT2, JT0, rs, 0); a64_sub_reg(b, sf, JT2, JT2, JTU, 0); }
+        break;
     case OCERZ_OP_AND: a64_and_reg(b, sf, JT2, JT0, rs, 0); break;
     case OCERZ_OP_TEST: if (need) a64_and_reg(b, sf, JT2, JT0, rs, 0); have_new = 0; break;
     case OCERZ_OP_OR:  a64_orr_reg(b, sf, JT2, JT0, rs, 0); break;
@@ -15590,6 +15604,8 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         return emit_not_neg(b, insn, need);
     case OCERZ_OP_ADC:
     case OCERZ_OP_SBB:
+        if (insn->ops[0].kind == OCERZ_OPK_MEM)
+            return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
         return emit_adc_sbb(b, insn, need);
     case OCERZ_OP_CBW:
     case OCERZ_OP_CWD:

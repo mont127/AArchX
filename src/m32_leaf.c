@@ -59,20 +59,10 @@ static uint64_t leaf_memset(uint8_t *d, uint32_t c, uint32_t n)
     return 0;
 }
 static uint64_t leaf_bzero(uint8_t *d, uint32_t n) { return leaf_memset(d, 0, n); }
-static uint64_t leaf_memcmp(const uint8_t *a, const uint8_t *b, uint32_t n)
-{
-    for (; n; a++, b++, n--)
-        if (*a != *b)
-            return (uint32_t)((int)*a - (int)*b);
-    return 0;
-}
-static uint64_t leaf_strlen(const char *s)
-{
-    const char *p = s;
-    while (*p)
-        p++;
-    return (uint32_t)(p - s);
-}
+/* libc's own, vectorized: DarkPlaces spent 6% of its benchmark demo in a byte loop here.  Apple's memcmp answers the
+ * difference of the first bytes that differ, as this did */
+static uint64_t leaf_memcmp(const uint8_t *a, const uint8_t *b, uint32_t n) { return (uint32_t)memcmp(a, b, n); }
+static uint64_t leaf_strlen(const char *s) { return (uint32_t)strlen(s); }
 /* wchar_t is 4 bytes on both; FreeBSD's (and so the host's) wcscmp: the difference as unsigned ints */
 static uint64_t leaf_wcscmp(const uint32_t *a, const uint32_t *b)
 {
