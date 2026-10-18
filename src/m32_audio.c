@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,6 +31,7 @@ typedef struct { uint32_t n; HostBuffer b[]; } HostBufferList;         /* AudioB
 typedef struct Render {
     struct OcerzVM *vm;
     uint32_t proc, refcon;
+    int v1;                  /* Mac OS X 10.1's callback: flags by value, one AudioBuffer */
     uint32_t scratch, cap;   /* guest: flags (4), time stamp (64), buffer list (4 + 12 n), the samples */
 } Render;
 
@@ -72,7 +74,17 @@ static int32_t render_thunk(void *ctx, uint32_t *flags, const uint8_t *ts, uint3
         d += io->b[i].size;
     }
     uint32_t args[6] = { r->refcon, flags ? gf : 0, ts ? gts : 0, bus, frames, io ? gl : 0 };
-    int32_t status = (int32_t)m32_call(r->vm, r->proc, args, 6, NULL, NULL);
+    if (r->v1) {   /* (refcon, flags, time stamp, bus, AudioBuffer *): the list's first buffer, interleaved */
+        args[1] = flags ? *flags : 0;
+        args[4] = n ? gl + 4 : 0;
+    }
+    static int log = -1;   /* OCERZ_M32LOG=render: each render callback the host makes, its frames and bytes */
+    if (log < 0)
+        log = getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "render") ? 1 : 0;
+    if (log)
+        fprintf(stderr, "ocerz: m32: render %s %#x: %u frames, %u bytes in %u buffers\n", r->v1 ? "v1" : "v2", r->proc,
+                frames, bytes, n);
+    int32_t status = (int32_t)m32_call(r->vm, r->proc, args, r->v1 ? 5 : 6, NULL, NULL);
     if (flags)
         *flags = m32_rd(gf);
     static int mute = -1;   /* OCERZ_M32_MUTE=1: the guest still renders (and keeps its time), the host plays silence */
@@ -91,13 +103,14 @@ static int32_t render_thunk(void *ctx, uint32_t *flags, const uint8_t *ts, uint3
     return status;
 }
 
+static void *at(const char *sym);
+
 /* AudioUnitSetProperty(unit, id, scope, element, data, size) */
 static int sp_AudioUnitSetProperty(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static int32_t (*f)(void *, uint32_t, uint32_t, uint32_t, const void *, uint32_t);
     if (!f)
-        f = (int32_t (*)(void *, uint32_t, uint32_t, uint32_t, const void *, uint32_t))
-                ocerz_bridge_host_symbol(AT_LIB, "AudioUnitSetProperty");
+        f = (int32_t (*)(void *, uint32_t, uint32_t, uint32_t, const void *, uint32_t))at("AudioUnitSetProperty");
     if (!f)
         RET(-4);   /* unimpErr */
     void *unit = m32_host(m32_arg(cpu, 0));
@@ -106,7 +119,11 @@ static int sp_AudioUnitSetProperty(struct OcerzVM *vm, OcerzCPU *cpu)
     static int off = -1;   /* OCERZ_M32_NO_AUDIOCB=1: the struct goes through as before (the host rejects it) */
     if (off < 0)
         off = getenv("OCERZ_M32_NO_AUDIOCB") ? 1 : 0;
-    if ((id == 23 || id == 2005) && data && size == 8 && !off) {   /* SetRenderCallback, SetInputCallback */
+    /* kAudioUnitProperty_SetInputCallback (7) is Mac OS X 10.1's render callback, which audio units no longer take
+     * (kAudioUnitErr_InvalidProperty): SDL 1.2's CoreAudio driver sets it, and Neverball played silent.  It becomes
+     * kAudioUnitProperty_SetRenderCallback, whose thunk calls the guest the old way. */
+    int v1 = id == 7;
+    if ((id == 23 || id == 2005 || v1) && data && size == 8 && !off) {   /* SetRenderCallback, SetInputCallback */
         struct { void *proc, *refcon; } host = { NULL, NULL };
         if (m32_rd(data)) {
             Render *r = calloc(1, sizeof *r);
@@ -115,10 +132,11 @@ static int sp_AudioUnitSetProperty(struct OcerzVM *vm, OcerzCPU *cpu)
             r->vm = vm;
             r->proc = m32_rd(data);
             r->refcon = m32_rd(data + 4);
+            r->v1 = v1;
             host.proc = (void *)render_thunk;
             host.refcon = r;
         }
-        RET(f(unit, id, scope, element, &host, sizeof host));
+        RET(f(unit, v1 ? 23 : id, scope, element, &host, sizeof host));
     }
     RET(f(unit, id, scope, element, m32_host(data), size));
 }
@@ -326,6 +344,29 @@ static int ac_known(void *p)
 }
 static void *cm(const char *sym) { return dlsym(RTLD_DEFAULT, sym); }
 
+/* A description in Mac OS X 10.1's terms, which SDL 1.2's CoreAudio driver still uses: type kAudioUnitComponentType
+ * ('aunt'), the kind of unit as subtype ('out ' for an output), and the unit's ID as manufacturer ('def ', the default
+ * output).  Today the kind is the type ('auou'), the ID the subtype and Apple the manufacturer.  Answered as it was,
+ * SDL found no output and Neverball played silent ("Failed to start CoreAudio: FindNextComponent returned NULL"). */
+static const void *modern_desc(const void *desc, uint32_t out[5])
+{
+    static const uint32_t kinds[][2] = { { 'out ', 'auou' }, { 'muse', 'aumu' }, { 'mufx', 'aumf' },
+                                         { 'fmtc', 'aufc' }, { 'efct', 'aufx' }, { 'mixr', 'aumx' } };
+    if (!desc)
+        return NULL;
+    memcpy(out, desc, 20);
+    if (out[0] != 'aunt')
+        return desc;
+    for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++)
+        if (out[1] == kinds[i][0]) {
+            out[0] = kinds[i][1];
+            out[1] = out[2];
+            out[2] = 'appl';
+            return out;
+        }
+    return desc;
+}
+
 /* FindNextComponent(Component prev, ComponentDescription *looking) */
 static int sp_FindNextComponent(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -333,7 +374,8 @@ static int sp_FindNextComponent(struct OcerzVM *vm, OcerzCPU *cpu)
     void *(*find_ac)(void *, const void *) = at("AudioComponentFindNext");
     void *(*find)(void *, const void *) = cm("FindNextComponent");
     void *prev = m32_host(m32_arg(cpu, 0)), *c = NULL;
-    const void *desc = m32_arg(cpu, 1) ? m32_h(m32_arg(cpu, 1)) : NULL;
+    uint32_t now[5];
+    const void *desc = modern_desc(m32_arg(cpu, 1) ? m32_h(m32_arg(cpu, 1)) : NULL, now);
     if (find_ac && (!prev || ac_known(prev)) && (c = find_ac(prev, desc)))
         ac_note(c);
     else if (find && (!prev || !ac_known(prev)))
@@ -346,7 +388,8 @@ static int sp_CountComponents(struct OcerzVM *vm, OcerzCPU *cpu)
     (void)vm;
     uint32_t (*count_ac)(const void *) = at("AudioComponentCount");
     long (*count)(const void *) = cm("CountComponents");
-    const void *desc = m32_arg(cpu, 0) ? m32_h(m32_arg(cpu, 0)) : NULL;
+    uint32_t now[5];
+    const void *desc = modern_desc(m32_arg(cpu, 0) ? m32_h(m32_arg(cpu, 0)) : NULL, now);
     uint32_t n = count_ac ? count_ac(desc) : 0;
     RET(n ? n : count ? (uint32_t)count(desc) : 0);
 }

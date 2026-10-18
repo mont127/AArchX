@@ -2791,6 +2791,29 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     }
                     t = str_into(t, "\n");
                     write(2, tb, (size_t)(t - tb));
+                    /* OCERZ_WILDDUMP=1: the host frames too, walked by frame pointer, each read through the kernel so
+                     * a bad one ends the walk instead of faulting again (the fault is in host code, which the guest
+                     * report's walk cannot follow) */
+                    if (uc && getenv("OCERZ_WILDDUMP")) {
+                        t = tb;
+                        t = str_into(t, "ocerz: WILD-HOST-BT ");
+                        t = hex_into(t, uc->uc_mcontext->__ss.__pc);
+                        t = str_into(t, " ");
+                        t = hex_into(t, uc->uc_mcontext->__ss.__lr);
+                        uint64_t fp = uc->uc_mcontext->__ss.__fp;
+                        for (int i = 0; i < 24 && fp && !(fp & 7); i++) {
+                            uint64_t fr[2];
+                            mach_vm_size_t got = 0;
+                            if (mach_vm_read_overwrite(mach_task_self(), fp, sizeof fr, (mach_vm_address_t)(uintptr_t)fr,
+                                                       &got) != KERN_SUCCESS || got != sizeof fr || !fr[1])
+                                break;
+                            t = str_into(t, " ");
+                            t = hex_into(t, fr[1]);
+                            fp = fr[0];
+                        }
+                        t = str_into(t, "\n");
+                        write(2, tb, (size_t)(t - tb));
+                    }
                 }
             }
             if (getenv("OCERZ_WILDDUMP"))

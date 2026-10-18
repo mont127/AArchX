@@ -58,6 +58,31 @@ int ocerz_afp(void)
     return g_afp;
 }
 
+/* Host code run with FPCR.AH set computes differently: AppKit's TextKit upgrade of an archived NSTextView faulted in
+ * UIFoundation under m32 (Wesnoth's main nib), and loads fine with the bit clear.  m32 calls host frameworks from
+ * guest threads all the time, as native mode does, so its calls clear the bit and its callbacks set it again. */
+uint64_t ocerz_afp_host(void)
+{
+    uint64_t fpcr = g_afp ? __arm_rsr64("fpcr") : 0;
+    if (fpcr & CPU_FPCR_AH)
+        __arm_wsr64("fpcr", fpcr & ~CPU_FPCR_AH);
+    return fpcr;
+}
+
+uint64_t ocerz_afp_guest(void)
+{
+    uint64_t fpcr = g_afp ? __arm_rsr64("fpcr") : 0;
+    if (g_afp && !(fpcr & CPU_FPCR_AH))
+        __arm_wsr64("fpcr", fpcr | CPU_FPCR_AH);
+    return fpcr;
+}
+
+void ocerz_afp_restore(uint64_t fpcr)
+{
+    if (g_afp && __arm_rsr64("fpcr") != fpcr)
+        __arm_wsr64("fpcr", fpcr);
+}
+
 void ocerz_apply_mxcsr_round(uint32_t mxcsr)
 {
     static const int fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };

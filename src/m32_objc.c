@@ -1647,7 +1647,29 @@ static int sp_NSCreateMapTableWithZone(struct OcerzVM *vm, OcerzCPU *cpu) { retu
 static int sp_NSCreateHashTable(struct OcerzVM *vm, OcerzCPU *cpu) { return hash_table(vm, cpu, 0); }
 static int sp_NSCreateHashTableWithZone(struct OcerzVM *vm, OcerzCPU *cpu) { return hash_table(vm, cpu, 1); }
 
+/* NSApplicationMain(int argc, const char **argv): argv is the guest's vector of 4-byte pointers, which AppKit read as
+ * 8-byte ones and faulted on (SDL 1.2's SDLMain.m calls it in every SDL game that ships it: Wesnoth).  AppKit gets a
+ * vector of its own.  It does not return. */
+static int sp_NSApplicationMain(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int (*app_main)(int, const char **) = (int (*)(int, const char **))ocerz_bridge_host_symbol(
+        "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit", "NSApplicationMain");
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP], argv = rd(esp + 8);
+    int argc = (int32_t)rd(esp + 4);
+    if (argc < 0 || argc > 4096 || !argv)
+        argc = 0;
+    const char **hv = calloc((size_t)argc + 1, sizeof *hv);
+    for (int i = 0; hv && i < argc; i++)
+        hv[i] = rd(argv + 4 * (uint32_t)i) ? m32_h(rd(argv + 4 * (uint32_t)i)) : NULL;
+    int r = app_main && hv ? app_main(argc, hv) : 1;
+    free(hv);
+    m32_ret(cpu, (uint32_t)r, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 const M32SpecialEntry m32_objc_specials[] = {
+    { "_NSApplicationMain", sp_NSApplicationMain },
     { "_NSCreateMapTable", sp_NSCreateMapTable }, { "_NSCreateMapTableWithZone", sp_NSCreateMapTableWithZone },
     { "_NSCreateHashTable", sp_NSCreateHashTable }, { "_NSCreateHashTableWithZone", sp_NSCreateHashTableWithZone },
     { "_NSLog", sp_NSLog }, { "_NSLogv", sp_NSLogv },

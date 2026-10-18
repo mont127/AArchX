@@ -477,7 +477,10 @@ static uint32_t legacy_symbol(M32Image *img, uint32_t symidx, const char **name_
     *weak = (desc & N_WEAK_REF) != 0;
     if ((nl[4] & N_TYPE) == N_SECT)   /* defined here: its own address */
         return le32(nl + 8) + (uint32_t)img->slide;
-    return m32_resolve(img, legacy_ordinal(desc), name, *weak);
+    /* an image linked with -flat_namespace (no MH_TWOLEVEL: Wesnoth's GLib and Pango) records no library for an
+     * import; dyld looks each one up in every image, then the system, which a two-level ordinal of 0 would not */
+    uint32_t mh_flags = le32(img->file + 24);
+    return m32_resolve(img, (mh_flags & MH_TWOLEVEL) ? legacy_ordinal(desc) : BIND_SPECIAL_DYLIB_FLAT_LOOKUP, name, *weak);
 }
 
 static int legacy_fixups(M32Image *img)

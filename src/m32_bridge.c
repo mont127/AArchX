@@ -346,7 +346,18 @@ int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap)
     return OCERZ_STEP_OK + 1;
 }
 
+static int trap_dispatch(struct OcerzVM *vm, OcerzCPU *cpu);
+
+/* every call the guest makes into the host: host code runs without FPCR.AH (src/cpu.c ocerz_afp_host) */
 int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t fpcr = ocerz_afp_host();
+    int r = trap_dispatch(vm, cpu);
+    ocerz_afp_restore(fpcr);
+    return r;
+}
+
+static int trap_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t id = (uint32_t)(cpu->rip - OCERZ_DYLDAPI_LO);
     if (id == M32_ID_EXIT) {

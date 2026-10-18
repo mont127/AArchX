@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <locale.h>
 #include <mach-o/loader.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1181,6 +1182,92 @@ static void test_sdl_shims(void)
     check("GetComponentInfo", call("_GetComponentInfo", 5, (uint32_t[]){ comp, DATA + 0x22c0, 0, 0, 0 }) == 0 &&
                               m32_rd(DATA + 0x22c0) == 'auou');
     check("CloseComponent", inst && call("_CloseComponent", 1, (uint32_t[]){ inst }) == 0);
+    /* SDL 1.2's CoreAudio driver: Mac OS X 10.1's description ('aunt', 'out ', the unit's ID 'def ') and its render
+     * callback (kAudioUnitProperty_SetInputCallback, the flags by value, one AudioBuffer) */
+    const uint32_t old_desc[5] = { 'aunt', 'out ', 'def ', 0, 0 };
+    memcpy(m32_h(DATA + 0x2300), old_desc, sizeof old_desc);
+    uint32_t oc = call("_FindNextComponent", 2, (uint32_t[]){ 0, DATA + 0x2300 });
+    check("FindNextComponent of a Mac OS X 10.1 description", oc != 0);
+    m32_wr(DATA + 0x2320, 0);
+    if (oc && call("_OpenAComponent", 2, (uint32_t[]){ oc, DATA + 0x2320 }) == 0) {
+        uint32_t unit = m32_rd(DATA + 0x2320);
+        int32_t (*render)(void *, uint32_t *, const void *, uint32_t, uint32_t, void *) =
+            (int32_t (*)(void *, uint32_t *, const void *, uint32_t, uint32_t, void *))
+                dlsym(dlopen("/System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox", RTLD_LAZY),
+                      "AudioUnitRender");
+        int32_t (*init)(void *) = (int32_t (*)(void *))dlsym(RTLD_DEFAULT, "AudioUnitInitialize");
+        memcpy(m32_h(CG_CODE), k_cg_code, sizeof k_cg_code);
+        m32_wr(DATA + 0x2340, 0);             /* renders counted by the guest's counter */
+        m32_wr(DATA + 0x2348, COUNTER);       /* AudioUnitInputCallback: inputProc, inputProcRefCon */
+        m32_wr(DATA + 0x234c, DATA + 0x2340);
+        int32_t st = (int32_t)call("_AudioUnitSetProperty", 6, (uint32_t[]){ unit, 7, 1, 0, DATA + 0x2348, 8 });
+        check("kAudioUnitProperty_SetInputCallback", st == 0);
+        static float samples[2 * 64];
+        struct { uint32_t n; struct { uint32_t channels, size; void *data; } b[1]; } list = { 1, { { 2, sizeof samples, samples } } };
+        struct { double sample_time; uint64_t host_time; double rate; uint64_t word; uint32_t flags, reserved; } ts = { 0, 0, 1, 0, 1, 0 };
+        uint32_t flags = 0;
+        if (init && render && st == 0 && init(m32_host(unit)) == 0)
+            render(m32_host(unit), &flags, &ts, 0, 64, &list);
+        check("... the old callback runs as guest code", m32_rd(DATA + 0x2340) == 1);
+        call("_CloseComponent", 1, (uint32_t[]){ unit });
+    }
+}
+
+/* what Neverball's and Wesnoth's libraries needed of libc, ATSUI and the FPCR (src/m32_stdio.c, src/m32_libsystem.c,
+ * src/m32_atsu.c, src/cpu.c) */
+static void test_game_libs(void)
+{
+    /* __srget is the next character, not the first of the next buffer (the i386 getc macro calls it every time) */
+    char path[] = "/tmp/test_m32_srget.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd >= 0) {
+        char data[5000];
+        for (size_t i = 0; i < sizeof data; i++)
+            data[i] = (char)('a' + i % 26);
+        write(fd, data, sizeof data);
+        close(fd);
+        FILE *f = fopen(path, "r");
+        uint32_t twin = f ? m32_file(f) : 0;
+        int a = (int)call("___srget", 1, (uint32_t[]){ twin }), b = (int)call("___srget", 1, (uint32_t[]){ twin }),
+            c = (int)call("___srget", 1, (uint32_t[]){ twin });
+        check("__srget reads the stream in order", a == 'a' && b == 'b' && c == 'c');
+        if (f)
+            fclose(f);
+        unlink(path);
+    }
+    /* valloc is aligned to the page size the guest is told */
+    uint32_t v = call("_valloc", 1, (uint32_t[]){ 100 });
+    check("valloc is page aligned", v && (v % (uint32_t)getpagesize()) == 0);
+    /* localeconv: an i386 struct lconv, ten string pointers then the chars at 40 */
+    uint32_t lc = call("_localeconv", 0, NULL);
+    check("localeconv's decimal point", lc && m32_rd(lc) && !strcmp((const char *)m32_h(m32_rd(lc)), localeconv()->decimal_point));
+    check("... and its chars at 40", lc && *(const char *)m32_h(lc + 40) == localeconv()->int_frac_digits);
+    /* an ATSUI layout made empty and given its text and style afterwards, as Pango makes it */
+    uint32_t st = DATA + 0x2400, lay = DATA + 0x2404;
+    call("_ATSUCreateStyle", 1, (uint32_t[]){ st });
+    const uint16_t ok[2] = { 'O', 'K' };
+    memcpy(m32_h(DATA + 0x2410), ok, sizeof ok);
+    check("ATSUCreateTextLayout", call("_ATSUCreateTextLayout", 1, (uint32_t[]){ lay }) == 0 && m32_rd(lay));
+    check("ATSUSetTextPointerLocation", call("_ATSUSetTextPointerLocation", 5, (uint32_t[]){ m32_rd(lay), DATA + 0x2410, 0, 2, 2 }) == 0);
+    check("ATSUSetRunStyle", call("_ATSUSetRunStyle", 4, (uint32_t[]){ m32_rd(lay), m32_rd(st), 0, 0xffffffffu }) == 0);
+    m32_wr(DATA + 0x2420, 0);
+    call("_ATSUGetGlyphInfo", 5, (uint32_t[]){ m32_rd(lay), 0, 2, DATA + 0x2420, 0 });
+    check("... the layout lays out its two glyphs", m32_rd(DATA + 0x2420) == 8 + 2 * 28);
+    call("_ATSUDisposeTextLayout", 1, (uint32_t[]){ m32_rd(lay) });
+    /* FPCR.AH: clear for host code, set for guest code, put back after */
+    ocerz_afp_enable();
+    if (ocerz_afp()) {
+        uint64_t before = __builtin_arm_rsr64("fpcr");
+        uint64_t g = ocerz_afp_guest();
+        int set = (__builtin_arm_rsr64("fpcr") & 2) != 0;
+        uint64_t h = ocerz_afp_host();
+        int clear = !(__builtin_arm_rsr64("fpcr") & 2);
+        ocerz_afp_restore(h);
+        int back = (__builtin_arm_rsr64("fpcr") & 2) != 0;
+        ocerz_afp_restore(g);
+        check("FPCR.AH set for guest code, clear for host code, put back", set && clear && back &&
+              __builtin_arm_rsr64("fpcr") == before);
+    }
 }
 
 /* through the databases: theme structures packed to 2 (src/m32_cross.c), GNU libiconv's names (src/m32_bridge.c), and
@@ -1282,6 +1369,7 @@ int main(int argc, char **argv)
     test_cg();
     test_removed_calls();
     test_sdl_shims();
+    test_game_libs();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

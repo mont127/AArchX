@@ -1395,7 +1395,39 @@ static int sp_MD5_Final(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 #pragma clang diagnostic pop
 
+/* localeconv() and localeconv_l(locale): a struct lconv is ten string pointers and fourteen chars, 56 bytes on i386
+ * (the chars at 40) and 96 on arm64 (at 80, clang -arch i386 and -arch arm64).  Crossed, the guest read the host's
+ * structure as its own, and GLib's g_ascii_strtod found an empty decimal point and asserted (Wesnoth).  The guest
+ * gets an i386 copy, kept per thread, with the strings in guest memory. */
+#include <locale.h>
+#include <xlocale.h>
+static uint32_t lconv_guest(const struct lconv *l)
+{
+    static __thread uint32_t g;
+    if (!g)
+        g = m32_static_alloc(56, 4);
+    if (!g || !l)
+        return 0;
+    const char *const *s = (const char *const *)(const void *)l;
+    for (uint32_t i = 0; i < 10; i++)
+        m32_wr(g + 4 * i, m32_cstring(s[i]));
+    memcpy(m32_h(g + 40), (const char *)l + 80, 14);
+    return g;
+}
+static int sp_localeconv(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    return RETV_PLAIN(lconv_guest(localeconv()));
+}
+static int sp_localeconv_l(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    void *loc = m32_host(m32_arg(cpu, 0));
+    return RETV_PLAIN(lconv_guest(localeconv_l(loc ? (locale_t)loc : LC_GLOBAL_LOCALE)));
+}
+
 static const M32SpecialEntry g_specials[] = {
+    { "_localeconv", sp_localeconv }, { "_localeconv_l", sp_localeconv_l },
     { "_MD5_Init", sp_MD5_Init }, { "_MD5_Update", sp_MD5_Update }, { "_MD5_Final", sp_MD5_Final },
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
     { "__keymgr_get_and_lock_processwide_ptr_2", sp_keymgr_get_lock_2 },

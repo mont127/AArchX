@@ -702,6 +702,59 @@ static int sp_ATSUCreateTextLayoutWithTextPtr(struct OcerzVM *vm, OcerzCPU *cpu)
         m32_wr(out, m32_handle(l));
     RET(NO_ERR);
 }
+/* ATSUCreateTextLayout(ATSUTextLayout *), ATSUSetTextPointerLocation(layout, text, offset, length, totalLength) and
+ * ATSUSetRunStyle(layout, style, runStart, runLength): a layout made empty and given its text and runs afterwards, as
+ * Pango's ATSUI renderer makes them (Wesnoth); a run over the whole text replaces the runs, one starting where the
+ * last ended is appended */
+static int sp_ATSUCreateTextLayout(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = ready() ? calloc(1, sizeof *l) : NULL;
+    if (!l)
+        RET(PARAM_ERR);
+    if (A(0))
+        m32_wr(A(0), m32_handle(l));
+    RET(NO_ERR);
+}
+static int sp_ATSUSetTextPointerLocation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = m32_host(A(0));
+    if (!l)
+        RET(INVALID_LAYOUT);
+    l->text = A(1);
+    l->offset = range_start(A(2));
+    l->length = A(3) == 0xffffffffu ? A(4) - l->offset : A(3);
+    RET(NO_ERR);
+}
+static int sp_ATSUSetRunStyle(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = m32_host(A(0));
+    AtsuStyle *st = m32_host(A(1));
+    uint32_t start = range_start(A(2)), len = A(3), end = 0;
+    if (!l)
+        RET(INVALID_LAYOUT);
+    for (uint32_t i = 0; i < l->runs && l->run_len[i] != 0xffffffffu; i++)
+        end += l->run_len[i];
+    int whole = start == 0 && (len == 0xffffffffu || len >= l->length);
+    if (whole)
+        l->runs = 0;
+    else if (start != end)   /* ponytail: a run inside the others restyles nothing */
+        RET(NO_ERR);
+    uint32_t *lens = realloc(l->run_len, ((size_t)l->runs + 2) * sizeof *lens);
+    AtsuStyle **styles = realloc(l->run_style, ((size_t)l->runs + 2) * sizeof *styles);
+    if (lens)
+        l->run_len = lens;
+    if (styles)
+        l->run_style = styles;
+    if (!lens || !styles)
+        RET(PARAM_ERR);
+    l->run_len[l->runs] = whole ? 0xffffffffu : len;
+    l->run_style[l->runs] = st;
+    l->runs++;
+    RET(NO_ERR);
+}
 static int sp_ATSUDisposeTextLayout(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     AtsuLayout *l = m32_host(A(0));
@@ -1072,7 +1125,8 @@ const M32SpecialEntry m32_atsu_specials[] = {
     { "_CGFontGetHMetrics", sp_CGFontGetHMetrics },
     { "_ATSUSetAttributes", sp_ATSUSetAttributes },
     { "_ATSUCreateTextLayoutWithTextPtr", sp_ATSUCreateTextLayoutWithTextPtr },
-    { "_ATSUDisposeTextLayout", sp_ATSUDisposeTextLayout },
+    { "_ATSUDisposeTextLayout", sp_ATSUDisposeTextLayout }, { "_ATSUCreateTextLayout", sp_ATSUCreateTextLayout },
+    { "_ATSUSetTextPointerLocation", sp_ATSUSetTextPointerLocation }, { "_ATSUSetRunStyle", sp_ATSUSetRunStyle },
     { "_ATSUSetLayoutControls", sp_ATSUSetLayoutControls },
     { "_ATSUSetTransientFontMatching", sp_ATSUSetTransientFontMatching }, { "_ATSUDrawText", sp_ATSUDrawText },
     { "_ATSUDirectGetLayoutDataArrayPtrFromTextLayout", sp_ATSUDirectGetLayoutDataArrayPtrFromTextLayout },

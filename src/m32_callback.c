@@ -68,7 +68,9 @@ uint32_t m32_call(struct OcerzVM *vm, uint32_t fn, const uint32_t *args, int nar
     uint32_t top = ((uint32_t)cpu->gpr[OCERZ_RSP] - 256) & ~15u;
     struct OcerzBridgeFrame saved;
     ocerz_bridge_guest_enter(&saved);
+    uint64_t fpcr = ocerz_afp_guest();   /* translated code relies on FPCR.AH (src/cpu.c) */
     ocerz_vm_call32(vm, fn, &call, top, M32_TRAP(M32_ID_SENTINEL));
+    ocerz_afp_restore(fpcr);
     ocerz_bridge_guest_leave(&saved);
     if (edx)
         *edx = (uint32_t)call.rdx;
