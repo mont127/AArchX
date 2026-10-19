@@ -392,6 +392,9 @@ static int trap_dispatch(struct OcerzVM *vm, OcerzCPU *cpu);
 /* every call the guest makes into the host: host code runs without FPCR.AH (src/cpu.c ocerz_afp_host) */
 int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    if (__builtin_expect(__atomic_load_n(&m32_sig_pending, __ATOMIC_RELAXED) != 0, 0) &&
+        cpu->rip - OCERZ_DYLDAPI_LO < M32_ID_LIMIT)
+        m32_signals_deliver(vm);   /* a signal's guest handler runs before the call */
     uint64_t fpcr = ocerz_afp_host();
     int r = trap_dispatch(vm, cpu);
     ocerz_afp_restore(fpcr);

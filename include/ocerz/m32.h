@@ -161,6 +161,8 @@ uint32_t m32_call(struct OcerzVM *vm, uint32_t fn, const uint32_t *args, int nar
 OcerzCPU *m32_thread_attach(struct OcerzVM *vm);   /* a 32-bit guest cpu for a thread the host started */
 extern int m32_started;                              /* the main cpu is running (before: loader calls use it) */
 int m32_tlv_trap(struct OcerzVM *vm, OcerzCPU *cpu);   /* src/m32_thread.c */
+extern volatile uint32_t m32_sig_pending;   /* src/m32_libsystem.c: signals caught for the guest's handlers */
+void m32_signals_deliver(struct OcerzVM *vm); /* runs them, at a crossing */
 void m32_save_errno(OcerzCPU *cpu);
 void m32_load_errno(void);   /* before a call: the host's errno is the guest's (src/m32_stdio.c) */
 uint32_t m32_special_data(const char *symbol, void *host_var);   /* guest variable for a special data import, or 0 */

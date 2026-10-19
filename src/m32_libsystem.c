@@ -868,19 +868,93 @@ static int sp_longjmp(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
-/* ---- signals: handlers are recorded, not delivered (no i386 signal frames yet) ---- */
-static uint32_t g_sig_handler[NSIG];
+/* ---- signals ----
+ * A handler for an asynchronous signal (SIGINT, SIGTERM, SIGALRM, SIGCHLD, ...) runs at the guest's next crossing into
+ * the host: the host's handler only marks the signal, for the whole process since the kernel picks any thread, and
+ * m32_trap calls the guest's handler there as a nested call, before the call the guest was making.  A call blocked in
+ * the host (nanosleep, pause, read) is interrupted first, as on a Mac.  SDL 1.2 turns SIGINT and SIGTERM into its
+ * quit event this way, so a game asked to stop saves its settings and quits.  The handler gets (sig) or, with
+ * SA_SIGINFO, (sig, siginfo, ucontext) with only si_signo filled in.  Faults (SIGSEGV, SIGBUS, ...) have no i386
+ * signal frames: their handlers are recorded, not run.  OCERZ_NO_M32_SIGNALS=1 records every handler only. */
+static uint32_t g_sig_handler[NSIG], g_sig_flags[NSIG];
+volatile uint32_t m32_sig_pending;          /* signals caught for the guest, not yet run */
+static __thread uint32_t t_sig_running;     /* signals whose handler is running on this thread */
+
+static int async_signal(uint32_t sig)
+{
+    switch (sig) {
+    case SIGHUP: case SIGINT: case SIGQUIT: case SIGTERM: case SIGALRM: case SIGVTALRM: case SIGPROF:
+    case SIGCHLD: case SIGWINCH: case SIGUSR1: case SIGUSR2: case SIGPIPE: case SIGCONT: case SIGINFO:
+    case SIGURG: case SIGIO: case SIGTSTP:
+        return 1;
+    }
+    return 0;
+}
+
+static void host_signal(int sig) { __atomic_or_fetch(&m32_sig_pending, 1u << sig, __ATOMIC_SEQ_CST); }
+
+static void set_handler(uint32_t sig, uint32_t h, uint32_t flags)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_SIGNALS") != NULL;
+    g_sig_handler[sig] = h;
+    g_sig_flags[sig] = flags;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    if (h == 1) {   /* SIG_IGN is honored: SIGPIPE */
+        sa.sa_handler = SIG_IGN;
+    } else if (h > 1 && async_signal(sig) && !off) {
+        sa.sa_handler = host_signal;
+        sa.sa_flags = (int)(flags & (SA_RESTART | SA_NOCLDSTOP | SA_NOCLDWAIT));
+    } else {
+        if (h > 1)
+            m32_log_once("signal handler recorded (not delivered) for signal",
+                         sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "another");
+        if (!async_signal(sig))
+            return;
+        sa.sa_handler = SIG_DFL;
+    }
+    sigaction((int)sig, &sa, NULL);
+}
+
+/* The guest's handlers for the signals caught since, each once, on the calling thread (m32_trap). */
+void m32_signals_deliver(struct OcerzVM *vm)
+{
+    uint32_t pending = __atomic_load_n(&m32_sig_pending, __ATOMIC_SEQ_CST) & ~t_sig_running;
+    while (pending) {
+        uint32_t sig = (uint32_t)__builtin_ctz(pending), bit = 1u << sig;
+        pending &= pending - 1;
+        if (!(__atomic_fetch_and(&m32_sig_pending, ~bit, __ATOMIC_SEQ_CST) & bit))
+            continue;   /* another thread ran it */
+        uint32_t h = g_sig_handler[sig], flags = g_sig_flags[sig];
+        if (h <= 1)
+            continue;
+        if (flags & SA_RESETHAND)
+            set_handler(sig, 0, 0);
+        uint32_t info = 0;
+        if (flags & SA_SIGINFO) {   /* an i386 siginfo_t (64 bytes), then room for a ucontext nobody fills */
+            info = m32_calloc(1, 64 + 512);
+            if (info)
+                m32_wr(info, sig);
+        }
+        uint32_t running = flags & SA_NODEFER ? 0 : bit;
+        t_sig_running |= running;
+        const uint32_t args[3] = { sig, info, info ? info + 64 : 0 };
+        m32_call(vm, h, args, 3, NULL, NULL);
+        t_sig_running &= ~running;
+        if (info)
+            m32_free(info);
+    }
+}
+
 static int sp_signal(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t sig = m32_arg(cpu, 0), h = m32_arg(cpu, 1);
     if (sig == 0 || sig >= NSIG)
         RETV(0xffffffffu);   /* SIG_ERR */
     uint32_t old = g_sig_handler[sig];
-    g_sig_handler[sig] = h;
-    if (h > 1)
-        m32_log_once("signal handler recorded (not delivered) for signal", sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "another");
-    if (h == 1)   /* SIG_IGN is honored: SIGPIPE */
-        signal((int)sig, SIG_IGN);
+    set_handler(sig, h, SA_RESTART);   /* signal() is BSD's: interrupted calls restart */
     RETV(old);
 }
 static int sp_sigaction(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -891,16 +965,10 @@ static int sp_sigaction(struct OcerzVM *vm, OcerzCPU *cpu)
     if (old) {   /* struct sigaction: handler, mask, flags */
         m32_wr(old, g_sig_handler[sig]);
         m32_wr(old + 4, 0);
-        m32_wr(old + 8, 0);
+        m32_wr(old + 8, g_sig_flags[sig]);
     }
-    if (act) {
-        uint32_t h = m32_rd(act);
-        g_sig_handler[sig] = h;
-        if (h == 1)
-            signal((int)sig, SIG_IGN);
-        else if (h > 1)
-            m32_log_once("sigaction handler recorded (not delivered) for signal", sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "another");
-    }
+    if (act)
+        set_handler(sig, m32_rd(act), m32_rd(act + 8));
     RETV(0);
 }
 

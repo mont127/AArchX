@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <locale.h>
 #include <mach-o/loader.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1710,6 +1711,57 @@ static void test_objc1_strings(void)
 }
 
 
+/* an asynchronous signal's guest handler runs at the guest's next crossing (src/m32_libsystem.c): signal(), and
+ * sigaction() with SA_SIGINFO and SA_RESETHAND */
+static void test_signals(void)
+{
+    enum { HANDLER = CODE + 0x3800, SEEN = DATA + 0x4b00, SIGNO = DATA + 0x4b04, ACT = DATA + 0x4b10, OLD = DATA + 0x4b20 };
+    uint8_t code[] = { 0x8b, 0x44, 0x24, 0x04,          /* mov eax, [esp+4] (sig) */
+                       0xa3, 0, 0, 0, 0,                /* mov [SEEN], eax */
+                       0x8b, 0x44, 0x24, 0x08,          /* mov eax, [esp+8] (siginfo) */
+                       0x85, 0xc0, 0x74, 0x07,          /* test eax, eax; jz done */
+                       0x8b, 0x00,                      /* mov eax, [eax] (si_signo) */
+                       0xa3, 0, 0, 0, 0,                /* mov [SIGNO], eax */
+                       0xc3 };                          /* done: ret */
+    uint32_t seen = SEEN, signo = SIGNO;
+    memcpy(code + 5, &seen, 4);
+    memcpy(code + 20, &signo, 4);
+    memcpy(m32_h(HANDLER), code, sizeof code);
+    m32_wr(SEEN, 0);
+    m32_wr(SIGNO, 0);
+    check("signal() hands back SIG_DFL", call("_signal", 2, (uint32_t[]){ SIGUSR2, HANDLER }) == 0);
+    kill(getpid(), SIGUSR2);
+    check("the host catches the signal for the guest", (m32_sig_pending & (1u << SIGUSR2)) != 0);
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    m32_signals_deliver(&g_vm);
+    check("... and the guest's handler gets it", m32_rd(SEEN) == SIGUSR2 && !(m32_sig_pending & (1u << SIGUSR2)));
+
+    m32_wr(SEEN, 0);
+    kill(getpid(), SIGUSR2);
+    uint32_t trap = m32_export("/usr/lib/libSystem.B.dylib", "_signal");
+    m32_wr(STACK, RET_ADDR);
+    m32_wr(STACK + 4, SIGUSR2);
+    m32_wr(STACK + 8, HANDLER);
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    cpu()->rip = trap;
+    m32_trap(&g_vm, cpu());
+    check("a crossing runs a caught signal's handler first", m32_rd(SEEN) == SIGUSR2 && cpu()->rip == RET_ADDR);
+    call("_signal", 2, (uint32_t[]){ SIGUSR2, 0 });
+
+    m32_wr(SEEN, 0);
+    m32_wr(ACT, HANDLER);
+    m32_wr(ACT + 4, 0);
+    m32_wr(ACT + 8, SA_SIGINFO | SA_RESETHAND);
+    check("sigaction", call("_sigaction", 3, (uint32_t[]){ SIGUSR1, ACT, 0 }) == 0);
+    kill(getpid(), SIGUSR1);
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    m32_signals_deliver(&g_vm);
+    check("an SA_SIGINFO handler gets the signal and its siginfo", m32_rd(SEEN) == SIGUSR1 && m32_rd(SIGNO) == SIGUSR1);
+    m32_wr(OLD, 0xdeadbeefu);
+    call("_sigaction", 3, (uint32_t[]){ SIGUSR1, 0, OLD });
+    check("... and SA_RESETHAND puts SIG_DFL back", m32_rd(OLD) == 0);
+}
+
 /* Apple's file streams on the runtime's GCC libstdc++ (src/m32_fstream.c): an ofstream and an fstream at Apple's
  * offsets, opened, written through the library's operator<< (whose sentry finds the basic_ios by the vtable, where
  * Armagetron Advanced's config save went wrong), closed and destroyed through the vtable */
@@ -1992,6 +2044,7 @@ int main(int argc, char **argv)
     test_queues();
     test_gl_buffers();
     test_unix_calls();
+    test_signals();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }
