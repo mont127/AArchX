@@ -427,6 +427,7 @@ struct OcerzBridgeFn {
     int ninplace;
     BrInplaceBinding inplace[OCERZ_APIDB_INPLACE];
     uint64_t calls;
+    int waits;                    /* BR_WAITS_*: the call can wait in the kernel for a signal to interrupt */
     struct OcerzBridgeFn *next;
 };
 
@@ -3297,6 +3298,28 @@ static int br_bind_inplace(const OcerzApiEntry *e, struct OcerzBridgeFn *fn)
     return 1;
 }
 
+/* The host calls that can wait in the kernel until a signal interrupts them, by name before any $ variant.  XNU
+ * restarts the first kind when the handler asked for SA_RESTART; the others return EINTR (poll, select, kevent, the
+ * sleeps) or a spurious wakeup (pthread_cond_wait) whatever it asked. */
+enum { BR_WAITS_NOT, BR_WAITS, BR_WAITS_RESTART };
+static int br_waits(const char *host)
+{
+    static const char *const restart[] = { "read", "write", "readv", "writev", "pread", "pwrite", "recv", "recvfrom",
+                                           "recvmsg", "send", "sendto", "sendmsg", "accept", "wait", "waitpid",
+                                           "wait3", "wait4", NULL };
+    static const char *const waits[] = { "poll", "select", "pselect", "kevent", "kevent64", "nanosleep", "usleep",
+                                         "sleep", "pause", "sigsuspend", "sem_wait", "connect", "flock", "fcntl",
+                                         "msgrcv", "msgsnd", "pthread_cond_wait", "pthread_cond_timedwait", NULL };
+    size_t n = host ? strcspn(host, "$") : 0;
+    for (int k = 0; n && restart[k]; k++)
+        if (strlen(restart[k]) == n && !strncmp(host, restart[k], n))
+            return BR_WAITS_RESTART;
+    for (int k = 0; n && waits[k]; k++)
+        if (strlen(waits[k]) == n && !strncmp(host, waits[k], n))
+            return BR_WAITS;
+    return BR_WAITS_NOT;
+}
+
 static struct OcerzBridgeFn *br_make(const OcerzApiLibrary *api, const OcerzApiEntry *e)
 {
     struct OcerzBridgeFn *fn = calloc(1, sizeof *fn);
@@ -3335,6 +3358,7 @@ static struct OcerzBridgeFn *br_make(const OcerzApiLibrary *api, const OcerzApiE
             return NULL;
         }
         fn->register_only = ocerz_abi_register_only(&fn->parsed);
+        fn->waits = br_waits(fn->host);
     }
     fn->next = g_br_made;
     g_br_made = fn;
@@ -3608,6 +3632,39 @@ static int br_cross(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
     return rc;
 }
 
+/* A call that can wait in the kernel, as native mode's ulock wait is (br_ulock): a guest signal that lands after the
+ * guest's last crossing and before the wait reaches the kernel is only marked pending, and its handler would wait
+ * for the call to end, as would one whose host handler restarted the wait.  The wait is marked kickable once a guest
+ * signal is pending, the unstick monitor (vm.c) interrupts it, and br_settle runs the handler.  A read or the like
+ * that comes back EINTR, when every pending handler asked for SA_RESTART, is made again instead: the guest goes
+ * back onto the bridge trap with its arguments and return address, where the handler's sigreturn lands, as the
+ * cache-mode syscall goes back onto its syscall instruction. */
+static int br_cross_waiting(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
+{
+    uint64_t gpr[16], rip = cpu->rip;
+    memcpy(gpr, cpu->gpr, sizeof gpr);
+    ocerz_unstick_start();
+    cpu->block_sigonly = 1;
+    __atomic_store_n(&cpu->block_since_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_SEQ_CST);
+    int rc, restart = 0;
+    if (fn->waits == BR_WAITS_RESTART && (__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~cpu->sig_mask) &&
+        ocerz_signals_restart(cpu)) {
+        rc = OCERZ_STEP_OK;   /* the handler first, then the call */
+        restart = 1;
+    } else {
+        rc = br_cross(fn, cpu);
+        restart = rc == OCERZ_STEP_OK && fn->waits == BR_WAITS_RESTART && (int32_t)cpu->gpr[OCERZ_RAX] == -1 &&
+                  errno == EINTR && ocerz_signals_restart(cpu);
+    }
+    __atomic_store_n(&cpu->block_since_ns, 0, __ATOMIC_SEQ_CST);
+    cpu->block_sigonly = 0;
+    if (restart) {
+        memcpy(cpu->gpr, gpr, sizeof gpr);
+        cpu->rip = rip;
+    }
+    return rc;
+}
+
 int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBridgeFn *fn)
 {
     if (!fn)
@@ -3629,7 +3686,7 @@ int ocerz_bridge_invoke(struct OcerzVM *vm, OcerzCPU *cpu, const struct OcerzBri
         br_trace_str(a1, ts1);
     }
 
-    int rc = fn->special ? fn->special(vm, cpu) : br_cross(fn, cpu);
+    int rc = fn->special ? fn->special(vm, cpu) : fn->waits ? br_cross_waiting(fn, cpu) : br_cross(fn, cpu);
     if (rc == OCERZ_STEP_OK && !fn->special)
         rc = br_settle(vm, cpu);
     if (br_logging() == 2)

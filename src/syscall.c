@@ -8828,8 +8828,8 @@ static int restartable_bsd(int num)
 }
 
 /* whether every signal ready for the guest (as deliver_async_signals takes them) has a handler installed with
- * SA_RESTART, so the call they interrupted is made again once they are handled */
-static int signals_restart(OcerzCPU *cpu)
+ * SA_RESTART, so the call they interrupted is made again once they are handled; native mode's bridge asks too */
+int ocerz_signals_restart(OcerzCPU *cpu)
 {
     uint64_t ready = (__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~cpu->sig_mask) |
                      (uint64_t)((ocerz_peek_pending_async_sig() & async_accept(cpu->sig_mask)) >> 1);
@@ -8995,7 +8995,7 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
      * until the unstick monitor (vm.c) interrupts the wait, and a read whose handler was installed with SA_RESTART
      * must not see the EINTR that took. */
     if (rc == OCERZ_STEP_OK && class == 2 && restartable_bsd(num) && (cpu->rflags & OCERZ_CF) &&
-        cpu->gpr[OCERZ_RAX] == EINTR && signals_restart(cpu)) {
+        cpu->gpr[OCERZ_RAX] == EINTR && ocerz_signals_restart(cpu)) {
         cpu->gpr[OCERZ_RAX] = rax;
         cpu->gpr[OCERZ_RDI] = args[0];
         cpu->gpr[OCERZ_RSI] = args[1];
