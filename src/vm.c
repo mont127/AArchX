@@ -111,8 +111,13 @@
  * left alone, because those never return EINTR on their own and apps rightly do
  * not expect it.  OCERZ_UNSTICK_ALL=1 kicks those too.  A native-mode ulock wait
  * (bridge.c) sets block_sigonly instead: it is kicked only once a guest signal
- * is pending for it, which is how a signal that landed between the guest's last
- * check and the kernel wait still reaches its handler.  The same no-op handler
+ * is pending for it.  Any blocked cpu with a guest signal pending for 50 ms is
+ * kicked, read and recvmsg included: that is a signal that landed between the
+ * guest's last check and the kernel wait (or whose host handler restarted it),
+ * and the EINTR lets its handler run; a call the handler asked to restart
+ * (SA_RESTART) is made again rather than returning it (syscall.c).  A SIGUSR1
+ * into a thread parked in read(), as wineserver suspends one, was lost about
+ * once in thirty runs of tests/dynamic/thread_signal.c.  The same no-op handler
  * doubles as a context-synchronization event, so a thread spinning in JIT code
  * observes the stop-site patches made by ocerz_jit_request_stop.
  *
@@ -4276,8 +4281,8 @@ static void *ocerz_unstick_thread(void *arg)
         for (int i = 0; i < g_cpus_n; i++) {
             uint64_t t0 = g_cpus[i]->block_since_ns;
             int sigonly = g_cpus[i]->block_sigonly;
-            int due = sigonly ? (g_cpus[i]->sig_pending & ~g_cpus[i]->sig_mask) && now - t0 > 50ull * 1000 * 1000
-                              : now - t0 > 800ull * 1000 * 1000 && (kick_all || !g_cpus[i]->block_nokick);
+            int signalled = (g_cpus[i]->sig_pending & ~g_cpus[i]->sig_mask) && now - t0 > 50ull * 1000 * 1000;
+            int due = signalled || (!sigonly && now - t0 > 800ull * 1000 * 1000 && (kick_all || !g_cpus[i]->block_nokick));
             if (t0 && due) {
                 g_cpus[i]->block_since_ns = now;
                 if (lg)
