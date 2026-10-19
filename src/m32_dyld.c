@@ -644,6 +644,18 @@ static void guest32_root(void)
     }
 }
 
+/* fontconfig from runtime/guest32 (tools/fetch_guest32_x11.sh) looks for /opt/local/etc/fonts/fonts.conf, where it
+ * was built; the fonts.conf installed beside it names the Mac's font folders, and is the one used unless the user
+ * named another */
+void m32_fontconfig_default(void)
+{
+    guest32_root();
+    char conf[1100];
+    snprintf(conf, sizeof conf, "%s/usr/X11R6/etc/fonts/fonts.conf", g_guest32_root);
+    if (g_guest32_root[0] && !getenv("FONTCONFIG_FILE") && access(conf, R_OK) == 0)
+        setenv("FONTCONFIG_FILE", conf, 0);
+}
+
 static int file_exists(const char *p)
 {
     struct stat st;

@@ -174,6 +174,7 @@ int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **
         if (wine)
             ocerz_mem_set_alloc_floor(M32_WINE_FLOOR);
     }
+    m32_fontconfig_default();
     char real[1024];
     ocerz_dyld_set_main_path(realpath(path, real) ? real : path);   /* CoreFoundation's main bundle is the game's */
     ocerz_bridge_set_process_args(argc, argv);

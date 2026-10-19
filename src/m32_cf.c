@@ -118,6 +118,67 @@ static int sp_CFAllocatorCreate(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* CFAllocatorAllocate, CFAllocatorReallocate and CFAllocatorDeallocate with a system allocator (NULL, the default,
+ * the system default, malloc): the program writes what they hand out, so it comes from the guest heap, where host
+ * memory came back as a handle cell (PhysFS allocates its paths this way, under Warzone 2100).  An allocator the
+ * guest made runs its own callbacks through the host, as before. */
+static int system_allocator(uint32_t g)
+{
+    void *a = m32_host(g);
+    if (!a)
+        return 1;
+    static const char *const names[] = { "kCFAllocatorDefault", "kCFAllocatorSystemDefault", "kCFAllocatorMalloc",
+                                         "kCFAllocatorMallocZone" };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        void **v = cf(names[i]);
+        if (v && *v == a)
+            return 1;
+    }
+    return 0;
+}
+static int sp_CFAllocatorAllocate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t al = m32_arg(cpu, 0), n = m32_arg(cpu, 1);
+    if (system_allocator(al)) {
+        m32_ret(cpu, n ? m32_malloc(n) : 0, 0, 0);
+        return OCERZ_STEP_OK;
+    }
+    void *(*f)(void *, long, unsigned long) = cf("CFAllocatorAllocate");
+    void *r = f ? f(m32_host(al), (long)(int32_t)n, m32_arg(cpu, 2)) : NULL;
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_CFAllocatorReallocate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t al = m32_arg(cpu, 0), p = m32_arg(cpu, 1), n = m32_arg(cpu, 2);
+    if (system_allocator(al) && (!p || m32_in_window(m32_h(p)))) {
+        uint32_t r = 0;
+        if (!n)
+            m32_free(p);
+        else
+            r = p ? m32_realloc(p, n) : m32_malloc(n);
+        m32_ret(cpu, r, 0, 0);
+        return OCERZ_STEP_OK;
+    }
+    void *(*f)(void *, void *, long, unsigned long) = cf("CFAllocatorReallocate");
+    void *r = f ? f(m32_host(al), m32_host(p), (long)(int32_t)n, m32_arg(cpu, 3)) : NULL;
+    m32_ret(cpu, m32_handle(r), 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_CFAllocatorDeallocate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t al = m32_arg(cpu, 0), p = m32_arg(cpu, 1);
+    if (system_allocator(al) && p && p < M32_HANDLE_LO) {
+        m32_free(p);
+    } else if (p) {
+        void (*f)(void *, void *) = cf("CFAllocatorDeallocate");
+        if (f)
+            f(m32_host(al), m32_host(p));
+    }
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 /* CFBundleGetFunctionPointerForName(bundle, name) / ...DataPointerForName: a system function by name becomes the
  * m32 export of that name (a trap with its database signature); a name no database knows is logged and 0 */
 static int bundle_pointer(OcerzCPU *cpu, int data)
@@ -750,7 +811,8 @@ const M32SpecialEntry m32_cf_specials[] = {
     { "_CFDictionaryGetValueIfPresent", sp_CFDictionaryGetValueIfPresent },
     { "_CFBundleGetFunctionPointerForName", sp_CFBundleGetFunctionPointerForName },
     { "_CFBundleGetDataPointerForName", sp_CFBundleGetDataPointerForName },
-    { "_CFAllocatorCreate", sp_CFAllocatorCreate },
+    { "_CFAllocatorCreate", sp_CFAllocatorCreate }, { "_CFAllocatorAllocate", sp_CFAllocatorAllocate },
+    { "_CFAllocatorReallocate", sp_CFAllocatorReallocate }, { "_CFAllocatorDeallocate", sp_CFAllocatorDeallocate },
     { "_CFArrayCreate", sp_CFArrayCreate },
     { "_CFDictionaryCreate", sp_CFDictionaryCreate },
     { NULL, NULL }

@@ -1678,8 +1678,8 @@ static void test_db_shapes(void)
 }
 
 /* An Objective-C 1 constant string, a 12-byte {isa, cString, length} in __OBJC,__cstring_object, stands for a host
- * string, as a __cfstring literal does (ScummVM's Info.plist keys; src/m32_cf.c).  In the carbon run, where the
- * bridge has CoreFoundation. */
+ * string, as a __cfstring literal does (ScummVM's Info.plist keys), and the system allocators hand out guest heap
+ * (src/m32_cf.c).  In the carbon run, where the bridge has CoreFoundation. */
 static void test_objc1_strings(void)
 {
     /* an Objective-C 1 constant string stands for a host string */
@@ -1696,6 +1696,17 @@ static void test_objc1_strings(void)
     const char *u = s && (void *)s != m32_h(DATA + 0xa00)
                   ? ((const char *(*)(id, SEL))objc_msgSend)(s, sel_registerName("UTF8String")) : NULL;
     check("an Objective-C 1 constant string is a host string", u && !strcmp(u, "CFBundleName"));
+    /* CFAllocatorAllocate with the default allocator hands out guest heap the program can write (PhysFS's paths) */
+    uint32_t p = call("_CFAllocatorAllocate", 3, (uint32_t[]){ 0, 64, 0 });
+    check("CFAllocatorAllocate with the default allocator is guest memory", p && p < M32_HANDLE_LO &&
+          m32_in_window(m32_h(p)));
+    if (p) {
+        put_str(p, "/Library/Application Support/");
+        uint32_t q = call("_CFAllocatorReallocate", 4, (uint32_t[]){ 0, p, 4096, 0 });
+        check("CFAllocatorReallocate keeps the contents in guest memory", q && q < M32_HANDLE_LO &&
+              !strcmp((const char *)m32_h(q), "/Library/Application Support/"));
+        call("_CFAllocatorDeallocate", 2, (uint32_t[]){ 0, q });
+    }
 }
 
 /* What WineHQ's 32-bit Wine and the free games ScummVM, DOSBox and Armagetron Advanced needed (src/m32_libsystem.c,

@@ -67,6 +67,7 @@ int m32_image_fixup(M32Image *img);
 uint32_t m32_resolve(M32Image *img, int ordinal, const char *name, int weak_import);
 const M32Sect *m32_section(const M32Image *img, const char *seg, const char *sect);
 void m32_cf_alias_strings(M32Image *img);   /* src/m32_cf.c */
+void m32_fontconfig_default(void);   /* FONTCONFIG_FILE for the guest fontconfig (src/m32_dyld.c) */
 void m32_tlv_register(M32Image *img);       /* src/m32_thread.c */
 struct OcerzVM;
 void m32_run_initializers(struct OcerzVM *vm, M32Image *img, const uint32_t args[5]);
