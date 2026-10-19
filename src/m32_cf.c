@@ -34,18 +34,27 @@ static void *cf(const char *sym)
 void m32_cf_alias_strings(M32Image *img)
 {
     const M32Sect *s = m32_section(img, "__DATA", "__cfstring");
-    if (!s || !s->size)
-        return;
     void *(*create)(void *, const uint8_t *, long, uint32_t, unsigned char) = cf("CFStringCreateWithBytes");
     if (!create)
         return;
-    for (uint32_t off = 0; off + 16 <= s->size; off += 16) {
+    for (uint32_t off = 0; s && off + 16 <= s->size; off += 16) {
         uint32_t g = s->addr + (uint32_t)img->slide + off;
         uint32_t flags = m32_rd(g + 4), str = m32_rd(g + 8), len = m32_rd(g + 12);
         int utf16 = (flags & 0xff) == 0xd0;   /* 0x7c8: 8-bit, 0x7d0: UTF-16 (clang's two forms) */
         void *h = str ? create(NULL, m32_h(str), utf16 ? (long)len * 2 : (long)len, utf16 ? kUTF16LE : kUTF8, 0) : NULL;
         if (h)
             m32_alias(g, h);   /* immortal: the +1 from Create is never released */
+    }
+    /* Objective-C 1's own constant strings, 12-byte {isa, cString, length} objects of NSConstantString, which GCC
+     * emits for @"..." without -fconstant-cfstrings (ScummVM's Cocoa code looks its Info.plist keys up with them):
+     * handed to the host as they were, their isa read as a host one */
+    const M32Sect *o = m32_section(img, "__OBJC", "__cstring_object");
+    for (uint32_t off = 0; o && off + 12 <= o->size; off += 12) {
+        uint32_t g = o->addr + (uint32_t)img->slide + off;
+        uint32_t str = m32_rd(g + 4), len = m32_rd(g + 8);
+        void *h = str ? create(NULL, m32_h(str), (long)len, kUTF8, 0) : NULL;
+        if (h)
+            m32_alias(g, h);
     }
 }
 

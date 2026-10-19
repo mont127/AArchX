@@ -24,7 +24,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -35,6 +38,7 @@
 #include "ocerz/m32_objc.h"
 #include "ocerz/m32_sig.h"
 #include "ocerz/mem.h"
+#include "ocerz/syscall.h"
 #include "ocerz/vm.h"
 
 #define STACK    0x00800000u
@@ -1673,6 +1677,155 @@ static void test_db_shapes(void)
     check("AEDisposeDesc", cross(cs, "_AEDisposeDesc", 1, (uint32_t[]){ desc }) == 0 && m32_rd(desc + 4) == 0);
 }
 
+/* An Objective-C 1 constant string, a 12-byte {isa, cString, length} in __OBJC,__cstring_object, stands for a host
+ * string, as a __cfstring literal does (ScummVM's Info.plist keys; src/m32_cf.c).  In the carbon run, where the
+ * bridge has CoreFoundation. */
+static void test_objc1_strings(void)
+{
+    /* an Objective-C 1 constant string stands for a host string */
+    static M32Image oimg;
+    oimg.nsect = 1;
+    snprintf(oimg.sect[0].seg, sizeof oimg.sect[0].seg, "__OBJC");
+    snprintf(oimg.sect[0].name, sizeof oimg.sect[0].name, "__cstring_object");
+    oimg.sect[0].addr = DATA + 0xa00;
+    oimg.sect[0].size = 12;
+    put_str(DATA + 0xa40, "CFBundleName");
+    m32_wr(DATA + 0xa00, 0x1234); m32_wr(DATA + 0xa04, DATA + 0xa40); m32_wr(DATA + 0xa08, 12);
+    m32_cf_alias_strings(&oimg);
+    id s = (id)m32_host(DATA + 0xa00);
+    const char *u = s && (void *)s != m32_h(DATA + 0xa00)
+                  ? ((const char *(*)(id, SEL))objc_msgSend)(s, sel_registerName("UTF8String")) : NULL;
+    check("an Objective-C 1 constant string is a host string", u && !strcmp(u, "CFBundleName"));
+}
+
+/* What WineHQ's 32-bit Wine and the free games ScummVM, DOSBox and Armagetron Advanced needed (src/m32_libsystem.c,
+ * src/m32_dyld.c, src/m32_selfload.c, src/m32_cf.c): the preloader's dyld calls and raw mincore, mmap hints, the
+ * calls whose i386 arrays the database converted one element of (kevent, iovecs), getopt_long, the LDT,
+ * getsegmentdata over a 32-bit header, ___dso_handle, Foundation's memory pages and Objective-C 1 constant strings */
+static void test_unix_calls(void)
+{
+    put_str(DATA + 0x100, "__dyld_dlopen");
+    uint32_t lk[2] = { DATA + 0x100, DATA + 0x200 };
+    check("_dyld_func_lookup answers the preloader's __dyld_dlopen", call("__dyld_func_lookup", 2, lk) == 1 &&
+                                                                     m32_rd(DATA + 0x200) != 0);
+    /* mincore: a mapped page is in core, a range with no mapping is ENOMEM */
+    uint32_t in = sysenter(78, 3, (uint32_t[]){ DATA, 0x1000, DATA + 0x300 });
+    check("raw mincore of a mapped page", !carry() && in == 0 && *(uint8_t *)m32_h(DATA + 0x300) == 1);
+    sysenter(78, 3, (uint32_t[]){ 0x31000000u, 0x2000, DATA + 0x300 });
+    check("raw mincore of a free range fails", carry() && cpu()->gpr[OCERZ_RAX] == ENOMEM);
+    /* an mmap hint where the range is free is taken */
+    uint32_t got = call("_mmap", 7, (uint32_t[]){ 0x31000000u, 0x4000, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
+                                                   0xffffffffu, 0, 0 });
+    check("an mmap hint over a free range is taken", got == 0x31000000u);
+    sysenter(78, 3, (uint32_t[]){ 0x31000000u, 0x1000, DATA + 0x300 });
+    check("... and mincore sees the mapping", !carry());
+    call("_munmap", 2, (uint32_t[]){ 0x31000000u, 0x4000 });
+    /* readv and writev over two i386 iovecs */
+    int fds[2];
+    if (pipe(fds) == 0) {
+        put_str(DATA + 0x400, "ab");
+        put_str(DATA + 0x410, "cde");
+        uint32_t iov = DATA + 0x420;
+        m32_wr(iov, DATA + 0x400); m32_wr(iov + 4, 2); m32_wr(iov + 8, DATA + 0x410); m32_wr(iov + 12, 3);
+        check("writev of two i386 iovecs", call("_writev", 3, (uint32_t[]){ (uint32_t)fds[1], iov, 2 }) == 5);
+        memset(m32_h(DATA + 0x440), 0, 16);
+        m32_wr(iov, DATA + 0x440); m32_wr(iov + 4, 3); m32_wr(iov + 8, DATA + 0x450); m32_wr(iov + 12, 2);
+        check("readv into two i386 iovecs", call("_readv", 3, (uint32_t[]){ (uint32_t)fds[0], iov, 2 }) == 5 &&
+              !memcmp(m32_h(DATA + 0x440), "abc", 3) && !memcmp(m32_h(DATA + 0x450), "de", 2));
+        /* kevent: two changes in, an event out, with a zero timeout */
+        int kq = kqueue(), other[2];
+        if (kq >= 0 && pipe(other) == 0) {
+            write(fds[1], "xyz", 3);
+            uint32_t ch = DATA + 0x500, ev = DATA + 0x540, ts = DATA + 0x5a0;
+            memset(m32_h(ch), 0, 0x40);
+            uint16_t add = EV_ADD;
+            int16_t rd = EVFILT_READ;
+            uint32_t ids[2] = { (uint32_t)fds[0], (uint32_t)other[0] }, ud[2] = { 0x1111, 0x2222 };
+            for (int i = 0; i < 2; i++) {
+                uint8_t *g = m32_h(ch + 20 * (uint32_t)i);
+                memcpy(g, &ids[i], 4); memcpy(g + 4, &rd, 2); memcpy(g + 6, &add, 2); memcpy(g + 16, &ud[i], 4);
+            }
+            m32_wr(ts, 0); m32_wr(ts + 4, 0);
+            uint32_t n = call("_kevent", 6, (uint32_t[]){ (uint32_t)kq, ch, 2, ev, 4, ts });
+            const uint8_t *e = m32_h(ev);
+            uint32_t ident, data, udata;
+            memcpy(&ident, e, 4); memcpy(&data, e + 12, 4); memcpy(&udata, e + 16, 4);
+            check("kevent takes two i386 changes and answers the readable one", n == 1 && ident == (uint32_t)fds[0] &&
+                  data == 3 && udata == 0x1111);
+            close(other[0]);
+            close(other[1]);
+        }
+        if (kq >= 0)
+            close(kq);
+        close(fds[0]);
+        close(fds[1]);
+    }
+    /* sendmsg and recvmsg with i386 msghdrs */
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        uint32_t iov = DATA + 0x600, msg = DATA + 0x620;
+        put_str(DATA + 0x640, "hi");
+        put_str(DATA + 0x650, "there");
+        m32_wr(iov, DATA + 0x640); m32_wr(iov + 4, 2); m32_wr(iov + 8, DATA + 0x650); m32_wr(iov + 12, 5);
+        memset(m32_h(msg), 0, 28);
+        m32_wr(msg + 8, iov); m32_wr(msg + 12, 2);
+        check("sendmsg of an i386 msghdr", call("_sendmsg", 3, (uint32_t[]){ (uint32_t)sv[0], msg, 0 }) == 7);
+        memset(m32_h(DATA + 0x660), 0, 16);
+        m32_wr(iov, DATA + 0x660); m32_wr(iov + 4, 16);
+        memset(m32_h(msg), 0, 28);
+        m32_wr(msg + 8, iov); m32_wr(msg + 12, 1); m32_wr(msg + 24, 0xffffffffu);
+        check("recvmsg into an i386 msghdr", call("_recvmsg", 3, (uint32_t[]){ (uint32_t)sv[1], msg, 0 }) == 7 &&
+              !memcmp(m32_h(DATA + 0x660), "hithere", 7) && m32_rd(msg + 24) == 0);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    /* getopt_long over a guest argv and a 16-byte i386 struct option */
+    put_str(DATA + 0x700, "prog");
+    put_str(DATA + 0x708, "-a");
+    put_str(DATA + 0x710, "--foreground");
+    put_str(DATA + 0x720, "ab:");
+    put_str(DATA + 0x728, "foreground");
+    uint32_t argv = DATA + 0x740, lo = DATA + 0x760;
+    m32_wr(argv, DATA + 0x700); m32_wr(argv + 4, DATA + 0x708); m32_wr(argv + 8, DATA + 0x710); m32_wr(argv + 12, 0);
+    memset(m32_h(lo), 0, 32);
+    m32_wr(lo, DATA + 0x728); m32_wr(lo + 12, 'f');
+    optreset = 1;
+    optind = 1;
+    uint32_t ga[5] = { 3, argv, DATA + 0x720, lo, 0 };
+    uint32_t r1 = call("_getopt_long", 5, ga), r2 = call("_getopt_long", 5, ga), r3 = call("_getopt_long", 5, ga);
+    check("getopt_long reads a guest argv and long options", r1 == 'a' && r2 == 'f' && r3 == 0xffffffffu);
+    /* i386_set_ldt with LDT_AUTO_ALLOC: an index whose selector has the descriptor's base */
+    uint64_t d = 0x0fffull | (0x45000ull << 16) | (0x12ull << 56) | (0xf2ull << 40) | (0x4ull << 52);
+    memcpy(m32_h(DATA + 0x800), &d, 8);
+    uint32_t idx = call("_i386_set_ldt", 3, (uint32_t[]){ 0xffffffffu, DATA + 0x800, 1 });
+    check("i386_set_ldt allocates an entry", idx > 0 && idx < 8192 && ocerz_ldt_base((idx << 3) | 7) == 0x12045000u);
+    /* getsegmentdata over a 32-bit header slid to DATA + 0x6000 */
+    uint32_t mh = DATA + 0x6000;
+    memset(m32_h(mh), 0, 0x200);
+    m32_wr(mh, 0xfeedface); m32_wr(mh + 4, 7); m32_wr(mh + 12, 2); m32_wr(mh + 16, 2); m32_wr(mh + 20, 2 * 56);
+    uint32_t cmd = mh + 28;
+    m32_wr(cmd, LC_SEGMENT); m32_wr(cmd + 4, 56); memcpy(m32_h(cmd + 8), "__TEXT", 7);
+    m32_wr(cmd + 24, 0x1000); m32_wr(cmd + 28, 0x2000);
+    cmd += 56;
+    m32_wr(cmd, LC_SEGMENT); m32_wr(cmd + 4, 56); memcpy(m32_h(cmd + 8), "__DATA", 7);
+    m32_wr(cmd + 24, 0x3000); m32_wr(cmd + 28, 0x1000);
+    put_str(DATA + 0x6300, "__DATA");
+    uint32_t seg = call("_getsegmentdata", 3, (uint32_t[]){ mh, DATA + 0x6300, DATA + 0x6310 });
+    check("getsegmentdata walks a 32-bit header", seg == 0x3000 + (mh - 0x1000) && m32_rd(DATA + 0x6310) == 0x1000);
+    /* ___dso_handle is the importing image's header */
+    static M32Image img;
+    img.base = 0x7654000;
+    check("___dso_handle resolves to the image's header", m32_resolve(&img, 0, "___dso_handle", 0) == 0x7654000);
+    /* Foundation's memory pages are window pages */
+    uint32_t pages = call("_NSAllocateMemoryPages", 1, (uint32_t[]){ 0x5000 });
+    check("NSAllocateMemoryPages hands out zeroed window pages", pages && !(pages & 0xfff) && pages < M32_HANDLE_LO &&
+          m32_rd(pages) == 0 && m32_rd(pages + 0x4ffc) == 0);
+    put_str(DATA + 0x900, "copied");
+    call("_NSCopyMemoryPages", 3, (uint32_t[]){ DATA + 0x900, pages, 7 });
+    check("NSCopyMemoryPages copies in the window", !strcmp((const char *)m32_h(pages), "copied"));
+    call("_NSDeallocateMemoryPages", 2, (uint32_t[]){ pages, 0x5000 });
+}
+
 int main(int argc, char **argv)
 {
     if (ocerz_mem_init(0, M32_WINDOW) != OCERZ_OK ||
@@ -1695,9 +1848,13 @@ int main(int argc, char **argv)
             return 2;
         }
         setenv("OCERZ_APIDB32", db, 0);   /* unless the caller named one */
+        char db64[PATH_MAX];
+        if (realpath("runtime/apis", db64))
+            setenv("OCERZ_APIDB", db64, 0);   /* the host side: frameworks the bridge opens by install name */
         test_carbon();
         test_db_shapes();
         test_objc_pairs();
+        test_objc1_strings();
         printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
         return g_failures != 0;
     }
@@ -1720,6 +1877,7 @@ int main(int argc, char **argv)
     test_image_order();
     test_queues();
     test_gl_buffers();
+    test_unix_calls();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

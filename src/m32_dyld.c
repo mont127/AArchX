@@ -912,6 +912,10 @@ uint32_t m32_resolve(M32Image *img, int ordinal, const char *name, int weak_impo
 {
     uint32_t v = 0;
     const char *lib = NULL;
+    /* ___dso_handle, which old linkers left as an import, is the importing image's own header, as dyld answers it:
+     * C++'s __cxa_atexit keys an image's destructors by it (Armagetron Advanced) */
+    if (!strcmp(name, "___dso_handle"))
+        return img->base;
     if (ordinal > 0 && ordinal <= img->ndeps) {
         lib = img->deps[ordinal - 1];
         M32Image *d = img->dep_img[ordinal - 1];

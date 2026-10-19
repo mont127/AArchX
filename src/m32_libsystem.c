@@ -786,6 +786,32 @@ static int sp_munmap(struct OcerzVM *vm, OcerzCPU *cpu)
         ocerz_unmap(g, map_len(len));   /* ponytail: a partial 4 KB unmap keeps the host page */
     RETV(0);
 }
+/* Foundation's page calls hand out memory the program writes, which has to be in the window: SDL 1.2's main
+ * converts its arguments to UTF-16 in NSAllocateMemoryPages' pages (Armagetron Advanced), and given host pages it
+ * got a handle cell instead and wrote past it */
+static int sp_NSAllocateMemoryPages(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t n = m32_arg(cpu, 0);
+    uint32_t g = n ? m32_mmap(0, n, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0) : 0;
+    m32_ret(cpu, g == M32_MAP_FAILED ? 0 : g, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSDeallocateMemoryPages(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t g = m32_arg(cpu, 0), n = m32_arg(cpu, 1);
+    if (g && !(g & 0x3fff))
+        ocerz_unmap(g, map_len(n));
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSCopyMemoryPages(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t s = m32_arg(cpu, 0), d = m32_arg(cpu, 1), n = m32_arg(cpu, 2);
+    if (s && d && n)
+        memmove(m32_h(d), m32_h(s), n);
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
 static int sp_vm_allocate(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t addrp = m32_arg(cpu, 1), size = map_len(m32_arg(cpu, 2)), flags = m32_arg(cpu, 3);
@@ -1443,14 +1469,20 @@ static int sp_localeconv_l(struct OcerzVM *vm, OcerzCPU *cpu)
  * {name, has_arg, flag, val}, and the state lives in variables the guest has its own copies of.  The host's
  * getopt runs on a host argv over the same strings, with the guest's optind, opterr and optreset copied in; optind,
  * optarg and optopt come back, and so does argv's order, which getopt_long permutes. */
+/* the guest's copy of a libSystem variable, or 0 where the import is not one (no database: a trap address) */
+static uint32_t data_cell(const char *name)
+{
+    uint32_t a = m32_export(NULL, name);
+    return a - (uint32_t)OCERZ_DYLDAPI_LO < (uint32_t)(OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO) ? 0 : a;
+}
 static int getopt_common(OcerzCPU *cpu, int kind)
 {
     int argc = (int)m32_arg(cpu, 0);
     uint32_t gargv = m32_arg(cpu, 1), gopts = m32_arg(cpu, 2), glong = kind ? m32_arg(cpu, 3) : 0;
     uint32_t gindex = kind ? m32_arg(cpu, 4) : 0;
-    uint32_t c_optind = m32_export(NULL, "_optind"), c_optarg = m32_export(NULL, "_optarg");
-    uint32_t c_opterr = m32_export(NULL, "_opterr"), c_optopt = m32_export(NULL, "_optopt");
-    uint32_t c_optreset = m32_export(NULL, "_optreset");
+    uint32_t c_optind = data_cell("_optind"), c_optarg = data_cell("_optarg");
+    uint32_t c_opterr = data_cell("_opterr"), c_optopt = data_cell("_optopt");
+    uint32_t c_optreset = data_cell("_optreset");
     if (argc < 0 || argc > 4096 || !gargv || !gopts) {
         m32_ret(cpu, (uint32_t)-1, 0, 0);
         return OCERZ_STEP_OK;
@@ -1757,6 +1789,8 @@ static const M32SpecialEntry g_specials[] = {
     { "_strftime", sp_strftime }, { "_asctime", sp_asctime }, { "_ctime", sp_ctime },
     { "_getrusage", sp_getrusage }, { "_gettimeofday", sp_gettimeofday }, { "_nanosleep", sp_nanosleep }, { "_select", sp_select },
     { "_open", sp_open }, { "_openat", sp_openat }, { "_fcntl", sp_fcntl },
+    { "_NSAllocateMemoryPages", sp_NSAllocateMemoryPages }, { "_NSDeallocateMemoryPages", sp_NSDeallocateMemoryPages },
+    { "_NSCopyMemoryPages", sp_NSCopyMemoryPages },
     { "_mmap", sp_mmap }, { "_munmap", sp_munmap }, { "_mprotect", sp_ok0 }, { "_madvise", sp_ok0 },
     { "_msync", sp_ok0 }, { "_vm_allocate", sp_vm_allocate }, { "_vm_deallocate", sp_vm_deallocate },
     { "_sbrk", sp_sbrk },
