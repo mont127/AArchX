@@ -1709,6 +1709,105 @@ static void test_objc1_strings(void)
     }
 }
 
+
+/* Apple's file streams on the runtime's GCC libstdc++ (src/m32_fstream.c): an ofstream and an fstream at Apple's
+ * offsets, opened, written through the library's operator<< (whose sentry finds the basic_ios by the vtable, where
+ * Armagetron Advanced's config save went wrong), closed and destroyed through the vtable */
+static uint32_t guest_call(uint32_t fn, int n, const uint32_t *args)
+{
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    return m32_call(&g_vm, fn, args, n, NULL, NULL);
+}
+
+static uint32_t cxx_sym(uint32_t lib, const char *name)
+{
+    put_str(DATA + 0x4700, name);
+    uint32_t v = call("_dlsym", 2, (uint32_t[]){ lib, DATA + 0x4700 });
+    check(name, v != 0);
+    return v;
+}
+
+static void test_fstreams(void)
+{
+    char lib[PATH_MAX], path[] = "/tmp/test_m32_fstream.XXXXXX";
+    if (!realpath("runtime/guest32/usr/lib/libstdc++.6.dylib", lib)) {
+        printf("test_m32: no runtime/guest32 libstdc++ (tools/fetch_guest32_cxx.sh): file streams not checked\n");
+        return;
+    }
+    int was_active = m32_active;
+    m32_active = 1;   /* guest code's calls of traps reach m32, as under m32_run */
+    if (!m32_argc_var) {   /* what dlopen hands the initializers, which m32_run sets up */
+        m32_argc_var = DATA + 0x4a00;
+        m32_argv_var = DATA + 0x4a04;
+        m32_environ_var = DATA + 0x4a08;
+    }
+    put_str(DATA + 0x4600, "/usr/lib/libstdc++.6.dylib");
+    uint32_t h = call("_dlopen", 2, (uint32_t[]){ DATA + 0x4600, 2 });
+    check("dlopen of the runtime's libstdc++", h != 0);
+    int fd = mkstemp(path);
+    if (!h || fd < 0) {
+        m32_active = was_active;
+        return;
+    }
+    close(fd);
+    static const struct { const char *tv; uint32_t ios; } tvs[] = {
+        { "_ZTVSt14basic_ofstreamIcSt11char_traitsIcEE", 0x20c }, { "_ZTVSt14basic_ofstreamIwSt11char_traitsIwEE", 0x210 },
+        { "_ZTVSt13basic_fstreamIcSt11char_traitsIcEE", 0x214 }, { "_ZTVSt13basic_fstreamIwSt11char_traitsIwEE", 0x218 },
+        { "_ZTVSt14basic_ifstreamIcSt11char_traitsIcEE", 0x20c },
+    };
+    for (size_t i = 0; i < sizeof tvs / sizeof tvs[0]; i++)
+        check("a file stream's vtable has Apple's basic_ios offset", m32_rd(cxx_sym(h, tvs[i].tv)) == tvs[i].ios);
+
+    uint32_t os = m32_calloc(1, 0x300), fs = m32_calloc(1, 0x300), bad = m32_calloc(1, 0x300);
+    put_str(DATA + 0x4800, path);
+    put_str(DATA + 0x4900, "hello ");
+    put_str(DATA + 0x4910, "/nonexistent-dir/test_m32/x");
+    guest_call(cxx_sym(h, "_ZNSt14basic_ofstreamIcSt11char_traitsIcEEC1EPKcSt13_Ios_Openmode"), 3,
+               (uint32_t[]){ os, DATA + 0x4800, 16 });
+    check("an ofstream from a file name: its filebuf at 8, its basic_ios at 0x20c, good",
+          m32_rd(os + 0x20c + 0x78) == os + 8 && m32_rd(m32_rd(os) - 12) == 0x20c && m32_rd(os + 0x20c + 0x14) == 0);
+    check("... is_open", (guest_call(cxx_sym(h, "_ZNSt14basic_ofstreamIcSt11char_traitsIcEE7is_openEv"), 1,
+                                     (uint32_t[]){ os }) & 0xff) == 1);
+    check("... rdbuf", guest_call(cxx_sym(h, "_ZNKSt14basic_ofstreamIcSt11char_traitsIcEE5rdbufEv"), 1,
+                                  (uint32_t[]){ os }) == os + 8);
+    uint32_t put = cxx_sym(h, "_ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc");
+    check("operator<< writes through the library's sentry",
+          guest_call(put, 2, (uint32_t[]){ os, DATA + 0x4900 }) == os && m32_rd(os + 0x20c + 0x14) == 0);
+    guest_call(cxx_sym(h, "_ZNSt14basic_ofstreamIcSt11char_traitsIcEE5closeEv"), 1, (uint32_t[]){ os });
+    check("... close leaves it good and closed", m32_rd(os + 0x20c + 0x14) == 0 &&
+          (guest_call(cxx_sym(h, "_ZNKSt14basic_ofstreamIcSt11char_traitsIcEE7is_openEv"), 1, (uint32_t[]){ os }) & 0xff) == 0);
+    guest_call(m32_rd(m32_rd(os)), 1, (uint32_t[]){ os });   /* its complete destructor, from the vtable */
+    check("... its destructor runs down to ios_base's, at Apple's offset", m32_rd(os + 0x20c) ==
+          cxx_sym(h, "_ZTVSt8ios_base") + 8);
+
+    /* an fstream built by its default constructor and opened afterwards: in | out | app */
+    guest_call(cxx_sym(h, "_ZNSt13basic_fstreamIcSt11char_traitsIcEEC1Ev"), 1, (uint32_t[]){ fs });
+    guest_call(cxx_sym(h, "_ZNSt13basic_fstreamIcSt11char_traitsIcEE4openEPKcSt13_Ios_Openmode"), 3,
+               (uint32_t[]){ fs, DATA + 0x4800, 8 | 16 | 1 });
+    check("an fstream: its filebuf at 16, its basic_ios at 0x214, open",
+          m32_rd(fs + 0x214 + 0x78) == fs + 16 && m32_rd(m32_rd(fs) - 12) == 0x214 && m32_rd(fs + 0x214 + 0x14) == 0);
+    check("... its ostream's vtable finds the same basic_ios", m32_rd(m32_rd(fs + 8) - 12) == 0x20c);
+    guest_call(put, 2, (uint32_t[]){ fs + 8, DATA + 0x4900 });
+    guest_call(m32_rd(m32_rd(fs) + 4), 1, (uint32_t[]){ fs });   /* deleting destructor: closes, frees */
+
+    guest_call(cxx_sym(h, "_ZNSt14basic_ofstreamIcSt11char_traitsIcEEC1EPKcSt13_Ios_Openmode"), 3,
+               (uint32_t[]){ bad, DATA + 0x4910, 16 });
+    check("an ofstream that cannot open is failed", (m32_rd(bad + 0x20c + 0x14) & 4) != 0);
+    guest_call(m32_rd(m32_rd(bad)), 1, (uint32_t[]){ bad });
+
+    char got[32] = { 0 };
+    FILE *f = fopen(path, "r");
+    if (f) {
+        fread(got, 1, sizeof got - 1, f);
+        fclose(f);
+    }
+    check("the file has what both streams wrote", !strcmp(got, "hello hello "));
+    unlink(path);
+    m32_free(os);
+    m32_free(bad);
+    m32_active = was_active;
+}
+
 /* What WineHQ's 32-bit Wine and the free games ScummVM, DOSBox and Armagetron Advanced needed (src/m32_libsystem.c,
  * src/m32_dyld.c, src/m32_selfload.c, src/m32_cf.c): the preloader's dyld calls and raw mincore, mmap hints, the
  * calls whose i386 arrays the database converted one element of (kevent, iovecs), getopt_long, the LDT,
@@ -1847,6 +1946,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_m32: cannot set up the window\n");
         return 2;
     }
+    char g32[PATH_MAX];
+    if (!getenv("OCERZ_GUEST32_ROOT") && realpath("runtime/guest32", g32))
+        setenv("OCERZ_GUEST32_ROOT", g32, 1);   /* the i386 runtime, as ocerz finds it beside itself */
     ocerz_vm_init(&g_vm);
     g_vm.jit_enabled = 0;
     ocerz_cpu_reset(cpu());
@@ -1866,6 +1968,7 @@ int main(int argc, char **argv)
         test_db_shapes();
         test_objc_pairs();
         test_objc1_strings();
+        test_fstreams();
         printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
         return g_failures != 0;
     }

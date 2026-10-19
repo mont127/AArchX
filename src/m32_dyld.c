@@ -418,6 +418,8 @@ const M32Sect *m32_section(const M32Image *img, const char *seg, const char *sec
 }
 
 /* Load an i386 image from path. The main executable maps at its own addresses. */
+static int runtime_libstdcxx(const char *path);
+
 M32Image *m32_image_load(const char *path, int is_main)
 {
     size_t len = 0, slen = 0;
@@ -441,6 +443,7 @@ M32Image *m32_image_load(const char *path, int is_main)
         free(img);
         return NULL;
     }
+    img->runtime_cxx = runtime_libstdcxx(path);
     if (img->has_main)
         img->entry_main = img->base + img->entry_main_off;   /* entryoff counts from the mach header */
     if (img->entry_thread)
@@ -616,6 +619,7 @@ int m32_image_fixup(M32Image *img)
     int bad = bind_stream(img, img->bind_off, img->bind_size, 0, 0);
     bad += bind_stream(img, img->lazy_off, img->lazy_size, 1, 0);
     bind_stream(img, img->weak_off, img->weak_size, 0, 1);
+    m32_fstream_fixup(img);
     m32_cf_alias_strings(img);
     m32_tlv_register(img);
     m32_objc_load(img);
@@ -642,6 +646,15 @@ static void guest32_root(void)
         *strrchr(real, '/') = 0;
         snprintf(g_guest32_root, sizeof g_guest32_root, "%s/runtime/guest32", real);
     }
+}
+
+/* the runtime's libstdc++ (tools/fetch_guest32_cxx.sh), which src/m32_fstream.c gives Apple's file streams */
+static int runtime_libstdcxx(const char *path)
+{
+    guest32_root();
+    char want[1100];
+    snprintf(want, sizeof want, "%s/usr/lib/libstdc++.6.dylib", g_guest32_root);
+    return g_guest32_root[0] && !strcmp(path, want);
 }
 
 /* fontconfig from runtime/guest32 (tools/fetch_guest32_x11.sh) looks for /opt/local/etc/fonts/fonts.conf, where it
@@ -907,6 +920,11 @@ static uint32_t lookup_in(M32Image *img, const char *name, int depth)
      * unwinder after its first throw.  GCC's arithmetic helpers stay where they are. */
     if (!strncmp(name, "__Unwind_", 9) && guest_libgcc(img) && m32_special(name))
         return m32_export("/usr/lib/libSystem.B.dylib", name);
+    if (img->runtime_cxx) {   /* Apple's file streams */
+        uint32_t f = m32_fstream_symbol(img, name);
+        if (f)
+            return f;
+    }
     uint32_t v = img->export_size ? trie_lookup(img, name, depth) : nlist_lookup(img, name);
     for (int i = 0; !v && i < img->ndeps; i++)   /* LC_REEXPORT_DYLIB */
         if (img->dep_reexport[i])

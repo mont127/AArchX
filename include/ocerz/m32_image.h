@@ -51,6 +51,7 @@ typedef struct M32Image {
     int ndeps;
     char *rpath[M32_MAX_RPATHS];
     int nrpath;
+    int runtime_cxx;              /* runtime/guest32's libstdc++, given Apple's file streams (src/m32_fstream.c) */
 } M32Image;
 
 extern M32Image *m32_images[M32_MAX_IMAGES];
@@ -69,6 +70,8 @@ const M32Sect *m32_section(const M32Image *img, const char *seg, const char *sec
 void m32_cf_alias_strings(M32Image *img);   /* src/m32_cf.c */
 void m32_fontconfig_default(void);   /* FONTCONFIG_FILE for the guest fontconfig (src/m32_dyld.c) */
 void m32_tlv_register(M32Image *img);       /* src/m32_thread.c */
+uint32_t m32_fstream_symbol(M32Image *img, const char *name);   /* src/m32_fstream.c: Apple's ofstream member, or 0 */
+void m32_fstream_fixup(M32Image *img);      /* Apple's offsets in the runtime libstdc++'s file stream vtables */
 struct OcerzVM;
 void m32_run_initializers(struct OcerzVM *vm, M32Image *img, const uint32_t args[5]);
 int m32_start_program(struct OcerzVM *vm, M32Image *img, uint32_t sp, const char *path);   /* src/m32.c */
