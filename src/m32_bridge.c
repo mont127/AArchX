@@ -245,6 +245,17 @@ uint32_t m32_export_special(const char *name, M32Special fn)
     return M32_TRAP(id);
 }
 
+/* Copies a host variable into the guest's copy of it again, if the guest imported it: a fork child's
+ * mach_task_self_ and bootstrap_port, which libSystem sets afresh there and the guest copied in its parent. */
+void m32_refill_data(const char *name)
+{
+    pthread_mutex_lock(&g_lock);
+    for (uint32_t id = M32_ID_FIRST; id < g_next; id++)
+        if (!strcmp(g_exports[id]->name, name) && g_exports[id]->kind == M32_EX_DATA)
+            m32_fill_data(g_exports[id]);
+    pthread_mutex_unlock(&g_lock);
+}
+
 /* The trap address for an import of name from lib (NULL: flat lookup). One export per symbol name. */
 uint32_t m32_export(const char *lib, const char *name)
 {

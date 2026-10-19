@@ -138,6 +138,21 @@ int m32_raw_syscall(struct OcerzVM *vm, OcerzCPU *cpu, int sysenter)
     case 75:    /* madvise: accepted without effect, as the bridged calls are */
         r = 0;
         break;
+    case 78: {  /* mincore: a page with a mapping in the window is in core, and a range with none is not mapped */
+        uint32_t lo = A(0) & ~0xfffu, n = (uint32_t)(((uint64_t)A(1) + (A(0) & 0xfffu) + 0xfffu) >> 12), vec = A(2);
+        int any = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            int in = ocerz_addr_mapped(lo + (uint64_t)i * 0x1000) == 1;
+            any |= in;
+            if (vec)
+                *(uint8_t *)m32_h(vec + i) = (uint8_t)in;
+        }
+        if (any)
+            r = 0;
+        else
+            errno = ENOMEM;
+        break;
+    }
     case 153:   /* pread */
         r = pread((int)A(0), m32_h(A(1)), A(2), (off_t)(A(3) | (uint64_t)A(4) << 32));
         break;

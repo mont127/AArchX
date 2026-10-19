@@ -22,6 +22,7 @@ struct OcerzVM;
 #define M32_HANDLE_LO    0xE0000000u      /* handle cells, 8 bytes each */
 #define M32_HANDLE_HI    0xF0000000u
 #define M32_TOP_LO       0xF0000000u      /* reserved, never mapped */
+#define M32_WINE_FLOOR   0x82000000u      /* what m32 maps for itself under Wine starts here (m32_run) */
 #define M32_TRAP(id)     ((uint32_t)(OCERZ_DYLDAPI_LO + (id)))
 #define M32_ID_SENTINEL  0xfff0           /* return address of calls into the guest */
 #define M32_ID_EXIT      0xfff4           /* main()'s return address: exit(eax) */
@@ -166,6 +167,7 @@ uint32_t m32_special_data(const char *symbol, void *host_var);   /* guest variab
 void m32_refresh_data(void);   /* re-read host pointer variables that changed (NSApp) */
 
 uint32_t m32_export(const char *lib, const char *name);     /* trap address for an import */
+void m32_refill_data(const char *name);   /* the guest's copy of a host variable, copied again */
 M32Export *m32_export_by_id(uint32_t id);
 M32Special m32_special(const char *symbol);                 /* NULL when none */
 void m32_log_once(const char *what, const char *name);

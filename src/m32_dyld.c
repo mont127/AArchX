@@ -734,6 +734,14 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
                     return 0;
             }
         }
+        /* An image already loaded under exactly that install name is the one, as dyld reuses it: Wine's
+         * ntdll.dll.so names @rpath/libwine.1.dylib and has no rpath that finds it, and the loader chain whose
+         * rpaths would (libwine's own, wine's) is not the one m32 searches */
+        for (int i = 0; i < m32_nimages; i++)
+            if (!strcmp(m32_images[i]->install_name, name)) {
+                snprintf(out, outlen, "%s", m32_images[i]->path);
+                return 0;
+            }
         return -1;
     } else {
         guest32_root();
@@ -1401,6 +1409,17 @@ static int sp_image_slide(struct OcerzVM *vm, OcerzCPU *cpu)
     m32_ret(cpu, i < (uint32_t)m32_nimages ? (uint32_t)m32_images[i]->slide : 0, 0, 0);
     return OCERZ_STEP_OK;
 }
+/* intptr_t _dyld_get_image_slide(const struct mach_header *): the slide of the image whose header that is, 0 for
+ * one m32 did not load */
+static int sp_image_slide_of(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t mh = m32_arg(cpu, 0), slide = 0;
+    for (int i = 0; i < m32_nimages; i++)
+        if (m32_images[i]->base == mh)
+            slide = (uint32_t)m32_images[i]->slide;
+    m32_ret(cpu, slide, 0, 0);
+    return OCERZ_STEP_OK;
+}
 static int sp_register_add_image(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t fn = m32_arg(cpu, 0);
@@ -1485,10 +1504,47 @@ static int sp_getsectdatafromheader(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* uint8_t *getsegmentdata(const struct mach_header *, const char *segname, unsigned long *size): the segment of an
+ * i386 header, read in the window, slid by what its __TEXT, which the header starts, was slid by.  The host's walks
+ * 64-bit load commands, and over a 32-bit header it read past the image (Wine looks up its own segments). */
+static int sp_getsegmentdata(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t mh = m32_arg(cpu, 0), szp = m32_arg(cpu, 2), text = 0, addr = 0, size = 0;
+    const char *want = m32_arg(cpu, 1) ? (const char *)m32_h(m32_arg(cpu, 1)) : "";
+    int have_text = 0, found = 0;
+    uint32_t ncmds = mh ? m32_rd(mh + 16) : 0, at = mh + 28;
+    for (uint32_t i = 0; i < ncmds && i < 1024; i++) {
+        uint32_t cmd = m32_rd(at), cmdsize = m32_rd(at + 4);
+        if (cmd == 0x1 /* LC_SEGMENT */) {
+            const char *seg = (const char *)m32_h(at + 8);
+            if (!strncmp(seg, "__TEXT", 16)) {
+                text = m32_rd(at + 24);
+                have_text = 1;
+            }
+            if (!found && !strncmp(seg, want, 16)) {
+                addr = m32_rd(at + 24);
+                size = m32_rd(at + 28);
+                found = 1;
+            }
+        }
+        if (cmdsize < 8)
+            break;
+        at += cmdsize;
+    }
+    if (szp)
+        m32_wr(szp, found ? size : 0);
+    m32_ret(cpu, found ? addr + (have_text ? mh - text : 0) : 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 const M32SpecialEntry m32_dyld_specials[] = {
+    { "_getsegmentdata", sp_getsegmentdata },
     { "__dyld_func_lookup", sp_dyld_func_lookup },
     { "_dlopen", sp_dlopen }, { "_dlsym", sp_dlsym }, { "_dlclose", sp_dlclose }, { "_dlerror", sp_dlerror },
     { "_dladdr", sp_dladdr },
+    /* dyld's own names for them, which Wine's preloader asks _dyld_func_lookup for: it has no libSystem to call */
+    { "__dyld_dlopen", sp_dlopen }, { "__dyld_dlsym", sp_dlsym }, { "__dyld_dladdr", sp_dladdr },
+    { "__dyld_get_image_slide", sp_image_slide_of },
     { "_NSAddImage", sp_NSAddImage }, { "_NSLookupSymbolInImage", sp_NSLookupSymbolInImage },
     { "_NSLinkEditError", sp_NSLinkEditError },
     { "_NSCreateObjectFileImageFromFile", sp_NSCreateObjectFileImageFromFile }, { "_NSLinkModule", sp_NSLinkModule },

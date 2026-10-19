@@ -26,6 +26,10 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <getopt.h>
+#include <sys/event.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
@@ -713,6 +717,15 @@ uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint
         return M32_MAP_FAILED;
     }
     uint32_t size = map_len(len), g;
+    /* A hint is taken where the range is free, as macOS takes it: Wine's preloader reserves the address ranges
+     * Windows programs need that way, and a range given out anywhere else is no use to it. */
+    if (!(flags & MAP_FIXED) && want && !(want & 0xfff) && (uint64_t)want + len <= M32_HANDLE_LO) {
+        int free_range = 1;
+        for (uint64_t a = want; free_range && a < (uint64_t)want + len; a += 0x1000)
+            free_range = ocerz_addr_mapped(a) == 0;
+        if (free_range)
+            flags |= MAP_FIXED;
+    }
     if (flags & MAP_FIXED) {
         /* 4 KB pages, as on the Intel Macs (MW3's VirtualAlloc commits and decommits single pages): the 16 KB host
          * pages wholly inside are mapped afresh, and of a host page the range covers only partly, just the covered
@@ -1426,7 +1439,252 @@ static int sp_localeconv_l(struct OcerzVM *vm, OcerzCPU *cpu)
     return RETV_PLAIN(lconv_guest(localeconv_l(loc ? (locale_t)loc : LC_GLOBAL_LOCALE)));
 }
 
+/* getopt, getopt_long and getopt_long_only: argv is an array of guest pointers and a long option a 16-byte
+ * {name, has_arg, flag, val}, and the state lives in variables the guest has its own copies of.  The host's
+ * getopt runs on a host argv over the same strings, with the guest's optind, opterr and optreset copied in; optind,
+ * optarg and optopt come back, and so does argv's order, which getopt_long permutes. */
+static int getopt_common(OcerzCPU *cpu, int kind)
+{
+    int argc = (int)m32_arg(cpu, 0);
+    uint32_t gargv = m32_arg(cpu, 1), gopts = m32_arg(cpu, 2), glong = kind ? m32_arg(cpu, 3) : 0;
+    uint32_t gindex = kind ? m32_arg(cpu, 4) : 0;
+    uint32_t c_optind = m32_export(NULL, "_optind"), c_optarg = m32_export(NULL, "_optarg");
+    uint32_t c_opterr = m32_export(NULL, "_opterr"), c_optopt = m32_export(NULL, "_optopt");
+    uint32_t c_optreset = m32_export(NULL, "_optreset");
+    if (argc < 0 || argc > 4096 || !gargv || !gopts) {
+        m32_ret(cpu, (uint32_t)-1, 0, 0);
+        return OCERZ_STEP_OK;
+    }
+    char **argv = calloc((size_t)argc + 1, sizeof *argv);
+    for (int i = 0; i < argc; i++) {
+        uint32_t s = m32_rd(gargv + 4 * (uint32_t)i);
+        argv[i] = s ? (char *)m32_h(s) : NULL;
+    }
+    int nlong = 0;
+    while (glong && m32_rd(glong + 16 * (uint32_t)nlong) && nlong < 1024)
+        nlong++;
+    struct option *lo = calloc((size_t)nlong + 1, sizeof *lo);
+    for (int i = 0; i < nlong; i++) {
+        uint32_t at = glong + 16 * (uint32_t)i, flag = m32_rd(at + 8);
+        lo[i].name = (const char *)m32_h(m32_rd(at));
+        lo[i].has_arg = (int)m32_rd(at + 4);
+        lo[i].flag = flag ? (int *)m32_h(flag) : NULL;
+        lo[i].val = (int)m32_rd(at + 12);
+    }
+    if (c_optind) optind = (int)m32_rd(c_optind);
+    if (c_opterr) opterr = (int)m32_rd(c_opterr);
+    if (c_optreset) optreset = (int)m32_rd(c_optreset);
+    int longindex = gindex ? (int)m32_rd(gindex) : 0;
+    const char *opts = (const char *)m32_h(gopts);
+    int r = kind == 0 ? getopt(argc, argv, opts)
+          : kind == 1 ? getopt_long(argc, argv, opts, lo, gindex ? &longindex : NULL)
+                      : getopt_long_only(argc, argv, opts, lo, gindex ? &longindex : NULL);
+    for (int i = 0; i < argc; i++)
+        m32_wr(gargv + 4 * (uint32_t)i, argv[i] ? (uint32_t)ocerz_h2g(argv[i]) : 0);
+    if (gindex)
+        m32_wr(gindex, (uint32_t)longindex);
+    if (c_optind) m32_wr(c_optind, (uint32_t)optind);
+    if (c_optarg) m32_wr(c_optarg, optarg ? (uint32_t)ocerz_h2g(optarg) : 0);
+    if (c_optopt) m32_wr(c_optopt, (uint32_t)optopt);
+    if (c_optreset) m32_wr(c_optreset, (uint32_t)optreset);
+    free(argv);
+    free(lo);
+    m32_ret(cpu, (uint32_t)r, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_getopt(struct OcerzVM *vm, OcerzCPU *cpu) { return getopt_common(cpu, 0); }
+static int sp_getopt_long(struct OcerzVM *vm, OcerzCPU *cpu) { return getopt_common(cpu, 1); }
+static int sp_getopt_long_only(struct OcerzVM *vm, OcerzCPU *cpu) { return getopt_common(cpu, 2); }
+
+/* kevent and kevent64 take arrays, nchanges structures in and up to nevents out, where the database's r{} carries
+ * one.  i386's struct kevent is 20 bytes, {ident, filter, flags, fflags, data, udata} with 4-byte ident, data and
+ * udata, against 32 on the host; kevent64_s is the same 48 bytes on both; a timeout's two longs are 4 bytes each.
+ * udata comes back as the guest stored it.  Wine's server waits on its clients' sockets this way. */
+static int kevent_timeout(uint32_t g, struct timespec *ts)
+{
+    if (!g)
+        return 0;
+    ts->tv_sec = (int32_t)m32_rd(g);
+    ts->tv_nsec = (int32_t)m32_rd(g + 4);
+    return 1;
+}
+static int sp_kevent(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int kq = (int)m32_arg(cpu, 0), nch = (int)m32_arg(cpu, 2), nev = (int)m32_arg(cpu, 4);
+    uint32_t gch = m32_arg(cpu, 1), gev = m32_arg(cpu, 3);
+    struct timespec ts;
+    int timed = kevent_timeout(m32_arg(cpu, 5), &ts);
+    if (nch < 0 || nev < 0 || nch > 65536 || nev > 65536) {
+        errno = EINVAL;
+        RETV(-1);
+    }
+    struct kevent *ch = calloc((size_t)nch + 1, sizeof *ch), *ev = calloc((size_t)nev + 1, sizeof *ev);
+    for (int i = 0; i < nch; i++) {
+        const uint8_t *g = m32_h(gch + 20 * (uint32_t)i);
+        int16_t filter; uint16_t flags; uint32_t ident, fflags, udata; int32_t data;
+        memcpy(&ident, g, 4); memcpy(&filter, g + 4, 2); memcpy(&flags, g + 6, 2);
+        memcpy(&fflags, g + 8, 4); memcpy(&data, g + 12, 4); memcpy(&udata, g + 16, 4);
+        EV_SET(&ch[i], ident, filter, flags, fflags, data, (void *)(uintptr_t)udata);
+    }
+    int r = kevent(kq, ch, nch, ev, nev, timed ? &ts : NULL);
+    int err = errno;
+    for (int i = 0; i < r; i++) {
+        uint8_t *g = m32_h(gev + 20 * (uint32_t)i);
+        uint32_t ident = (uint32_t)ev[i].ident, fflags = ev[i].fflags, udata = (uint32_t)(uintptr_t)ev[i].udata;
+        int32_t data = (int32_t)ev[i].data;
+        memcpy(g, &ident, 4); memcpy(g + 4, &ev[i].filter, 2); memcpy(g + 6, &ev[i].flags, 2);
+        memcpy(g + 8, &fflags, 4); memcpy(g + 12, &data, 4); memcpy(g + 16, &udata, 4);
+    }
+    free(ch);
+    free(ev);
+    errno = err;
+    RETV(r);
+}
+static int sp_kevent64(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int kq = (int)m32_arg(cpu, 0), nch = (int)m32_arg(cpu, 2), nev = (int)m32_arg(cpu, 4);
+    uint32_t gch = m32_arg(cpu, 1), gev = m32_arg(cpu, 3), flags = m32_arg(cpu, 5);
+    struct timespec ts;
+    int timed = kevent_timeout(m32_arg(cpu, 6), &ts);
+    RETV(kevent64(kq, nch > 0 ? m32_h(gch) : NULL, nch, nev > 0 ? m32_h(gev) : NULL, nev, flags,
+                  timed ? &ts : NULL));
+}
+
+/* bootstrap_register takes a name_t, a char[128], which crosses as the pointer C passes (look_up and check_in
+ * are above); the ports are names */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static int sp_bootstrap_register(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    RETV(bootstrap_register(m32_arg(cpu, 0), (char *)m32_h(m32_arg(cpu, 1)), m32_arg(cpu, 2)));
+}
+#pragma clang diagnostic pop
+
+/* fork and vfork: in the child libSystem sets mach_task_self_ and bootstrap_port afresh, since the names can
+ * differ there, and so are the guest's copies of them (Wine's server forks to run as a daemon and then looks for
+ * the bootstrap port).  vfork runs as fork, the child having its own copy of the window. */
+static int sp_fork(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    pid_t pid = fork();
+    int err = errno;
+    if (pid == 0) {
+        m32_refill_data("_mach_task_self_");
+        m32_refill_data("_bootstrap_port");
+    }
+    errno = err;
+    RETV(pid);
+}
+
+/* sendmsg and recvmsg: i386's struct msghdr is {name, namelen, iov, iovlen, control, controllen, flags} in 28 bytes
+ * and an iovec {base, len} 8, where the database converts the header and hands the host an i386 iovec array.  The
+ * control data, the descriptors SCM_RIGHTS passes among it, has one layout on both (4-byte cmsghdr fields and
+ * alignment), and so do the names.  Wine's client and server talk this way. */
+#define M32_MSG_IOV_MAX 1024
+static int msg_in(uint32_t g, struct msghdr *m, struct iovec *iov)
+{
+    uint32_t name = m32_rd(g), giov = m32_rd(g + 8), n = m32_rd(g + 12), control = m32_rd(g + 16);
+    if (n > M32_MSG_IOV_MAX)
+        return -1;
+    memset(m, 0, sizeof *m);
+    m->msg_name = name ? m32_h(name) : NULL;
+    m->msg_namelen = m32_rd(g + 4);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t base = m32_rd(giov + 8 * i);
+        iov[i].iov_base = base ? m32_h(base) : NULL;
+        iov[i].iov_len = m32_rd(giov + 8 * i + 4);
+    }
+    m->msg_iov = n ? iov : NULL;
+    m->msg_iovlen = (int)n;
+    m->msg_control = control ? m32_h(control) : NULL;
+    m->msg_controllen = m32_rd(g + 20);
+    m->msg_flags = (int)m32_rd(g + 24);
+    return 0;
+}
+static int sp_sendmsg(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    struct msghdr m;
+    static __thread struct iovec iov[M32_MSG_IOV_MAX];
+    if (msg_in(m32_arg(cpu, 1), &m, iov) != 0) {
+        errno = EMSGSIZE;
+        RETV(-1);
+    }
+    RETV(sendmsg((int)m32_arg(cpu, 0), &m, (int)m32_arg(cpu, 2)));
+}
+static int sp_recvmsg(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    struct msghdr m;
+    static __thread struct iovec iov[M32_MSG_IOV_MAX];
+    uint32_t g = m32_arg(cpu, 1);
+    if (msg_in(g, &m, iov) != 0) {
+        errno = EMSGSIZE;
+        RETV(-1);
+    }
+    ssize_t r = recvmsg((int)m32_arg(cpu, 0), &m, (int)m32_arg(cpu, 2));
+    int err = errno;
+    if (r >= 0) {
+        m32_wr(g + 4, m.msg_namelen);
+        m32_wr(g + 20, m.msg_controllen);
+        m32_wr(g + 24, (uint32_t)m.msg_flags);
+    }
+    errno = err;
+    RETV(r);
+}
+
+/* i386_set_ldt and i386_get_ldt on ocerz's one table (ocerz_ldt_call), which a segment register load reads: Wine
+ * gives each thread an %fs selector for its TEB this way, LDT_AUTO_ALLOC (-1) choosing the index.  The 8-byte
+ * descriptors are read and written in the window. */
+static int ldt_common(OcerzCPU *cpu, int num)
+{
+    long r = ocerz_ldt_call(num, (int32_t)m32_arg(cpu, 0), m32_arg(cpu, 1), (int32_t)m32_arg(cpu, 2));
+    if (r < 0)
+        errno = (int)-r;
+    RETV(r < 0 ? -1 : r);
+}
+static int sp_i386_set_ldt(struct OcerzVM *vm, OcerzCPU *cpu) { return ldt_common(cpu, 5); }
+static int sp_i386_get_ldt(struct OcerzVM *vm, OcerzCPU *cpu) { return ldt_common(cpu, 6); }
+
+/* readv and writev, and the positioned preadv and pwritev: an array of i386 iovecs, as in a msghdr above (Wine's
+ * client sends each request to its server with writev) */
+static int iov_in(uint32_t giov, int n, struct iovec *iov)
+{
+    if (n < 0 || n > M32_MSG_IOV_MAX)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        uint32_t base = m32_rd(giov + 8 * (uint32_t)i);
+        iov[i].iov_base = base ? m32_h(base) : NULL;
+        iov[i].iov_len = m32_rd(giov + 8 * (uint32_t)i + 4);
+    }
+    return 0;
+}
+static int iov_call(OcerzCPU *cpu, int kind)
+{
+    static __thread struct iovec iov[M32_MSG_IOV_MAX];
+    int fd = (int)m32_arg(cpu, 0), n = (int)m32_arg(cpu, 2);
+    if (iov_in(m32_arg(cpu, 1), n, iov) != 0) {
+        errno = EINVAL;
+        RETV(-1);
+    }
+    off_t off = (off_t)(m32_arg(cpu, 3) | (uint64_t)m32_arg(cpu, 4) << 32);
+    switch (kind) {
+    case 0: RETV(readv(fd, iov, n));
+    case 1: RETV(writev(fd, iov, n));
+    case 2: RETV(preadv(fd, iov, n, off));
+    default: RETV(pwritev(fd, iov, n, off));
+    }
+}
+static int sp_readv(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 0); }
+static int sp_writev(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 1); }
+static int sp_preadv(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 2); }
+static int sp_pwritev(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 3); }
+
 static const M32SpecialEntry g_specials[] = {
+    { "_readv", sp_readv }, { "_writev", sp_writev }, { "_preadv", sp_preadv }, { "_pwritev", sp_pwritev },
+    { "_i386_set_ldt", sp_i386_set_ldt }, { "_i386_get_ldt", sp_i386_get_ldt },
+    { "_sendmsg", sp_sendmsg }, { "_recvmsg", sp_recvmsg },
+    { "_fork", sp_fork }, { "_vfork", sp_fork },
+    { "_kevent", sp_kevent }, { "_kevent64", sp_kevent64 },
+    { "_bootstrap_register", sp_bootstrap_register },
+    { "_getopt", sp_getopt }, { "_getopt_long", sp_getopt_long }, { "_getopt_long_only", sp_getopt_long_only },
     { "_localeconv", sp_localeconv }, { "_localeconv_l", sp_localeconv_l },
     { "_MD5_Init", sp_MD5_Init }, { "_MD5_Update", sp_MD5_Update }, { "_MD5_Final", sp_MD5_Final },
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },

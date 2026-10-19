@@ -110,6 +110,8 @@ static inline int ocerz_host_in_guest_reservation(const void *haddr)
 }
 
 int ocerz_mem_init(uint64_t lo, uint64_t hi);
+void ocerz_mem_set_alloc_floor(uint64_t floor);
+int ocerz_addr_mapped(uint64_t gaddr);
 int ocerz_mem_init_identity(uint64_t size);
 extern int ocerz_wine_process;
 #define OCERZ_WINE_ARENA_BASE 0x7a0000000000ull

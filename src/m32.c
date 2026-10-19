@@ -163,6 +163,17 @@ int m32_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **
     ocerz_map_fixed(OCERZ_DYLDAPI_LO, OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO, PROT_NONE);
     ocerz_map_fixed(M32_HANDLE_LO, M32_HANDLE_HI - M32_HANDLE_LO, PROT_READ | PROT_WRITE);
     ocerz_map_fixed(M32_TOP_LO, (uint32_t)(M32_WINDOW - M32_TOP_LO), PROT_NONE);
+    /* Wine's preloader reserves the low 2 GB for Windows programs (from 0x110000, the builtin DLLs at 0x7a000000,
+     * its heaps to 0x82000000) before it loads Wine, and a program built for a fixed base needs its range free.
+     * What m32 maps for itself, its heap, stacks and libraries, goes above that (OCERZ_M32_WINE=1 or 0 decides
+     * for a preloader under another name). */
+    {
+        const char *w = getenv("OCERZ_M32_WINE"), *b = strrchr(path, '/');
+        size_t n = strlen(b ? b + 1 : path);
+        int wine = w ? atoi(w) != 0 : n >= 9 && !strcmp((b ? b + 1 : path) + n - 9, "preloader");
+        if (wine)
+            ocerz_mem_set_alloc_floor(M32_WINE_FLOOR);
+    }
     char real[1024];
     ocerz_dyld_set_main_path(realpath(path, real) ? real : path);   /* CoreFoundation's main bundle is the game's */
     ocerz_bridge_set_process_args(argc, argv);
