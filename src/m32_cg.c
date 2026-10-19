@@ -11,6 +11,10 @@
  *   private    two calls cairo declares itself, which no SDK does: CGContextSetCompositeOperation, whose Porter-Duff
  *              operators are CGContextSetBlendMode's from kCGBlendModeClear on, and CGContextSetCTM, a
  *              concatenation of the transform that takes the current one to the one asked for.
+ *   provider   CGDataProviderCreate, Mac OS X 10.4's provider over {getBytes, skipBytes, rewind, release} callbacks,
+ *              which 64-bit CoreGraphics dropped for CGDataProviderCreateSequential: SDL_image reads every image that
+ *              comes from an SDL_RWops through one (Sauerbraten's textures), and got NULL.  The host's sequential
+ *              provider calls the guest's functions, its bytes through guest memory.
  *   modes      CGDisplayBestModeForParameters and its refresh-rate sibling.  Today's CoreGraphics still has them, but
  *              they answer some large mode, not an exact match, even for a size CGDisplayAvailableModes lists (1280x800
  *              on a MacBook Air), and SDL 1.2 goes full screen only on an exact match: LinCity-NG, full screen by
@@ -34,6 +38,7 @@
 #define HOST(fn) static __typeof__(fn) *fn##_
 HOST(CGFunctionCreate); HOST(CGPatternCreate); HOST(CGPathApply); HOST(CGContextSetBlendMode);
 HOST(CGContextGetCTM); HOST(CGContextConcatCTM); HOST(CGAffineTransformConcat); HOST(CGAffineTransformInvert);
+HOST(CGDataProviderCreateSequential);
 
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static int g_ok;
@@ -43,7 +48,7 @@ static void load(void)
     int ok = cg != NULL;
 #define L(fn) ok &= (fn##_ = cg ? (__typeof__(fn) *)dlsym(cg, #fn) : NULL) != NULL
     L(CGFunctionCreate); L(CGPatternCreate); L(CGPathApply); L(CGContextSetBlendMode); L(CGContextGetCTM);
-    L(CGContextConcatCTM); L(CGAffineTransformConcat); L(CGAffineTransformInvert);
+    L(CGContextConcatCTM); L(CGAffineTransformConcat); L(CGAffineTransformInvert); L(CGDataProviderCreateSequential);
 #undef L
     g_ok = ok;
 }
@@ -226,6 +231,63 @@ static int sp_CGContextSetCTM(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(0);
 }
 
+/* ---- CGDataProviderCreate(void *info, const CGDataProviderCallbacks *callbacks): getBytes(info, buffer, count)
+ *      returns the bytes it read, skipBytes(info, count) and rewind(info) return nothing, release(info) ---- */
+
+typedef struct Provider { struct OcerzVM *vm; uint32_t info, get, skip, rewind, release; } Provider;
+
+static size_t provider_get(void *ctx, void *buffer, size_t count)
+{
+    Provider *p = ctx;
+    uint32_t want = count < (1u << 20) ? (uint32_t)count : 1u << 20, g = want ? m32_malloc(want) : 0;
+    if (!g)
+        return 0;
+    uint32_t n = m32_call(p->vm, p->get, (const uint32_t[]){ p->info, g, want }, 3, NULL, NULL);
+    if (n > want)
+        n = 0;   /* a failure the guest reported as (size_t)-1, or nonsense */
+    memcpy(buffer, m32_h(g), n);
+    m32_free(g);
+    return n;
+}
+
+static off_t provider_skip(void *ctx, off_t count)
+{
+    Provider *p = ctx;
+    if (p->skip && count > 0)
+        m32_call(p->vm, p->skip, (const uint32_t[]){ p->info, (uint32_t)count }, 2, NULL, NULL);
+    return count;
+}
+
+static void provider_rewind(void *ctx)
+{
+    Provider *p = ctx;
+    if (p->rewind)
+        m32_call(p->vm, p->rewind, &p->info, 1, NULL, NULL);
+}
+
+static void provider_release(void *ctx)
+{
+    Provider *p = ctx;
+    if (p->release)
+        m32_call(p->vm, p->release, &p->info, 1, NULL, NULL);
+    free(p);
+}
+
+static int sp_CGDataProviderCreate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t cbs = A(1);
+    Provider *p = ready() && cbs && m32_rd(cbs) ? calloc(1, sizeof *p) : NULL;
+    if (!p)
+        RET(0);
+    *p = (Provider){ vm, A(0), m32_rd(cbs), m32_rd(cbs + 4), m32_rd(cbs + 8), m32_rd(cbs + 12) };
+    static const CGDataProviderSequentialCallbacks hc = { 0, provider_get, provider_skip, provider_rewind,
+                                                          provider_release };
+    CGDataProviderRef r = CGDataProviderCreateSequential_(p, &hc);
+    if (!r)
+        free(p);
+    RET(m32_handle((void *)r));
+}
+
 /* ---- CGDisplayBestModeForParameters(display, bpp, width, height, boolean_t *exact) and the one with a refresh rate
  *      (a double) before exact; the dictionary calls are not in today's SDK headers ---- */
 
@@ -327,6 +389,7 @@ const M32SpecialEntry m32_cg_specials[] = {
     { "_CGFunctionCreate", sp_CGFunctionCreate }, { "_CGPatternCreate", sp_CGPatternCreate },
     { "_CGPathApply", sp_CGPathApply }, { "_CGContextSetCompositeOperation", sp_CGContextSetCompositeOperation },
     { "_CGContextSetCTM", sp_CGContextSetCTM },
+    { "_CGDataProviderCreate", sp_CGDataProviderCreate },
     { "_CGDisplayBestModeForParameters", sp_CGDisplayBestModeForParameters },
     { "_CGDisplayBestModeForParametersAndRefreshRate", sp_CGDisplayBestModeForParametersAndRefreshRate },
     { NULL, NULL }

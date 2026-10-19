@@ -1728,6 +1728,39 @@ static void test_objc1_strings(void)
 }
 
 
+/* CGDataProviderCreate's guest callbacks feed a host sequential provider (src/m32_cg.c), as SDL_image's images from
+ * an SDL_RWops are read: getBytes hands out "AAAABBBB" once, rewind starts it over */
+static void test_data_provider(void)
+{
+    enum { GET = CODE + 0x3900, NOP = CODE + 0x3940, REWIND = CODE + 0x3950, INFO = DATA + 0x4d00, CBS = DATA + 0x4d10 };
+    static const uint8_t get[] = { 0x8b, 0x44, 0x24, 0x04,                   /* mov eax, [esp+4] (info) */
+                                   0x83, 0x38, 0x00, 0x75, 0x1d,             /* cmp dword [eax], 0; jne done */
+                                   0xc7, 0x00, 0x01, 0x00, 0x00, 0x00,       /* mov dword [eax], 1 */
+                                   0x8b, 0x54, 0x24, 0x08,                   /* mov edx, [esp+8] (buffer) */
+                                   0xc7, 0x02, 0x41, 0x41, 0x41, 0x41,       /* mov dword [edx], "AAAA" */
+                                   0xc7, 0x42, 0x04, 0x42, 0x42, 0x42, 0x42, /* mov dword [edx+4], "BBBB" */
+                                   0xb8, 0x08, 0x00, 0x00, 0x00, 0xc3,       /* mov eax, 8; ret */
+                                   0x31, 0xc0, 0xc3 };                       /* done: xor eax, eax; ret */
+    static const uint8_t rewind[] = { 0x8b, 0x44, 0x24, 0x04, 0xc7, 0x00, 0, 0, 0, 0, 0xc3 };   /* [info] = 0 */
+    memcpy(m32_h(GET), get, sizeof get);
+    *(uint8_t *)m32_h(NOP) = 0xc3;
+    memcpy(m32_h(REWIND), rewind, sizeof rewind);
+    m32_wr(INFO, 0);
+    const uint32_t cbs[4] = { GET, NOP, REWIND, NOP };
+    memcpy(m32_h(CBS), cbs, sizeof cbs);
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    uint32_t provider = call("_CGDataProviderCreate", 2, (uint32_t[]){ INFO, CBS });
+    check("CGDataProviderCreate over guest callbacks", provider != 0);
+    const void *(*copy)(const void *) = (const void *(*)(const void *))dlsym(RTLD_DEFAULT, "CGDataProviderCopyData");
+    long (*length)(const void *) = (long (*)(const void *))dlsym(RTLD_DEFAULT, "CFDataGetLength");
+    const uint8_t *(*bytes)(const void *) = (const uint8_t *(*)(const void *))dlsym(RTLD_DEFAULT, "CFDataGetBytePtr");
+    if (!provider || !copy || !length || !bytes)
+        return;
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    const void *data = copy(m32_host(provider));
+    check("... the host reads the guest's bytes through it", data && length(data) == 8 && !memcmp(bytes(data), "AAAABBBB", 8));
+}
+
 /* CGDisplayBestModeForParameters chooses among the display's modes as Mac OS X did, where today's answers some large
  * mode, never exact (src/m32_cg.c) */
 static void test_display_modes(void)
@@ -2079,6 +2112,7 @@ int main(int argc, char **argv)
         test_objc1_strings();
         test_fstreams();
         test_display_modes();
+        test_data_provider();
         printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
         return g_failures != 0;
     }
