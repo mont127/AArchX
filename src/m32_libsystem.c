@@ -698,17 +698,39 @@ static int sp_fcntl(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 
 /* ---- memory mappings: inside the window, never the host's own address space ----
- * Host pages are 16 KB and i386 ones 4 KB: lengths round up to 16 KB, and mprotect/madvise are accepted without
- * effect (ponytail: a guard page an allocator protects stays writable; nothing we run relies on the fault). */
+ * Host pages are 16 KB and i386 ones 4 KB: lengths round up to 16 KB.  An mprotect that asks for write access gets
+ * it for the host pages it touches (an image's __TEXT, which m32 maps read and execute, is one Wine writes after
+ * unprotecting it); one that takes access away, and madvise, are accepted without effect (ponytail: a guard page an
+ * allocator protects stays writable; nothing we run relies on the fault). */
 #define M32_MAP_FAILED 0xffffffffu
 static uint32_t map_len(uint32_t len) { return (len + 0x3fffu) & ~0x3fffu; }
-/* [a, b) of the 16 KB host page at page, for a fixed anonymous mapping: zeroed, the page mapped if it was not */
+/* [a, b) of the 16 KB host page at page, for a fixed anonymous mapping: zeroed, the page mapped if it was not and
+ * made writable if it was not (Wine maps a builtin DLL's header page over the start of its read-only image) */
 static int map_part(uint32_t page, uint32_t a, uint32_t b)
 {
     if (!ocerz_addr_readable(page))
         return ocerz_map_fixed(page, 0x4000, PROT_READ | PROT_WRITE) != OCERZ_OK;
+    if (ocerz_protect(page, 0x4000, PROT_READ | PROT_WRITE) != OCERZ_OK)
+        return 1;
     memset(m32_h(a), 0, b - a);
     return 0;
+}
+
+static int sp_mprotect(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t g = m32_arg(cpu, 0), len = m32_arg(cpu, 1);
+    int prot = (int)m32_arg(cpu, 2);
+    if ((g & 0xfff) || (uint64_t)g + len > M32_HANDLE_LO) {
+        errno = EINVAL;
+        RETV(0xffffffffu);
+    }
+    if ((prot & PROT_WRITE) && len) {
+        uint32_t lo = g & ~0x3fffu, hi = (uint32_t)(((uint64_t)g + len + 0x3fff) & ~0x3fffull);
+        for (uint32_t p = lo; p < hi; p += 0x4000)
+            if (ocerz_addr_readable(p))
+                ocerz_protect(p, 0x4000, PROT_READ | PROT_WRITE);
+    }
+    RETV(0);
 }
 
 /* mmap from i386 code, the bridged call's and a raw system call's (src/m32_selfload.c): the guest address, or
@@ -1130,6 +1152,20 @@ int m32_sigreturn(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+static int sp_getpagesize(struct OcerzVM *vm, OcerzCPU *cpu) { RETV(m32_page_size()); }
+static int sp_sysconf(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int name = (int)m32_arg(cpu, 0);
+    RETV(name == _SC_PAGESIZE ? (long)m32_page_size() : sysconf(name));
+}
+/* host_page_size(host, vm_size_t *size): KERN_SUCCESS */
+static int sp_host_page_size(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (m32_arg(cpu, 1))
+        m32_wr(m32_arg(cpu, 1), m32_page_size());
+    RETV(0);
+}
+
 static int sp_stack_chk_fail(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     fprintf(stderr, "ocerz: m32: stack protector tripped (called from %#x)\n", m32_rd((uint32_t)cpu->gpr[OCERZ_RSP]));
@@ -1153,11 +1189,39 @@ static uint32_t rune_locale(void)
     return g;
 }
 
+/* The page size an i386 program is told: 4 KB, as on the Intel Macs it was built for, where the host's are 16 KB.
+ * m32's mmap already maps at 4 KB (a fixed range clears just the part of a host page it covers), its mprotect leaves
+ * the window as it is and a partial munmap keeps the host page, so a 4 KB answer costs nothing; and a program that
+ * lays out memory by it expects 4 KB.  Wine does: told 16 KB, wineserver flagged every PE DLL with 4 KB sections
+ * as one to map flat and ntdll refused it (STATUS_INVALID_IMAGE_FORMAT, at kernelbase.dll).  getpagesize,
+ * sysconf(_SC_PAGESIZE), host_page_size and vm_page_size, vm_page_mask, vm_page_shift and vm_kernel_page_size agree,
+ * and valloc aligns to it.  OCERZ_M32_HOST_PAGES=1 tells the host's. */
+uint32_t m32_page_size(void)
+{
+    static uint32_t size;
+    if (!size)
+        size = getenv("OCERZ_M32_HOST_PAGES") ? (uint32_t)getpagesize() : 4096;
+    return size;
+}
+
+static uint32_t page_var(uint32_t v)
+{
+    uint32_t g = m32_static_alloc(4, 4);
+    m32_wr(g, v);
+    return g;
+}
+
 uint32_t m32_special_data(const char *symbol, void *host_var)
 {
     (void)host_var;
     if (!strcmp(symbol, "__DefaultRuneLocale"))
         return rune_locale();
+    if (!strcmp(symbol, "_vm_page_size") || !strcmp(symbol, "_vm_kernel_page_size"))
+        return page_var(m32_page_size());
+    if (!strcmp(symbol, "_vm_page_mask"))
+        return page_var(m32_page_size() - 1);
+    if (!strcmp(symbol, "_vm_page_shift"))
+        return page_var((uint32_t)__builtin_ctz(m32_page_size()));
     /* object constants CoreFoundation exports but only Foundation's headers declare (so the database has no
      * record): the guest reads the object */
     if (host_var && (!strcmp(symbol, "_NSDefaultRunLoopMode") || !strcmp(symbol, "_NSRunLoopCommonModes"))) {
@@ -2017,7 +2081,9 @@ static const M32SpecialEntry g_specials[] = {
     { "_open", sp_open }, { "_openat", sp_openat }, { "_fcntl", sp_fcntl },
     { "_NSAllocateMemoryPages", sp_NSAllocateMemoryPages }, { "_NSDeallocateMemoryPages", sp_NSDeallocateMemoryPages },
     { "_NSCopyMemoryPages", sp_NSCopyMemoryPages },
-    { "_mmap", sp_mmap }, { "_munmap", sp_munmap }, { "_mprotect", sp_ok0 }, { "_madvise", sp_ok0 },
+    { "_mmap", sp_mmap }, { "_munmap", sp_munmap }, { "_mprotect", sp_mprotect }, { "_madvise", sp_ok0 },
+    { "_getpagesize", sp_getpagesize }, { "_sysconf", sp_sysconf }, { "_host_page_size", sp_host_page_size },
+    { "__host_page_size", sp_host_page_size },
     { "_msync", sp_ok0 }, { "_vm_allocate", sp_vm_allocate }, { "_vm_deallocate", sp_vm_deallocate },
     { "_sbrk", sp_sbrk },
     { "_setjmp", sp_setjmp }, { "__setjmp", sp_setjmp }, { "_sigsetjmp", sp_setjmp },

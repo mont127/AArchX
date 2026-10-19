@@ -662,14 +662,14 @@ static int to_zone(OcerzCPU *cpu, uint32_t off)
 
 static int sp_malloc(struct OcerzVM *vm, OcerzCPU *cpu) { if (g_gzone) return to_zone(cpu, 12); RET(m32_malloc(m32_arg(cpu, 0))); }
 static int sp_calloc(struct OcerzVM *vm, OcerzCPU *cpu) { if (g_gzone) return to_zone(cpu, 16); RET(m32_calloc(m32_arg(cpu, 0), m32_arg(cpu, 1))); }
-/* valloc: aligned to the page size the guest is told (getpagesize and sysconf cross, and answer the host's 16 KB):
- * GLib's slice allocator takes a valloc'd page and asserts it is aligned to sysconf(_SC_PAGESIZE), and with 4 KB
- * alignment Wesnoth stopped there ("GSlice: assertion failed: aligned_memory == (gpointer) addr") */
+/* valloc: aligned to the page size the guest is told (m32_page_size): GLib's slice allocator takes a valloc'd page and
+ * asserts it is aligned to sysconf(_SC_PAGESIZE), and when the two disagreed Wesnoth stopped there ("GSlice:
+ * assertion failed: aligned_memory == (gpointer) addr") */
 static int sp_valloc(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     if (g_gzone)
         return to_zone(cpu, 20);
-    RET(m32_memalign((uint32_t)getpagesize(), m32_arg(cpu, 0)));
+    RET(m32_memalign(m32_page_size(), m32_arg(cpu, 0)));
 }
 static int sp_free(struct OcerzVM *vm, OcerzCPU *cpu)
 {

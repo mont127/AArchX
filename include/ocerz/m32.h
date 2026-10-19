@@ -52,6 +52,7 @@ int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu);
 int m32_raw_syscall(struct OcerzVM *vm, OcerzCPU *cpu, int sysenter);   /* sysenter, or int 0x80 */
 int m32_dyld_entry(struct OcerzVM *vm, OcerzCPU *cpu);                   /* the M32_ID_DYLD trap */
 uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint64_t off);   /* src/m32_libsystem.c */
+uint32_t m32_page_size(void);   /* the page size an i386 program is told: 4 KB (src/m32_libsystem.c) */
 void m32_selfload_begin(const char *path);                                 /* m32_run, before the program starts */
 void *m32_carbon_wrap(const char *symbol, void *fn);   /* src/m32_carbon.c: the host function an export calls */
 M32Special m32_carbon_special(const char *symbol);      /* src/m32_carbon.c: the UPP calls, by name pattern */

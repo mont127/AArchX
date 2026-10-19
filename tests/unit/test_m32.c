@@ -1243,9 +1243,16 @@ static void test_game_libs(void)
             fclose(f);
         unlink(path);
     }
-    /* valloc is aligned to the page size the guest is told */
+    /* the guest is told 4 KB pages, as on the Intel Macs, by every call that tells it, and valloc aligns to them */
+    check("getpagesize and sysconf(_SC_PAGESIZE) say 4 KB", call("_getpagesize", 0, NULL) == 4096 &&
+          call("_sysconf", 1, (uint32_t[]){ _SC_PAGESIZE }) == 4096 && m32_page_size() == 4096);
+    m32_wr(DATA + 0x4f00, 0);
+    check("... as host_page_size does", call("_host_page_size", 2, (uint32_t[]){ 0, DATA + 0x4f00 }) == 0 &&
+          m32_rd(DATA + 0x4f00) == 4096);
+    check("... and vm_page_size", m32_rd(m32_special_data("_vm_page_size", NULL)) == 4096 &&
+          m32_rd(m32_special_data("_vm_page_mask", NULL)) == 4095 && m32_rd(m32_special_data("_vm_page_shift", NULL)) == 12);
     uint32_t v = call("_valloc", 1, (uint32_t[]){ 100 });
-    check("valloc is page aligned", v && (v % (uint32_t)getpagesize()) == 0);
+    check("valloc is page aligned", v && (v % m32_page_size()) == 0);
     /* localeconv: an i386 struct lconv, ten string pointers then the chars at 40 */
     uint32_t lc = call("_localeconv", 0, NULL);
     check("localeconv's decimal point", lc && m32_rd(lc) && !strcmp((const char *)m32_h(m32_rd(lc)), localeconv()->decimal_point));
@@ -1852,6 +1859,23 @@ static void test_signals(void)
     check("... and SA_RESETHAND puts SIG_DFL back", m32_rd(OLD) == 0);
 }
 
+/* iret in 32-bit code to its own privilege level pops EIP, CS and EFLAGS and leaves ESP just above them, as Wine's i386
+ * set_full_cpu_context expects (a zero CS keeps the current selector) */
+static void test_iret32(void)
+{
+    enum { IRET = CODE + 0x3b80 };
+    uint8_t c[] = { 0x89, 0xe1,                         /* mov ecx, esp */
+                    0x9c, 0x6a, 0x00,                   /* pushfd; push 0 (CS: keep) */
+                    0x68, 0, 0, 0, 0,                   /* push target */
+                    0xcf,                               /* iretd */
+                    0x89, 0xe0, 0x29, 0xc8, 0xc3 };     /* target: mov eax, esp; sub eax, ecx; ret */
+    uint32_t target = IRET + 11;
+    memcpy(c + 6, &target, 4);
+    memcpy(m32_h(IRET), c, sizeof c);
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    check("iretd in 32-bit code pops three words, not five", m32_call(&g_vm, IRET, NULL, 0, NULL, NULL) == 0);
+}
+
 /* A fault in i386 code reaches the guest's own handler in i386's frame, and the context the handler changes is the one
  * the code goes on with (src/m32_libsystem.c), end to end through ocerz's host fault handler: a load from page zero
  * (SIGSEGV) and a division by zero (SIGFPE), each skipped by the handler, which also sets eax.  Last, since it installs
@@ -2195,6 +2219,7 @@ int main(int argc, char **argv)
     test_gl_buffers();
     test_unix_calls();
     test_signals();
+    test_iret32();
     test_fault_handlers();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;

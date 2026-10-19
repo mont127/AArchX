@@ -1001,12 +1001,19 @@ static int op_branch(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
 
         uint32_t cs = (uint16_t)ocerz_ld(sp + (uint64_t)sz, sz);
         uint64_t flags = ocerz_ld(sp + (uint64_t)sz * 2, sz);
-        uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
-        uint32_t ss = (uint16_t)ocerz_ld(sp + (uint64_t)sz * 4, sz);
         cpu->rflags = flags | 0x2;
-        cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(newsp, m32);
-        if (ss)
-            cpu->seg_sel[OCERZ_SREG_SS] = (uint16_t)ss;
+        if (m32) {
+            /* 32-bit code returning to its own privilege level, which user code always does, pops EIP, CS and
+             * EFLAGS and no more; only 64-bit mode (wow64cpu's iretq) pops SS:RSP as well.  Wine's i386
+             * set_full_cpu_context stacks just those three under the new ESP, and five pops left ESP 0. */
+            cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(sp + (uint64_t)sz * 3, m32);
+        } else {
+            uint64_t newsp = ocerz_ld(sp + (uint64_t)sz * 3, sz);
+            uint32_t ss = (uint16_t)ocerz_ld(sp + (uint64_t)sz * 4, sz);
+            cpu->gpr[OCERZ_RSP] = ocerz_stack_wrap(newsp, m32);
+            if (ss)
+                cpu->seg_sel[OCERZ_SREG_SS] = (uint16_t)ss;
+        }
         if (!cs) {
             cpu->rip = m32 ? (uint32_t)rip : rip;
             return OCERZ_STEP_OK;
