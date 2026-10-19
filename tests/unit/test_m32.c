@@ -1393,6 +1393,15 @@ static void test_image_order(void)
     check("dlopen of a leaf name finds the system library", z != 0 &&
           call("_dlsym", 2, (uint32_t[]){ z, DATA + 0x4520 }) != 0);
     check("... and not one that is nowhere", call("_dlopen", 2, (uint32_t[]){ DATA + 0x4540, 9 }) == 0);
+    /* a library missing where its path says falls back to its leaf name as dyld does (LinCity-NG): the system's
+     * libz, the runtime's libstdc++ */
+    char fb[PATH_MAX], want_cxx[PATH_MAX];
+    check("a missing @executable_path library falls back to the system's",
+          m32_resolve_path(NULL, "@executable_path/../Frameworks/libz.1.dylib", fb, sizeof fb) == 0 && fb[0] == 0);
+    if (realpath("runtime/guest32/usr/lib/libstdc++.6.dylib", want_cxx))
+        check("... and libstdc++ to the runtime's",
+              m32_resolve_path(NULL, "@executable_path/../Frameworks/libstdc++.6.dylib", fb, sizeof fb) == 0 &&
+              !strcmp(fb, want_cxx));
     /* a libgcc_s a program bundles answers _Unwind_* with m32's unwinder too, as the runtime's does (Pingus) */
     static M32Image gcc, other;
     snprintf(gcc.path, sizeof gcc.path, "/Applications/Game.app/Contents/libs/libgcc_s.1.dylib");
@@ -1719,6 +1728,46 @@ static void test_objc1_strings(void)
 }
 
 
+/* CGDisplayBestModeForParameters chooses among the display's modes as Mac OS X did, where today's answers some large
+ * mode, never exact (src/m32_cg.c) */
+static void test_display_modes(void)
+{
+    void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY);
+    uint32_t (*main_display)(void) = cg ? (uint32_t (*)(void))dlsym(cg, "CGMainDisplayID") : NULL;
+    const void *(*current)(uint32_t) = cg ? (const void *(*)(uint32_t))dlsym(cg, "CGDisplayCurrentMode") : NULL;
+    const void *(*get)(const void *, const void *) = (const void *(*)(const void *, const void *))dlsym(RTLD_DEFAULT, "CFDictionaryGetValue");
+    int (*number)(const void *, long, void *) = (int (*)(const void *, long, void *))dlsym(RTLD_DEFAULT, "CFNumberGetValue");
+    const void *(*string)(const void *, const char *, uint32_t) =
+        (const void *(*)(const void *, const char *, uint32_t))dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+    if (!main_display || !current || !get || !number || !string)
+        return;
+    uint32_t display = main_display();
+    const void *mode = current(display);
+    if (!mode)
+        return;   /* no display */
+    const void *kw = string(NULL, "Width", 0x600), *kh = string(NULL, "Height", 0x600), *kb = string(NULL, "BitsPerPixel", 0x600);
+    long w = 0, h = 0, b = 0;
+    number(get(mode, kw), 9 /* kCFNumberLongType */, &w);
+    number(get(mode, kh), 9, &h);
+    number(get(mode, kb), 9, &b);
+    uint32_t exact = DATA + 0x4c00;
+    m32_wr(exact, 7);
+    uint32_t got = call("_CGDisplayBestModeForParameters", 5, (uint32_t[]){ display, (uint32_t)b, (uint32_t)w, (uint32_t)h, exact });
+    long gw = 0, gh = 0;
+    if (got) {
+        number(get(m32_host(got), kw), 9, &gw);
+        number(get(m32_host(got), kh), 9, &gh);
+    }
+    check("the current mode's size and depth are an exact match", got && m32_rd(exact) == 1 && gw == w && gh == h);
+    got = call("_CGDisplayBestModeForParameters", 5, (uint32_t[]){ display, (uint32_t)b, 1, 1, exact });
+    gw = 0;
+    if (got)
+        number(get(m32_host(got), kw), 9, &gw);
+    check("... a smaller size answers a mode at least that large, not exact", got && m32_rd(exact) == 0 && gw >= 1);
+    got = call("_CGDisplayBestModeForParameters", 5, (uint32_t[]){ display, (uint32_t)b, 100000, 100000, exact });
+    check("... and a size no mode has, the current mode", got && m32_host(got) == mode && m32_rd(exact) == 0);
+}
+
 /* an asynchronous signal's guest handler runs at the guest's next crossing (src/m32_libsystem.c): signal(), and
  * sigaction() with SA_SIGINFO and SA_RESETHAND */
 static void test_signals(void)
@@ -2029,6 +2078,7 @@ int main(int argc, char **argv)
         test_objc_pairs();
         test_objc1_strings();
         test_fstreams();
+        test_display_modes();
         printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
         return g_failures != 0;
     }

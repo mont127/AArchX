@@ -11,6 +11,11 @@
  *   private    two calls cairo declares itself, which no SDK does: CGContextSetCompositeOperation, whose Porter-Duff
  *              operators are CGContextSetBlendMode's from kCGBlendModeClear on, and CGContextSetCTM, a
  *              concatenation of the transform that takes the current one to the one asked for.
+ *   modes      CGDisplayBestModeForParameters and its refresh-rate sibling.  Today's CoreGraphics still has them, but
+ *              they answer some large mode, not an exact match, even for a size CGDisplayAvailableModes lists (1280x800
+ *              on a MacBook Air), and SDL 1.2 goes full screen only on an exact match: LinCity-NG, full screen by
+ *              default, gave up.  m32 chooses among the available modes as Mac OS X did: that size and depth (exact),
+ *              else the smallest at least that large and deep, the same depth first, else the current mode.
  */
 #include <CoreGraphics/CoreGraphics.h>
 #include <dlfcn.h>
@@ -221,9 +226,108 @@ static int sp_CGContextSetCTM(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(0);
 }
 
+/* ---- CGDisplayBestModeForParameters(display, bpp, width, height, boolean_t *exact) and the one with a refresh rate
+ *      (a double) before exact; the dictionary calls are not in today's SDK headers ---- */
+
+static struct {
+    CFArrayRef (*available)(uint32_t);
+    CFDictionaryRef (*current)(uint32_t);
+    CFIndex (*count)(CFArrayRef);
+    const void *(*at)(CFArrayRef, CFIndex);
+    const void *(*get)(CFDictionaryRef, const void *);
+    Boolean (*number)(CFNumberRef, CFNumberType, void *);
+    CFStringRef (*string)(CFAllocatorRef, const char *, CFStringEncoding);
+} g_mode;
+
+static void load_modes(void)
+{
+    void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY | RTLD_LOCAL);
+    if (!cg)
+        return;
+    g_mode.available = (CFArrayRef (*)(uint32_t))dlsym(cg, "CGDisplayAvailableModes");
+    g_mode.current = (CFDictionaryRef (*)(uint32_t))dlsym(cg, "CGDisplayCurrentMode");
+    g_mode.count = (CFIndex (*)(CFArrayRef))dlsym(RTLD_DEFAULT, "CFArrayGetCount");
+    g_mode.at = (const void *(*)(CFArrayRef, CFIndex))dlsym(RTLD_DEFAULT, "CFArrayGetValueAtIndex");
+    g_mode.get = (const void *(*)(CFDictionaryRef, const void *))dlsym(RTLD_DEFAULT, "CFDictionaryGetValue");
+    g_mode.number = (Boolean (*)(CFNumberRef, CFNumberType, void *))dlsym(RTLD_DEFAULT, "CFNumberGetValue");
+    g_mode.string = (CFStringRef (*)(CFAllocatorRef, const char *, CFStringEncoding))dlsym(RTLD_DEFAULT,
+                                                                                           "CFStringCreateWithCString");
+}
+
+static long mode_value(CFDictionaryRef mode, CFStringRef key)
+{
+    CFNumberRef n = key ? (CFNumberRef)g_mode.get(mode, key) : NULL;
+    long v = -1;
+    if (n)
+        g_mode.number(n, kCFNumberLongType, &v);
+    return v;
+}
+
+static CFDictionaryRef best_mode(uint32_t display, long bpp, long w, long h, double rate, int *exact)
+{
+    static CFStringRef width, height, depth, refresh;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, load_modes);
+    *exact = 0;
+    if (!g_mode.available || !g_mode.count || !g_mode.at || !g_mode.get || !g_mode.number || !g_mode.string)
+        return NULL;
+    if (!width) {
+        width = g_mode.string(NULL, "Width", kCFStringEncodingASCII);
+        height = g_mode.string(NULL, "Height", kCFStringEncodingASCII);
+        depth = g_mode.string(NULL, "BitsPerPixel", kCFStringEncodingASCII);
+        refresh = g_mode.string(NULL, "RefreshRate", kCFStringEncodingASCII);
+    }
+    CFArrayRef modes = g_mode.available(display);
+    CFDictionaryRef best = NULL;
+    long best_score = 0;
+    for (CFIndex i = 0; modes && i < g_mode.count(modes); i++) {
+        CFDictionaryRef m = (CFDictionaryRef)g_mode.at(modes, i);
+        long mw = mode_value(m, width), mh = mode_value(m, height), mb = mode_value(m, depth);
+        long mr = mode_value(m, refresh);
+        if (mw < w || mh < h || mb < bpp)
+            continue;
+        int rate_off = rate > 0 && mr > 0 && mr != (long)(rate + 0.5);
+        if (mw == w && mh == h && mb == bpp && !rate_off) {
+            *exact = 1;
+            return m;
+        }
+        long score = (mb != bpp) * (1l << 40) + rate_off * (1l << 39) + mw * mh;
+        if (!best || score < best_score) {
+            best = m;
+            best_score = score;
+        }
+    }
+    return best ? best : g_mode.current ? g_mode.current(display) : NULL;
+}
+
+static int sp_CGDisplayBestModeForParameters(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int exact;
+    CFDictionaryRef m = best_mode(A(0), A(1), A(2), A(3), 0, &exact);
+    if (A(4))
+        m32_wr(A(4), (uint32_t)exact);
+    RET(m32_handle((void *)m));
+}
+
+static int sp_CGDisplayBestModeForParametersAndRefreshRate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    int exact;
+    double rate;
+    uint64_t bits = A(4) | (uint64_t)A(5) << 32;
+    memcpy(&rate, &bits, 8);
+    CFDictionaryRef m = best_mode(A(0), A(1), A(2), A(3), rate, &exact);
+    if (A(6))
+        m32_wr(A(6), (uint32_t)exact);
+    RET(m32_handle((void *)m));
+}
+
 const M32SpecialEntry m32_cg_specials[] = {
     { "_CGFunctionCreate", sp_CGFunctionCreate }, { "_CGPatternCreate", sp_CGPatternCreate },
     { "_CGPathApply", sp_CGPathApply }, { "_CGContextSetCompositeOperation", sp_CGContextSetCompositeOperation },
     { "_CGContextSetCTM", sp_CGContextSetCTM },
+    { "_CGDisplayBestModeForParameters", sp_CGDisplayBestModeForParameters },
+    { "_CGDisplayBestModeForParametersAndRefreshRate", sp_CGDisplayBestModeForParametersAndRefreshRate },
     { NULL, NULL }
 };

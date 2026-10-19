@@ -696,7 +696,10 @@ static void rpath_dir(const M32Image *img, const char *rp, char *out, size_t out
 
 /* A leaf name alone, as DarkPlaces asks for zlib ("libz.dylib"), is looked for as dyld looks: in
  * DYLD_FALLBACK_LIBRARY_PATH, by default ~/lib, /usr/local/lib and /usr/lib.  An i386 image there is the guest's; one
- * in /usr/lib is a system library, bridged, if the host has it.  Nexuiz found no zlib and read none of its data. */
+ * in /usr/lib is our runtime's (runtime/guest32) or else a system library, bridged, if the host has it.  Nexuiz found
+ * no zlib and read none of its data.  So is the leaf of a library that is not where its path says, as dyld falls
+ * back: LinCity-NG's Mac build links libiconv, libz, libstdc++, libgcc_s and even libSystem from its own Frameworks,
+ * which it does not carry, and ran on the ones in /usr/lib. */
 static int fallback_path(const char *name, char *out, size_t outlen)
 {
     char def[1100], cand[2048];
@@ -708,6 +711,11 @@ static int fallback_path(const char *name, char *out, size_t outlen)
             continue;
         snprintf(cand, sizeof cand, "%.*s/%s", (int)n, d, name);
         if (!strncmp(cand, "/usr/lib/", 9)) {
+            char ours[3200];
+            guest32_root();
+            snprintf(ours, sizeof ours, "%s%s", g_guest32_root, cand);
+            if (g_guest32_root[0] && file_exists(ours) && realpath(ours, out))
+                return 0;
             void *h = dlopen(cand, RTLD_LAZY | RTLD_LOCAL);
             if (h) {
                 out[0] = 0;   /* a system library */
@@ -781,7 +789,7 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
         return 0;
     if (!strchr(name, '/') && name[0] != '@')
         return fallback_path(name, out, outlen);
-    return -1;
+    return leaf && leaf[1] ? fallback_path(leaf + 1, out, outlen) : -1;
 }
 
 static M32Image *find_loaded(const char *path)

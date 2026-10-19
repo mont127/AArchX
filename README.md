@@ -119,7 +119,7 @@ make apis
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
 | Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window |
 | Batman: Arkham Asylum, a 32-bit Mac game | plays through m32 at about 61 fps, launched from Steam and signed in to it (October 2026) |
-| Other 32-bit Mac games | Left 4 Dead 2 and Call of Duty: Modern Warfare 3 from Steam; AssaultCube, SuperTuxKart, Neverball, Battle for Wesnoth, Teeworlds, Nexuiz, ScummVM, DOSBox, Warzone 2100 and Armagetron Advanced (October 2026) |
+| Other 32-bit Mac games | Left 4 Dead 2 and Call of Duty: Modern Warfare 3 from Steam; AssaultCube, SuperTuxKart, Neverball, Battle for Wesnoth, Teeworlds, Nexuiz, ScummVM, DOSBox, Warzone 2100, Armagetron Advanced, Chocolate Doom, Enigma, Pingus and LinCity-NG (October 2026) |
 | 32-bit Mac apps | Adium, VLC 1.1.12 and Kega Fusion open their windows (October 2026) |
 | Older Intel apps, native mode | Transmission, Sequel Pro, HandBrake and VLC 2.2 open their windows (October 2026) |
 | Counter-Strike 2, under Wine with D3DMetal | reaches its window, then stops on an error Rosetta does not hit |
