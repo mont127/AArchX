@@ -1852,6 +1852,64 @@ static void test_signals(void)
     check("... and SA_RESETHAND puts SIG_DFL back", m32_rd(OLD) == 0);
 }
 
+/* A fault in i386 code reaches the guest's own handler in i386's frame, and the context the handler changes is the one
+ * the code goes on with (src/m32_libsystem.c), end to end through ocerz's host fault handler: a load from page zero
+ * (SIGSEGV) and a division by zero (SIGFPE), each skipped by the handler, which also sets eax.  Last, since it installs
+ * the host handlers. */
+static void test_fault_handlers(void)
+{
+    enum { HANDLER = CODE + 0x3a00, LOADER = CODE + 0x3a80, DIVIDER = CODE + 0x3ac0,
+           SEEN = DATA + 0x4e00, ADDR = DATA + 0x4e04, AFTER = DATA + 0x4e08, EBX = DATA + 0x4e0c, SKIP = DATA + 0x4e10,
+           ACT = DATA + 0x4e20 };
+    uint8_t h[] = { 0x8b, 0x44, 0x24, 0x04, 0xa3, 0, 0, 0, 0,          /* mov eax, [esp+4]; mov [SEEN], eax */
+                    0x8b, 0x44, 0x24, 0x08, 0x8b, 0x40, 0x18,          /* mov eax, [esp+8]; mov eax, [eax+24] (si_addr) */
+                    0xa3, 0, 0, 0, 0,                                  /* mov [ADDR], eax */
+                    0x8b, 0x44, 0x24, 0x0c, 0x8b, 0x40, 0x1c,          /* mov eax, [esp+12]; mov eax, [eax+28] (mcontext) */
+                    0x8b, 0x0d, 0, 0, 0, 0, 0x01, 0x48, 0x34,          /* mov ecx, [SKIP]; add [eax+52], ecx (ss.eip) */
+                    0xc7, 0x40, 0x0c, 0x77, 0, 0, 0,                   /* mov dword [eax+12], 0x77 (ss.eax) */
+                    0xc3 };
+    uint32_t seen = SEEN, addr = ADDR, skip = SKIP, after = AFTER, ebx = EBX;
+    memcpy(h + 5, &seen, 4);
+    memcpy(h + 17, &addr, 4);
+    memcpy(h + 30, &skip, 4);
+    memcpy(m32_h(HANDLER), h, sizeof h);
+    uint8_t load[] = { 0xbb, 0x11, 0x11, 0x11, 0x11,                   /* mov ebx, 0x11111111 */
+                       0xa1, 0x10, 0, 0, 0,                            /* mov eax, [0x10]: faults */
+                       0xc7, 0x05, 0, 0, 0, 0, 0x22, 0x22, 0x22, 0x22, /* mov dword [AFTER], 0x22222222 */
+                       0x89, 0x1d, 0, 0, 0, 0, 0xc3 };                 /* mov [EBX], ebx; ret */
+    memcpy(load + 12, &after, 4);
+    memcpy(load + 22, &ebx, 4);
+    memcpy(m32_h(LOADER), load, sizeof load);
+    static const uint8_t divide[] = { 0x31, 0xd2, 0xb8, 5, 0, 0, 0, 0x31, 0xc9,   /* xor edx,edx; mov eax,5; xor ecx,ecx */
+                                      0xf7, 0xf1, 0xc3 };                        /* div ecx: faults; ret */
+    memcpy(m32_h(DIVIDER), divide, sizeof divide);
+
+    ocerz_vm_install_handlers(&g_vm);
+    int was_active = m32_active;
+    m32_active = 1;   /* the handler's return is a trap, which reaches m32 as under m32_run */
+    m32_wr(ACT, HANDLER);
+    m32_wr(ACT + 4, 0);
+    m32_wr(ACT + 8, SA_SIGINFO);
+    call("_sigaction", 3, (uint32_t[]){ SIGSEGV, ACT, 0 });
+    call("_sigaction", 3, (uint32_t[]){ SIGFPE, ACT, 0 });
+
+    m32_wr(SKIP, 5);
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    uint32_t eax = m32_call(&g_vm, LOADER, NULL, 0, NULL, NULL);
+    check("a load from page zero reaches the guest's SIGSEGV handler with its address",
+          m32_rd(SEEN) == SIGSEGV && m32_rd(ADDR) == 0x10);
+    check("... and goes on after it with the context the handler changed",
+          eax == 0x77 && m32_rd(AFTER) == 0x22222222 && m32_rd(EBX) == 0x11111111);
+
+    m32_wr(SEEN, 0);
+    m32_wr(SKIP, 2);
+    cpu()->gpr[OCERZ_RSP] = STACK;
+    eax = m32_call(&g_vm, DIVIDER, NULL, 0, NULL, NULL);
+    check("a division by zero reaches the guest's SIGFPE handler, and goes on", m32_rd(SEEN) == SIGFPE && eax == 0x77);
+    call("_sigaction", 3, (uint32_t[]){ SIGSEGV, 0, 0 });
+    m32_active = was_active;
+}
+
 /* Apple's file streams on the runtime's GCC libstdc++ (src/m32_fstream.c): an ofstream and an fstream at Apple's
  * offsets, opened, written through the library's operator<< (whose sentry finds the basic_ios by the vtable, where
  * Armagetron Advanced's config save went wrong), closed and destroyed through the vtable */
@@ -2137,6 +2195,7 @@ int main(int argc, char **argv)
     test_gl_buffers();
     test_unix_calls();
     test_signals();
+    test_fault_handlers();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;
 }

@@ -386,6 +386,7 @@
  * SIGUSR1 the server had sent and the client had lost (see vm.c).
  */
 #include "ocerz/syscall.h"
+#include "ocerz/m32.h"
 #include "ocerz/cache.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
@@ -4397,6 +4398,8 @@ __thread int g_ocerz_deliver_src;
 int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_code,
                          uint32_t err)
 {
+    if (cpu->mode32 && m32_active)   /* an i386 program's handler, its frame i386's (m32_libsystem.c) */
+        return m32_signal_fault(cpu, sig, fault_addr, si_code, err);
     if (!guest_sig_catchable(sig))
         return 0;
     GuestSigact *sa = &guest_sigact[sig];

@@ -31,12 +31,15 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 
+#include "ocerz/decode.h"
+#include "ocerz/flags.h"
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
 #include "ocerz/m32_objc.h"
 #include "ocerz/syscall.h"
 #include "ocerz/types.h"
 #include "ocerz/vm.h"
+#include "ocerz/x87.h"
 
 /* OCERZ_M32LOG=calls or exit: who ended the process (games quit quietly when a check fails) */
 static void log_exit(OcerzCPU *cpu, const char *how)
@@ -874,11 +877,19 @@ static int sp_longjmp(struct OcerzVM *vm, OcerzCPU *cpu)
  * m32_trap calls the guest's handler there as a nested call, before the call the guest was making.  A call blocked in
  * the host (nanosleep, pause, read) is interrupted first, as on a Mac.  SDL 1.2 turns SIGINT and SIGTERM into its
  * quit event this way, so a game asked to stop saves its settings and quits.  The handler gets (sig) or, with
- * SA_SIGINFO, (sig, siginfo, ucontext) with only si_signo filled in.  Faults (SIGSEGV, SIGBUS, ...) have no i386
- * signal frames: their handlers are recorded, not run.  OCERZ_NO_M32_SIGNALS=1 records every handler only. */
+ * SA_SIGINFO, (sig, siginfo, ucontext) with only si_signo filled in.  A fault's handler (SIGSEGV, SIGBUS, SIGFPE,
+ * SIGILL, SIGTRAP) runs at the fault instead (below).  OCERZ_NO_M32_SIGNALS=1 records the asynchronous handlers
+ * only; OCERZ_NO_M32_FAULT_HANDLERS=1 leaves a fault to ocerz's crash report, as a program's crash handler (SDL's
+ * parachute) would otherwise take it. */
 static uint32_t g_sig_handler[NSIG], g_sig_flags[NSIG];
 volatile uint32_t m32_sig_pending;          /* signals caught for the guest, not yet run */
 static __thread uint32_t t_sig_running;     /* signals whose handler is running on this thread */
+
+static int fault_signal(uint32_t sig)
+{
+    return sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE || sig == SIGILL || sig == SIGTRAP;
+}
+static int g_faults_off = -1;   /* OCERZ_NO_M32_FAULT_HANDLERS, read before any fault can ask */
 
 static int async_signal(uint32_t sig)
 {
@@ -898,6 +909,8 @@ static void set_handler(uint32_t sig, uint32_t h, uint32_t flags)
     static int off = -1;
     if (off < 0)
         off = getenv("OCERZ_NO_M32_SIGNALS") != NULL;
+    if (g_faults_off < 0)
+        g_faults_off = getenv("OCERZ_NO_M32_FAULT_HANDLERS") != NULL;
     g_sig_handler[sig] = h;
     g_sig_flags[sig] = flags;
     struct sigaction sa;
@@ -908,7 +921,7 @@ static void set_handler(uint32_t sig, uint32_t h, uint32_t flags)
         sa.sa_handler = host_signal;
         sa.sa_flags = (int)(flags & (SA_RESTART | SA_NOCLDSTOP | SA_NOCLDWAIT));
     } else {
-        if (h > 1)
+        if (h > 1 && (!fault_signal(sig) || g_faults_off == 1))
             m32_log_once("signal handler recorded (not delivered) for signal",
                          sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "another");
         if (!async_signal(sig))
@@ -970,6 +983,151 @@ static int sp_sigaction(struct OcerzVM *vm, OcerzCPU *cpu)
     if (act)
         set_handler(sig, m32_rd(act), m32_rd(act + 8));
     RETV(0);
+}
+
+/* ---- faults ----
+ * A fault in i386 code reaches the program's own handler for it: Mono's SIGSEGV handler turns a null access into a
+ * NullReferenceException and its SIGFPE one a division by zero into a DivideByZeroException, 32-bit Wine turns either
+ * into a Windows exception.  The host's fault handler (vm.c), and the interpreter for a division or an int3, hand it to
+ * ocerz_signal_deliver, which sends a 32-bit cpu here.  The frame is the one XNU's sendsig builds for i386: a 64-byte
+ * siginfo, a 32-byte ucontext and its 600-byte mcontext (exception state, thread state, and the float state, which is
+ * eight reserved bytes then an FXSAVE image), on the thread's stack or on the alternate stack sigaltstack recorded when
+ * the handler asked for SA_ONSTACK.  The handler is called as handler(sig, info, uc) and returns to a trap that loads
+ * the mcontext back, whatever the handler changed in it, as sigreturn does.  A handler that faults again for its own
+ * signal more than a few levels deep is not run again: the kernel would have killed the process. */
+#define MC_SS 12            /* mcontext32: __es at 0, __ss at 12, __fs at 76 */
+#define MC_FS 76
+#define MC_SIZE 600
+#define FS_SNAPSHOT 296     /* the float state's reserved bytes after xmm7 */
+static __thread struct { uint32_t sp, size, flags; } t_altstack = { 0, 0, SS_DISABLE };
+static __thread int t_fault_depth;
+
+/* sigaltstack(const stack_t *ss, stack_t *old): {ss_sp, ss_size, ss_flags}, kept for the guest's fault handlers; the
+ * host thread keeps its own */
+static int sp_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t ss = m32_arg(cpu, 0), old = m32_arg(cpu, 1), esp = (uint32_t)cpu->gpr[OCERZ_RSP];
+    int on = !(t_altstack.flags & SS_DISABLE) && esp - t_altstack.sp < t_altstack.size;
+    if (old) {
+        m32_wr(old, t_altstack.sp);
+        m32_wr(old + 4, t_altstack.size);
+        m32_wr(old + 8, (t_altstack.flags & SS_DISABLE) | (on ? SS_ONSTACK : 0));
+    }
+    if (ss) {
+        uint32_t flags = m32_rd(ss + 8);
+        if (on) {
+            errno = EPERM;
+            RETV(0xffffffffu);
+        }
+        if (flags & SS_DISABLE) {
+            t_altstack.flags = SS_DISABLE;
+        } else {
+            t_altstack.sp = m32_rd(ss);
+            t_altstack.size = m32_rd(ss + 4);
+            t_altstack.flags = 0;
+        }
+    }
+    RETV(0);
+}
+
+static const int g_thread_state_regs[8] = { OCERZ_RAX, OCERZ_RBX, OCERZ_RCX, OCERZ_RDX, OCERZ_RDI, OCERZ_RSI,
+                                            OCERZ_RBP, OCERZ_RSP };
+
+int m32_signal_fault(OcerzCPU *cpu, int sig, uint64_t addr, int code, uint32_t err)
+{
+    if (sig <= 0 || sig >= NSIG)
+        return 0;
+    uint32_t h = g_sig_handler[sig];
+    if (h <= 1 && (sig == SIGSEGV || sig == SIGBUS) && g_sig_handler[sig == SIGSEGV ? SIGBUS : SIGSEGV] > 1) {
+        sig = sig == SIGSEGV ? SIGBUS : SIGSEGV;   /* macOS raises either for a bad access */
+        h = g_sig_handler[sig];
+    }
+    uint32_t flags = g_sig_flags[sig];
+    if (h <= 1 || t_fault_depth >= 4 || g_faults_off == 1)
+        return 0;
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP];
+    int alt = (flags & SA_ONSTACK) && !(t_altstack.flags & SS_DISABLE) && t_altstack.size &&
+              !(esp - t_altstack.sp < t_altstack.size);
+    uint32_t top = alt ? t_altstack.sp + t_altstack.size : esp;
+    uint32_t mc = (top - MC_SIZE) & ~15u, uc = (mc - 32) & ~15u, si = (uc - 64) & ~15u;
+    uint32_t sp = ((si - 16) & ~15u) - 4;   /* at the handler's entry esp + 4 is 16-byte aligned */
+    if (top < MC_SIZE + 256 || !ocerz_addr_readable(sp) || !ocerz_addr_readable(top - 1))
+        return 0;
+    memset(m32_h(sp), 0, top - sp);
+
+    m32_wr(mc + 0, sig == SIGSEGV || sig == SIGBUS ? 14 : sig == SIGFPE ? 0 : sig == SIGTRAP ? 3 : 6);   /* trapno */
+    m32_wr(mc + 4, err);
+    m32_wr(mc + 8, (uint32_t)addr);
+    if (cpu->cc_op != OCERZ_CC_NONE)
+        ocerz_flags_materialize(cpu);
+    for (int i = 0; i < 8; i++)
+        m32_wr(mc + MC_SS + 4 * (uint32_t)i, (uint32_t)cpu->gpr[g_thread_state_regs[i]]);
+    m32_wr(mc + MC_SS + 32, cpu->seg_sel[OCERZ_SREG_SS]);
+    m32_wr(mc + MC_SS + 36, (uint32_t)cpu->rflags);
+    m32_wr(mc + MC_SS + 40, (uint32_t)cpu->rip);
+    m32_wr(mc + MC_SS + 44, cpu->cs_sel);
+    m32_wr(mc + MC_SS + 48, cpu->seg_sel[OCERZ_SREG_DS]);
+    m32_wr(mc + MC_SS + 52, cpu->seg_sel[OCERZ_SREG_ES]);
+    m32_wr(mc + MC_SS + 56, cpu->seg_sel[OCERZ_SREG_FS]);
+    m32_wr(mc + MC_SS + 60, cpu->seg_sel[OCERZ_SREG_GS]);
+    ocerz_x87_fxsave(cpu, mc + MC_FS + 8);
+    m32_wr(mc + MC_FS + 32, cpu->mxcsr);
+    m32_wr(mc + MC_FS + 36, 0xffbf);
+    for (uint32_t i = 0; i < 8; i++) {
+        memcpy(m32_h(mc + MC_FS + 168 + 16 * i), &cpu->xmm[i].lo, 8);
+        memcpy(m32_h(mc + MC_FS + 176 + 16 * i), &cpu->xmm[i].hi, 8);
+    }
+    m32_wr(mc + MC_FS + FS_SNAPSHOT, cpu->fsw);   /* fxsave's FSW folds TOP in; the exact word comes back too */
+
+    m32_wr(uc + 0, (uint32_t)alt);
+    m32_wr(uc + 8, t_altstack.sp);
+    m32_wr(uc + 12, t_altstack.size);
+    m32_wr(uc + 16, t_altstack.flags | (alt ? SS_ONSTACK : 0));
+    m32_wr(uc + 24, MC_SIZE);
+    m32_wr(uc + 28, mc);
+
+    m32_wr(si + 0, (uint32_t)sig);
+    m32_wr(si + 8, (uint32_t)code);
+    m32_wr(si + 24, (uint32_t)addr);
+
+    m32_wr(sp, M32_TRAP(M32_ID_SIGRETURN));
+    m32_wr(sp + 4, (uint32_t)sig);
+    m32_wr(sp + 8, si);
+    m32_wr(sp + 12, uc);
+    cpu->gpr[OCERZ_RSP] = sp;
+    cpu->rip = h;
+    t_fault_depth++;
+    if (flags & SA_RESETHAND)
+        g_sig_handler[sig] = 0;
+    return 1;
+}
+
+/* the handler returned: its ret popped the trap's address, so uc is the third word at esp */
+int m32_sigreturn(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t uc = m32_rd((uint32_t)cpu->gpr[OCERZ_RSP] + 8), mc = uc ? m32_rd(uc + 28) : 0;
+    if (!mc || !ocerz_addr_readable(mc) || !ocerz_addr_readable(mc + MC_SIZE - 1)) {
+        fprintf(stderr, "ocerz: m32: a signal handler returned without its context (esp %#x)\n",
+                (uint32_t)cpu->gpr[OCERZ_RSP]);
+        return OCERZ_STEP_FATAL;
+    }
+    for (int i = 0; i < 8; i++)
+        cpu->gpr[g_thread_state_regs[i]] = m32_rd(mc + MC_SS + 4 * (uint32_t)i);
+    cpu->rflags = (m32_rd(mc + MC_SS + 36) & 0x00ffffffu) | OCERZ_FLAG_FIXED1;
+    cpu->cc_op = OCERZ_CC_NONE;
+    cpu->rip = m32_rd(mc + MC_SS + 40);
+    ocerz_x87_fxrstor(cpu, mc + MC_FS + 8);
+    cpu->fsw = (uint16_t)m32_rd(mc + MC_FS + FS_SNAPSHOT);
+    cpu->mxcsr = m32_rd(mc + MC_FS + 32);
+    ocerz_apply_mxcsr_round(cpu->mxcsr);
+    for (uint32_t i = 0; i < 8; i++) {
+        memcpy(&cpu->xmm[i].lo, m32_h(mc + MC_FS + 168 + 16 * i), 8);
+        memcpy(&cpu->xmm[i].hi, m32_h(mc + MC_FS + 176 + 16 * i), 8);
+    }
+    if (t_fault_depth > 0)
+        t_fault_depth--;
+    return OCERZ_STEP_OK;
 }
 
 static int sp_stack_chk_fail(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -1864,7 +2022,7 @@ static const M32SpecialEntry g_specials[] = {
     { "_sbrk", sp_sbrk },
     { "_setjmp", sp_setjmp }, { "__setjmp", sp_setjmp }, { "_sigsetjmp", sp_setjmp },
     { "_longjmp", sp_longjmp }, { "__longjmp", sp_longjmp }, { "_siglongjmp", sp_longjmp },
-    { "_signal", sp_signal }, { "_sigaction", sp_sigaction }, { "_sigaltstack", sp_ok0 },
+    { "_signal", sp_signal }, { "_sigaction", sp_sigaction }, { "_sigaltstack", sp_sigaltstack },
     { "___bzero", sp_bzero }, { "_bzero", sp_bzero }, { "___stack_chk_fail", sp_stack_chk_fail },
     { "_exit", sp_exit },
     { "_SetFrontProcess", sp_SetFrontProcess }, { "_CPSSetFrontProcess", sp_SetFrontProcess },

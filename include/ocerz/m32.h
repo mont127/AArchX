@@ -28,6 +28,7 @@ struct OcerzVM;
 #define M32_ID_EXIT      0xfff4           /* main()'s return address: exit(eax) */
 #define M32_ID_TLV       0xfff8           /* __tlv_bootstrap thunk */
 #define M32_ID_DYLD      0xfffc           /* the entry of the dyld a self-loading program maps (src/m32_selfload.c) */
+#define M32_ID_SIGRETURN 0xffec           /* a fault handler's return address: its context loaded back (m32_libsystem.c) */
 #define M32_ID_FIRST     0x0010           /* first export id */
 #define M32_ID_LIMIT     0xfff0
 
@@ -163,6 +164,8 @@ extern int m32_started;                              /* the main cpu is running 
 int m32_tlv_trap(struct OcerzVM *vm, OcerzCPU *cpu);   /* src/m32_thread.c */
 extern volatile uint32_t m32_sig_pending;   /* src/m32_libsystem.c: signals caught for the guest's handlers */
 void m32_signals_deliver(struct OcerzVM *vm); /* runs them, at a crossing */
+int m32_signal_fault(OcerzCPU *cpu, int sig, uint64_t addr, int code, uint32_t err);   /* a fault's handler, or 0 */
+int m32_sigreturn(struct OcerzVM *vm, OcerzCPU *cpu);   /* the M32_ID_SIGRETURN trap */
 void m32_save_errno(OcerzCPU *cpu);
 void m32_load_errno(void);   /* before a call: the host's errno is the guest's (src/m32_stdio.c) */
 uint32_t m32_special_data(const char *symbol, void *host_var);   /* guest variable for a special data import, or 0 */
