@@ -1393,6 +1393,14 @@ static void test_image_order(void)
     check("dlopen of a leaf name finds the system library", z != 0 &&
           call("_dlsym", 2, (uint32_t[]){ z, DATA + 0x4520 }) != 0);
     check("... and not one that is nowhere", call("_dlopen", 2, (uint32_t[]){ DATA + 0x4540, 9 }) == 0);
+    /* a libgcc_s a program bundles answers _Unwind_* with m32's unwinder too, as the runtime's does (Pingus) */
+    static M32Image gcc, other;
+    snprintf(gcc.path, sizeof gcc.path, "/Applications/Game.app/Contents/libs/libgcc_s.1.dylib");
+    snprintf(other.path, sizeof other.path, "/Applications/Game.app/Contents/libs/libSDL-1.2.0.dylib");
+    uint32_t unwinder = m32_export("/usr/lib/libSystem.B.dylib", "__Unwind_RaiseException");
+    check("a bundled libgcc_s's _Unwind_RaiseException is m32's", unwinder &&
+          m32_image_symbol(&gcc, "__Unwind_RaiseException") == unwinder);
+    check("... and another library's is its own", m32_image_symbol(&other, "__Unwind_RaiseException") == 0);
 }
 
 void *objc_autoreleasePoolPush(void);

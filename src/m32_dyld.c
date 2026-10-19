@@ -901,13 +901,11 @@ static uint32_t nlist_lookup(M32Image *img, const char *name)
     return 0;
 }
 
-/* whether img is one of our runtime's GCC support libraries (runtime/guest32/usr/lib/libgcc_*) */
+/* whether img is a GCC support library (libgcc_*): our runtime's (runtime/guest32/usr/lib) or one a program brings */
 static int guest_libgcc(const M32Image *img)
 {
-    guest32_root();
-    size_t n = strlen(g_guest32_root);
     const char *base = strrchr(img->path, '/');
-    return n && !strncmp(img->path, g_guest32_root, n) && base && !strncmp(base + 1, "libgcc_", 7);
+    return base && !strncmp(base + 1, "libgcc_", 7);
 }
 
 static uint32_t lookup_in(M32Image *img, const char *name, int depth)
@@ -917,7 +915,8 @@ static uint32_t lookup_in(M32Image *img, const char *name, int depth)
     /* One unwinder for every frame: a program built with Apple's GCC imports _Unwind_Resume and the rest from
      * libgcc_s, which our runtime's GCC libraries answer with their own unwinder, while libstdc++'s throw goes through
      * m32's (src/m32_unwind.c), and the two do not know each other's state: SuperTuxKart aborted inside libgcc's
-     * unwinder after its first throw.  GCC's arithmetic helpers stay where they are. */
+     * unwinder after its first throw.  A libgcc_s the program bundles is the same: Pingus's found no frame to unwind
+     * its first exception through and aborted.  GCC's arithmetic helpers stay where they are. */
     if (!strncmp(name, "__Unwind_", 9) && guest_libgcc(img) && m32_special(name))
         return m32_export("/usr/lib/libSystem.B.dylib", name);
     if (img->runtime_cxx) {   /* Apple's file streams */
