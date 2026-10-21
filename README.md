@@ -14,7 +14,7 @@
   <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
-  <img alt="version" src="https://img.shields.io/badge/version-0.8-green.svg">
+  <img alt="version" src="https://img.shields.io/badge/version-0.9-green.svg">
 </p>
 
 > [!WARNING]
@@ -64,7 +64,7 @@ The app is only a wrapper around the terminal version, which works the same with
 or without it. In Terminal, open a new window, then:
 
 ```sh
-ocerz version                         # AArchX 0.8
+ocerz version                         # AArchX 0.9
 ocerz /Applications/Some.app          # a bundle runs the executable its Info.plist names
 ```
 
@@ -90,7 +90,7 @@ You need:
 
 ```sh
 make -j
-./ocerz version                       # AArchX 0.8
+./ocerz version                       # AArchX 0.9
 ./ocerz tests/guest/bin/hello         # a test program from this repository
 ./ocerz /Applications/Some.app       # a bundle runs the executable its Info.plist names
 ```
@@ -117,7 +117,7 @@ make apis
 | Brawlhalla | reaches its menus, launched from Steam |
 | Ollama | command line and server work, and the menu-bar app runs |
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
-| Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window |
+| Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window; WineHQ's 32-bit Wine for macOS runs `cmd` through m32 (October 2026) |
 | Batman: Arkham Asylum, a 32-bit Mac game | plays through m32 at about 61 fps, launched from Steam and signed in to it (October 2026) |
 | Other 32-bit Mac games | Left 4 Dead 2 and Call of Duty: Modern Warfare 3 from Steam; AssaultCube, SuperTuxKart, Neverball, Battle for Wesnoth, Teeworlds, Nexuiz, ScummVM, DOSBox, Warzone 2100, Armagetron Advanced, Chocolate Doom, Enigma, Pingus, LinCity-NG and Sauerbraten (October 2026) |
 | 32-bit Mac apps | Adium, VLC 1.1.12 and Kega Fusion open their windows (October 2026) |
@@ -186,8 +186,8 @@ contributors.
 | x86-64 guest suite, interpreted and translated | 134 / 134 |
 | x86-64 differential, interpreter against JIT | 100 / 100 |
 | i386 differential, in each of two memory layouts | 40,044 / 40,044 |
-| dynamic-linking suite | 406 / 406 |
-| native-mode suite | 87 / 87 |
+| dynamic-linking suite | 410 / 410 |
+| native-mode suite | 88 / 88 |
 | 32-bit (m32) programs | 79 / 79, one more skipped without a Steam database |
 
 Counted on macOS 27 in October 2026. [Testing](docs/testing.md) says what
@@ -236,6 +236,25 @@ Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) describes how the
 tree is worked on: the gates, the test that pins every change, and the commit
 style. Please also read the [code of conduct](CODE_OF_CONDUCT.md), and report
 security issues as described in [SECURITY.md](SECURITY.md).
+
+## Credits
+
+AArchX builds on other people's work:
+
+- **Jfishin**, through [MacShack](https://github.com/Jfishin/MacShack): native-mode fixes and the 32-bit Steam games work, the
+  Steam bridge, Left 4 Dead 2 and Call of Duty: Modern Warfare 3.
+- **LLVM**: the guest C++ runtime in `runtime/guest` is LLVM's libc++, libc++abi and libunwind, built by
+  `tools/build_guest_cxx.sh` and shipped with each release under their own licenses.
+- **The Swift project**: the guest Swift runtime `make guest-swift` installs.
+- **MacPorts**: the runtimes the fetch scripts download, which no release carries:
+  - GCC's libstdc++ and libgcc for 32-bit and 64-bit programs built with GCC (GPL 3 with the GCC Runtime Library
+    Exception), and GNU libiconv, which the 64-bit one needs (LGPL);
+  - LLVM's libc++ and libc++abi 5.0.1 for 32-bit programs built with Apple's clang (MIT and UIUC);
+  - fontconfig, FreeType, zlib, bzip2, libpng, brotli, libiconv, expat and gettext's libintl for the X11 libraries
+    32-bit games link (their own licenses: MIT, FreeType License, zlib, BSD-style and LGPL).
+- **Wine**: AArchX runs Wine and WineHQ's builds; it does not include them.
+- **Apple**: cache mode runs the x86-64 system libraries a Mac with Rosetta installed already has; AArchX does not
+  include them.
 
 ## License
 
