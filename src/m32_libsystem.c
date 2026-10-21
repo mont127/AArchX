@@ -2109,7 +2109,7 @@ static const M32SpecialEntry *const g_tables[] = { g_specials, m32_stdio_special
                                                    m32_gl_specials, m32_audio_specials, m32_atsu_specials,
                                                    m32_qd_specials, m32_agl_specials, m32_carbon_specials,
                                                    m32_controls_specials, m32_tsearch_specials,
-                                                   m32_cg_specials };
+                                                   m32_cg_specials, m32_iokit_specials };
 
 static M32Special find_special(const char *name)
 {

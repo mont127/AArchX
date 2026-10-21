@@ -65,6 +65,7 @@ void m32_qd_show_window_rect(void *window, void *cg_context, double x, double y,
 extern const M32SpecialEntry m32_controls_specials[]; /* src/m32_controls.c: menus and controls arm64 dropped */
 extern const M32SpecialEntry m32_tsearch_specials[];  /* src/m32_tsearch.c: tsearch's trees, in guest memory */
 extern const M32SpecialEntry m32_cg_specials[];       /* src/m32_cg.c: CoreGraphics callbacks and path elements */
+extern const M32SpecialEntry m32_iokit_specials[];    /* src/m32_iokit.c: registry calls that name a plane or a class */
 void m32_qd_window_gone(void *window);                 /* src/m32_qd.c: DisposeWindow drops the window's port */
 void *m32_qd_port_window(uint32_t port);               /* a QuickDraw port's host window, or NULL */
 int m32_qd_port_pixels(uint32_t port, int *w, int *h, uint32_t *rowbytes, uint32_t *pixels);   /* a GWorld's */
