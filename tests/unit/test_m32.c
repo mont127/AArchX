@@ -22,6 +22,7 @@
 #include <locale.h>
 #include <mach-o/loader.h>
 #include <signal.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1918,6 +1919,22 @@ static void test_thread_stacks(void)
     ocerz_unmap(STACKS, 0x10000);
 }
 
+/* syscall(number, ...) runs m32's raw system calls with libc's convention (src/m32_libsystem.c): getpid, the thread's
+ * 64-bit id in edx:eax, and -1 with errno for a number m32 does not answer */
+static void test_syscall(void)
+{
+    check("syscall(SYS_getpid)", call("_syscall", 1, (uint32_t[]){ 20 }) == (uint32_t)getpid());
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    uint32_t lo = call("_syscall", 1, (uint32_t[]){ 372 });
+    check("syscall(SYS_thread_selfid) is the thread's 64-bit id",
+          tid && (lo | (uint64_t)(uint32_t)cpu()->gpr[OCERZ_RDX] << 32) == tid);
+    uint32_t slot = call("___error", 0, NULL);
+    m32_wr(slot, 0);
+    check("an unknown number is -1 with ENOSYS", call("_syscall", 1, (uint32_t[]){ 9998 }) == 0xffffffffu &&
+          m32_rd(slot) == ENOSYS);
+}
+
 /* A fault in i386 code reaches the guest's own handler in i386's frame, and the context the handler changes is the one
  * the code goes on with (src/m32_libsystem.c), end to end through ocerz's host fault handler: a load from page zero
  * (SIGSEGV) and a division by zero (SIGFPE), each skipped by the handler, which also sets eax.  Last, since it installs
@@ -2360,6 +2377,7 @@ int main(int argc, char **argv)
     test_signals();
     test_iret32();
     test_thread_stacks();
+    test_syscall();
     test_fault_handlers();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;

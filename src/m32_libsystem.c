@@ -1694,6 +1694,27 @@ static int spawn_guest(struct OcerzVM *vm, OcerzCPU *cpu, int search)
     m32_ret(cpu, (uint32_t)e, 0, 0);   /* the error number itself, errno untouched */
     return OCERZ_STEP_OK;
 }
+/* syscall(number, ...): the raw system calls m32 answers (src/m32_selfload.c), in libc's convention: -1 and errno where
+ * the kernel's sets the carry flag, a 64-bit result (lseek, thread_selfid) in edx:eax.  Being variadic it had no
+ * crossing and answered 0, so syscall(SYS_thread_selfid) gave every thread the same id. */
+static int sp_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP], back = m32_rd(esp);
+    cpu->gpr[OCERZ_RAX] = m32_arg(cpu, 0);
+    cpu->gpr[OCERZ_RSP] = esp + 4;   /* the number's slot stands for the return address: arguments at [sp + 4] */
+    cpu->rip = back;
+    int rc = m32_raw_syscall(vm, cpu, 0);
+    if (rc != OCERZ_STEP_OK)
+        return rc;
+    cpu->gpr[OCERZ_RSP] = esp + 4;   /* as ret leaves it */
+    if (cpu->rflags & OCERZ_CF) {
+        errno = (int)(uint32_t)cpu->gpr[OCERZ_RAX];
+        m32_save_errno(cpu);
+        cpu->gpr[OCERZ_RAX] = 0xffffffffu;
+        cpu->gpr[OCERZ_RDX] = 0xffffffffu;
+    }
+    return OCERZ_STEP_OK;
+}
 static int sp_posix_spawn(struct OcerzVM *vm, OcerzCPU *cpu) { return spawn_guest(vm, cpu, 0); }
 static int sp_posix_spawnp(struct OcerzVM *vm, OcerzCPU *cpu) { return spawn_guest(vm, cpu, 1); }
 
@@ -2063,7 +2084,7 @@ static const M32SpecialEntry g_specials[] = {
     { "__keymgr_set_and_unlock_processwide_ptr", sp_keymgr_set_unlock },
     { "__keymgr_unlock_processwide_ptr", sp_keymgr_unlock },
     { "_execv", sp_execv }, { "_execve", sp_execve }, { "_posix_spawn", sp_posix_spawn },
-    { "_posix_spawnp", sp_posix_spawnp },
+    { "_posix_spawnp", sp_posix_spawnp }, { "_syscall", sp_syscall },
     { "_ioctl", sp_ioctl }, { "_pipe", sp_pipe },
     { "_getaddrinfo", sp_getaddrinfo }, { "_freeaddrinfo", sp_freeaddrinfo }, { "_gethostbyname", sp_gethostbyname },
     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },

@@ -19,6 +19,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mach-o/loader.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,6 +131,30 @@ int m32_raw_syscall(struct OcerzVM *vm, OcerzCPU *cpu, int sysenter)
     case 20:    /* getpid */
         r = getpid();
         break;
+    case 24:    /* getuid */
+        r = getuid();
+        break;
+    case 25:    /* geteuid */
+        r = geteuid();
+        break;
+    case 37:    /* kill(pid, signal, posix) */
+        r = kill((pid_t)A(0), (int)A(1));
+        break;
+    case 39:    /* getppid */
+        r = getppid();
+        break;
+    case 43:    /* getegid */
+        r = getegid();
+        break;
+    case 47:    /* getgid */
+        r = getgid();
+        break;
+    case 372: { /* thread_selfid: the thread's 64-bit id, in edx:eax */
+        uint64_t tid = 0;
+        pthread_threadid_np(NULL, &tid);
+        r = (int64_t)tid;
+        break;
+    }
     case 73:    /* munmap: a partial 4 KB unmap keeps the host page, as the bridged call does */
         if (!(A(0) & 0x3fff))
             ocerz_unmap(A(0), (A(1) + 0x3fffu) & ~0x3fffu);
@@ -180,7 +206,7 @@ int m32_raw_syscall(struct OcerzVM *vm, OcerzCPU *cpu, int sysenter)
     } else {
         cpu->rflags &= ~OCERZ_CF;
         cpu->gpr[OCERZ_RAX] = (uint32_t)r;
-        if (nr == 199)
+        if (nr == 199 || nr == 372)
             cpu->gpr[OCERZ_RDX] = (uint32_t)((uint64_t)r >> 32);
     }
     cpu->gpr[OCERZ_RSP] = sp;
