@@ -338,9 +338,31 @@ static const char *drift(const char *sel, const char *enc)
 
 static const char *guest_encoding(void *host_cls, const char *sel, int is_class);
 
+/* The answer for a class and a selector does not change once the headers are loaded, and sends ask it again and
+ * again: a method the class's own records have took about 200 ns, one only a protocol declares (or none, as for
+ * -self) about 5.6 us, a name formatted and looked up for every protocol of every class up the chain.  Each thread
+ * keeps its last answers, misses too, by class, selector and kind (ponytail: a protocol added to a class after it
+ * was asked about is not seen; m32 adds a paired class's protocols before its first send).
+ * OCERZ_NO_M32_ENCODING_CACHE=1 looks every send up. */
+typedef struct EncHit { void *cls; const char *sel; const char *enc; int is_class, variadic; } EncHit;
+#define ENC_CACHE 256
+static __thread EncHit t_enc[ENC_CACHE];
+
 const char *m32_objc_guest_encoding(void *host_cls, const char *sel, int is_class)
 {
-    return drift(sel, guest_encoding(host_cls, sel, is_class));
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_ENCODING_CACHE") != NULL;
+    if (off || !host_cls || !sel)
+        return drift(sel, guest_encoding(host_cls, sel, is_class));
+    EncHit *h = &t_enc[(((uintptr_t)host_cls >> 4) ^ ((uintptr_t)sel >> 2) ^ (uintptr_t)is_class) & (ENC_CACHE - 1)];
+    if (h->cls == host_cls && h->is_class == is_class && (h->sel == sel || !strcmp(h->sel, sel))) {
+        t_variadic = h->variadic;
+        return drift(sel, h->enc);
+    }
+    const char *e = guest_encoding(host_cls, sel, is_class);
+    *h = (EncHit){ host_cls, sel, e, is_class, t_variadic };
+    return drift(sel, e);
 }
 
 static const char *guest_encoding(void *host_cls, const char *sel, int is_class)

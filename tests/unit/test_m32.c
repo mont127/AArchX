@@ -1975,6 +1975,25 @@ static void test_fault_handlers(void)
     m32_active = was_active;
 }
 
+/* The i386 encoding of a selector, looked up once per class and kept (src/m32_objc_types.c): asked again it is the
+ * same, and a variadic method is still known as one when the answer comes from the cache */
+static void test_encoding_cache(void)
+{
+    Class str = objc_getClass("NSString"), app = objc_getClass("NSApplication");
+    const char *fmt = sel_getName(sel_registerName("stringWithFormat:")), *del = sel_getName(sel_registerName("setDelegate:"));
+    if (!str || !app)
+        return;
+    const char *e1 = m32_objc_guest_encoding(str, fmt, 1);
+    int v1 = m32_objc_last_variadic();
+    const char *d1 = m32_objc_guest_encoding(app, del, 0);
+    int dv = m32_objc_last_variadic();
+    const char *e2 = m32_objc_guest_encoding(str, fmt, 1);
+    int v2 = m32_objc_last_variadic();
+    check("+stringWithFormat: is found and variadic", e1 && v1 == 1);
+    check("... -setDelegate: is not variadic", d1 && dv == 0);
+    check("... and asked again, the cached answer is the same and still variadic", e2 && !strcmp(e1, e2) && v2 == 1);
+}
+
 /* Apple's file streams on the runtime's GCC libstdc++ (src/m32_fstream.c): an ofstream and an fstream at Apple's
  * offsets, opened, written through the library's operator<< (whose sentry finds the basic_ios by the vtable, where
  * Armagetron Advanced's config save went wrong), closed and destroyed through the vtable */
@@ -2236,6 +2255,7 @@ int main(int argc, char **argv)
         test_fstreams();
         test_display_modes();
         test_data_provider();
+        test_encoding_cache();
         printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
         return g_failures != 0;
     }
