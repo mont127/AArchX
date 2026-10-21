@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1649,6 +1650,53 @@ static int exec_guest(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t genv)
 static int sp_execv(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, cpu, 0); }
 static int sp_execve(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, cpu, m32_arg(cpu, 2)); }
 
+/* posix_spawn(pid_t *pid, path, file_actions *, attr *, argv, envp) and posix_spawnp: the vectors hold 4-byte
+ * pointers, and the file actions and attributes are the host's own, behind the handle their _init calls left in the
+ * guest's slot (the database crosses those as one pointer written back).  The program starts under ocerz as the
+ * syscall's does (ocerz_guest_posix_spawn), an i386 one by m32 and POSIX_SPAWN_SETEXEC in place of this one.  The
+ * database had no shape for the vectors and answered 0 without starting anything: Wine fell back to execv.
+ * posix_spawnp looks a name without a slash up in PATH, as libc does. */
+static int spawn_guest(struct OcerzVM *vm, OcerzCPU *cpu, int search)
+{
+    extern char **environ;
+    char *v[2][512];
+    uint32_t gv[2] = { m32_arg(cpu, 4), m32_arg(cpu, 5) };
+    for (int k = 0; k < 2; k++) {
+        int n = 0;
+        for (uint32_t p; gv[k] && n < 511 && (p = m32_rd(gv[k] + 4 * (uint32_t)n)); n++)
+            v[k][n] = (char *)m32_h(p);
+        v[k][n] = NULL;
+    }
+    uint32_t gpid = m32_arg(cpu, 0), gpath = m32_arg(cpu, 1), gfa = m32_arg(cpu, 2), gat = m32_arg(cpu, 3);
+    posix_spawn_file_actions_t fa = gfa ? (posix_spawn_file_actions_t)m32_host(m32_rd(gfa)) : NULL;
+    posix_spawnattr_t at = gat ? (posix_spawnattr_t)m32_host(m32_rd(gat)) : NULL;
+    char *const *argv = gv[0] ? v[0] : NULL, *const *envp = gv[1] ? v[1] : environ;
+    const char *path = gpath ? (const char *)m32_h(gpath) : NULL;
+    int pid = 0, e;
+    if (!path || !*path) {
+        e = path ? ENOENT : EINVAL;
+    } else if (search && !strchr(path, '/')) {
+        const char *dirs = getenv("PATH") ? getenv("PATH") : "/usr/bin:/bin";
+        e = ENOENT;
+        for (const char *d = dirs; d; d = strchr(d, ':') ? strchr(d, ':') + 1 : NULL) {
+            char full[PATH_MAX];
+            size_t n = strcspn(d, ":");
+            snprintf(full, sizeof full, "%.*s/%s", (int)n, n ? d : ".", path);
+            e = ocerz_guest_posix_spawn(vm, cpu, &pid, full, gfa ? &fa : NULL, gat ? &at : NULL, argv, envp);
+            if (e != ENOENT && e != ENOTDIR && e != EACCES)
+                break;
+        }
+    } else {
+        e = ocerz_guest_posix_spawn(vm, cpu, &pid, path, gfa ? &fa : NULL, gat ? &at : NULL, argv, envp);
+    }
+    if (!e && gpid)
+        m32_wr(gpid, (uint32_t)pid);
+    m32_ret(cpu, (uint32_t)e, 0, 0);   /* the error number itself, errno untouched */
+    return OCERZ_STEP_OK;
+}
+static int sp_posix_spawn(struct OcerzVM *vm, OcerzCPU *cpu) { return spawn_guest(vm, cpu, 0); }
+static int sp_posix_spawnp(struct OcerzVM *vm, OcerzCPU *cpu) { return spawn_guest(vm, cpu, 1); }
+
 /* keymgr: the process-wide pointers GCC 3 and 4's runtime support keeps under fixed keys, one lock each (crt3.o's
  * atexit list, libgcc's unwinder object list).  libkeymgr has no header in today's SDK, so its calls had no
  * declaration and answered 0 without writing the pointer back: Kega Fusion's crt3.o then read whatever the stack
@@ -2014,7 +2062,8 @@ static const M32SpecialEntry g_specials[] = {
     { "__keymgr_get_and_lock_processwide_ptr", sp_keymgr_get_lock },
     { "__keymgr_set_and_unlock_processwide_ptr", sp_keymgr_set_unlock },
     { "__keymgr_unlock_processwide_ptr", sp_keymgr_unlock },
-    { "_execv", sp_execv }, { "_execve", sp_execve },
+    { "_execv", sp_execv }, { "_execve", sp_execve }, { "_posix_spawn", sp_posix_spawn },
+    { "_posix_spawnp", sp_posix_spawnp },
     { "_ioctl", sp_ioctl }, { "_pipe", sp_pipe },
     { "_getaddrinfo", sp_getaddrinfo }, { "_freeaddrinfo", sp_freeaddrinfo }, { "_gethostbyname", sp_gethostbyname },
     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },

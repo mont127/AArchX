@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1975,6 +1976,73 @@ static void test_fault_handlers(void)
     m32_active = was_active;
 }
 
+/* posix_spawn from i386 code (src/m32_libsystem.c): the 4-byte argument vector, the PATH search of posix_spawnp, and
+ * file actions a guest made through the database's crossings, whose handles stand for the host's objects.  The child
+ * is this harness itself (`test_m32 spawned <file> <text>` appends a line, "-" being stdout): an arm64 program, which
+ * ocerz starts as it is, where a shell would be started under ocerz, here this harness. */
+static char g_self[PATH_MAX];
+static void test_posix_spawn(void)
+{
+    enum { PID = DATA + 0x5100, ARGV = DATA + 0x5110, FA = DATA + 0x5130, STR = DATA + 0x5200 };
+    char path[] = "/tmp/test_m32_spawn.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0 || !g_self[0])
+        return;
+    close(fd);
+    const char *slash = strrchr(g_self, '/');
+    put_str(STR, g_self);
+    put_str(STR + 0x400, slash ? slash + 1 : g_self);
+    put_str(STR + 0x480, "spawned");
+    put_str(STR + 0x500, path);
+    put_str(STR + 0x580, "one");
+    put_str(STR + 0x600, "-");
+    put_str(STR + 0x680, "through-dup2");
+    put_str(STR + 0x700, "test_m32_no_such_program");
+    const uint32_t argv[5] = { STR, STR + 0x480, STR + 0x500, STR + 0x580, 0 };
+    memcpy(m32_h(ARGV), argv, sizeof argv);
+    m32_wr(PID, 0);
+    check("posix_spawn of a program", call("_posix_spawn", 6, (uint32_t[]){ PID, STR, 0, 0, ARGV, 0 }) == 0 && m32_rd(PID) > 0);
+    int st = 0;
+    waitpid((pid_t)m32_rd(PID), &st, 0);
+
+    /* posix_spawnp: the harness's own directory first in PATH */
+    char *old_path = getenv("PATH") ? strdup(getenv("PATH")) : NULL, dirs[PATH_MAX + 32];
+    snprintf(dirs, sizeof dirs, "%.*s:/usr/bin:/bin", slash ? (int)(slash - g_self) : 1, slash ? g_self : ".");
+    setenv("PATH", dirs, 1);
+    m32_wr(PID, 0);
+    check("posix_spawnp finds a name in PATH", call("_posix_spawnp", 6, (uint32_t[]){ PID, STR + 0x400, 0, 0, ARGV, 0 }) == 0 &&
+          m32_rd(PID) > 0);
+    waitpid((pid_t)m32_rd(PID), &st, 0);
+    check("... and a name that is nowhere is ENOENT",
+          call("_posix_spawnp", 6, (uint32_t[]){ PID, STR + 0x700, 0, 0, ARGV, 0 }) == ENOENT);
+    if (old_path) {
+        setenv("PATH", old_path, 1);
+        free(old_path);
+    }
+
+    /* stdout through a file action the guest made: dup2 of an open descriptor onto 1 */
+    int out = open(path, O_WRONLY | O_APPEND);
+    const uint32_t dup_argv[5] = { STR, STR + 0x480, STR + 0x600, STR + 0x680, 0 };
+    memcpy(m32_h(ARGV), dup_argv, sizeof dup_argv);
+    m32_wr(FA, 0);
+    check("posix_spawn_file_actions_init and adddup2 cross",
+          cross("/usr/lib/libSystem.B.dylib", "_posix_spawn_file_actions_init", 1, (uint32_t[]){ FA }) == 0 && m32_rd(FA) &&
+          cross("/usr/lib/libSystem.B.dylib", "_posix_spawn_file_actions_adddup2", 3, (uint32_t[]){ FA, (uint32_t)out, 1 }) == 0);
+    m32_wr(PID, 0);
+    check("... and posix_spawn applies them", call("_posix_spawn", 6, (uint32_t[]){ PID, STR, FA, 0, ARGV, 0 }) == 0);
+    waitpid((pid_t)m32_rd(PID), &st, 0);
+    cross("/usr/lib/libSystem.B.dylib", "_posix_spawn_file_actions_destroy", 1, (uint32_t[]){ FA });
+    close(out);
+
+    char got[200] = { 0 };
+    FILE *f = fopen(path, "r");
+    if (f) {
+        fread(got, 1, sizeof got - 1, f);
+        fclose(f);
+    }
+    check("the spawned programs wrote what they were given", !strcmp(got, "one\none\nthrough-dup2\n"));
+    unlink(path);
+}
 /* The i386 encoding of a selector, looked up once per class and kept (src/m32_objc_types.c): asked again it is the
  * same, and a variadic method is still known as one when the answer comes from the cache */
 static void test_encoding_cache(void)
@@ -2222,6 +2290,15 @@ static void test_unix_calls(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 4 && !strcmp(argv[1], "spawned")) {   /* test_posix_spawn's child: a line to a file or stdout */
+        FILE *f = strcmp(argv[2], "-") ? fopen(argv[2], "a") : stdout;
+        if (!f)
+            return 1;
+        fprintf(f, "%s\n", argv[3]);
+        return fclose(f) != 0;
+    }
+    if (!realpath(argv[0], g_self))
+        g_self[0] = 0;
     if (ocerz_mem_init(0, M32_WINDOW) != OCERZ_OK ||
         ocerz_map_fixed(STACK - 0x10000, 0x10000 + 0x10000, PROT_READ | PROT_WRITE) != OCERZ_OK ||
         ocerz_map_fixed(DATA, 0x10000, PROT_READ | PROT_WRITE) != OCERZ_OK ||
@@ -2256,6 +2333,7 @@ int main(int argc, char **argv)
         test_display_modes();
         test_data_provider();
         test_encoding_cache();
+        test_posix_spawn();
         printf("test_m32 carbon: %d checks, %d failed\n", g_checks, g_failures);
         return g_failures != 0;
     }
