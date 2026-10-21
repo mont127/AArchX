@@ -1876,6 +1876,47 @@ static void test_iret32(void)
     check("iretd in 32-bit code pops three words, not five", m32_call(&g_vm, IRET, NULL, 0, NULL, NULL) == 0);
 }
 
+/* A thread runs on the guest stack its attributes name (pthread_attr_setstack, as Wine gives each Windows thread its
+ * own), or on one as large as they ask for (src/m32_thread.c) */
+static void test_thread_stacks(void)
+{
+    enum { RECORD = CODE + 0x3c00, PROBE = CODE + 0x3c40, ATTR = DATA + 0x5000, OUT = DATA + 0x5040,
+           ESP = DATA + 0x5044, GOT = DATA + 0x5048, STACKS = 0x01000000u };
+    static const uint8_t record[] = { 0x8b, 0x44, 0x24, 0x04, 0x89, 0x20, 0x31, 0xc0, 0xc3 };   /* [arg] = esp; return 0 */
+    static const uint8_t probe[] = { 0x8b, 0x44, 0x24, 0x04, 0x89, 0x20,          /* [arg] = esp */
+                                     0x81, 0xec, 0x00, 0x00, 0x30, 0x00,          /* sub esp, 3 MB */
+                                     0xc7, 0x04, 0x24, 1, 0, 0, 0,                /* mov dword [esp], 1: faults on 2 MB */
+                                     0x81, 0xc4, 0x00, 0x00, 0x30, 0x00,          /* add esp, 3 MB */
+                                     0x31, 0xc0, 0xc3 };
+    memcpy(m32_h(RECORD), record, sizeof record);
+    memcpy(m32_h(PROBE), probe, sizeof probe);
+    if (ocerz_map_fixed(STACKS, 0x10000, PROT_READ | PROT_WRITE) != OCERZ_OK)
+        return;
+
+    call("_pthread_attr_init", 1, (uint32_t[]){ ATTR });
+    check("pthread_attr_setstack takes a page-aligned stack", call("_pthread_attr_setstack", 3, (uint32_t[]){ ATTR, STACKS, 0x10000 }) == 0);
+    check("... and refuses one smaller than PTHREAD_STACK_MIN", call("_pthread_attr_setstack", 3, (uint32_t[]){ ATTR, STACKS, 0x1000 }) == EINVAL);
+    m32_wr(GOT, 0);
+    m32_wr(GOT + 4, 0);
+    call("_pthread_attr_getstack", 3, (uint32_t[]){ ATTR, GOT, GOT + 4 });
+    check("... and pthread_attr_getstack gives it back", m32_rd(GOT) == STACKS && m32_rd(GOT + 4) == 0x10000);
+    m32_wr(GOT, 0);
+    call("_pthread_attr_getstackaddr", 2, (uint32_t[]){ ATTR, GOT });
+    check("... its top as the stack address, as Darwin keeps it", m32_rd(GOT) == STACKS + 0x10000);
+    m32_wr(ESP, 0);
+    check("pthread_create on that stack", call("_pthread_create", 4, (uint32_t[]){ OUT, ATTR, RECORD, ESP }) == 0);
+    call("_pthread_join", 2, (uint32_t[]){ m32_rd(OUT), 0 });
+    check("... runs the thread on it", m32_rd(ESP) > STACKS && m32_rd(ESP) <= STACKS + 0x10000);
+
+    call("_pthread_attr_init", 1, (uint32_t[]){ ATTR });
+    call("_pthread_attr_setstacksize", 2, (uint32_t[]){ ATTR, 4u << 20 });
+    m32_wr(ESP, 0);
+    check("a thread asking for a 4 MB stack", call("_pthread_create", 4, (uint32_t[]){ OUT, ATTR, PROBE, ESP }) == 0);
+    call("_pthread_join", 2, (uint32_t[]){ m32_rd(OUT), 0 });
+    check("... can use 3 MB of it", m32_rd(ESP) != 0);
+    ocerz_unmap(STACKS, 0x10000);
+}
+
 /* A fault in i386 code reaches the guest's own handler in i386's frame, and the context the handler changes is the one
  * the code goes on with (src/m32_libsystem.c), end to end through ocerz's host fault handler: a load from page zero
  * (SIGSEGV) and a division by zero (SIGFPE), each skipped by the handler, which also sets eax.  Last, since it installs
@@ -2220,6 +2261,7 @@ int main(int argc, char **argv)
     test_unix_calls();
     test_signals();
     test_iret32();
+    test_thread_stacks();
     test_fault_handlers();
     printf("test_m32: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures != 0;

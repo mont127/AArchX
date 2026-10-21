@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/mman.h>
 
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
@@ -335,20 +336,70 @@ static int sp_once(struct OcerzVM *vm, OcerzCPU *cpu)
     RETI(0);
 }
 
-/* ---- thread attributes: magic, stack size, detach state ---- */
+/* ---- thread attributes: magic, stack size, detach state, stack top, guard size ----
+ * A thread's stack is the guest's when it names one: Wine runs each Windows thread on the stack it allocated for it
+ * (pthread_attr_setstack), whose bounds its TEB records and its exception dispatch checks frames against.  A stack
+ * address is the top of the stack, as Darwin keeps it (pthread_attr_setstackaddr takes the top; setstack the base and
+ * a size), and the checks are Darwin's, with the 4 KB pages i386 programs are told.  A thread that names no stack and
+ * asks for more than the attached cpu's own (about 2 MB) gets a guest mapping that large. */
+#define ATTR_STACKSIZE 4
+#define ATTR_DETACH    8
+#define ATTR_STACKTOP  12   /* 0: none named */
+#define ATTR_GUARD     16
+#define M32_STACK_MIN  8192u   /* i386's PTHREAD_STACK_MIN */
+#define M32_OWN_STACK  0x1f0000u   /* what an attached cpu's own guest stack holds (src/vm.c, ocerz_thread_attach) */
+
 static int sp_attr_init(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t g = m32_arg(cpu, 0);
     memset(m32_h(g), 0, 40);
     m32_wr(g, ATTR_MAGIC);
-    m32_wr(g + 4, 512u << 10);
-    m32_wr(g + 8, PTHREAD_CREATE_JOINABLE);
+    m32_wr(g + ATTR_STACKSIZE, 512u << 10);
+    m32_wr(g + ATTR_DETACH, PTHREAD_CREATE_JOINABLE);
+    m32_wr(g + ATTR_GUARD, 4096);
     RETI(0);
 }
-static int sp_attr_setstacksize(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 0) + 4, m32_arg(cpu, 1)); RETI(0); }
-static int sp_attr_getstacksize(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 1), m32_rd(m32_arg(cpu, 0) + 4)); RETI(0); }
-static int sp_attr_setdetachstate(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 0) + 8, m32_arg(cpu, 1)); RETI(0); }
-static int sp_attr_getdetachstate(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 1), m32_rd(m32_arg(cpu, 0) + 8)); RETI(0); }
+/* any size, rounded up to whole pages, as m32 always took it (a game that once got 0 does not get EINVAL now) */
+static int sp_attr_setstacksize(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t size = m32_arg(cpu, 1);
+    m32_wr(m32_arg(cpu, 0) + ATTR_STACKSIZE, size > 0xfffff000u ? 0xfffff000u : (size + 0xfffu) & ~0xfffu);
+    RETI(0);
+}
+static int sp_attr_getstacksize(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 1), m32_rd(m32_arg(cpu, 0) + ATTR_STACKSIZE)); RETI(0); }
+static int sp_attr_setdetachstate(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 0) + ATTR_DETACH, m32_arg(cpu, 1)); RETI(0); }
+static int sp_attr_getdetachstate(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 1), m32_rd(m32_arg(cpu, 0) + ATTR_DETACH)); RETI(0); }
+/* (attr, base, size): the stack is [base, base + size) */
+static int sp_attr_setstack(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t attr = m32_arg(cpu, 0), base = m32_arg(cpu, 1), size = m32_arg(cpu, 2);
+    if ((base & 0xfff) || (size & 0xfff) || size < M32_STACK_MIN || (uint64_t)base + size > 0x100000000ull)
+        RETI(EINVAL);
+    m32_wr(attr + ATTR_STACKTOP, base + size);
+    m32_wr(attr + ATTR_STACKSIZE, size);
+    RETI(0);
+}
+static int sp_attr_getstack(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t attr = m32_arg(cpu, 0), top = m32_rd(attr + ATTR_STACKTOP), size = m32_rd(attr + ATTR_STACKSIZE);
+    if (m32_arg(cpu, 1))
+        m32_wr(m32_arg(cpu, 1), top ? top - size : 0);
+    if (m32_arg(cpu, 2))
+        m32_wr(m32_arg(cpu, 2), size);
+    RETI(0);
+}
+/* (attr, top) */
+static int sp_attr_setstackaddr(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t top = m32_arg(cpu, 1);
+    if (top & 0xfff)
+        RETI(EINVAL);
+    m32_wr(m32_arg(cpu, 0) + ATTR_STACKTOP, top);
+    RETI(0);
+}
+static int sp_attr_getstackaddr(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 1), m32_rd(m32_arg(cpu, 0) + ATTR_STACKTOP)); RETI(0); }
+static int sp_attr_setguardsize(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 0) + ATTR_GUARD, m32_arg(cpu, 1)); RETI(0); }
+static int sp_attr_getguardsize(struct OcerzVM *vm, OcerzCPU *cpu) { m32_wr(m32_arg(cpu, 1), m32_rd(m32_arg(cpu, 0) + ATTR_GUARD)); RETI(0); }
 
 /* pthread_setname_np(name): the host thread gets it too (sample, the crash reports) */
 static int sp_setname(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -360,7 +411,9 @@ static int sp_setname(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 
 /* ---- threads ---- */
-typedef struct Start { struct OcerzVM *vm; uint32_t fn, arg, stack; } Start;
+/* stack: the top of the guest stack the thread starts on (0: the attached cpu's own); own, own_size: a mapping m32 made
+ * for it, given back when the thread function returns (ponytail: not when the thread ends in pthread_exit) */
+typedef struct Start { struct OcerzVM *vm; uint32_t fn, arg, stack, own, own_size; } Start;
 
 static void *thread_main(void *p)
 {
@@ -369,11 +422,15 @@ static void *thread_main(void *p)
     OcerzCPU *cpu = m32_thread_attach(s.vm);
     if (!cpu)
         return NULL;
+    if (s.stack)
+        cpu->gpr[OCERZ_RSP] = s.stack;
     /* A game's threads are interactive work.  At the default QoS macOS sometimes parks Batman's render thread on the
      * efficiency cores for good (7x slower frames, glstat cpus=0-3); the game's own pthread_setschedparam is not
      * applied (sp_setschedparam), since a fixed priority would take the thread out of QoS again. */
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     uint32_t r = m32_call(s.vm, s.fn, &s.arg, 1, NULL, NULL);
+    if (s.own)
+        ocerz_unmap(s.own, s.own_size);
     return (void *)(uintptr_t)r;
 }
 
@@ -382,23 +439,41 @@ static void *thread_main(void *p)
 static int create(struct OcerzVM *vm, OcerzCPU *cpu, int suspended)
 {
     uint32_t out = m32_arg(cpu, 0), attr = m32_arg(cpu, 1);
-    Start *s = malloc(sizeof *s);
+    Start *s = calloc(1, sizeof *s);
+    if (!s)
+        RETI(EAGAIN);
     s->vm = vm;
     s->fn = m32_arg(cpu, 2);
     s->arg = m32_arg(cpu, 3);
     pthread_attr_t a;
     pthread_attr_init(&a);
     if (attr && m32_rd(attr) == ATTR_MAGIC) {
-        if (m32_rd(attr + 8) == PTHREAD_CREATE_DETACHED)
+        if (m32_rd(attr + ATTR_DETACH) == PTHREAD_CREATE_DETACHED)
             pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        uint32_t size = m32_rd(attr + ATTR_STACKSIZE);
+        s->stack = m32_rd(attr + ATTR_STACKTOP);
+        if (!s->stack && size > M32_OWN_STACK) {
+            uint32_t len = (size + 0x3fffu) & ~0x3fffu;   /* whole host pages, so the unmap takes it all */
+            uint32_t g = m32_mmap(0, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (g == 0xffffffffu) {
+                pthread_attr_destroy(&a);
+                free(s);
+                RETI(EAGAIN);
+            }
+            s->own = g;
+            s->own_size = len;
+            s->stack = g + len;
+        }
     }
     pthread_attr_setstacksize(&a, 1u << 20);   /* the host side: the guest stack is the attached cpu's own */
     pthread_t t;
     int r = suspended ? pthread_create_suspended_np(&t, &a, thread_main, s) : pthread_create(&t, &a, thread_main, s);
     pthread_attr_destroy(&a);
-    if (r)
+    if (r) {
+        if (s->own)
+            ocerz_unmap(s->own, s->own_size);
         free(s);
-    else if (out)
+    } else if (out)
         m32_wr(out, m32_handle(t));
     RETI(r);
 }
@@ -565,6 +640,9 @@ const M32SpecialEntry m32_thread_specials[] = {
     { "_pthread_attr_setdetachstate", sp_attr_setdetachstate }, { "_pthread_attr_getdetachstate", sp_attr_getdetachstate },
     { "_pthread_attr_setschedparam", sp_ok }, { "_pthread_attr_setschedpolicy", sp_ok },
     { "_pthread_attr_setinheritsched", sp_ok }, { "_pthread_attr_setscope", sp_ok },
+    { "_pthread_attr_setstack", sp_attr_setstack }, { "_pthread_attr_getstack", sp_attr_getstack },
+    { "_pthread_attr_setstackaddr", sp_attr_setstackaddr }, { "_pthread_attr_getstackaddr", sp_attr_getstackaddr },
+    { "_pthread_attr_setguardsize", sp_attr_setguardsize }, { "_pthread_attr_getguardsize", sp_attr_getguardsize },
     { "_pthread_create", sp_pthread_create }, { "_pthread_create_suspended_np", sp_pthread_create_suspended },
     { "_pthread_join", sp_pthread_join }, { "_pthread_setschedparam", sp_setschedparam },
     { "_pthread_setname_np", sp_setname },
