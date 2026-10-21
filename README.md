@@ -52,8 +52,12 @@ Mac's own arm64 frameworks, so they need no x86 system libraries at all.
 On an Apple silicon Mac with macOS 26 or 27, without Xcode:
 
 ```sh
-curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
+CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
 ```
+
+(`CURL_SSL_BACKEND=secure-transport` has macOS's curl check certificates with
+Apple's TLS, which already distrusts the eMudhra certificates compromised in
+October 2026; the TLS curl uses by default does not yet.)
 
 This installs the latest release's prebuilt `ocerz` and its runtime files in
 `~/.aarchx`, adds `~/.aarchx/bin` to `PATH` in your shell profile, and puts

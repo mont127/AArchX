@@ -4,8 +4,8 @@
 # line in the shell profile (~/.zprofile or ~/.bash_profile), and no password
 # is asked for.
 #
-#   curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
-#   curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall
+#   CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
+#   CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall
 #
 # AARCHX_HOME           where to install (default ~/.aarchx)
 # AARCHX_VERSION        a release tag such as v0.7 (default: the latest release)
@@ -18,6 +18,11 @@
 # Gatekeeper does not stop the unsigned ocerz binary.
 
 set -eu
+
+# Apple's TLS, not the LibreSSL that macOS's curl uses by default: in October 2026 the keys of eight eMudhra
+# intermediate CAs turned out to be public, so anyone can sign a certificate for any site with them.  Apple
+# distrusts them, but only in its own TLS; through LibreSSL /usr/bin/curl still accepts what they sign.
+export CURL_SSL_BACKEND=secure-transport
 
 REPO=mont127/AArchX
 ASSET=aarchx-macos-arm64.tar.gz
@@ -184,7 +189,7 @@ install() {
     say "Run an Intel program:"
     say "  ocerz /Applications/Some.app"
     say "  ocerz -native ./some_tool"
-    say "Uninstall: curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall"
+    say "Uninstall: CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall"
 }
 
 case "${1:-}" in

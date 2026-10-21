@@ -22,7 +22,7 @@ x86_64` for the fixtures the dynamic and native gates build.
 ## Install the prebuilt
 
 ```sh
-curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
+CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
 ```
 
 The script downloads the latest release's `aarchx-macos-arm64.tar.gz`, checks
@@ -34,16 +34,24 @@ mode reads (`runtime/apis`, `runtime/apis32`) and the guest C++ runtime
 curl does not quarantine what it downloads, Gatekeeper does not stop the
 unsigned binary.
 
+`CURL_SSL_BACKEND=secure-transport` makes macOS's curl check certificates with
+Apple's TLS. In October 2026 the keys of eight eMudhra intermediate certificate
+authorities turned out to be public, so anyone can sign a certificate for any
+site with them; Apple's TLS distrusts them, but the LibreSSL that curl uses by
+default still accepts what they sign. The script uses Apple's TLS for its own
+downloads too.
+
 | Variable | Effect |
 | --- | --- |
 | `AARCHX_HOME=<dir>` | install there instead of `~/.aarchx` |
 | `AARCHX_VERSION=v0.7` | install that release instead of the latest |
 | `AARCHX_NO_MODIFY_PATH=1` | leave the shell profile alone |
 | `AARCHX_NO_APP=1` | leave AArchX.app in the install directory instead of `~/Applications` |
+| `AARCHX_NO_32BIT_RUNTIMES=1` | skip the 32-bit C++ and X11 libraries from MacPorts |
 
 Pass them to the `sh` side of the pipe: `curl -fsSL ... | AARCHX_HOME=/opt/aarchx sh`.
 Running the script again updates the install, and
-`curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall`
+`CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall`
 removes it and the `PATH` line. The translation cache in
 `~/Library/Caches/ocerz` is left behind; delete it too if you want the space back.
 
