@@ -57,7 +57,9 @@ curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
 
 This installs the latest release's prebuilt `ocerz` and its runtime files in
 `~/.aarchx`, adds `~/.aarchx/bin` to `PATH` in your shell profile, and puts
-AArchX.app in `~/Applications`. To run a program without Terminal, drop an
+AArchX.app in `~/Applications`. It also fetches the C++ and X11 libraries many
+32-bit games need from MacPorts, about 15 MB, which no release carries
+(`AARCHX_NO_32BIT_RUNTIMES=1` skips them). To run a program without Terminal, drop an
 Intel app on AArchX.app's window, or right-click the app in Finder and choose
 Open With → AArchX. With Wine installed, a Windows `.exe` works the same way.
 The app is only a wrapper around the terminal version, which works the same with

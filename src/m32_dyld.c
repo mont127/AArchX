@@ -648,13 +648,15 @@ static void guest32_root(void)
     }
 }
 
-/* the runtime's libstdc++ (tools/fetch_guest32_cxx.sh), which src/m32_fstream.c gives Apple's file streams */
+/* the runtime's libstdc++ (tools/fetch_guest32_cxx.sh), which src/m32_fstream.c gives Apple's file streams: the file
+ * the runtime's /usr/lib name leads to, a symlink into MacPorts' layout since the fetch needs no Xcode tools (an image's
+ * path is its real path), or the name itself as older fetches wrote it */
 static int runtime_libstdcxx(const char *path)
 {
     guest32_root();
-    char want[1100];
+    char want[1100], real[1100];
     snprintf(want, sizeof want, "%s/usr/lib/libstdc++.6.dylib", g_guest32_root);
-    return g_guest32_root[0] && !strcmp(path, want);
+    return g_guest32_root[0] && (!strcmp(path, want) || (realpath(want, real) && !strcmp(path, real)));
 }
 
 /* fontconfig from runtime/guest32 (tools/fetch_guest32_x11.sh) looks for /opt/local/etc/fonts/fonts.conf, where it
