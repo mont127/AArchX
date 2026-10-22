@@ -81,6 +81,10 @@
  * with more than one each image is done by a child of its own, one after the
  * other; a dylib or bundle named after a single executable is loaded into that
  * executable's process, and one named alone gets a process with no main image.
+ * Before that, -aot reads which programs the named executables were seen to
+ * execute (their profiles, src/tcache.c) and, when there are any, does the
+ * named images in a child as above and then each of those programs in a child
+ * of its own; the children get OCERZ_AOT_NO_EXECS=1, so nothing is done twice.
  */
 #include <signal.h>
 #include <pthread.h>
@@ -91,6 +95,7 @@
 #include "ocerz/mem.h"
 #include "ocerz/dyld.h"
 #include "ocerz/mode.h"
+#include "ocerz/tcache.h"
 
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -122,10 +127,61 @@ static char **env_snapshot(char **env)
 
 extern char **environ;
 
+static int aot_spawn(const char *self, int deps, int n, char **images)
+{
+    char *args[64];
+    int k = 0, status = 0;
+    pid_t pid;
+    args[k++] = (char *)self;
+    args[k++] = (char *)(deps ? "-aot-deps" : "-aot");
+    for (int i = 0; i < n && k < 63; i++)
+        args[k++] = images[i];
+    args[k] = NULL;
+    return posix_spawn(&pid, self, NULL, NULL, args, environ) != 0 || waitpid(pid, &status, 0) < 0 ||
+           !WIFEXITED(status) || WEXITSTATUS(status);
+}
+
+/* The programs the named executables were seen to execute, and those they
+ * did, each once and none of the named ones. */
+static int aot_execs(int n, char **images, char **out, int cap)
+{
+    char seen[64][PATH_MAX];
+    int ns = 0, no = 0;
+    for (int k = 0; k < n && ns < 64; k++)
+        if (realpath(images[k], seen[ns]))
+            ns++;
+    for (int at = 0; at < ns && ns < 64; at++) {
+        char *list = ocerz_tcache_profile_execs(ocerz_dyld_file_ident(seen[at]));
+        for (char *line = list ? strtok(list, "\n") : NULL; line && ns < 64 && no < cap; line = strtok(NULL, "\n")) {
+            char abs[PATH_MAX];
+            int dup = !realpath(line, abs) || ocerz_dyld_filetype(abs) != MH_EXECUTE;
+            for (int j = 0; j < ns && !dup; j++)
+                dup = !strcmp(seen[j], abs);
+            if (dup)
+                continue;
+            snprintf(seen[ns++], PATH_MAX, "%s", abs);
+            out[no++] = strdup(abs);
+        }
+        free(list);
+    }
+    return no;
+}
+
 /* -aot with more than one program: each image in a process of its own, since
  * each program is loaded as the main image of one. */
 static int aot_main(OcerzVM *vm, int n, char **images, int deps, const char *self)
 {
+    char *execs[32];
+    int nx = getenv("OCERZ_AOT_NO_EXECS") ? 0 : aot_execs(n, images, execs, 32);
+    if (nx) {
+        setenv("OCERZ_AOT_NO_EXECS", "1", 1);
+        int rc = aot_spawn(self, deps, n, images);
+        for (int k = 0; k < nx; k++) {
+            fprintf(stderr, "ocerz: -aot %s: executed by %s before\n", execs[k], images[0]);
+            rc |= aot_spawn(self, deps, 1, &execs[k]);
+        }
+        return rc;
+    }
     int nexe = 0, exe = -1;
     for (int k = 0; k < n; k++)
         if (ocerz_dyld_filetype(images[k]) == MH_EXECUTE) {
@@ -134,14 +190,8 @@ static int aot_main(OcerzVM *vm, int n, char **images, int deps, const char *sel
         }
     if (nexe > 1) {
         int rc = 0;
-        for (int k = 0; k < n; k++) {
-            char *args[] = { (char *)self, (char *)(deps ? "-aot-deps" : "-aot"), images[k], NULL };
-            pid_t pid;
-            int status = 0;
-            if (posix_spawn(&pid, self, NULL, NULL, args, environ) != 0 || waitpid(pid, &status, 0) < 0 ||
-                !WIFEXITED(status) || WEXITSTATUS(status))
-                rc = 1;
-        }
+        for (int k = 0; k < n; k++)
+            rc |= aot_spawn(self, deps, 1, &images[k]);
         return rc;
     }
     if (exe > 0) {

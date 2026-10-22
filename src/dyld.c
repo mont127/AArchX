@@ -569,6 +569,7 @@
 #include "ocerz/abi.h"
 #include "ocerz/syscall.h"
 #include "ocerz/jit.h"
+#include "ocerz/tcache.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -1058,6 +1059,35 @@ int ocerz_dyld_image_ident(uint64_t addr, uint64_t *lo, uint64_t *hi, uint64_t *
     *hi = d->ext_hi;
     *ident = d->tc_ident;
     return 1;
+}
+
+static uint64_t profile_ident(const uint8_t *slice, const char *path)
+{
+    uint64_t h = ident_mix(0xcbf29ce484222325ull, "ocerz-prof-1", 12);
+    const uint8_t *lc = slice + sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < rd32(slice + 16); k++, lc += rd32(lc + 4))
+        if (rd32(lc) == LC_UUID)
+            return ident_mix(h, lc + 8, 16) | 1;
+    struct stat st;
+    h = ident_mix(h, path, strlen(path));
+    if (stat(path, &st) == 0) {
+        uint64_t v[3] = { (uint64_t)st.st_size, (uint64_t)st.st_mtimespec.tv_sec, (uint64_t)st.st_mtimespec.tv_nsec };
+        h = ident_mix(h, v, sizeof v);
+    }
+    return h | 1;
+}
+
+uint64_t ocerz_dyld_file_ident(const char *path)
+{
+    char abspath[PATH_MAX];
+    if (realpath(path, abspath))
+        path = abspath;
+    size_t flen = 0;
+    uint8_t *buf = read_file(path, &flen);
+    const uint8_t *slice = buf ? select_slice(buf, flen) : NULL;
+    uint64_t id = slice && rd32(slice + 12) == MH_EXECUTE ? profile_ident(slice, path) : 0;
+    free(buf);
+    return id;
 }
 
 const char *ocerz_dyld_main_path(void)
@@ -6827,11 +6857,90 @@ static void aot_image(const DynImage *d, AotVec *seed, AotVec *rng)
         aot_push(seed, d->main_entry);
 }
 
+static void aot_cache_code(uint64_t mhaddr, AotVec *rng)
+{
+    const uint8_t *mh = (const uint8_t *)ocerz_g2h(mhaddr);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < rd32(mh + 16); k++, lc += rd32(lc + 4)) {
+        if (rd32(lc) != LC_SEGMENT_64)
+            continue;
+        const uint8_t *sec = lc + sizeof(struct segment_command_64);
+        for (uint32_t j = 0; j < rd32(lc + 64); j++, sec += sizeof(struct section_64))
+            if (rd32(sec + 64) & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) {
+                aot_push(rng, rd64(sec + 32));
+                aot_push(rng, rd64(sec + 32) + rd64(sec + 40));
+            }
+    }
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int cmp_prof(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a & OCERZ_TC_PROF_RIP, y = *(const uint64_t *)b & OCERZ_TC_PROF_RIP;
+    return x < y ? -1 : x > y;
+}
+
+static size_t aot_below(const uint64_t *v, size_t n, size_t stride, uint64_t a)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t m = (lo + hi) / 2;
+        if (v[m * stride] <= a)
+            lo = m + 1;
+        else
+            hi = m;
+    }
+    return lo;
+}
+
+/* The shared-cache rips the program's earlier runs kept (its profile), one
+ * entry a rip with the memory models it was kept under, those outside the
+ * code sections of the cache image they fall in dropped. */
+static size_t aot_profile(OcerzCache *cache, AotVec *pseed, size_t *dropped)
+{
+    uint64_t *v = NULL;
+    size_t n = g_main_dimg_valid && cache->mapped
+                   ? ocerz_tcache_profile_read(profile_ident(g_main_dimg.slice, g_main_dimg.path), ocerz_cache_uuid(), &v)
+                   : 0;
+    AotVec rng = { 0 }, mhs = { 0 };
+    for (uint32_t i = 0; n && i < cache->images_cnt; i++)
+        aot_push(&mhs, ocerz_cache_image_addr(cache, i, NULL));
+    qsort(mhs.v, mhs.n, sizeof *mhs.v, cmp_u64);
+    qsort(v, n, sizeof *v, cmp_prof);
+    for (size_t i = 0, last = 0; i < n; i++) {
+        size_t k = aot_below(mhs.v, mhs.n, 1, v[i] & OCERZ_TC_PROF_RIP);
+        if (k && k != last)
+            aot_cache_code(mhs.v[k - 1], &rng);
+        last = k;
+    }
+    size_t nr = rng.n / 2;
+    qsort(rng.v, nr, 2 * sizeof *rng.v, cmp_u64);
+    for (size_t i = 0; i < n;) {
+        uint64_t rip = v[i] & OCERZ_TC_PROF_RIP, bits = 0;
+        for (; i < n && (v[i] & OCERZ_TC_PROF_RIP) == rip; i++)
+            bits |= v[i] & (OCERZ_TC_PROF_PLAIN | OCERZ_TC_PROF_ORDERED);
+        size_t r = aot_below(rng.v, nr, 2, rip);
+        if (bits && r && rip < rng.v[2 * r - 1])
+            aot_push(pseed, rip | bits);
+        else
+            (*dropped)++;
+    }
+    free(v);
+    free(rng.v);
+    free(mhs.v);
+    return n;
+}
+
 /* -aot: the images are mapped and bound as for a launch; their code is
  * translated into the store instead of run. */
 static int aot_run(struct OcerzVM *vm, OcerzCache *cache, int first)
 {
-    AotVec seed = { 0 }, rng = { 0 };
+    AotVec seed = { 0 }, rng = { 0 }, pseed = { 0 };
     int nimg = 0;
     if (g_main_dimg_valid && first) {
         aot_image(&g_main_dimg, &seed, &rng);
@@ -6853,19 +6962,21 @@ static int aot_run(struct OcerzVM *vm, OcerzCache *cache, int first)
             aot_image(&g_dimgs[i], &seed, &rng);
             nimg++;
         }
+    size_t dropped = 0, nprof = aot_profile(cache, &pseed, &dropped);
     OcerzJitAotStats st;
-    int rc = ocerz_jit_aot(vm, seed.v, seed.n, (const uint64_t (*)[2])rng.v, (int)(rng.n / 2), &st);
+    int rc = ocerz_jit_aot(vm, seed.v, seed.n, (const uint64_t (*)[2])rng.v, (int)(rng.n / 2), pseed.v, pseed.n, &st);
     if (rc != 0)
         fprintf(stderr, "ocerz: -aot needs the JIT and the translation cache on, in cache mode\n");
     else
-        fprintf(stderr, "ocerz: -aot %s: %d image%s, %zu entries, %llu blocks in %d memory model%s (%llu kept,"
-                        " %llu already kept), %llu not translated, %llu ms%s\n",
-                g_aot_paths[0], nimg, nimg == 1 ? "" : "s", seed.n, (unsigned long long)st.blocks,
-                st.models ? st.models : 1, st.models > 1 ? "s" : "", (unsigned long long)st.saved,
-                (unsigned long long)st.present, (unsigned long long)st.failed, (unsigned long long)st.ms,
-                st.full ? "; stopped at half the store's room" : "");
+        fprintf(stderr, "ocerz: -aot %s: %d image%s, %zu entries, %zu profiled (%zu dropped), %llu blocks in %d memory"
+                        " model%s (%llu profiled, %llu kept, %llu already kept), %llu not translated, %llu ms%s\n",
+                g_aot_paths[0], nimg, nimg == 1 ? "" : "s", seed.n, nprof ? pseed.n : 0, dropped,
+                (unsigned long long)st.blocks, st.models ? st.models : 1, st.models > 1 ? "s" : "",
+                (unsigned long long)st.profiled, (unsigned long long)st.saved, (unsigned long long)st.present,
+                (unsigned long long)st.failed, (unsigned long long)st.ms, st.full ? "; stopped at half the store's room" : "");
     free(seed.v);
     free(rng.v);
+    free(pseed.v);
     return rc ? 1 : 0;
 }
 
@@ -7069,6 +7180,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         OCERZ_LOG("dynamic: dyld API shim not installed\n");
     if (g_aot_n)
         return aot_run(vm, &cache, 1);
+    if (ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled)
+        ocerz_tcache_profile_open(profile_ident(g_main_dimg.slice, g_main_dimg.path), ocerz_cache_uuid());
 
     uint64_t environ_addr = ocerz_cache_resolve(&cache, "_environ");
     if (environ_addr) {

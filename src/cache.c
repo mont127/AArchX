@@ -646,6 +646,11 @@ int ocerz_cache_map(OcerzCache *c)
     return OCERZ_OK;
 }
 
+const uint8_t *ocerz_cache_uuid(void)
+{
+    return g_named_cache && g_named_cache->mapped ? g_named_cache->hdr + 0x58 : NULL;
+}
+
 const char *ocerz_cache_name_for_addr(uint64_t addr, uint64_t *base_out)
 {
     const OcerzCache *c = g_named_cache;

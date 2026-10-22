@@ -46,6 +46,7 @@ uint64_t ocerz_cache_dlsym_image(OcerzCache *c, uint64_t mh, const char *symbol,
 uint64_t ocerz_cache_image_addr(OcerzCache *c, uint32_t i, const char **path_out);
 uint64_t ocerz_cache_find_alias(OcerzCache *c, const char *path);
 const char *ocerz_cache_name_for_addr(uint64_t addr, uint64_t *base_out);
+const uint8_t *ocerz_cache_uuid(void);
 
 void ocerz_cache_prefork(void);
 void ocerz_cache_postfork(void);

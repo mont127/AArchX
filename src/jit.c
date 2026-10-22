@@ -662,6 +662,28 @@
  * blocks; the first launch afterwards finds 99.8% of the 13.7k image blocks it
  * asks for, and takes 0.27 s where a cold one takes 0.37 s and a warm one 0.22.
  *
+ * The shared cache is not walked: a program's closure in it is 342 images and
+ * 800k function starts, and ruby's and tclsh's interpreters live there, so
+ * -aot took 0.04 s for either and the launch after it was nearly as slow as a
+ * cold one (ruby 0.39 s, cold 0.47, warm 0.24; tclsh 0.27, 0.30, 0.12).  So
+ * every launch notes the shared-cache blocks it loads or keeps (tc_prof_note)
+ * in its program's profile (src/tcache.c, "profiles"), and -aot seeds the
+ * profile's rips that lie in a code section of their cache image, with
+ * nothing followed from them: a walk from ruby's 30k executed rips reached
+ * 450k blocks, for 600 fewer misses.  Each is translated under the memory
+ * models it ran under only, and when none ran ordered the ordered pass is
+ * left out for the program's own code too.  A program the profiled runs
+ * executed (python3's xcrun shim runs python3.9 and Python.app, ruby runs
+ * uname) gets the same after it, in a process of its own (src/main.c).  With
+ * the profile of one earlier run, in a store that run did not fill, the first
+ * launch after -aot takes ruby 0.25 s, tclsh 0.12, python3 0.23 (0.33 with
+ * -aot as it was, which never reached python3.9) and sqlite3 0.044 (0.069),
+ * against warm 0.24, 0.12, 0.23 and 0.040; -aot itself takes 0.23 s and 100
+ * MB of store for ruby or tclsh, 0.85 s and 217 MB for python3's three
+ * programs, and 0.49 s and 160 MB for sqlite3, which took 0.89 s and 238 MB
+ * walking the ordered model it never runs under.  With no profile -aot does
+ * what it did, and OCERZ_NO_TCACHE_PROFILE=1 neither notes nor seeds.
+ *
  * ---- i386 ----
  * 32-bit blocks are compiled from a whitelist of instructions (m32_inline_ok),
  * with no superblocks and 0x67/16-bit addressing left to the interpreter.
@@ -21515,6 +21537,7 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
 enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
 static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
+static _Atomic unsigned long long g_tc_n_sfind, g_tc_n_sload;
 
 static int tc_fixed(uint64_t a);
 
@@ -21631,6 +21654,8 @@ static void tc_summary(void)
             (unsigned long long)g_tc_n_ibad[TCI_EDGE], (unsigned long long)g_tc_n_ibad[TCI_INSN],
             (unsigned long long)g_tc_n_ibad[TCI_DEP], (unsigned long long)g_tc_n_ibad[TCI_RAS],
             (unsigned long long)g_tc_n_ibad[TCI_ELIDE], (unsigned long long)g_tc_n_ibad[TCI_CODE]);
+    fprintf(g_tc_lf, "ocerz: TCACHE[%d] shared asked=%llu in=%llu\n", (int)getpid(),
+            (unsigned long long)g_tc_n_sfind, (unsigned long long)g_tc_n_sload);
     fflush(g_tc_lf);
 }
 
@@ -21850,6 +21875,12 @@ static int tc_keepable(uint64_t rip, int mode32)
     if (ocerz_guest_base != 0)
         return 0;
     return tc_fixed(rip) || (!mode32 && tc_image_of(rip));
+}
+
+static void tc_prof_note(uint64_t rip)
+{
+    if (!g_tc_img_hi && !ocerz_low_base && !(g_tc_key & OCERZ_TC_KEY_M32))
+        ocerz_tcache_profile_note(rip | (g_tc_key & OCERZ_TC_KEY_PLAIN ? OCERZ_TC_PROF_PLAIN : OCERZ_TC_PROF_ORDERED));
 }
 
 static uint64_t tc_mix(uint64_t h, uint64_t w)
@@ -22090,6 +22121,7 @@ static void tc_put(OcerzJit *jit, JitBlock *blk)
     g_tc_n_put++;
     if (g_tc_img_hi)
         g_tc_n_iput++;
+    tc_prof_note(blk_rip(blk));
 }
 
 #define TC_TAKE(dst, type, count) do { \
@@ -22212,6 +22244,8 @@ static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, i
         g_tc_n_rej++;
     else if ((b = tc_load_rec(jit, &v, rip, mode32)) && g_tc_img_hi)
         g_tc_n_iload++;
+    else if (b && !ocerz_low_base)
+        g_tc_n_sload++;
     g_tc_rlo = g_tc_rhi = g_tc_rd = 0;
     return b;
 }
@@ -22347,6 +22381,7 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
     cache_insert(jit, blk);
     blk_chain_install(jit, blk);
     g_tc_n_load++;
+    tc_prof_note(rip);
     return blk;
 }
 
@@ -22559,6 +22594,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         if (!al_marked(jk) && !al_marked(jk | AL_BLK_TAG) && !cp_marked(jk) && !tc_noload_has(jk)) {
             tc_hit = ocerz_tcache_find(g_tc_key);
             g_tc_n_ifind += g_tc_img_hi != 0;
+            g_tc_n_sfind += !g_tc_img_hi && !ocerz_low_base;
         }
         {
             static int tr = -1;
@@ -26855,20 +26891,26 @@ static int aot_in(const uint64_t (*rng)[2], int nrng, uint64_t a)
 }
 
 static int aot_walk(struct OcerzVM *vm, OcerzJit *jit, const uint64_t *seed, size_t nseed, const uint64_t (*rng)[2],
-                    int nrng, OcerzJitAotStats *st)
+                    int nrng, const uint64_t *pseed, size_t npseed, OcerzJitAotStats *st)
 {
     size_t cap = 1u << 16, n = 0, hcap = 1u << 18, hn = 0;
     uint64_t *work = (uint64_t *)malloc(cap * sizeof *work), *seen = (uint64_t *)calloc(hcap, sizeof *seen);
+    uint64_t model = jit->plain_mem ? OCERZ_TC_PROF_PLAIN : OCERZ_TC_PROF_ORDERED;
     int ok = work && seen;
-    for (size_t k = 0; ok;) {
+    for (size_t k = 0, kp = 0; ok;) {
         uint64_t rip;
+        int walk = 1;
         if (n)
             rip = work[--n];
         else if (k < nseed)
             rip = seed[k++];
-        else
+        else if (kp < npseed) {
+            walk = 0;
+            rip = pseed[kp] & model ? pseed[kp] & OCERZ_TC_PROF_RIP : 0;
+            kp++;
+        } else
             break;
-        if (!rip || !aot_in(rng, nrng, rip))
+        if (!rip || (walk && !aot_in(rng, nrng, rip)))
             continue;
         if (2 * (hn + 1) > hcap) {
             uint64_t *ns = (uint64_t *)calloc(hcap * 2, sizeof *ns);
@@ -26903,7 +26945,7 @@ static int aot_walk(struct OcerzVM *vm, OcerzJit *jit, const uint64_t *seed, siz
         if (!b && tc_keepable(rip, 0) && ocerz_tcache_has(tc_key(rip, 0))) {
             kept = 1;
             st->present++;
-            for (uint64_t pc = rip; ni < JIT_MAX_BLOCK_INSNS; pc += x.len, ni++)
+            for (uint64_t pc = rip; walk && ni < JIT_MAX_BLOCK_INSNS; pc += x.len, ni++)
                 if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc, &x, 0) != OCERZ_OK ||
                     is_terminator(x.op)) {
                     ni++;
@@ -26922,6 +26964,10 @@ static int aot_walk(struct OcerzVM *vm, OcerzJit *jit, const uint64_t *seed, siz
             continue;
         }
         st->blocks++;
+        if (!walk) {
+            st->profiled++;
+            continue;
+        }
         if (!kept)
             ni = b->n_insns;
         for (int i = 0, at0 = 0; i < ni; i++) {
@@ -26968,7 +27014,7 @@ static int aot_walk(struct OcerzVM *vm, OcerzJit *jit, const uint64_t *seed, siz
 }
 
 int ocerz_jit_aot(struct OcerzVM *vm, const uint64_t *seed, size_t nseed, const uint64_t (*rng)[2], int nrng,
-                  OcerzJitAotStats *st)
+                  const uint64_t *pseed, size_t npseed, OcerzJitAotStats *st)
 {
     OcerzJit *jit = vm->jit;
     memset(st, 0, sizeof *st);
@@ -26976,11 +27022,14 @@ int ocerz_jit_aot(struct OcerzVM *vm, const uint64_t *seed, size_t nseed, const 
         return -1;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t saved0 = g_tc_n_put;
-    int rc = aot_walk(vm, jit, seed, nseed, rng, nrng, st);
-    if (rc == 0 && !st->full && jit->plain_mem) {
+    int ordered = !npseed;
+    for (size_t i = 0; i < npseed && !ordered; i++)
+        ordered = (pseed[i] & OCERZ_TC_PROF_ORDERED) != 0;
+    int rc = aot_walk(vm, jit, seed, nseed, rng, nrng, pseed, npseed, st);
+    if (rc == 0 && !st->full && jit->plain_mem && ordered) {
         st->models = 2;
         ocerz_jit_require_ordered(vm);
-        rc = aot_walk(vm, jit, seed, nseed, rng, nrng, st);
+        rc = aot_walk(vm, jit, seed, nseed, rng, nrng, pseed, npseed, st);
     }
     st->saved = g_tc_n_put - saved0;
     st->ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1000000;

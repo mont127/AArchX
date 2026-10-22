@@ -1079,6 +1079,27 @@ else
              "$(grep -h 'images asked=' "$aot_dir/run.log" | head -1))"
         fail=$((fail+1))
     fi
+    # That launch left a profile of the shared-cache code it ran beside the
+    # store.  With the store itself gone, as after a rebuild of ocerz, -aot must
+    # seed it from the profile, and the next launch must find (nearly) every
+    # shared-cache block it asks for.
+    rm -rf "$aot_dir"/store/tc-*
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$aot_dir/store" OCERZ_TCACHE_MIN_FREE_MB=0 \
+        run_bounded "$aot_dir/aotp.out" "$aot_dir/aotp.err" "$OCERZ" -aot "$aot_dir/work"
+    aot_code=$?
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$aot_dir/store" OCERZ_TCACHE_LOG="$aot_dir/runp.log" OCERZ_TCACHE_MIN_FREE_MB=0 \
+        run_bounded "$aot_dir/runp.out" "$aot_dir/runp.err" "$OCERZ" "$aot_dir/work"
+    aot_run_code=$?
+    if [ "$aot_code" = 0 ] && [ "$aot_run_code" = 0 ] && [ "$(cat "$aot_dir/runp.out")" = OK ] &&
+       grep -q ' [1-9][0-9]* profiled (0 dropped)' "$aot_dir/aotp.err" &&
+       awk '/shared asked=/ { split($4, a, "="); split($5, b, "="); asked += a[2]; got += b[2] }
+            END { exit !(asked > 0 && got * 100 >= asked * 98) }' "$aot_dir/runp.log"; then
+        echo "PASS dtcache_aot_profile"; pass=$((pass+1))
+    else
+        echo "FAIL dtcache_aot_profile (aot exit=$aot_code run exit=$aot_run_code out='$(cat "$aot_dir/runp.out")'" \
+             "$(grep -h 'profiled' "$aot_dir/aotp.err" | head -1) $(grep -h 'shared asked=' "$aot_dir/runp.log" | head -1))"
+        fail=$((fail+1))
+    fi
 fi
 # With a free-space floor no disk can meet, the cache must not write a byte and
 # the program must still run; the floor is what kept the cache from filling a

@@ -2188,6 +2188,12 @@ static void guest_child_env(char **henv, int cap, char *const *envp)
     henv[m] = NULL;
 }
 
+static void guest_child_profile(const char *path)
+{
+    char abspath[PATH_MAX];
+    ocerz_tcache_profile_exec(realpath(path, abspath) ? abspath : path);
+}
+
 static int guest_vector(uint64_t gv, char **out, int cap)
 {
     int n = 0;
@@ -2224,6 +2230,10 @@ static int guest_spawn_apply(OcerzVM *vm, pid_t *pid, const char *path,
     char *henv[GUEST_ENV_MAX + 8];
     guest_child_env(henv, GUEST_ENV_MAX + 8, envp);
     ocerz_jit_require_ordered(vm);
+    guest_child_profile(path);
+    short sf = 0;
+    if (at && posix_spawnattr_getflags(at, &sf) == 0 && (sf & POSIX_SPAWN_SETEXEC))
+        ocerz_tcache_flush();
     return posix_spawn(pid, self, fa, at, hargv, henv);
 }
 
@@ -2240,6 +2250,8 @@ static int guest_exec_apply(const char *path, char *const *argv, char *const *en
     }
     if (access(path, X_OK) != 0)
         return errno;
+    if (!guest_child_runs_native(path))
+        guest_child_profile(path);
     ocerz_tcache_flush();
     if (guest_child_runs_native(path)) {
         execve(path, argv, envp);

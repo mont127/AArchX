@@ -25,10 +25,22 @@
  * ocerz_tcache_put stores a record, ocerz_tcache_flush makes everything put so
  * far visible to other processes, and ocerz_tcache_child is called in a forked
  * child, which writes a data file of its own rather than its parent's.
+ *
+ * A profile is what -aot learns from a program's earlier runs.
+ * ocerz_tcache_profile_open names the program (an identity of its main
+ * executable) and the shared cache (its UUID); from then on
+ * ocerz_tcache_profile_note collects shared-cache rips, each with
+ * OCERZ_TC_PROF_PLAIN or OCERZ_TC_PROF_ORDERED for the memory model it was
+ * kept under, and ocerz_tcache_flush and exit add the new ones to the
+ * program's profile.  ocerz_tcache_profile_exec adds a program this one
+ * executes.  ocerz_tcache_profile_read hands back a profile's entries (one
+ * rip may come twice, once per model), and ocerz_tcache_profile_execs the
+ * programs, one path a line, in a string for the caller to free.
  */
 #ifndef OCERZ_TCACHE_H
 #define OCERZ_TCACHE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 enum { OCERZ_TC_OFF = 0, OCERZ_TC_ROUNDTRIP, OCERZ_TC_ON, OCERZ_TC_VERIFY };
@@ -37,6 +49,10 @@ enum { OCERZ_TC_OFF = 0, OCERZ_TC_ROUNDTRIP, OCERZ_TC_ON, OCERZ_TC_VERIFY };
 #define OCERZ_TC_KEY_PLAIN (1ull << 62)
 #define OCERZ_TC_KEY_IMAGE (1ull << 61)
 #define OCERZ_TC_REC_MAGIC 0x32524354u
+#define OCERZ_TC_PROF_PLAIN (1ull << 62)
+#define OCERZ_TC_PROF_ORDERED (1ull << 61)
+#define OCERZ_TC_PROF_RIP ((1ull << 48) - 1)
+#define OCERZ_TC_PROF_MAX 100000
 
 typedef struct OcerzTcRecHead {
     uint32_t magic;
@@ -53,5 +69,10 @@ void ocerz_tcache_flush(void);
 void ocerz_tcache_child(void);
 const char *ocerz_tcache_dir(int for_write);
 int ocerz_tcache_room(void);
+void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid);
+void ocerz_tcache_profile_note(uint64_t v);
+void ocerz_tcache_profile_exec(const char *path);
+size_t ocerz_tcache_profile_read(uint64_t ident, const uint8_t *cache_uuid, uint64_t **out);
+char *ocerz_tcache_profile_execs(uint64_t ident);
 
 #endif

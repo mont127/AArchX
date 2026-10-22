@@ -38,6 +38,9 @@
  * ocerz_dyld_aot is -aot's loader: the images are mapped and bound as for a
  * launch, no initializer runs, and their code goes to ocerz_jit_aot instead;
  * ocerz_dyld_filetype answers an x86_64 slice's MH_ file type, or -1.
+ * ocerz_dyld_file_ident answers the identity an executable's profile is kept
+ * under (src/tcache.c): its LC_UUID, or its path, size and mtime; 0 for a file
+ * that is no x86_64 executable.
  */
 #ifndef OCERZ_DYLD_H
 #define OCERZ_DYLD_H
@@ -53,6 +56,7 @@ int ocerz_peek_dynamic(const char *path);
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp);
 int ocerz_dyld_aot(struct OcerzVM *vm, int n, char **paths, int deps, char **envp);
 int ocerz_dyld_filetype(const char *path);
+uint64_t ocerz_dyld_file_ident(const char *path);
 
 uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode);
 uint64_t ocerz_dlopen_from(struct OcerzVM *vm, const char *hostpath, int mode, uint64_t caller);

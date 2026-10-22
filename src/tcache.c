@@ -83,6 +83,29 @@
  * probes the index for a key without reading the record, and ocerz_tcache_room
  * says whether the store is still under half of its size limit, which is where
  * -aot stops.
+ *
+ * ---- profiles ----
+ * -aot cannot know which shared-cache code a program runs: ruby's and tclsh's
+ * interpreters are themselves cache images, and the static closure of either
+ * is 342 images and 800k function starts.  A launch knows, though, so every
+ * process remembers the shared-cache rips it loaded or kept (each with the
+ * memory model it ran them under) in a set of its own, and adds the new ones
+ * to the program's profile when it flushes, execs or exits.  A profile lives
+ * in profiles/ beside the tc- directories, named for the main executable's
+ * identity (src/dyld.c, ocerz_dyld_file_ident) and the shared cache's UUID,
+ * so a rebuilt ocerz or a changed knob, which open a new store, keep it, and
+ * an OS update starts a new one.  It is a file of 8-byte entries appended
+ * under an exclusive flock, after reading what is already there so an entry
+ * is written once; a torn tail is cut off by the next writer, and the file
+ * stops growing at OCERZ_TC_PROF_MAX entries.  A second file, named for the
+ * identity alone (.execs), lists the programs this one was seen to execute
+ * (python3's xcrun shim runs python3.9, which runs Python.app; ruby runs
+ * /bin/sh and uname), one path a line.  A writer that finds all of its own
+ * entries already there writes nothing, and keeping profiles costs a warm
+ * launch nothing measurable (python3 0.187 s with and without, tclsh 0.109
+ * and 0.108).  src/jit.c ("Ahead of time") says how -aot uses them.
+ * OCERZ_NO_TCACHE_PROFILE=1 writes and reads none and, like the profiles
+ * themselves, stays out of the fingerprint.
  */
 #include "ocerz/tcache.h"
 #include "ocerz/mem.h"
@@ -97,6 +120,7 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <os/lock.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -244,6 +268,7 @@ static int env_ignored(const char *kv)
         "OCERZ_TCACHE=", "OCERZ_TCACHE_LOG=", "OCERZ_TCACHE_DIR=", "OCERZ_TCACHE_TRACE=",
         "OCERZ_TCACHE_MAX_MB=", "OCERZ_TCACHE_MIN_FREE_MB=", "OCERZ_GUESTPROF=", "OCERZ_GUESTPROF_PERIOD=", "OCERZ_LOWBASE=",
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
+        "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
@@ -878,6 +903,242 @@ static void hand_off_locked(void)
     g_buf_n = 0;
 }
 
+static int profile_off(void)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_TCACHE_PROFILE") || ocerz_tcache_mode() != OCERZ_TC_ON;
+    return off;
+}
+
+static int profile_path(char *out, size_t n, const char *leaf)
+{
+    const char *dir = getenv("OCERZ_TCACHE_DIR");
+    const char *home = getenv("HOME");
+    if (dir && dir[0])
+        snprintf(out, n, "%s/profiles%s%s", dir, leaf ? "/" : "", leaf ? leaf : "");
+    else if (home && home[0])
+        snprintf(out, n, "%s/Library/Caches/ocerz/profiles%s%s", home, leaf ? "/" : "", leaf ? leaf : "");
+    else
+        return 0;
+    return 1;
+}
+
+static void profile_rips_name(char *out, size_t n, uint64_t ident, const uint8_t *uuid)
+{
+    char leaf[80];
+    int k = snprintf(leaf, sizeof leaf, "%016llx-", (unsigned long long)ident);
+    for (int i = 0; i < 16; i++)
+        k += snprintf(leaf + k, sizeof leaf - (size_t)k, "%02x", uuid[i]);
+    snprintf(leaf + k, sizeof leaf - (size_t)k, ".rips");
+    if (!profile_path(out, n, leaf))
+        out[0] = 0;
+}
+
+static void profile_execs_name(char *out, size_t n, uint64_t ident)
+{
+    char leaf[40];
+    snprintf(leaf, sizeof leaf, "%016llx.execs", (unsigned long long)ident);
+    if (!profile_path(out, n, leaf))
+        out[0] = 0;
+}
+
+static os_unfair_lock g_plock = OS_UNFAIR_LOCK_INIT;
+static uint64_t *g_pset;
+static size_t g_pcap, g_pn, g_pwritten;
+static uint64_t g_pident;
+static char g_prips[1200];
+
+static int pset_add(uint64_t **set, size_t *cap, size_t *n, uint64_t v)
+{
+    if (2 * (*n + 1) > *cap) {
+        size_t nc = *cap ? *cap * 2 : 8192;
+        uint64_t *ns = (uint64_t *)calloc(nc, sizeof *ns);
+        if (!ns)
+            return 0;
+        for (size_t i = 0; i < *cap; i++)
+            if ((*set)[i]) {
+                size_t j = (size_t)(slot_hash((*set)[i]) & (nc - 1));
+                while (ns[j]) j = (j + 1) & (nc - 1);
+                ns[j] = (*set)[i];
+            }
+        free(*set);
+        *set = ns;
+        *cap = nc;
+    }
+    size_t j = (size_t)(slot_hash(v) & (*cap - 1));
+    while ((*set)[j] && (*set)[j] != v) j = (j + 1) & (*cap - 1);
+    if ((*set)[j])
+        return 0;
+    (*set)[j] = v;
+    (*n)++;
+    return 1;
+}
+
+static int pset_has(const uint64_t *set, size_t cap, uint64_t v)
+{
+    if (!v || !cap)
+        return 0;
+    size_t j = (size_t)(slot_hash(v) & (cap - 1));
+    while (set[j] && set[j] != v) j = (j + 1) & (cap - 1);
+    return set[j] != 0;
+}
+
+static void profile_write(void)
+{
+    os_unfair_lock_lock(&g_plock);
+    if (!g_prips[0] || g_pwritten == g_pn) {
+        os_unfair_lock_unlock(&g_plock);
+        return;
+    }
+    char dir[1200];
+    int fd = -1;
+    if (profile_path(dir, sizeof dir, NULL) && mkdirs(dir) == 0)
+        fd = open(g_prips, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    struct stat st;
+    if (fd >= 0 && flock(fd, LOCK_EX) == 0 && fstat(fd, &st) == 0) {
+        size_t have = (size_t)st.st_size / 8, fcap = 0, fn = 0, nout = 0;
+        uint64_t *old = have && have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(have * 8) : NULL;
+        uint64_t *fset = NULL, *out = have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(g_pn * 8) : NULL;
+        size_t held = 0;
+        if (old && pread(fd, old, have * 8, 0) == (ssize_t)(have * 8))
+            for (size_t i = 0; i < have; i++)
+                held += pset_has(g_pset, g_pcap, old[i]);
+        for (size_t i = 0; held < g_pn && old && i < have; i++)
+            if (old[i])
+                pset_add(&fset, &fcap, &fn, old[i]);
+        if (held >= g_pn) {
+            free(out);
+            out = NULL;
+        }
+        for (size_t i = 0; out && i < g_pcap && have + nout < OCERZ_TC_PROF_MAX; i++)
+            if (g_pset[i] && !pset_has(fset, fcap, g_pset[i]))
+                out[nout++] = g_pset[i];
+        if (nout)
+            (void)!pwrite(fd, out, nout * 8, (off_t)(have * 8));
+        if (g_log > 0)
+            fprintf(stderr, "ocerz: TCACHE[%d] profile %s: %zu held, %zu added\n", (int)getpid(), g_prips, have, nout);
+        free(old);
+        free(fset);
+        free(out);
+        g_pwritten = g_pn;
+    }
+    if (fd >= 0)
+        close(fd);
+    os_unfair_lock_unlock(&g_plock);
+}
+
+static void profile_atexit(void)
+{
+    profile_write();
+}
+
+void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid)
+{
+    if (!ident || !cache_uuid || profile_off())
+        return;
+    if (g_log < 0)
+        g_log = getenv("OCERZ_TCACHE_LOG") ? 1 : 0;
+    os_unfair_lock_lock(&g_plock);
+    int first = !g_prips[0];
+    profile_rips_name(g_prips, sizeof g_prips, ident, cache_uuid);
+    g_pident = ident;
+    os_unfair_lock_unlock(&g_plock);
+    if (first && g_prips[0])
+        atexit(profile_atexit);
+}
+
+void ocerz_tcache_profile_note(uint64_t v)
+{
+    if (!g_prips[0])
+        return;
+    os_unfair_lock_lock(&g_plock);
+    if (g_pn < OCERZ_TC_PROF_MAX)
+        pset_add(&g_pset, &g_pcap, &g_pn, v);
+    os_unfair_lock_unlock(&g_plock);
+}
+
+void ocerz_tcache_profile_exec(const char *path)
+{
+    char name[1200], dir[1200];
+    if (!g_pident || !path || !path[0] || strchr(path, '\n'))
+        return;
+    profile_execs_name(name, sizeof name, g_pident);
+    if (!name[0] || !profile_path(dir, sizeof dir, NULL) || mkdirs(dir) != 0)
+        return;
+    int fd = open(name, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return;
+    struct stat st;
+    if (flock(fd, LOCK_EX) == 0 && fstat(fd, &st) == 0 && st.st_size < (64 << 10)) {
+        size_t have = (size_t)st.st_size, pl = strlen(path);
+        char *buf = (char *)malloc(have + 2), *line = NULL;
+        if (buf && pread(fd, buf + 1, have, 0) == (ssize_t)have) {
+            buf[0] = '\n';
+            buf[have + 1] = 0;
+            for (char *p = strstr(buf, path); p && !line; p = strstr(p + 1, path))
+                if (p[-1] == '\n' && p[pl] == '\n')
+                    line = p;
+            if (!line) {
+                char *rec = (char *)malloc(pl + 1);
+                if (rec) {
+                    memcpy(rec, path, pl);
+                    rec[pl] = '\n';
+                    (void)!pwrite(fd, rec, pl + 1, (off_t)have);
+                    free(rec);
+                }
+            }
+        }
+        free(buf);
+    }
+    close(fd);
+}
+
+size_t ocerz_tcache_profile_read(uint64_t ident, const uint8_t *cache_uuid, uint64_t **out)
+{
+    char name[1200];
+    *out = NULL;
+    if (!ident || !cache_uuid || profile_off())
+        return 0;
+    profile_rips_name(name, sizeof name, ident, cache_uuid);
+    int fd = name[0] ? open(name, O_RDONLY | O_CLOEXEC) : -1;
+    struct stat st;
+    size_t n = 0;
+    if (fd >= 0 && flock(fd, LOCK_SH) == 0 && fstat(fd, &st) == 0 && st.st_size >= 8) {
+        n = (size_t)st.st_size / 8;
+        if (n > OCERZ_TC_PROF_MAX)
+            n = OCERZ_TC_PROF_MAX;
+        *out = (uint64_t *)malloc(n * 8);
+        if (!*out || pread(fd, *out, n * 8, 0) != (ssize_t)(n * 8)) {
+            free(*out);
+            *out = NULL;
+            n = 0;
+        }
+    }
+    if (fd >= 0)
+        close(fd);
+    return n;
+}
+
+char *ocerz_tcache_profile_execs(uint64_t ident)
+{
+    char name[1200];
+    if (!ident || profile_off())
+        return NULL;
+    profile_execs_name(name, sizeof name, ident);
+    int fd = name[0] ? open(name, O_RDONLY | O_CLOEXEC) : -1;
+    struct stat st;
+    char *buf = NULL;
+    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size < (64 << 10) &&
+        (buf = (char *)malloc((size_t)st.st_size + 1)) != NULL) {
+        ssize_t got = pread(fd, buf, (size_t)st.st_size, 0);
+        buf[got > 0 ? got : 0] = 0;
+    }
+    if (fd >= 0)
+        close(fd);
+    return buf;
+}
+
 static void flush_atexit(void)
 {
     ocerz_tcache_flush();
@@ -918,6 +1179,7 @@ void ocerz_tcache_put(const OcerzTcRecHead *rec)
 
 void ocerz_tcache_flush(void)
 {
+    profile_write();
     if (!g_zbuf)
         return;
     pthread_mutex_lock(&g_lock);
@@ -939,6 +1201,7 @@ void ocerz_tcache_child(void)
     pthread_mutex_init(&g_qlock, NULL);
     pthread_cond_init(&g_qwork, NULL);
     pthread_cond_init(&g_qdone, NULL);
+    g_plock = OS_UNFAIR_LOCK_INIT;
     g_writer = 0;
     g_qn = 0;
     g_busy = 0;
