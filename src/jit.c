@@ -20734,6 +20734,18 @@ static void dep_plain_mark(const X86Insn *insns, int n)
  * In the Wine layout the accesses go through rsp plus the stack delta.
  * OCERZ_NO_STACK_RUN=1 goes back to pairs in the Wine layout only, and
  * OCERZ_NO_STACK_PAIR=1 turns both off.
+ *
+ * The stores are paired the way the pops will read them back.  A pop run
+ * pairs upward from rsp, so a push run of odd length stores its first register
+ * alone at the top and pairs the rest from the bottom.  Paired from the top,
+ * fib's push rbp, push r14, push rbx left the ldp that pops rbx and r14
+ * straddling the stur of rbx and half the stp of r14 and rbp: no single store
+ * covers that load, so it cannot be forwarded, and every return waited for both
+ * stores to reach the cache before rbx came back.  That wait was the whole
+ * critical path of the call kernel: mirrored, fibn(42)-fibn(38) went from 0.57
+ * to 0.51 s on an M4 Pro, where shaving the three rsp and rbp adjusts or the
+ * return path's null check off the same frame measured nothing.
+ * OCERZ_NO_STACK_RUN_MIRROR=1 pairs from the top again.
  */
 #define STACK_RUN_MAX 16
 static int stack_pair_reg(const X86Insn *in, int op)
@@ -20790,11 +20802,15 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
     }
     if (mov_idx > last) mov_at = -1;
     if (k < 2) return 0;
+    static int nomirror = -1;
+    if (nomirror < 0) nomirror = getenv("OCERZ_NO_STACK_RUN_MIRROR") ? 1 : 0;
+    int top = op == OCERZ_OP_PUSH && (k & 1) && !nomirror;
     int hs = pin_hreg(pin_slot(OCERZ_RSP));
     if (g_lazy_end >= 0) {
         int32_t at = g_rsp_pend;
         int j = 0;
         if (op == OCERZ_OP_PUSH) {
+            if (top) { a64_stur(b, 8, regs[0], hs, at - 8); j = 1; }
             for (; j + 1 < k; j += 2)
                 a64_stp_off(b, regs[j + 1], regs[j], hs, at - 8 * (j + 2));
             if (j < k)
@@ -20823,6 +20839,7 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
     }
     int j = 0;
     if (op == OCERZ_OP_PUSH) {
+        if (top) { a64_stur(b, 8, regs[0], base, -8); j = 1; }
         for (; j + 1 < k; j += 2)
             a64_stp_off(b, regs[j + 1], regs[j], base, -8 * (j + 2));
         if (j < k)
