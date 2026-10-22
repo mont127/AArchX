@@ -35,6 +35,9 @@
  * ocerz_dyld_image_ident answers, for the translation cache, the extent of the
  * disk image whose segments hold an address and an identity that changes when
  * the file does: its LC_UUID, or its path, size, mtime and load commands.
+ * ocerz_dyld_aot is -aot's loader: the images are mapped and bound as for a
+ * launch, no initializer runs, and their code goes to ocerz_jit_aot instead;
+ * ocerz_dyld_filetype answers an x86_64 slice's MH_ file type, or -1.
  */
 #ifndef OCERZ_DYLD_H
 #define OCERZ_DYLD_H
@@ -48,6 +51,8 @@ extern uint64_t ocerz_main_mh;
 
 int ocerz_peek_dynamic(const char *path);
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp);
+int ocerz_dyld_aot(struct OcerzVM *vm, int n, char **paths, int deps, char **envp);
+int ocerz_dyld_filetype(const char *path);
 
 uint64_t ocerz_dlopen(struct OcerzVM *vm, const char *hostpath, int mode);
 uint64_t ocerz_dlopen_from(struct OcerzVM *vm, const char *hostpath, int mode, uint64_t caller);

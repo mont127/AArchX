@@ -1056,6 +1056,30 @@ run_tcache_case() {
 
 run_tcache_case dtcache 'OK'
 run_tcache_case dtcache_low 'OK' -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000
+# ocerz -aot fills a fresh store with tcache_work's own code without running
+# it; the launch after it, at another slide, must print OK and find every block
+# of the program it asks for in the store.
+aot_dir="$TMP/dtcache_aot"
+mkdir -p "$aot_dir"
+if ! clang -arch x86_64 -O2 -o "$aot_dir/work" tests/dynamic/tcache_work.c 2>/dev/null; then
+    echo "FAIL dtcache_aot (build)"; fail=$((fail+1))
+else
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$aot_dir/store" OCERZ_TCACHE_MIN_FREE_MB=0 \
+        run_bounded "$aot_dir/aot.out" "$aot_dir/aot.err" "$OCERZ" -aot "$aot_dir/work"
+    aot_code=$?
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$aot_dir/store" OCERZ_TCACHE_LOG="$aot_dir/run.log" OCERZ_TCACHE_MIN_FREE_MB=0 \
+        OCERZ_GUEST_SLIDE=0x400000 run_bounded "$aot_dir/run.out" "$aot_dir/run.err" "$OCERZ" "$aot_dir/work"
+    aot_run_code=$?
+    if [ "$aot_code" = 0 ] && [ "$aot_run_code" = 0 ] && [ "$(cat "$aot_dir/run.out")" = OK ] &&
+       awk '/images asked=/ { split($4, a, "="); split($5, b, "="); asked += a[2]; got += b[2] }
+            END { exit !(asked > 0 && got == asked) }' "$aot_dir/run.log"; then
+        echo "PASS dtcache_aot"; pass=$((pass+1))
+    else
+        echo "FAIL dtcache_aot (aot exit=$aot_code run exit=$aot_run_code out='$(cat "$aot_dir/run.out")'" \
+             "$(grep -h 'images asked=' "$aot_dir/run.log" | head -1))"
+        fail=$((fail+1))
+    fi
+fi
 # With a free-space floor no disk can meet, the cache must not write a byte and
 # the program must still run; the floor is what kept the cache from filling a
 # nearly full disk.

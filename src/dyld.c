@@ -568,6 +568,7 @@
 #include "ocerz/bridge.h"
 #include "ocerz/abi.h"
 #include "ocerz/syscall.h"
+#include "ocerz/jit.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -6720,6 +6721,192 @@ static void wine_preload_skip_pinned(DynImage *img)
               (unsigned long long)OCERZ_LOW_LIMIT);
 }
 
+static char **g_aot_paths;
+static int g_aot_n, g_aot_deps;
+
+typedef struct { uint64_t *v; size_t n, cap; } AotVec;
+
+static void aot_push(AotVec *a, uint64_t x)
+{
+    if (a->n == a->cap) {
+        size_t nc = a->cap ? a->cap * 2 : 4096;
+        uint64_t *nv = realloc(a->v, nc * sizeof *nv);
+        if (!nv)
+            return;
+        a->v = nv;
+        a->cap = nc;
+    }
+    a->v[a->n++] = x;
+}
+
+static int aot_export(void *ctx, const char *name, uint64_t value, uint64_t flags)
+{
+    (void)name;
+    if ((flags & (EXPORT_SYMBOL_FLAGS_KIND_MASK | EXPORT_SYMBOL_FLAGS_REEXPORT)) == EXPORT_SYMBOL_FLAGS_KIND_REGULAR)
+        aot_push(ctx, value);
+    return 0;
+}
+
+static uint64_t aot_fileoff_addr(const DynImage *d, uint64_t off)
+{
+    const uint8_t *mh = d->slice;
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < rd32(mh + 16); k++, lc += rd32(lc + 4))
+        if (rd32(lc) == LC_SEGMENT_64 && off - rd64(lc + 40) < rd64(lc + 48))
+            return rd64(lc + 24) + (off - rd64(lc + 40)) + d->slide;
+    return 0;
+}
+
+/* An image's code sections, as ranges, and where its code is entered: every
+ * LC_FUNCTION_STARTS entry, every exported function, the entry point, and
+ * every case of a jump table LC_DATA_IN_CODE names (an int32 offset from the
+ * table each, as clang lays them out). */
+static void aot_image(const DynImage *d, AotVec *seed, AotVec *rng)
+{
+    const uint8_t *mh = d->slice;
+    uint32_t ncmds = rd32(mh + 16);
+    const uint8_t *lc = mh + sizeof(struct mach_header_64);
+    uint64_t text = 0, fs_off = 0, fs_size = 0, dic_off = 0, dic_size = 0;
+    for (uint32_t k = 0; k < ncmds; k++) {
+        uint32_t cmd = rd32(lc);
+        if (cmd == LC_DATA_IN_CODE) {
+            dic_off = rd32(lc + 8);
+            dic_size = rd32(lc + 12);
+        } else if (cmd == LC_SEGMENT_64) {
+            if (rd64(lc + 40) == 0 && rd64(lc + 48))
+                text = rd64(lc + 24);
+            const uint8_t *sec = lc + sizeof(struct segment_command_64);
+            for (uint32_t j = 0; j < rd32(lc + 64); j++, sec += sizeof(struct section_64))
+                if (rd32(sec + 64) & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) {
+                    aot_push(rng, rd64(sec + 32) + d->slide);
+                    aot_push(rng, rd64(sec + 32) + rd64(sec + 40) + d->slide);
+                }
+        } else if (cmd == LC_FUNCTION_STARTS) {
+            fs_off = rd32(lc + 8);
+            fs_size = rd32(lc + 12);
+        }
+        lc += rd32(lc + 4);
+    }
+    uint64_t at = text + d->slide;
+    for (const uint8_t *p = mh + fs_off, *e = p + fs_size; fs_size && p < e && *p;) {
+        uint64_t delta = 0;
+        for (int shift = 0; p < e && shift < 64; shift += 7) {
+            delta |= (uint64_t)(*p & 0x7f) << shift;
+            if (!(*p++ & 0x80))
+                break;
+        }
+        at += delta;
+        aot_push(seed, at);
+    }
+    AotVec data = { 0 };
+    lc = mh + sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < ncmds; k++, lc += rd32(lc + 4))
+        if (rd32(lc) == LC_SEGMENT_64 && !strncmp((const char *)lc + 8, "__DATA", 6)) {
+            aot_push(&data, rd64(lc + 24) + d->slide);
+            aot_push(&data, rd64(lc + 24) + d->slide + rd64(lc + 48));
+        }
+    for (size_t r = 0; r + 1 < data.n; r += 2)
+        for (uint64_t a = (data.v[r] + 7) & ~7ull; a + 8 <= data.v[r + 1]; a += 8) {
+            uint64_t v = ocerz_ld(a, 8);
+            for (size_t q = 0; q + 1 < rng->n; q += 2)
+                if (v - rng->v[q] < rng->v[q + 1] - rng->v[q]) {
+                    aot_push(seed, v);
+                    break;
+                }
+        }
+    free(data.v);
+    for (uint64_t e = 0; e + 8 <= dic_size; e += 8) {
+        const uint8_t *ent = mh + dic_off + e;
+        uint32_t off = rd32(ent), len = rd32(ent + 4) & 0xffff;
+        uint64_t table = (rd32(ent + 4) >> 16) == DICE_KIND_JUMP_TABLE32 ? aot_fileoff_addr(d, off) : 0;
+        for (uint32_t j = 0; table && j + 4 <= len; j += 4)
+            aot_push(seed, table + (uint64_t)(int64_t)(int32_t)rd32(mh + off + j));
+    }
+    ocerz_dyld_trie_each(d->slice, d->load_base, aot_export, seed);
+    if (d->main_entry)
+        aot_push(seed, d->main_entry);
+}
+
+/* -aot: the images are mapped and bound as for a launch; their code is
+ * translated into the store instead of run. */
+static int aot_run(struct OcerzVM *vm, OcerzCache *cache, int first)
+{
+    AotVec seed = { 0 }, rng = { 0 };
+    int nimg = 0;
+    if (g_main_dimg_valid && first) {
+        aot_image(&g_main_dimg, &seed, &rng);
+        nimg++;
+    }
+    for (int k = first; k < g_aot_n; k++) {
+        char abspath[PATH_MAX];
+        const char *p = realpath(g_aot_paths[k], abspath) ? abspath : g_aot_paths[k];
+        DynImage *d = load_disk_dylib(cache, p, g_main_dimg_valid ? &g_main_dimg : NULL, NULL);
+        if (!d)
+            fprintf(stderr, "ocerz: -aot: cannot load %s\n", p);
+        else if (!g_aot_deps && !d->is_virtual) {
+            aot_image(d, &seed, &rng);
+            nimg++;
+        }
+    }
+    for (int i = 0; g_aot_deps && i < g_dimgs_n; i++)
+        if (!g_dimgs[i].is_virtual && g_dimgs[i].slice) {
+            aot_image(&g_dimgs[i], &seed, &rng);
+            nimg++;
+        }
+    OcerzJitAotStats st;
+    int rc = ocerz_jit_aot(vm, seed.v, seed.n, (const uint64_t (*)[2])rng.v, (int)(rng.n / 2), &st);
+    if (rc != 0)
+        fprintf(stderr, "ocerz: -aot needs the JIT and the translation cache on, in cache mode\n");
+    else
+        fprintf(stderr, "ocerz: -aot %s: %d image%s, %zu entries, %llu blocks in %d memory model%s (%llu kept,"
+                        " %llu already kept), %llu not translated, %llu ms%s\n",
+                g_aot_paths[0], nimg, nimg == 1 ? "" : "s", seed.n, (unsigned long long)st.blocks,
+                st.models ? st.models : 1, st.models > 1 ? "s" : "", (unsigned long long)st.saved,
+                (unsigned long long)st.present, (unsigned long long)st.failed, (unsigned long long)st.ms,
+                st.full ? "; stopped at half the store's room" : "");
+    free(seed.v);
+    free(rng.v);
+    return rc ? 1 : 0;
+}
+
+int ocerz_dyld_filetype(const char *path)
+{
+    size_t flen = 0;
+    uint8_t *buf = read_file(path, &flen);
+    const uint8_t *slice = buf ? select_slice(buf, flen) : NULL;
+    int t = slice ? (int)rd32(slice + 12) : -1;
+    free(buf);
+    return t;
+}
+
+int ocerz_dyld_aot(struct OcerzVM *vm, int n, char **paths, int deps, char **envp)
+{
+    g_aot_paths = paths;
+    g_aot_n = n;
+    g_aot_deps = deps;
+    int t = ocerz_dyld_filetype(paths[0]);
+    if (t < 0) {
+        OCERZ_FATAL("-aot: %s is no x86_64 Mach-O\n", paths[0]);
+        return 65;
+    }
+    if (t == MH_EXECUTE)
+        return ocerz_dyld_run(vm, paths[0], 1, paths, envp);
+    if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
+        return OCERZ_ENOMEM;
+    static OcerzCache cache;
+    if (ocerz_mode == OCERZ_MODE_CACHE && ocerz_cache_map(&cache) != OCERZ_OK) {
+        OCERZ_FATAL("cannot map shared cache for dynamic loading\n");
+        return OCERZ_EIO;
+    }
+    g_run_cache = &cache;
+    g_run_vm = vm;
+    ocerz_vm_install_handlers(vm);
+    ocerz_commpage_init();
+    if (ocerz_mode == OCERZ_MODE_CACHE)
+        ocerz_dyldapi_setup(&cache);
+    return aot_run(vm, &cache, 0);
+}
+
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp)
 {
     if (ocerz_mem_init_identity(DYN_ARENA_SIZE) != OCERZ_OK)
@@ -6880,6 +7067,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     { extern void ocerz_peek_dump(const char *); ocerz_peek_dump("cache-mapped"); }
     if (ocerz_mode == OCERZ_MODE_CACHE && ocerz_dyldapi_setup(&cache) != OCERZ_OK)
         OCERZ_LOG("dynamic: dyld API shim not installed\n");
+    if (g_aot_n)
+        return aot_run(vm, &cache, 1);
 
     uint64_t environ_addr = ocerz_cache_resolve(&cache, "_environ");
     if (environ_addr) {

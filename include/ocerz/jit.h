@@ -37,6 +37,12 @@ typedef struct OcerzJitFaultInfo {
 OcerzJit *ocerz_jit_create(struct OcerzVM *vm);
 void ocerz_jit_destroy(OcerzJit *jit);
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu);
+typedef struct OcerzJitAotStats {
+    uint64_t blocks, failed, saved, present, ms;
+    int models, full;
+} OcerzJitAotStats;
+int ocerz_jit_aot(struct OcerzVM *vm, const uint64_t *seed, size_t nseed, const uint64_t (*rng)[2], int nrng,
+                  OcerzJitAotStats *st);
 uint64_t ocerz_jit_blocks(const OcerzJit *jit);
 void ocerz_jit_prof_stats(const struct OcerzVM *vm, uint64_t *translated, uint64_t *live,
                           uint64_t *retires, uint64_t *flips);

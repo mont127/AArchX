@@ -638,6 +638,30 @@
  * verify checks image records at another slide; under verify an image record's
  * relocated instructions must match the fresh decode too.
  *
+ * Ahead of time.  `ocerz -aot` (src/main.c, src/dyld.c) loads a program as for
+ * a launch, maps and binds it and its dependencies, and hands ocerz_jit_aot
+ * where the images' code is entered instead of jumping to the entry point:
+ * every LC_FUNCTION_STARTS entry, every exported function, the entry point,
+ * every case of a jump table LC_DATA_IN_CODE lists, and every pointer in a
+ * __DATA segment that lands in a code section (vtables, callbacks, the
+ * computed-goto table of Python's eval loop).  aot_walk translates each as the
+ * dispatcher would, with no registers known and the x87 top at zero, and
+ * follows its static successors inside the images' code sections: a direct
+ * branch's target, the instruction after a call, and the fall-through of every
+ * jcc, since a flipped superblock leaves through it at run time.  It stops at
+ * indirect branches and returns.  A block that already has a record is decoded
+ * for its successors rather than loaded.  Everything is walked twice, under the
+ * plain memory model and again after ocerz_jit_require_ordered, because a
+ * process keys its blocks by the model it runs under and goes ordered with its
+ * second thread; and the walk stops once the store holds half of
+ * OCERZ_TCACHE_MAX_MB, since a full store is emptied by the next process that
+ * finds it so.  What a translation learns at run time (flips, profiles) is left
+ * to the first real launch, which stores its learned blocks over the cold ones
+ * as any launch does.  For python3 (xcrun shim, libxcrun, the two Python
+ * executables and Python3.framework) -aot takes 1.4 s and 280 MB for 275k
+ * blocks; the first launch afterwards finds 99.8% of the 13.7k image blocks it
+ * asks for, and takes 0.27 s where a cold one takes 0.37 s and a warm one 0.22.
+ *
  * ---- i386 ----
  * 32-bit blocks are compiled from a whitelist of instructions (m32_inline_ok),
  * with no superblocks and 0x67/16-bit addressing left to the interpreter.
@@ -22510,8 +22534,8 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
             static int tr = -1;
             if (tr < 0) tr = getenv("OCERZ_TCACHE_TRACE") ? 1 : 0;
             if (tr && g_tc_log > 0)
-                fprintf(g_tc_lf, "ocerz: TCACHE[%d] %s key=%#llx\n", (int)getpid(), tc_hit ? "HIT" : "MISS",
-                        (unsigned long long)g_tc_key);
+                fprintf(g_tc_lf, "ocerz: TCACHE[%d] %s key=%#llx rip=%#llx\n", (int)getpid(), tc_hit ? "HIT" : "MISS",
+                        (unsigned long long)g_tc_key, (unsigned long long)rip);
         }
         if (tc_hit && tcm == OCERZ_TC_ON) {
             uint64_t t0 = ocerz_jit_time_xlat ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
@@ -26790,6 +26814,148 @@ static int jit_flush(struct OcerzVM *vm, OcerzJit *jit)
     __atomic_add_fetch(&g_flush_gen, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_flush_req, 0, __ATOMIC_SEQ_CST);
     return ok;
+}
+
+static int aot_in(const uint64_t (*rng)[2], int nrng, uint64_t a)
+{
+    for (int i = 0; i < nrng; i++)
+        if (a - rng[i][0] < rng[i][1] - rng[i][0])
+            return 1;
+    return 0;
+}
+
+static int aot_walk(struct OcerzVM *vm, OcerzJit *jit, const uint64_t *seed, size_t nseed, const uint64_t (*rng)[2],
+                    int nrng, OcerzJitAotStats *st)
+{
+    size_t cap = 1u << 16, n = 0, hcap = 1u << 18, hn = 0;
+    uint64_t *work = (uint64_t *)malloc(cap * sizeof *work), *seen = (uint64_t *)calloc(hcap, sizeof *seen);
+    int ok = work && seen;
+    for (size_t k = 0; ok;) {
+        uint64_t rip;
+        if (n)
+            rip = work[--n];
+        else if (k < nseed)
+            rip = seed[k++];
+        else
+            break;
+        if (!rip || !aot_in(rng, nrng, rip))
+            continue;
+        if (2 * (hn + 1) > hcap) {
+            uint64_t *ns = (uint64_t *)calloc(hcap * 2, sizeof *ns);
+            if (!ns)
+                break;
+            for (size_t i = 0; i < hcap; i++)
+                if (seen[i]) {
+                    size_t j = (size_t)((seen[i] * 0x9e3779b97f4a7c15ull) >> 20) & (2 * hcap - 1);
+                    while (ns[j]) j = (j + 1) & (2 * hcap - 1);
+                    ns[j] = seen[i];
+                }
+            free(seen);
+            seen = ns;
+            hcap *= 2;
+        }
+        size_t j = (size_t)((rip * 0x9e3779b97f4a7c15ull) >> 20) & (hcap - 1);
+        while (seen[j] && seen[j] != rip) j = (j + 1) & (hcap - 1);
+        if (seen[j])
+            continue;
+        seen[j] = rip;
+        hn++;
+        if ((hn & 4095) == 0 && !ocerz_tcache_room()) {
+            st->full = 1;
+            break;
+        }
+        if (jit_space_low(jit))
+            jit_flush(vm, jit);
+        JitBlock *b = cache_lookup(jit, rip, 0);
+        X86Insn x;
+        int ni = 0, kept = 0;
+        g_plain_mem = jit->plain_mem || ocerz_dyldapi_memfn(rip);
+        if (!b && tc_keepable(rip, 0) && ocerz_tcache_has(tc_key(rip, 0))) {
+            kept = 1;
+            st->present++;
+            for (uint64_t pc = rip; ni < JIT_MAX_BLOCK_INSNS; pc += x.len, ni++)
+                if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(pc), 15, pc, &x, 0) != OCERZ_OK ||
+                    is_terminator(x.op)) {
+                    ni++;
+                    break;
+                }
+        } else if (!b) {
+            jl_lock_step(rip);
+            g_xlat_ftop = 0;
+            g_xlat_cpu = NULL;
+            b = translate(jit, rip, 0);
+            g_xlat_ftop = -1;
+            jl_unlock_step();
+        }
+        if (!kept && (!b || b->n_insns <= 0)) {
+            st->failed++;
+            continue;
+        }
+        st->blocks++;
+        if (!kept)
+            ni = b->n_insns;
+        for (int i = 0, at0 = 0; i < ni; i++) {
+            uint64_t at = kept ? rip + (uint64_t)at0 : blk_insn_rip(b, i);
+            unsigned op, len;
+            if (kept) {
+                if (ocerz_decode_mode((const uint8_t *)ocerz_g2h(at), 15, at, &x, 0) != OCERZ_OK)
+                    break;
+                op = x.op;
+                len = x.len;
+                at0 += (int)len;
+            } else {
+                op = blk_insn_op(b, i);
+                len = blk_insn_len(b, i);
+            }
+            uint64_t next[2];
+            int nn = 0;
+            if (op == OCERZ_OP_CALL || op == OCERZ_OP_JCC)
+                next[nn++] = at + len;
+            if ((op == OCERZ_OP_JCC || op == OCERZ_OP_JMP || op == OCERZ_OP_CALL || op == OCERZ_OP_LOOP ||
+                 op == OCERZ_OP_LOOPE || op == OCERZ_OP_LOOPNE || op == OCERZ_OP_JRCXZ) &&
+                ocerz_decode_mode((const uint8_t *)ocerz_g2h(at), 15, at, &x, 0) == OCERZ_OK &&
+                x.nops >= 1 && x.ops[0].kind == OCERZ_OPK_IMM)
+                next[nn++] = x.ops[0].imm;
+            if (i == ni - 1 && op != OCERZ_OP_JMP && op != OCERZ_OP_RET && op != OCERZ_OP_UD2 &&
+                op != OCERZ_OP_HLT && op != OCERZ_OP_INT3 && op != OCERZ_OP_JMPF && op != OCERZ_OP_RETF &&
+                op != OCERZ_OP_IRET && op != OCERZ_OP_CALL && op != OCERZ_OP_JCC)
+                next[nn++] = at + len;
+            for (int q = 0; q < nn; q++) {
+                if (n == cap) {
+                    uint64_t *nw = (uint64_t *)realloc(work, cap * 2 * sizeof *nw);
+                    if (!nw)
+                        break;
+                    work = nw;
+                    cap *= 2;
+                }
+                work[n++] = next[q];
+            }
+        }
+    }
+    free(work);
+    free(seen);
+    return ok ? 0 : -1;
+}
+
+int ocerz_jit_aot(struct OcerzVM *vm, const uint64_t *seed, size_t nseed, const uint64_t (*rng)[2], int nrng,
+                  OcerzJitAotStats *st)
+{
+    OcerzJit *jit = vm->jit;
+    memset(st, 0, sizeof *st);
+    if (!jit || !tc_usable(jit) || ocerz_tcache_mode() != OCERZ_TC_ON || !ocerz_tcache_room())
+        return -1;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t saved0 = g_tc_n_put;
+    int rc = aot_walk(vm, jit, seed, nseed, rng, nrng, st);
+    if (rc == 0 && !st->full && jit->plain_mem) {
+        st->models = 2;
+        ocerz_jit_require_ordered(vm);
+        rc = aot_walk(vm, jit, seed, nseed, rng, nrng, st);
+    }
+    st->saved = g_tc_n_put - saved0;
+    st->ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1000000;
+    ocerz_tcache_flush();
+    return rc;
 }
 
 int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)

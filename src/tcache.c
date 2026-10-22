@@ -68,6 +68,21 @@
  * when a location points past what is mapped.  A forked child keeps its
  * parent's mappings but not its parent's data file: it drops the buffer and
  * opens a data file of its own on its first write.
+ *
+ * The index is 64 MB, and the volume allocates all of it when the file is
+ * created, so a page of it that no process has touched since is read from the
+ * disk the first time a probe lands on it: about 70 us a fault.  A store that
+ * -aot (src/jit.c) has just filled with a program's own code is exactly that,
+ * and the first launch's misses on shared-cache blocks made 1300 such faults,
+ * 0.1 s of xbench_dyn's 0.14.  So the thread that prunes other stores first
+ * asks whether a stretch of the index is in memory (mincore) and, when it is
+ * not, has the kernel read the whole index ahead (MADV_WILLNEED), while the
+ * translator goes on: that launch now takes 0.03 s, a cold python3 start went
+ * from 0.40 s to 0.33, and a warm one, whose index is in memory, is unchanged.
+ * OCERZ_NO_TCACHE_PREFETCH=1 leaves the index to fault.  ocerz_tcache_has
+ * probes the index for a key without reading the record, and ocerz_tcache_room
+ * says whether the store is still under half of its size limit, which is where
+ * -aot stops.
  */
 #include "ocerz/tcache.h"
 #include "ocerz/mem.h"
@@ -339,6 +354,14 @@ static uint64_t dir_bytes(const char *dir)
 static void *prune_other_dirs(void *arg)
 {
     (void)arg;
+    size_t len = sizeof(TcIdxHdr) + TC_SLOTS * sizeof(TcSlot), pg = (size_t)getpagesize(), out = 0;
+    char vec[64];
+    if (!getenv("OCERZ_NO_TCACHE_PREFETCH") && mincore((char *)g_hdr + len / 2, 64 * pg, vec) == 0) {
+        for (size_t i = 0; i < 64; i++)
+            out += !(vec[i] & MINCORE_INCORE);
+        if (out > 4)
+            madvise(g_hdr, len, MADV_WILLNEED);
+    }
     char parent[1024];
     snprintf(parent, sizeof parent, "%s", g_dir);
     char *slash = strrchr(parent, '/');
@@ -591,6 +614,35 @@ const char *ocerz_tcache_dir(int for_write)
     int ok = open_store();
     pthread_mutex_unlock(&g_lock);
     return ok && !(for_write && g_full) ? g_dir : NULL;
+}
+
+int ocerz_tcache_has(uint64_t key)
+{
+    int has = 0;
+    pthread_mutex_lock(&g_lock);
+    if (open_store()) {
+        uint64_t i = slot_hash(key) & g_mask;
+        for (int k = 0; k < TC_PROBE; k++, i = (i + 1) & g_mask) {
+            uint64_t sk = __atomic_load_n(&g_slot[i].key, __ATOMIC_ACQUIRE);
+            if (!sk || sk == key) {
+                has = sk && __atomic_load_n(&g_slot[i].loc, __ATOMIC_ACQUIRE);
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return has;
+}
+
+int ocerz_tcache_room(void)
+{
+    int m = ocerz_tcache_mode();
+    if (m != OCERZ_TC_ON)
+        return 0;
+    pthread_mutex_lock(&g_lock);
+    int ok = open_store() && !g_full && __atomic_load_n(&g_hdr->bytes, __ATOMIC_RELAXED) < g_cap_bytes / 2;
+    pthread_mutex_unlock(&g_lock);
+    return ok;
 }
 
 const OcerzTcRecHead *ocerz_tcache_find(uint64_t key)

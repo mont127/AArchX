@@ -73,6 +73,14 @@
  * itself, which keeps the process ID Steam tracks; the clean copy puts the
  * variable back before the guest's environment is taken, so the guest sees it
  * as it was set and the loader inserts the libraries into the guest alone.
+ *
+ * `ocerz -aot image...` fills the translation cache with the images' code
+ * without running it (src/dyld.c loads, src/jit.c translates; see "Ahead of
+ * time" there), and -aot-deps does the same for every disk dylib the images
+ * load as well.  An executable is loaded as the main image of a process, so
+ * with more than one each image is done by a child of its own, one after the
+ * other; a dylib or bundle named after a single executable is loaded into that
+ * executable's process, and one named alone gets a process with no main image.
  */
 #include <signal.h>
 #include <pthread.h>
@@ -93,6 +101,8 @@
 #include <unistd.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
+#include <spawn.h>
+#include <sys/wait.h>
 
 static char **env_snapshot(char **env)
 {
@@ -112,9 +122,40 @@ static char **env_snapshot(char **env)
 
 extern char **environ;
 
+/* -aot with more than one program: each image in a process of its own, since
+ * each program is loaded as the main image of one. */
+static int aot_main(OcerzVM *vm, int n, char **images, int deps, const char *self)
+{
+    int nexe = 0, exe = -1;
+    for (int k = 0; k < n; k++)
+        if (ocerz_dyld_filetype(images[k]) == MH_EXECUTE) {
+            nexe++;
+            exe = k;
+        }
+    if (nexe > 1) {
+        int rc = 0;
+        for (int k = 0; k < n; k++) {
+            char *args[] = { (char *)self, (char *)(deps ? "-aot-deps" : "-aot"), images[k], NULL };
+            pid_t pid;
+            int status = 0;
+            if (posix_spawn(&pid, self, NULL, NULL, args, environ) != 0 || waitpid(pid, &status, 0) < 0 ||
+                !WIFEXITED(status) || WEXITSTATUS(status))
+                rc = 1;
+        }
+        return rc;
+    }
+    if (exe > 0) {
+        char *t = images[0];
+        images[0] = images[exe];
+        images[exe] = t;
+    }
+    return ocerz_dyld_aot(vm, n, images, deps, env_snapshot(environ));
+}
+
 static void usage(void)
 {
     fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--] program [args...]\n"
+                    "       ocerz -aot|-aot-deps image [image...]\n"
                     "       ocerz version\n");
 }
 
@@ -360,6 +401,7 @@ int main(int argc, char **argv)
     int strace = 0;
     int nojit = 0;
     int mode_from_flag = 0;
+    int aot = 0;
     const char *load_path = NULL;
     setenv("MallocNanoZone", "0", 1);
     int i = 1;
@@ -390,6 +432,8 @@ int main(int argc, char **argv)
             mode_from_flag = 1;
         } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
             load_path = argv[++i];
+        } else if (strcmp(argv[i], "-aot") == 0 || strcmp(argv[i], "-aot-deps") == 0) {
+            aot = argv[i][4] ? 2 : 1;
         } else {
             usage();
             return 64;
@@ -413,6 +457,15 @@ int main(int argc, char **argv)
     if (i >= argc) {
         usage();
         return 64;
+    }
+    if (aot) {
+        static OcerzVM avm;
+        ocerz_vm_init(&avm);
+        avm.jit_enabled = !nojit && getenv("OCERZ_NOJIT") == NULL;
+        avm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
+        char selfpath[PATH_MAX];
+        uint32_t sl = sizeof selfpath;
+        return aot_main(&avm, argc - i, argv + i, aot == 2, _NSGetExecutablePath(selfpath, &sl) == 0 ? selfpath : argv[0]);
     }
     if (!load_path)
         load_path = argv[i];

@@ -19,7 +19,9 @@
  * and OCERZ_TC_VERIFY, which translates every block anyway and compares it
  * with the record it would have loaded.  ocerz_tcache_find returns the newest
  * stored record for a key, or NULL; the record stays readable until the next
- * call into this interface.
+ * call into this interface.  ocerz_tcache_has only answers whether there is
+ * one, and ocerz_tcache_room whether the store, under OCERZ_TC_ON, has more than
+ * half of its room left.
  * ocerz_tcache_put stores a record, ocerz_tcache_flush makes everything put so
  * far visible to other processes, and ocerz_tcache_child is called in a forked
  * child, which writes a data file of its own rather than its parent's.
@@ -45,9 +47,11 @@ typedef struct OcerzTcRecHead {
 
 int ocerz_tcache_mode(void);
 const OcerzTcRecHead *ocerz_tcache_find(uint64_t key);
+int ocerz_tcache_has(uint64_t key);
 void ocerz_tcache_put(const OcerzTcRecHead *rec);
 void ocerz_tcache_flush(void);
 void ocerz_tcache_child(void);
 const char *ocerz_tcache_dir(int for_write);
+int ocerz_tcache_room(void);
 
 #endif
