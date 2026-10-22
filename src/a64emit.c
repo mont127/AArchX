@@ -25,8 +25,17 @@
  * unscaled offset, and they are what the JIT's ordered accesses are built from;
  * LDAPURSB, LDAPURSH and LDAPURSW are the acquire-loads that sign-extend, so an
  * ordered movsx from memory is one instruction as a plain one is.
+ *
+ * mov_imm64 hands a value inside [a64_reloc_lo, a64_reloc_hi) to
+ * a64_reloc_imm instead of spelling it.  jit.c sets the range to the guest
+ * image a translation it keeps comes from, so every address in that image the
+ * translation builds goes out in one fixed shape the translation cache can
+ * relocate, whichever path built it.
  */
 #include "ocerz/a64emit.h"
+
+uint64_t a64_reloc_lo, a64_reloc_hi;
+void (*a64_reloc_imm)(A64Buf *b, int rd, uint64_t v);
 
 void a64_emit32(A64Buf *b, uint32_t w)
 {
@@ -161,6 +170,10 @@ int a64_try_eor_imm(A64Buf *b, int sf, int rd, int rn, uint64_t imm)
 
 void a64_mov_imm64(A64Buf *b, int rd, uint64_t v)
 {
+    if (v - a64_reloc_lo < a64_reloc_hi - a64_reloc_lo) {
+        a64_reloc_imm(b, rd, v);
+        return;
+    }
     uint16_t lane[4] = {
         (uint16_t)(v), (uint16_t)(v >> 16), (uint16_t)(v >> 32), (uint16_t)(v >> 48),
     };

@@ -570,18 +570,21 @@
  * ---- kept translations ----
  * Unless OCERZ_TCACHE=off, a translation is written to src/tcache.c's store,
  * and the next process to need the same key loads it instead of translating.
- * Only code whose address is the same from run to run is kept: everything in
- * a Wine process, whose low-shadow layout and fixed image bases make it so,
- * and otherwise only the shared cache, since a main program, a dylib or a JIT
- * loaded at a random address would fill the store with records nobody loads,
- * and nothing at all when the guest's own base is chosen at random.  The
- * code is emitted so that it can move: every value that differs between
- * processes (an ocerz function or global, the commpage delta, the block's own
- * JitBlock, an instruction or profile slot inside it, a RAS slot, a
- * return-address cell, an indirect-call cache table, the leaf routines and the
- * dispatch stub) is loaded by a fixed movz and three movk or sits in a literal
- * cell, and translate records where (TcReloc); a leaf call and the
- * dispatch-stub exit go through a register instead of a direct branch.  A load
+ * Code whose address is the same from run to run is kept under that address:
+ * everything in a Wine process, whose low-shadow layout and fixed image bases
+ * make it so, and otherwise the shared cache.  Code of a disk image - the main
+ * program, its frameworks, a dylib or bundle loaded later - is kept under the
+ * image and its offset in it instead, since the image sits at another slide
+ * in the next process (see "image records" below).  Code anywhere else, a
+ * JIT's, is not kept, and nothing at all is when the guest's own base is
+ * chosen at random.  The code is emitted so that it can move: every value
+ * that differs between processes (an ocerz function or global, the commpage
+ * delta, the block's own JitBlock, an instruction or profile slot inside it,
+ * a RAS slot, a return-address cell, an indirect-call cache table, the leaf
+ * routines and the dispatch stub) is loaded by a fixed movz and three movk or
+ * sits in a literal cell, and translate records where (TcReloc); a leaf call
+ * and the dispatch-stub exit go through a register instead of a direct
+ * branch.  A load
  * copies the code to the same address modulo 64, because the literal pool's
  * padding and a loop head's alignment are absolute, and fills every site from
  * the current process, allocating slots, cells and tables afresh.  A record
@@ -603,6 +606,37 @@
  * nothing, moves every translation to a fresh address, fills the original with
  * BRK, and reports a PC-relative reference that leaves the block or a
  * host-looking constant that no relocation covers.
+ *
+ * Image records.  The key of a disk image's block is OCERZ_TC_KEY_IMAGE over a
+ * hash of the image's identity and the block's offset in it; the identity
+ * (ocerz_dyld_image_ident) is the image's LC_UUID and span, or its path, size,
+ * mtime and load commands when it has no UUID, so a rebuilt file keys afresh.
+ * Such a translation also holds the image's own guest addresses - return
+ * addresses, branch targets, what a rip-relative operand names, GOT slots - and
+ * those move with it.  While one is recorded a64_mov_imm64 hands every value
+ * inside the image to tc_img_imm, which builds it in the fixed movz-and-three-
+ * movk shape, and a literal-pool cell holding one is noted as well, both as
+ * TCR_IMG with the offset in the image; emit_const_lit and a rip-relative
+ * operand always take the pool for such a value, because whether one needed
+ * three parts was itself a matter of the slide.  The record keeps the bounds
+ * the image had (img_lo, img_hi), and a load moves whatever else lies inside
+ * them by the image's new slide (tc_rip): the decoded instructions (rip, a
+ * rip-relative operand's address, a branch's target), the edges, the return
+ * addresses of RAS cells, RAS slots and elided pushes, and the dependency
+ * ranges, whose hash mixes in the offset in the image rather than the address.
+ * A translation that names a guest address outside both the image and the
+ * places that never move is not kept (tc_img_why: an edge, an instruction, a
+ * dependency range, a return address, or a constant left in the code, which
+ * would point into another slid image): two blocks of a python3 start, both in
+ * the xcrun shim, and none of sqlite3's.  x86_64 images carry no text
+ * relocations, so no guest immediate is an address inside a slid image, which
+ * is what lets a value in the image's range be taken for one; in an image that
+ * is never slid the move is zero anyway.  A warm `python3 -c pass` translated
+ * 13.4k blocks of Python3 every launch and took 0.25 s; it now translates a few
+ * dozen and takes 0.19 s.  OCERZ_NO_TCACHE_IMAGES=1 keeps image code out of the
+ * store, and OCERZ_GUEST_SLIDE (src/mem.c) moves the images, which is how
+ * verify checks image records at another slide; under verify an image record's
+ * relocated instructions must match the fresh decode too.
  *
  * ---- i386 ----
  * 32-bit blocks are compiled from a whitelist of instructions (m32_inline_ok),
@@ -1003,7 +1037,7 @@ static uint32_t *g_chain_epi;
 static int g_chain_keeps_jgb;
 typedef struct { uint32_t *site; uint64_t retaddr; uint64_t hi; int kind; int rt; int tcr; } RasLit;
 enum { TCR_SYM = 1, TCR_COMMPAGE, TCR_BUCKETS, TCR_LEAF, TCR_DSTUB, TCR_BLK, TCR_INSN, TCR_PROF,
-       TCR_RASSLOT, TCR_PSC, TCR_RASCELL };
+       TCR_RASSLOT, TCR_PSC, TCR_RASCELL, TCR_IMG };
 enum { TCS_FLAGS_MATERIALIZE, TCS_RAS_PUSH, TCS_EXEC_ONE, TCS_EXEC_ONE_AT, TCS_JGB_TRAP,
        TCS_RETIRE_COUNT, TCS_EXEC_RUN_AT, TCS_N };
 typedef struct { uint32_t off; uint8_t kind, form; uint64_t arg; } TcReloc;
@@ -1016,17 +1050,28 @@ static const uint32_t *g_tc_entry;
 #define RASLIT_MAX 96
 static RasLit g_raslit[RASLIT_MAX];
 static int g_n_raslit;
+static uint64_t g_tc_img_lo, g_tc_img_hi, g_tc_img_id;
+static uint64_t g_tc_rlo, g_tc_rhi, g_tc_rd;
+static inline uint64_t tc_rip(uint64_t v)
+{
+    return v - g_tc_rlo < g_tc_rhi - g_tc_rlo ? v + g_tc_rd : v;
+}
+static inline int tc_in_img(uint64_t v)
+{
+    return v - g_tc_img_lo < g_tc_img_hi - g_tc_img_lo;
+}
 /* A 64-bit constant that takes three or four instructions to build is one load from the block's literal pool. */
 static void emit_const_lit(A64Buf *b, int rd, uint64_t v)
 {
     int parts = 0;
     for (int k = 0; k < 4; k++) parts += ((v >> (16 * k)) & 0xffff) != 0;
     static int off = -1; if (off < 0) off = getenv("OCERZ_NO_CONST_LIT") ? 1 : 0;
-    if (parts < 3 || g_n_raslit >= RASLIT_MAX || off) { a64_mov_imm64(b, rd, v); return; }
+    int img = v - a64_reloc_lo < a64_reloc_hi - a64_reloc_lo;
+    if ((parts < 3 && !img) || g_n_raslit >= RASLIT_MAX || off) { a64_mov_imm64(b, rd, v); return; }
     g_raslit[g_n_raslit].site = a64_label(b);
     g_raslit[g_n_raslit].retaddr = v;
     g_raslit[g_n_raslit].kind = 1;
-    g_raslit[g_n_raslit].tcr = 0;
+    g_raslit[g_n_raslit].tcr = img ? TCR_IMG : 0;
     g_raslit[g_n_raslit].rt = rd;
     g_n_raslit++;
     a64_emit32(b, 0x58000000u | (uint32_t)(rd & 31));
@@ -1063,6 +1108,14 @@ static void tc_imm64(A64Buf *b, int rd, int kind, uint64_t arg, uint64_t value)
         return;
     }
     tc_note(b->p, kind, 0, arg);
+    a64_movz(b, rd, (uint16_t)value, 0);
+    a64_movk(b, rd, (uint16_t)(value >> 16), 1);
+    a64_movk(b, rd, (uint16_t)(value >> 32), 2);
+    a64_movk(b, rd, (uint16_t)(value >> 48), 3);
+}
+static void tc_img_imm(A64Buf *b, int rd, uint64_t value)
+{
+    tc_note(b->p, TCR_IMG, 0, value - a64_reloc_lo);
     a64_movz(b, rd, (uint16_t)value, 0);
     a64_movk(b, rd, (uint16_t)(value >> 16), 1);
     a64_movk(b, rd, (uint16_t)(value >> 32), 2);
@@ -6145,11 +6198,12 @@ static int emit_mem_ea_plain_ex(A64Buf *b, const X86Insn *insn, const X86Operand
     if (op->riprel) {
         uint64_t c = (uint64_t)op->disp + ocerz_guest_base;
         static int nolit = -1; if (nolit < 0) nolit = getenv("OCERZ_NO_RIPLIT") ? 1 : 0;
-        if (!nolit && g_n_raslit < RASLIT_MAX && (c >> 32) != 0 && ((c >> 16) & 0xffff) != 0) {
+        int img = c - a64_reloc_lo < a64_reloc_hi - a64_reloc_lo;
+        if (!nolit && g_n_raslit < RASLIT_MAX && (img || ((c >> 32) != 0 && ((c >> 16) & 0xffff) != 0))) {
             g_raslit[g_n_raslit].site = a64_label(b);
             g_raslit[g_n_raslit].retaddr = c;
             g_raslit[g_n_raslit].kind = 1;
-            g_raslit[g_n_raslit].tcr = 0;
+            g_raslit[g_n_raslit].tcr = img ? TCR_IMG : 0;
             g_raslit[g_n_raslit].rt = JTA;
             g_n_raslit++;
             a64_emit32(b, 0x58000000u | (uint32_t)JTA);
@@ -21195,6 +21249,10 @@ static uint64_t tc_value(const OcerzJit *jit, const JitBlock *blk, int kind, uin
         if (blk->prof && arg < SIDE_MAX * sizeof(JitProf))
             return (uint64_t)(uintptr_t)((const char *)blk->prof + arg);
         break;
+    case TCR_IMG:
+        if (arg < g_tc_img_hi - g_tc_img_lo)
+            return g_tc_img_lo + arg;
+        break;
     default:
         break;
     }
@@ -21266,13 +21324,13 @@ static int tc_bind(OcerzJit *jit, JitBlock *blk, uint32_t *code, const TcReloc *
         uint32_t *w = code + r->off;
         if (r->kind == TCR_RASCELL) {
             ras_cell_register((void **)w);
-            tc_ras_fill(jit, (void **)w, r->arg, mode32);
+            tc_ras_fill(jit, (void **)w, tc_rip(r->arg), mode32);
             continue;
         }
         if (!fresh)
             continue;
         if (r->kind == TCR_RASSLOT)
-            tc_ras_fill(jit, (void **)(uintptr_t)g_tc_val[i], r->arg, mode32);
+            tc_ras_fill(jit, (void **)(uintptr_t)g_tc_val[i], tc_rip(r->arg), mode32);
         if (r->form == 1)
             *(uint64_t *)(void *)w = g_tc_val[i];
         else
@@ -21401,6 +21459,103 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
 }
 
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
+enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
+static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
+
+static int tc_fixed(uint64_t a);
+
+static int tc_branch_op(unsigned op)
+{
+    return op == OCERZ_OP_JCC || op == OCERZ_OP_JMP || op == OCERZ_OP_CALL || op == OCERZ_OP_LOOP ||
+           op == OCERZ_OP_LOOPE || op == OCERZ_OP_LOOPNE || op == OCERZ_OP_JRCXZ;
+}
+
+static int tc_img_addr_ok(uint64_t a)
+{
+    return tc_in_img(a) || tc_fixed(a);
+}
+
+static int tc_insn_img_ok(const X86Insn *in)
+{
+    if (!tc_img_addr_ok(in->rip))
+        return 0;
+    for (int k = 0; k < in->nops && k < 3; k++) {
+        const X86Operand *o = &in->ops[k];
+        if (o->kind == OCERZ_OPK_MEM && o->riprel && !tc_img_addr_ok((uint64_t)o->disp))
+            return 0;
+        if (o->kind == OCERZ_OPK_IMM && k == 0 && tc_branch_op(in->op) && !tc_img_addr_ok(o->imm))
+            return 0;
+    }
+    return 1;
+}
+
+static void tc_insn_shift(X86Insn *in)
+{
+    in->rip = tc_rip(in->rip);
+    for (int k = 0; k < in->nops && k < 3; k++) {
+        X86Operand *o = &in->ops[k];
+        if (o->kind == OCERZ_OPK_MEM && o->riprel)
+            o->disp = (int64_t)tc_rip((uint64_t)o->disp);
+        else if (o->kind == OCERZ_OPK_IMM && k == 0 && tc_branch_op(in->op))
+            o->imm = tc_rip(o->imm);
+    }
+}
+
+static int tc_img_const(uint64_t v)
+{
+    uint64_t lo, hi, id;
+    return tc_in_img(v) || (v >= ocerz_arena_lo && v < ocerz_arena_hi && ocerz_dyld_image_ident(v, &lo, &hi, &id));
+}
+
+/* Why a translation of a disk image's code cannot be kept, or 0: a guest
+ * address it holds outside the image and outside what never moves. */
+static int tc_img_why(const JitBlock *blk, const uint32_t *code, uint32_t words)
+{
+    for (int i = 0; i < blk->n_edges; i++)
+        if (!tc_img_addr_ok(blk->edges[i].target_rip) ||
+            (blk->edges[i].jcc_rip && !tc_img_addr_ok(blk->edges[i].jcc_rip)))
+            return TCI_EDGE;
+    for (int i = 0; i < blk->n_insns; i++)
+        if (!tc_insn_img_ok(&blk->insns[i]))
+            return TCI_INSN;
+    for (int i = 0; i < g_tc_ndlog; i++)
+        if (!tc_img_addr_ok(g_tc_dlog[i].pc) || !tc_img_addr_ok(g_tc_dlog[i].pc + g_tc_dlog[i].len - 1) ||
+            tc_in_img(g_tc_dlog[i].pc) != tc_in_img(g_tc_dlog[i].pc + g_tc_dlog[i].len - 1))
+            return TCI_DEP;
+    for (int i = 0; i < g_tc_nrel; i++)
+        if ((g_tc_rel[i].kind == TCR_RASCELL || g_tc_rel[i].kind == TCR_RASSLOT) && !tc_img_addr_ok(g_tc_rel[i].arg))
+            return TCI_RAS;
+    for (int i = 0; blk->pushelide && i < blk->n_pushelide; i++)
+        if (!tc_img_addr_ok(blk->pushelide[i].ra))
+            return TCI_ELIDE;
+    uint32_t end = g_tc_pool_off < words ? g_tc_pool_off : words;
+    for (uint32_t w = 0; w < end; w++) {
+        uint32_t v = code[w];
+        if ((v & 0xffe00000u) != 0xd2800000u || tc_is_reloc_word(w))
+            continue;
+        int rd = (int)(v & 31);
+        uint64_t x = (uint64_t)((v >> 5) & 0xffffu);
+        uint32_t k = w + 1;
+        while (k < end && (code[k] & 0xff800000u) == 0xf2800000u && (int)(code[k] & 31) == rd) {
+            int hw = (int)((code[k] >> 21) & 3);
+            x = (x & ~(0xffffull << (16 * hw))) | ((uint64_t)((code[k] >> 5) & 0xffffu) << (16 * hw));
+            k++;
+        }
+        if (k > w + 1 && tc_img_const(x)) {
+            tc_report(blk, "IMGCONST", w, v, x);
+            return TCI_CODE;
+        }
+    }
+    for (uint32_t w = end; w + 2 <= words; w += 2) {
+        uint64_t x;
+        memcpy(&x, code + w, 8);
+        if (!tc_is_reloc_word(w) && tc_img_const(x)) {
+            tc_report(blk, "IMGCELL", w, code[w], x);
+            return TCI_CODE;
+        }
+    }
+    return 0;
+}
 
 static void tc_summary(void)
 {
@@ -21415,6 +21570,13 @@ static void tc_summary(void)
                 (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_put,
                 (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
                 (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
+    fprintf(g_tc_lf, "ocerz: TCACHE[%d] images asked=%llu in=%llu out=%llu same=%llu variant=%llu unkeepable edge=%llu"
+                     " insn=%llu dep=%llu ras=%llu elide=%llu code=%llu\n",
+            (int)getpid(), (unsigned long long)g_tc_n_ifind, (unsigned long long)g_tc_n_iload, (unsigned long long)g_tc_n_iput,
+            (unsigned long long)g_tc_n_ivok, (unsigned long long)g_tc_n_ivvar,
+            (unsigned long long)g_tc_n_ibad[TCI_EDGE], (unsigned long long)g_tc_n_ibad[TCI_INSN],
+            (unsigned long long)g_tc_n_ibad[TCI_DEP], (unsigned long long)g_tc_n_ibad[TCI_RAS],
+            (unsigned long long)g_tc_n_ibad[TCI_ELIDE], (unsigned long long)g_tc_n_ibad[TCI_CODE]);
     fflush(g_tc_lf);
 }
 
@@ -21543,6 +21705,7 @@ typedef struct {
     uint8_t n_edges, n_stop_extra, n_pinned, pin_class, ordered_loads, flags, pad[6];
     uint8_t host_holds[16];
     int8_t guest_in_host[16];
+    uint64_t img_id, img_lo, img_hi;
 } TcRec;
 typedef struct { uint64_t lo, hi; } TcDep;
 typedef struct { uint32_t off, insn; } TcStop;
@@ -21600,22 +21763,52 @@ static int tc_usable(const OcerzJit *jit)
            !jit->stop_requested;
 }
 
-static int tc_keepable(uint64_t rip)
+static int tc_fixed(uint64_t a)
 {
-    if (ocerz_guest_base != 0)
-        return 0;
-    return ocerz_low_base != 0 || ocerz_cache_region((uintptr_t)ocerz_g2h(rip));
+    return ocerz_low_base != 0 || ocerz_cache_region((uintptr_t)ocerz_g2h(a));
 }
 
-static uint64_t tc_key(uint64_t rip, int mode32)
+static int tc_image_of(uint64_t rip)
 {
-    return rip | (mode32 ? OCERZ_TC_KEY_M32 : 0) | (g_plain_mem ? OCERZ_TC_KEY_PLAIN : 0);
+    static int on = -1;
+    static uint64_t lo, hi, id;
+    static unsigned gen;
+    if (on < 0) on = getenv("OCERZ_NO_TCACHE_IMAGES") ? 0 : 1;
+    if (!on)
+        return 0;
+    unsigned g = ocerz_dyld_generation();
+    if (rip - lo >= hi - lo || g != gen) {
+        gen = g;
+        if (!ocerz_dyld_image_ident(rip, &lo, &hi, &id)) {
+            lo = hi = 0;
+            return 0;
+        }
+    }
+    g_tc_img_lo = lo;
+    g_tc_img_hi = hi;
+    g_tc_img_id = id;
+    return 1;
+}
+
+static int tc_keepable(uint64_t rip, int mode32)
+{
+    g_tc_img_lo = g_tc_img_hi = g_tc_img_id = 0;
+    if (ocerz_guest_base != 0)
+        return 0;
+    return tc_fixed(rip) || (!mode32 && tc_image_of(rip));
 }
 
 static uint64_t tc_mix(uint64_t h, uint64_t w)
 {
     h = (h ^ w) * 0x9e3779b97f4a7c15ull;
     return h ^ (h >> 29);
+}
+
+static uint64_t tc_key(uint64_t rip, int mode32)
+{
+    uint64_t k = g_tc_img_hi ? OCERZ_TC_KEY_IMAGE | (tc_mix(g_tc_img_id, rip - g_tc_img_lo) & (OCERZ_TC_KEY_IMAGE - 1))
+                             : rip;
+    return k | (mode32 ? OCERZ_TC_KEY_M32 : 0) | (g_plain_mem ? OCERZ_TC_KEY_PLAIN : 0);
 }
 
 static uint64_t tc_hash_range(uint64_t h, uint64_t lo, const uint8_t *p, uint64_t n)
@@ -21674,8 +21867,8 @@ static int tc_deps_build(uint32_t *ndep, uint64_t *hash)
     uint64_t h = TC_HASH_SEED;
     uint32_t at = 0;
     for (uint32_t i = 0; i < nd; i++) {
-        uint64_t len = g_tc_mdep[i].hi - g_tc_mdep[i].lo;
-        h = tc_hash_range(h, g_tc_mdep[i].lo, g_tc_mbytes + at, len);
+        uint64_t lo = g_tc_mdep[i].lo, len = g_tc_mdep[i].hi - lo;
+        h = tc_hash_range(h, tc_in_img(lo) ? lo - g_tc_img_lo : lo, g_tc_mbytes + at, len);
         at += (uint32_t)len;
     }
     *ndep = nd;
@@ -21694,10 +21887,12 @@ static int tc_deps_check(const TcDep *d, uint32_t n, uint64_t want)
         uint64_t hh = TC_HASH_SEED;
         int good = 1;
         for (uint32_t i = 0; i < n && good; i++) {
+            uint64_t lo = tc_rip(d[i].lo);
             if (d[i].hi <= d[i].lo || d[i].hi - d[i].lo > TC_DBYTES_MAX)
                 good = 0;
             else
-                hh = tc_hash_range(hh, d[i].lo, (const uint8_t *)ocerz_g2h(d[i].lo), d[i].hi - d[i].lo);
+                hh = tc_hash_range(hh, tc_in_img(lo) ? lo - g_tc_img_lo : lo, (const uint8_t *)ocerz_g2h(lo),
+                                   d[i].hi - d[i].lo);
         }
         h = hh;
         ok = good;
@@ -21784,6 +21979,9 @@ static void tc_put(OcerzJit *jit, JitBlock *blk)
                         (blk->prof ? TCF_PROF : 0) | (g_tc_learned ? TCF_LEARNED : 0));
     memcpy(r.host_holds, blk->host_holds, sizeof r.host_holds);
     memcpy(r.guest_in_host, blk->guest_in_host, sizeof r.guest_in_host);
+    r.img_id = g_tc_img_id;
+    r.img_lo = g_tc_img_lo;
+    r.img_hi = g_tc_img_hi;
 
     TcStop st[6];
     for (int i = 0; i < blk->n_stop_extra && i < 6; i++) {
@@ -21836,6 +22034,8 @@ static void tc_put(OcerzJit *jit, JitBlock *blk)
     ((TcRec *)(void *)g_tc_out)->h.size = (uint32_t)g_tc_opos;
     ocerz_tcache_put((const OcerzTcRecHead *)(const void *)g_tc_out);
     g_tc_n_put++;
+    if (g_tc_img_hi)
+        g_tc_n_iput++;
 }
 
 #define TC_TAKE(dst, type, count) do { \
@@ -21933,13 +22133,38 @@ static void *tc_dup(const void *p, size_t n, int *fail)
     return d;
 }
 
+/* Sets the relocation a record of rip needs (tc_rip): one of a disk image moves
+ * by its image's slide since it was kept, and must name the image now there. */
+static int tc_reloc_begin(const TcView *v, uint64_t rip)
+{
+    const TcRec *r = v->r;
+    g_tc_rlo = g_tc_rhi = g_tc_rd = 0;
+    if ((r->img_hi != 0) != (g_tc_img_hi != 0) || r->img_id != g_tc_img_id ||
+        r->img_hi - r->img_lo != g_tc_img_hi - g_tc_img_lo)
+        return 0;
+    g_tc_rlo = r->img_lo;
+    g_tc_rhi = r->img_hi;
+    g_tc_rd = g_tc_img_lo - r->img_lo;
+    return tc_rip(r->flags & TCF_COMPACT ? v->iref[0].rip : v->insns[0].rip) == rip;
+}
+
+static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int mode32);
+
 static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, int mode32)
 {
     TcView v;
-    if (!tc_parse(h, &v)) {
+    JitBlock *b = NULL;
+    if (!tc_parse(h, &v) || !tc_reloc_begin(&v, rip))
         g_tc_n_rej++;
-        return NULL;
-    }
+    else if ((b = tc_load_rec(jit, &v, rip, mode32)) && g_tc_img_hi)
+        g_tc_n_iload++;
+    g_tc_rlo = g_tc_rhi = g_tc_rd = 0;
+    return b;
+}
+
+static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int mode32)
+{
+    const TcView v = *vp;
     const TcRec *r = v.r;
     if (!tc_deps_check(v.dep, r->n_dep, r->dep_hash)) {
         g_tc_n_stale++;
@@ -21979,6 +22204,16 @@ static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, i
     if (fail) {
         tc_free_blk(blk);
         return NULL;
+    }
+    if (g_tc_rd) {
+        for (uint32_t i = 0; blk->insns && i < n; i++)
+            tc_insn_shift(&blk->insns[i]);
+        for (uint32_t i = 0; blk->kept && i < r->n_kept; i++)
+            tc_insn_shift(&blk->kept[i]);
+        for (uint32_t i = 0; blk->iref && i < n; i++)
+            blk->iref[i].rip = tc_rip(blk->iref[i].rip);
+        for (int i = 0; blk->pushelide && i < blk->n_pushelide; i++)
+            blk->pushelide[i].ra = tc_rip(blk->pushelide[i].ra);
     }
 
     pthread_jit_write_protect_np(0);
@@ -22023,8 +22258,8 @@ static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, i
     }
     blk->n_edges = r->n_edges;
     for (uint32_t i = 0; i < r->n_edges; i++) {
-        blk->edges[i].target_rip = v.edge[i].target_rip;
-        blk->edges[i].jcc_rip = v.edge[i].jcc_rip;
+        blk->edges[i].target_rip = tc_rip(v.edge[i].target_rip);
+        blk->edges[i].jcc_rip = tc_rip(v.edge[i].jcc_rip);
         blk->edges[i].patch_b = c + v.edge[i].patch_b;
         blk->edges[i].fallback_insn = v.edge[i].fallback_insn;
         blk->edges[i].cond_site = TC_AT(v.edge[i].cond_site);
@@ -22061,13 +22296,40 @@ static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, i
     return blk;
 }
 
+static void tc_verify_rec(OcerzJit *jit, JitBlock *blk, const TcView *vp);
+
 static void tc_verify(OcerzJit *jit, JitBlock *blk, const OcerzTcRecHead *h)
 {
     TcView v;
-    if (!tc_parse(h, &v)) {
+    if (!tc_parse(h, &v) || !tc_reloc_begin(&v, blk_rip(blk)))
         g_tc_n_rej++;
-        return;
+    else
+        tc_verify_rec(jit, blk, &v);
+    g_tc_rlo = g_tc_rhi = g_tc_rd = 0;
+}
+
+static int tc_insns_differ(const JitBlock *blk, const TcView *v)
+{
+    const TcRec *r = v->r;
+    uint32_t n = r->n_insns, k = (r->flags & TCF_COMPACT) ? r->n_kept : n;
+    if ((r->flags & TCF_COMPACT) != (blk->insns == NULL) || (r->flags & TCF_COMPACT ? k != blk->n_kept : 0))
+        return 0;
+    for (uint32_t i = 0; v->iref && i < n; i++)
+        if (tc_rip(v->iref[i].rip) != blk->iref[i].rip)
+            return 1;
+    const X86Insn *mine = blk->insns ? blk->insns : blk->kept;
+    for (uint32_t i = 0; mine && i < k; i++) {
+        X86Insn t = v->insns[i];
+        tc_insn_shift(&t);
+        if (memcmp(&t, &mine[i], sizeof t))
+            return 1;
     }
+    return 0;
+}
+
+static void tc_verify_rec(OcerzJit *jit, JitBlock *blk, const TcView *vp)
+{
+    const TcView v = *vp;
     const TcRec *r = v.r;
     if (!tc_deps_check(v.dep, r->n_dep, r->dep_hash)) {
         g_tc_n_stale++;
@@ -22086,7 +22348,9 @@ static void tc_verify(OcerzJit *jit, JitBlock *blk, const OcerzTcRecHead *h)
     uint32_t rel_i = 0;
     for (uint32_t i = 0; !why && i < r->n_rel; i++)
         if (v.rel[i].off != g_tc_rel[i].off || v.rel[i].kind != g_tc_rel[i].kind ||
-            v.rel[i].form != g_tc_rel[i].form || v.rel[i].arg != g_tc_rel[i].arg) {
+            v.rel[i].form != g_tc_rel[i].form ||
+            ((v.rel[i].kind == TCR_RASCELL || v.rel[i].kind == TCR_RASSLOT) ? tc_rip(v.rel[i].arg)
+                                                                             : v.rel[i].arg) != g_tc_rel[i].arg) {
             why = "rel";
             at = v.rel[i].off;
             rel_i = i;
@@ -22110,20 +22374,24 @@ static void tc_verify(OcerzJit *jit, JitBlock *blk, const OcerzTcRecHead *h)
             at = i;
         }
     for (uint32_t i = 0; !why && i < r->n_edges; i++)
-        if (v.edge[i].target_rip != blk->edges[i].target_rip ||
+        if (tc_rip(v.edge[i].target_rip) != blk->edges[i].target_rip ||
             v.edge[i].patch_b != tc_off(blk, blk->edges[i].patch_b) ||
             v.edge[i].cond_site != tc_off(blk, blk->edges[i].cond_site) ||
             v.edge[i].fallback_insn != blk->edges[i].fallback_insn || v.edge[i].kind != blk->edges[i].kind) {
             why = "edge";
             at = i;
         }
+    if (!why && r->img_hi && tc_insns_differ(blk, &v))
+        why = "insns";
     if (!why) {
         g_tc_n_vok++;
+        g_tc_n_ivok += r->img_hi != 0;
         return;
     }
     if (r->code_words != blk->code_words || (int)r->n_insns != blk->n_insns ||
         (r->flags & TCF_LEARNED) || g_tc_learned) {
         g_tc_n_vvar++;
+        g_tc_n_ivvar += r->img_hi != 0;
         return;
     }
     g_tc_n_vbad++;
@@ -22225,14 +22493,19 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_tc_ndlog = 0;
     g_tc_nbytes = 0;
     g_tc_dbar = 0;
+    g_tc_img_lo = g_tc_img_hi = g_tc_img_id = 0;
     if (tcm != OCERZ_TC_OFF)
         tc_log_init();
-    if ((tcm == OCERZ_TC_ON || tcm == OCERZ_TC_VERIFY) && tc_usable(jit) && tc_keepable(rip)) {
+    if (tcm == OCERZ_TC_ROUNDTRIP && tc_usable(jit))
+        tc_keepable(rip, mode32);
+    if ((tcm == OCERZ_TC_ON || tcm == OCERZ_TC_VERIFY) && tc_usable(jit) && tc_keepable(rip, mode32)) {
         g_tc_rec = 1;
         g_tc_key = tc_key(rip, mode32);
         uint64_t jk = jit_key(rip, mode32);
-        if (!al_marked(jk) && !al_marked(jk | AL_BLK_TAG) && !cp_marked(jk) && !tc_noload_has(jk))
+        if (!al_marked(jk) && !al_marked(jk | AL_BLK_TAG) && !cp_marked(jk) && !tc_noload_has(jk)) {
             tc_hit = ocerz_tcache_find(g_tc_key);
+            g_tc_n_ifind += g_tc_img_hi != 0;
+        }
         {
             static int tr = -1;
             if (tr < 0) tr = getenv("OCERZ_TCACHE_TRACE") ? 1 : 0;
@@ -22377,6 +22650,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_n_raslit = 0;
     g_tc_on = 0;
     g_tc_entry = NULL;
+    a64_reloc_lo = a64_reloc_hi = 0;
     g_tc_pool_off = UINT32_MAX;
     g_chain_epi = NULL;
     g_n_jcc_edges = 0;
@@ -22687,6 +22961,11 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     g_push_entry = entry;
     g_tc_entry = entry;
     g_tc_on = (g_tc_rec || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP) ? tc_usable(jit) : 0;
+    if (g_tc_on && g_tc_img_hi) {
+        a64_reloc_imm = tc_img_imm;
+        a64_reloc_lo = g_tc_img_lo;
+        a64_reloc_hi = g_tc_img_hi;
+    }
 
     a64_stp_pre(&b, 29, 30, 31, -16);
     a64_stp_pre(&b, 19, 20, 31, -16);
@@ -23936,6 +24215,8 @@ promo_push_fallthrough:
                 *cell = (void *)(uintptr_t)g_raslit[i].retaddr;
                 if (g_raslit[i].tcr == TCR_PSC)
                     tc_note((uint32_t *)cell, TCR_PSC, 1, 0);
+                else if (g_raslit[i].tcr == TCR_IMG)
+                    tc_note((uint32_t *)cell, TCR_IMG, 1, g_raslit[i].retaddr - g_tc_img_lo);
                 continue;
             }
             if (g_tc_on) {
@@ -24168,7 +24449,20 @@ promo_push_fallthrough:
             pthread_jit_write_protect_np(1);
         }
         tc_save = g_tc_rec && !g_tc_bad;
+        if (tc_save && g_tc_img_hi) {
+            int why = tc_img_why(blk, entry, blk->code_words);
+            if (why) {
+                g_tc_n_ibad[why]++;
+                tc_save = 0;
+                if (g_tc_log > 0 && g_tc_n_ibad[why] <= 8)
+                    fprintf(g_tc_lf, "ocerz: TCACHE[%d] UNKEEPABLE %s rip=%#llx image=[%#llx,%#llx)\n", (int)getpid(),
+                            (const char *[]){ "", "edge", "insn", "dep", "ras", "elide", "code" }[why],
+                            (unsigned long long)rip, (unsigned long long)g_tc_img_lo,
+                            (unsigned long long)g_tc_img_hi);
+            }
+        }
         g_tc_on = 0;
+        a64_reloc_lo = a64_reloc_hi = 0;
     }
 
     if (!code_index_append_locked(jit, blk)) {

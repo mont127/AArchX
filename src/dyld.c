@@ -726,6 +726,7 @@ typedef struct DynImage {
     const uint8_t *ext_slice;    /* the slice and slide ext_* bound the segments of (dimg_record_extent) */
     uint64_t ext_slide;
     uint64_t ext_lo, ext_hi, ext_xlo, ext_xhi;
+    uint64_t tc_ident;           /* ocerz_dyld_image_ident's answer, 0 until asked */
 } DynImage;
 
 #define DYN_DIMG_MAX 2048   /* VLC 2.2 alone loads 301 plugins */
@@ -1011,6 +1012,53 @@ static DynImage *dimg_containing(uint64_t addr)
     return NULL;
 }
 
+static uint64_t ident_mix(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+int ocerz_dyld_image_ident(uint64_t addr, uint64_t *lo, uint64_t *hi, uint64_t *ident)
+{
+    DynImage *d = dimg_containing(addr);
+    if (!d || d->is_virtual || !d->slice || d->ext_slice != d->slice || d->ext_slide != d->slide ||
+        d->ext_hi <= d->ext_lo)
+        return 0;
+    if (!d->tc_ident) {
+        uint64_t h = ident_mix(0xcbf29ce484222325ull, "ocerz-img-1", 11);
+        uint64_t span = d->ext_hi - d->ext_lo;
+        h = ident_mix(h, &span, sizeof span);
+        const uint8_t *mh = d->slice;
+        uint32_t ncmds = rd32(mh + 16);
+        const uint8_t *lc = mh + sizeof(struct mach_header_64);
+        int have_uuid = 0;
+        for (uint32_t k = 0; k < ncmds; k++) {
+            if (rd32(lc) == LC_UUID) {
+                h = ident_mix(h, lc + 8, 16);
+                have_uuid = 1;
+            }
+            lc += rd32(lc + 4);
+        }
+        if (!have_uuid) {
+            struct stat st;
+            h = ident_mix(h, d->path, strlen(d->path));
+            if (stat(d->path, &st) == 0) {
+                uint64_t v[3] = { (uint64_t)st.st_size, (uint64_t)st.st_mtimespec.tv_sec,
+                                  (uint64_t)st.st_mtimespec.tv_nsec };
+                h = ident_mix(h, v, sizeof v);
+            }
+            h = ident_mix(h, mh, sizeof(struct mach_header_64) + rd32(mh + 20));
+        }
+        d->tc_ident = h ? h : 1;
+    }
+    *lo = d->ext_lo;
+    *hi = d->ext_hi;
+    *ident = d->tc_ident;
+    return 1;
+}
+
 const char *ocerz_dyld_main_path(void)
 {
     return g_main_hostpath[0] ? g_main_hostpath : NULL;
@@ -1115,7 +1163,7 @@ static int map_segments(DynImage *img, int is_main)
         }
         ocerz_mem_pin_host_low();
     } else if (is_main) {
-        img->load_base = ocerz_arena_lo;
+        img->load_base = ocerz_arena_lo + ocerz_guest_slide;
         img->slide = img->load_base - text_vmaddr;
         if (ocerz_map_fixed(vmlo + img->slide, vmhi - vmlo, PROT_READ | PROT_WRITE) != OCERZ_OK)
             return OCERZ_ENOMEM;

@@ -1005,12 +1005,15 @@ run_cpp_file_case dcpp_exceptions tests/dynamic/cpp_exceptions.cpp 'OK'
 run_cpp_file_case dcpp_global_ctor tests/dynamic/cpp_global_ctor.cpp 'OK'
 run_cpp_file_case dweak_main_first tests/dynamic/weak_main_first.cpp 'OK'
 run_cpp_file_case dweak_main_first_classic tests/dynamic/weak_main_first.cpp 'OK' -Wl,-no_fixup_chains
-# tcache_work.c against one fresh translation cache directory, four runs (with
+# tcache_work.c against one fresh translation cache directory, five runs (with
 # no free-space floor, so a full disk on the test machine is not a failure): one
 # that records, one that must load what the first stored, one under
 # OCERZ_TCACHE=verify that must find no block differing from its record except
-# in shape, and one under OCERZ_TCACHE=roundtrip that must find no reference its
-# relocations miss.
+# in shape, one under OCERZ_TCACHE=roundtrip that must find no reference its
+# relocations miss, and one more verify with the program and its dylibs moved by
+# OCERZ_GUEST_SLIDE, so a record of the program's own code is checked at
+# another slide.  The second run of the slid variant must load records of the
+# program itself (images in=), the low variant's are kept by absolute address.
 run_tcache_case() {
     local name="$1" want_out="$2"
     shift 2
@@ -1019,12 +1022,14 @@ run_tcache_case() {
     if ! clang -arch x86_64 -O2 -o "$dir/$name" tests/dynamic/tcache_work.c "$@" 2>/dev/null; then
         echo "FAIL $name (build)"; fail=$((fail+1)); return
     fi
-    local i=0 mode log got_code got_out why
-    for mode in on on verify roundtrip; do
+    local i=0 mode log got_code got_out why slide
+    for mode in on on verify roundtrip verify; do
         i=$((i + 1))
         log="$dir/run$i.log"
+        slide=0
+        [ $i = 5 ] && slide=0x400000
         OCERZ_TCACHE=$mode OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG="$log" OCERZ_TCACHE_MIN_FREE_MB=0 \
-            run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name"
+            OCERZ_GUEST_SLIDE=$slide run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name"
         got_code=$?
         got_out=$(cat "$dir/run$i.out")
         why=""
@@ -1033,7 +1038,9 @@ run_tcache_case() {
         elif [ $i = 2 ] && ! awk '/TCACHE.*loaded=/ { for (f = 3; f <= NF; f++) { split($f, a, "="); t[a[1]] += a[2] } }
                                   END { exit !(t["loaded"] > 0 && t["rejected"] == 0) }' "$log"; then
             why="nothing loaded: $(grep -h 'loaded=' "$log" | head -1)"
-        elif [ $i = 3 ] && ! awk '/TCACHE.*loaded=/ { for (f = 3; f <= NF; f++) { split($f, a, "="); t[a[1]] += a[2] } }
+        elif [ $i = 2 ] && [ "$name" = dtcache ] && ! grep -q 'images asked=[0-9]* in=[1-9]' "$log"; then
+            why="no image record loaded: $(grep -h 'images asked=' "$log" | head -1)"
+        elif { [ $i = 3 ] || [ $i = 5 ]; } && ! awk '/TCACHE.*loaded=/ { for (f = 3; f <= NF; f++) { split($f, a, "="); t[a[1]] += a[2] } }
                                   END { exit !(t["verify_ok"] > 0 && t["verify_bad"] == 0) }' "$log"; then
             why="verify: $(grep -h 'VERIFY\|loaded=' "$log" | head -2 | tr '\n' ' ')"
         elif [ $i = 4 ] && grep -q "PCREL\|SHAPE\|MISMATCH" "$log"; then

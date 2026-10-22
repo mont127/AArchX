@@ -228,7 +228,7 @@ static int env_ignored(const char *kv)
     static const char *const skip[] = {
         "OCERZ_TCACHE=", "OCERZ_TCACHE_LOG=", "OCERZ_TCACHE_DIR=", "OCERZ_TCACHE_TRACE=",
         "OCERZ_TCACHE_MAX_MB=", "OCERZ_TCACHE_MIN_FREE_MB=", "OCERZ_GUESTPROF=", "OCERZ_GUESTPROF_PERIOD=", "OCERZ_LOWBASE=",
-        "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=",
+        "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))

@@ -32,6 +32,9 @@
  * terminal of an image's export trie with its name, value and flags, answering
  * how many it saw or -1 for a trie it cannot read; dladdr uses it to name an
  * address in an image that has no symbol table, as a synthesized one has not.
+ * ocerz_dyld_image_ident answers, for the translation cache, the extent of the
+ * disk image whose segments hold an address and an identity that changes when
+ * the file does: its LC_UUID, or its path, size, mtime and load commands.
  */
 #ifndef OCERZ_DYLD_H
 #define OCERZ_DYLD_H
@@ -62,6 +65,7 @@ uint64_t ocerz_dyld_resolve_guest_sym(const char *name);
 uint64_t ocerz_dyld_guest_export(const char *install_name, const char *sym, int *found);
 unsigned ocerz_dyld_generation(void);
 const char *ocerz_dyld_image_overlapping(uint64_t lo, uint64_t hi, int exec_only, uint64_t *base_out);
+int ocerz_dyld_image_ident(uint64_t addr, uint64_t *lo, uint64_t *hi, uint64_t *ident);
 uint64_t ocerz_dyld_trie_resolve(const uint8_t *slice, uint64_t load_base,
                                  const char *sym, int *found);
 extern uint64_t ocerz_exc_trap_rip;

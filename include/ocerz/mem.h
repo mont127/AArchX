@@ -20,6 +20,7 @@
 extern uint64_t ocerz_guest_base;
 extern uint64_t ocerz_arena_lo;
 extern uint64_t ocerz_arena_hi;
+extern uint64_t ocerz_guest_slide;
 extern uint64_t ocerz_low_base;
 extern uint64_t ocerz_top_base;
 extern uint8_t *ocerz_commpage;

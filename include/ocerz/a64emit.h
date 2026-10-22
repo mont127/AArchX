@@ -25,6 +25,9 @@ typedef struct A64Buf {
     uint32_t sink;
 } A64Buf;
 
+extern uint64_t a64_reloc_lo, a64_reloc_hi;
+extern void (*a64_reloc_imm)(A64Buf *b, int rd, uint64_t v);
+
 void a64_emit32(A64Buf *b, uint32_t w);
 uint32_t *a64_label(A64Buf *b);
 

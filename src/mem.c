@@ -97,6 +97,12 @@
  * a value below 64 KB is nobody's memory and crosses unchanged (ocerz_g2h).
  * OCERZ_PINLOG=1 prints each range as it is pinned, OCERZ_NO_LOW_PIN=1 turns
  * pinning off.
+ *
+ * The host puts the identity arena at the same address launch after launch,
+ * so a slid executable and the dylibs the bump allocator places after it land
+ * where they did last time.  OCERZ_GUEST_SLIDE moves both up by that many
+ * bytes (rounded to a host page, at most 256 MB), which is how the translation
+ * cache's image records are checked against a different slide.
  */
 #include "ocerz/mem.h"
 #include "ocerz/mode.h"
@@ -189,6 +195,7 @@ void ocerz_init_gate_postfork_child(void)
 uint64_t ocerz_guest_base;
 uint64_t ocerz_arena_lo;
 uint64_t ocerz_arena_hi;
+uint64_t ocerz_guest_slide;
 uint64_t ocerz_low_base;
 uint64_t ocerz_top_base;
 uint8_t *ocerz_commpage;
@@ -1429,7 +1436,11 @@ int ocerz_mem_init_identity(uint64_t size)
     if (loader_reserve > (1ull << 30))
         loader_reserve = 1ull << 30;
     alloc_floor = lo + loader_reserve;
-    bump_next = alloc_floor;
+    const char *gs = getenv("OCERZ_GUEST_SLIDE");
+    ocerz_guest_slide = gs ? strtoull(gs, NULL, 0) & ~(uint64_t)(OCERZ_HOST_PAGE - 1) : 0;
+    if (ocerz_guest_slide > (256ull << 20) || ocerz_guest_slide >= loader_reserve / 2)
+        ocerz_guest_slide = 0;
+    bump_next = alloc_floor + ocerz_guest_slide;
     if (!region_add(lo, lo + size))
         return OCERZ_ENOMEM;
     OCERZ_LOG("identity guest arena [%#llx, %#llx), bump %#llx, guest_base 0\n",
