@@ -699,7 +699,14 @@
  * still made visible at once.  Each load paid two barrier sequences and now
  * pays one: a warm python3 start spends 41.8 ms in tc_load where it spent
  * 44.4, and takes 210.6 ms where it took 214.7 (tclsh 116.5, was 120.4).
- * OCERZ_NO_TCACHE_FOLD=1 brings the two sequences back.
+ * OCERZ_NO_TCACHE_FOLD=1 brings the two sequences back.  A loaded block and
+ * its arrays (instruction offsets, decoded instructions, fault recipes, slow
+ * and lane maps, push fixes, edges, profile slots) are one malloc (slab) rather
+ * than a dozen: nothing grows a loaded block's arrays, shrink_edges leaves its
+ * edges alone because there are only as many as it has, and freeing it frees
+ * the one allocation and its predecessor list.  That took the same python3
+ * start's tc_load from 44.7 ms to 41.6; OCERZ_NO_TCACHE_SLAB=1 allocates them
+ * one by one.
  *
  * ---- i386 ----
  * 32-bit blocks are compiled from a whitelist of instructions (m32_inline_ok),
@@ -944,6 +951,7 @@ typedef struct JitBlock {
     uint16_t entry_live;
     uint16_t xmm_pinned;
     uint8_t ordered_loads;
+    uint8_t slab;
 } JitBlock;
 
 static inline uint64_t blk_rip(const JitBlock *b) { return jit_key_rip(b->key); }
@@ -2488,7 +2496,7 @@ static void gran_clear_all(void)
 static void shrink_edges(JitBlock *b)
 {
     unsigned n = b->n_edges ? b->n_edges : 1;
-    if (b->edges && n < JIT_MAX_EDGES) {
+    if (b->edges && !b->slab && n < JIT_MAX_EDGES) {
         void *p = realloc(b->edges, n * sizeof *b->edges);
         if (p) b->edges = p;
     }
@@ -22248,6 +22256,10 @@ static void tc_free_blk(JitBlock *b)
 {
     if (!b)
         return;
+    if (b->slab) {
+        free(b);
+        return;
+    }
     free(b->edges);
     free(b->insn_off);
     free(b->iref);
@@ -22260,6 +22272,21 @@ static void tc_free_blk(JitBlock *b)
     free(b->pushelide);
     free(b->prof);
     free(b);
+}
+
+#define TC_R16(x) (((x) + 15) & ~(size_t)15)
+
+static void *tc_carve(uint8_t **at, const void *src, size_t n)
+{
+    if (!n)
+        return NULL;
+    void *d = *at;
+    if (src)
+        memcpy(d, src, n);
+    else
+        memset(d, 0, n);
+    *at += TC_R16(n);
+    return d;
 }
 
 static void *tc_dup(const void *p, size_t n, int *fail)
@@ -22312,40 +22339,75 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
         return NULL;
     }
     uint32_t n = r->n_insns, words = r->code_words;
-    int fail = 0;
-    JitBlock *blk = (JitBlock *)calloc(1, sizeof *blk);
-    if (!blk)
-        return NULL;
+    int fail = 0, compact = (r->flags & TCF_COMPACT) != 0;
+    size_t ne = r->n_edges ? r->n_edges : 1;
+    static int slab = -1;
+    if (slab < 0)
+        slab = !getenv("OCERZ_NO_TCACHE_SLAB");
+    JitBlock *blk;
+    if (slab) {
+        size_t total = TC_R16(sizeof *blk) + TC_R16(ne * sizeof *blk->edges) + TC_R16(n * sizeof(uint32_t)) +
+                       (compact ? TC_R16(n * sizeof(JitInsnRef)) + TC_R16(r->n_kept * sizeof(X86Insn))
+                                : TC_R16(n * sizeof(X86Insn))) +
+                       (v.ff ? TC_R16(n * sizeof(JitFaultFlagRecipe)) : 0) + TC_R16(r->n_oslow * sizeof *blk->oslow) +
+                       TC_R16(r->n_lanerec * sizeof *blk->lanerec) + TC_R16(r->n_push_fix * sizeof(uint32_t)) +
+                       TC_R16(r->n_pushelide * sizeof *blk->pushelide) + (v.prof ? TC_R16(SIDE_MAX * sizeof(JitProf)) : 0);
+        uint8_t *at = (uint8_t *)malloc(total);
+        if (!at)
+            return NULL;
+        blk = (JitBlock *)tc_carve(&at, NULL, sizeof *blk);
+        blk->slab = 1;
+        blk->edges = tc_carve(&at, NULL, ne * sizeof *blk->edges);
+        blk->insn_off = (uint32_t *)tc_carve(&at, v.insn_off, n * sizeof(uint32_t));
+        if (compact) {
+            blk->iref = (JitInsnRef *)tc_carve(&at, v.iref, n * sizeof(JitInsnRef));
+            blk->kept = (X86Insn *)tc_carve(&at, v.insns, r->n_kept * sizeof(X86Insn));
+        } else {
+            blk->insns = (X86Insn *)tc_carve(&at, v.insns, n * sizeof(X86Insn));
+        }
+        if (v.ff)
+            blk->fault_flags = (JitFaultFlagRecipe *)tc_carve(&at, v.ff, n * sizeof(JitFaultFlagRecipe));
+        blk->oslow = (struct JitOslowMap *)tc_carve(&at, v.oslow, r->n_oslow * sizeof *blk->oslow);
+        blk->lanerec = (struct JitLaneRec *)tc_carve(&at, v.lanerec, r->n_lanerec * sizeof *blk->lanerec);
+        blk->push_fix = (uint32_t *)tc_carve(&at, v.push_fix, r->n_push_fix * sizeof(uint32_t));
+        blk->pushelide = (struct JitPushElide *)tc_carve(&at, v.pushelide, r->n_pushelide * sizeof *blk->pushelide);
+        if (v.prof)
+            blk->prof = (JitProf *)tc_carve(&at, NULL, SIDE_MAX * sizeof(JitProf));
+    } else {
+        blk = (JitBlock *)calloc(1, sizeof *blk);
+        if (!blk)
+            return NULL;
+        blk->edges = calloc(JIT_MAX_EDGES, sizeof *blk->edges);
+        if (!blk->edges) fail = 1;
+        blk->insn_off = (uint32_t *)tc_dup(v.insn_off, n * sizeof(uint32_t), &fail);
+        if (compact) {
+            blk->iref = (JitInsnRef *)tc_dup(v.iref, n * sizeof(JitInsnRef), &fail);
+            blk->kept = (X86Insn *)tc_dup(v.insns, r->n_kept * sizeof(X86Insn), &fail);
+        } else {
+            blk->insns = (X86Insn *)tc_dup(v.insns, n * sizeof(X86Insn), &fail);
+        }
+        if (v.ff)
+            blk->fault_flags = (JitFaultFlagRecipe *)tc_dup(v.ff, n * sizeof(JitFaultFlagRecipe), &fail);
+        blk->oslow = (struct JitOslowMap *)tc_dup(v.oslow, r->n_oslow * sizeof *blk->oslow, &fail);
+        blk->lanerec = (struct JitLaneRec *)tc_dup(v.lanerec, r->n_lanerec * sizeof *blk->lanerec, &fail);
+        blk->push_fix = (uint32_t *)tc_dup(v.push_fix, r->n_push_fix * sizeof(uint32_t), &fail);
+        blk->pushelide = (struct JitPushElide *)tc_dup(v.pushelide, r->n_pushelide * sizeof *blk->pushelide, &fail);
+        if (v.prof) {
+            blk->prof = (JitProf *)calloc(SIDE_MAX, sizeof(JitProf));
+            if (!blk->prof) fail = 1;
+        }
+        if (fail) {
+            tc_free_blk(blk);
+            return NULL;
+        }
+    }
     blk->key = jit_key(rip, mode32);
     blk->n_insns = (int)n;
-    blk->edges = calloc(JIT_MAX_EDGES, sizeof *blk->edges);
-    if (!blk->edges) fail = 1;
-    blk->insn_off = (uint32_t *)tc_dup(v.insn_off, n * sizeof(uint32_t), &fail);
-    if (r->flags & TCF_COMPACT) {
-        blk->iref = (JitInsnRef *)tc_dup(v.iref, n * sizeof(JitInsnRef), &fail);
-        blk->kept = (X86Insn *)tc_dup(v.insns, r->n_kept * sizeof(X86Insn), &fail);
-        blk->n_kept = (uint16_t)r->n_kept;
-    } else {
-        blk->insns = (X86Insn *)tc_dup(v.insns, n * sizeof(X86Insn), &fail);
-    }
-    if (v.ff)
-        blk->fault_flags = (JitFaultFlagRecipe *)tc_dup(v.ff, n * sizeof(JitFaultFlagRecipe), &fail);
-    blk->oslow = (struct JitOslowMap *)tc_dup(v.oslow, r->n_oslow * sizeof *blk->oslow, &fail);
+    blk->n_kept = compact ? (uint16_t)r->n_kept : 0;
     blk->n_oslow = blk->oslow ? (int)r->n_oslow : 0;
-    blk->lanerec = (struct JitLaneRec *)tc_dup(v.lanerec, r->n_lanerec * sizeof *blk->lanerec, &fail);
     blk->n_lanerec = blk->lanerec ? (int)r->n_lanerec : 0;
-    blk->push_fix = (uint32_t *)tc_dup(v.push_fix, r->n_push_fix * sizeof(uint32_t), &fail);
     blk->n_push_fix = blk->push_fix ? (uint16_t)r->n_push_fix : 0;
-    blk->pushelide = (struct JitPushElide *)tc_dup(v.pushelide, r->n_pushelide * sizeof *blk->pushelide, &fail);
     blk->n_pushelide = blk->pushelide ? (uint16_t)r->n_pushelide : 0;
-    if (v.prof) {
-        blk->prof = (JitProf *)calloc(SIDE_MAX, sizeof(JitProf));
-        if (!blk->prof) fail = 1;
-    }
-    if (fail) {
-        tc_free_blk(blk);
-        return NULL;
-    }
     if (g_tc_rd) {
         for (uint32_t i = 0; blk->insns && i < n; i++)
             tc_insn_shift(&blk->insns[i]);
@@ -25314,6 +25376,11 @@ static void ps_report_atexit(void)
 
 static void block_destroy(JitBlock *b)
 {
+    if (b->slab) {
+        free(b->preds);
+        free(b);
+        return;
+    }
     free(b->insn_off);
     free(b->oslow);
     free(b->lanerec);
