@@ -20753,6 +20753,26 @@ static void dep_plain_mark(const X86Insn *insns, int n)
  * late as well (fib with its pops split into single loads took 11% longer), so
  * matching the pairs matters more than how many accesses there are.
  * OCERZ_NO_STACK_RUN_MIRROR=1 pairs pop runs from rsp again.
+ *
+ * A frame that ends in leave reads its slots another way: leave loads rbp
+ * alone, and the pops before it stop below rbp's slot, or gcc's mov rbx,
+ * [rbp-16] restores read the slots one by one.  Paired from the top, push rbp
+ * / mov rbp, rsp / push r14 / push rbx put rbp in the upper half of r14's stp,
+ * so leave read half a store and the ldp of rbx and r14 straddled that stp and
+ * rbx's stur.  So when the code from a push rbp / mov rbp, rsp run to the
+ * first ret, decoded straight on for at most 128 instructions, holds a leave,
+ * rbp is stored alone, and so is every caller-saved register (the alignment
+ * push of rax that an add rsp, 8 skips), and the rest pair from the top
+ * between them.  The pops need nothing new: one that stops before a leave
+ * pairs from the top of what it pops, which is where the pushes after rbp's
+ * paired from.  A recursive fib with gcc's epilogues took 22% less time
+ * (lea rsp, [rbp-16]; pop; pop; leave) and 21% less (two mov restores;
+ * leave), going from 1.18 and 1.20 times Rosetta to 0.92 and 0.88.  A frame
+ * that pops rbp keeps its pairs: rbp alone there moves rbx into r14's pair,
+ * and that fib took 6% longer, so on the critical path a 16-byte forward costs
+ * more than an 8-byte one.  The scan added nothing measurable to translating
+ * 3,000 blocks of the shared cache.  OCERZ_NO_STACK_RUN_LEAVE=1 pairs these
+ * frames as any other.
  */
 #define STACK_RUN_MAX 16
 static int stack_pair_reg(const X86Insn *in, int op)
@@ -20772,6 +20792,33 @@ static int stack_run_rsp_mov(const X86Insn *in)
     int ds = pin_slot(d->reg);
     return ds < 0 ? -1 : pin_hreg(ds);
 }
+static int frame_leaves(uint64_t rip)
+{
+    X86Insn insn;
+    volatile uint64_t pc = rip;
+    volatile int leaves = 0;
+    sigjmp_buf db;
+    sigjmp_buf *prev = ocerz_jit_decode_recover;
+    if (sigsetjmp(db, 0) == 0) {
+        ocerz_jit_decode_recover = &db;
+        for (int n = 0; n < 128; n++) {
+            if (jit_decode(pc, &insn, 0) != OCERZ_OK || insn.op == OCERZ_OP_RET)
+                break;
+            if (insn.op == OCERZ_OP_LEAVE) {
+                leaves = 1;
+                break;
+            }
+            pc += insn.len;
+        }
+    }
+    ocerz_jit_decode_recover = prev;
+    return leaves;
+}
+static int stack_run_alone(int g)
+{
+    return g == OCERZ_RBP || g == OCERZ_RAX || g == OCERZ_RCX || g == OCERZ_RDX ||
+           (g >= OCERZ_R8 && g <= OCERZ_R11);
+}
 static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
 {
     static int runs = -1;
@@ -20787,7 +20834,7 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
     }
     if (op == OCERZ_OP_PUSH && !mem_native_store_ok()) return 0;
     int max = runs ? STACK_RUN_MAX : 2;
-    int regs[STACK_RUN_MAX];
+    int regs[STACK_RUN_MAX], gregs[STACK_RUN_MAX];
     int k = 0, last = i, mov_at = -1, mov_hd = -1, mov_idx = -1;
     for (int j = i; j < n && k < max; j++) {
         if (j > i && g_mov_skip[j]) break;
@@ -20804,23 +20851,35 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
         int dup = 0;
         for (int m = 0; m < k && op == OCERZ_OP_POP; m++) dup |= regs[m] == r;
         if (dup) break;
+        gregs[k] = insns[j].ops[0].reg & 15;
         regs[k++] = r;
         last = j;
     }
     if (mov_idx > last) mov_at = -1;
     if (k < 2) return 0;
-    static int nomirror = -1;
+    static int nomirror = -1, noleave = -1;
     if (nomirror < 0) nomirror = getenv("OCERZ_NO_STACK_RUN_MIRROR") ? 1 : 0;
-    int bot = op == OCERZ_OP_POP && (k & 1) && !nomirror;
+    if (noleave < 0) noleave = getenv("OCERZ_NO_STACK_RUN_LEAVE") ? 1 : 0;
+    int seg = !noleave && op == OCERZ_OP_PUSH && mov_at == 1 && gregs[0] == OCERZ_RBP && mov_hd == regs[0] &&
+              frame_leaves(insns[last].rip + insns[last].len);
+    uint8_t alone[STACK_RUN_MAX] = {0}, lo[STACK_RUN_MAX] = {0};
+    for (int j = 0; j < k && seg; j++)
+        alone[j] = (uint8_t)stack_run_alone(gregs[j]);
+    if (op == OCERZ_OP_PUSH || nomirror) {
+        for (int j = 0; j + 1 < k; j++)
+            if (!alone[j] && !alone[j + 1]) lo[j++] = 1;
+    } else {
+        for (int j = k - 1; j > 0; j -= 2)
+            lo[j - 1] = 1;
+    }
     int hs = pin_hreg(pin_slot(OCERZ_RSP));
     if (g_lazy_end >= 0) {
         int32_t at = g_rsp_pend;
-        int j = 0;
         if (op == OCERZ_OP_PUSH) {
-            for (; j + 1 < k; j += 2)
-                a64_stp_off(b, regs[j + 1], regs[j], hs, at - 8 * (j + 2));
-            if (j < k)
-                a64_stur(b, 8, regs[j], hs, at - 8 * (j + 1));
+            for (int j = 0; j < k; j += 1 + lo[j]) {
+                if (lo[j]) a64_stp_off(b, regs[j + 1], regs[j], hs, at - 8 * (j + 2));
+                else a64_stur(b, 8, regs[j], hs, at - 8 * (j + 1));
+            }
             if (mov_at >= 0) {
                 emit_add_simm(b, mov_hd, hs, at - 8 * mov_at);
                 if (!jgb_zero())
@@ -20828,11 +20887,10 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
             }
             g_rsp_pend -= 8 * k;
         } else {
-            if (bot) { a64_ldur(b, 8, regs[0], hs, at); j = 1; }
-            for (; j + 1 < k; j += 2)
-                a64_ldp_off(b, regs[j], regs[j + 1], hs, at + 8 * j);
-            if (j < k)
-                a64_ldur(b, 8, regs[j], hs, at + 8 * j);
+            for (int j = 0; j < k; j += 1 + lo[j]) {
+                if (lo[j]) a64_ldp_off(b, regs[j], regs[j + 1], hs, at + 8 * j);
+                else a64_ldur(b, 8, regs[j], hs, at + 8 * j);
+            }
             g_rsp_pend += 8 * k;
         }
         for (int m = i + 1; m <= last; m++)
@@ -20844,12 +20902,11 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
         a64_add_reg(b, 1, JTA, hs, JGB, 0);
         base = JTA;
     }
-    int j = 0;
     if (op == OCERZ_OP_PUSH) {
-        for (; j + 1 < k; j += 2)
-            a64_stp_off(b, regs[j + 1], regs[j], base, -8 * (j + 2));
-        if (j < k)
-            a64_stur(b, 8, regs[j], base, -8 * (j + 1));
+        for (int j = 0; j < k; j += 1 + lo[j]) {
+            if (lo[j]) a64_stp_off(b, regs[j + 1], regs[j], base, -8 * (j + 2));
+            else a64_stur(b, 8, regs[j], base, -8 * (j + 1));
+        }
         if (mov_at >= 0) {
             a64_sub_imm(b, 1, mov_hd, hs, 8 * mov_at);
             if (direct && !jgb_zero())
@@ -20857,11 +20914,10 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
         }
         a64_sub_imm(b, 1, hs, hs, 8 * k);
     } else {
-        if (bot) { a64_ldr(b, 8, regs[0], base, 0); j = 1; }
-        for (; j + 1 < k; j += 2)
-            a64_ldp_off(b, regs[j], regs[j + 1], base, 8 * j);
-        if (j < k)
-            a64_ldr(b, 8, regs[j], base, (uint32_t)(8 * j));
+        for (int j = 0; j < k; j += 1 + lo[j]) {
+            if (lo[j]) a64_ldp_off(b, regs[j], regs[j + 1], base, 8 * j);
+            else a64_ldr(b, 8, regs[j], base, (uint32_t)(8 * j));
+        }
         a64_add_imm(b, 1, hs, hs, 8 * k);
     }
     for (int m = i + 1; m <= last; m++)
