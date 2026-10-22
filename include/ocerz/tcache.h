@@ -28,7 +28,8 @@
  *
  * A profile is what -aot learns from a program's earlier runs.
  * ocerz_tcache_profile_open names the program (an identity of its main
- * executable) and the shared cache (its UUID); from then on
+ * executable) and the shared cache (its UUID), and starts a thread that reads
+ * the records the profile lists ahead of ocerz_tcache_find; from then on
  * ocerz_tcache_profile_note collects shared-cache rips, each with
  * OCERZ_TC_PROF_PLAIN or OCERZ_TC_PROF_ORDERED for the memory model it was
  * kept under, and ocerz_tcache_flush and exit add the new ones to the

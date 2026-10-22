@@ -106,6 +106,32 @@
  * and 0.108).  src/jit.c ("Ahead of time") says how -aot uses them.
  * OCERZ_NO_TCACHE_PROFILE=1 writes and reads none and, like the profiles
  * themselves, stays out of the fingerprint.
+ *
+ * ---- ahead of the translator ----
+ * A warm tclsh start asks for 31.7k records, one at a time as each block is
+ * first run, and every find probed a random slot of the 64 MB index (a page
+ * fault, nearly every time, until the whole index has been touched), then
+ * checked and decoded about a kilobyte of data, all on the guest's thread:
+ * 18 ms of a 112 ms start.  A profile lists the shared-cache records the
+ * program will ask for, in the order its first run asked for them (entries are
+ * written in the order they were noted).  So when ocerz_tcache_profile_open
+ * names the program, a warm thread reads the profile and does those finds
+ * itself, through mappings of its own and at most TC_WARM_AHEAD records past
+ * as many as the translator has asked for, and ocerz_tcache_find hands out a
+ * record it has ready (the caller's until the next call, as the store's own
+ * buffer is) or goes to the index as before.  Everything tc_load checks still
+ * runs on every record; a record the thread read is the one the index held a
+ * moment before the translator asked, as it would have been for a launch that
+ * started a moment earlier.  tclsh's finds went from 17.8 ms to 4.5 (27.8k of
+ * its records ready), python3's from 29.7 to 15.8 (15.6k of 41k: its image
+ * records are not in a profile), at the price of 2-4 ms in tc_load, since a
+ * record decoded on another core arrives cold.  Warm starts: tclsh 0.098 s
+ * (0.112 without), python3 0.190 (0.204), ruby 0.203 (0.208), sqlite3 0.037
+ * (0.041), with 12-20 ms more cpu.  A smaller window lost more than it saved
+ * (64: finds back to 13 ms), a larger one kept records long enough to go cold
+ * (4096: tc_load 1.5 ms slower than 1024).  OCERZ_NO_TCACHE_WARM=1 leaves every
+ * find to the translator's thread; under verify there is no profile and so no
+ * warm thread.
  */
 #include "ocerz/tcache.h"
 #include "ocerz/mem.h"
@@ -269,6 +295,7 @@ static int env_ignored(const char *kv)
         "OCERZ_TCACHE_MAX_MB=", "OCERZ_TCACHE_MIN_FREE_MB=", "OCERZ_GUESTPROF=", "OCERZ_GUESTPROF_PERIOD=", "OCERZ_LOWBASE=",
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
         "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=", "OCERZ_NO_TCACHE_FOLD=", "OCERZ_NO_TCACHE_SLAB=",
+        "OCERZ_NO_TCACHE_WARM=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
@@ -670,48 +697,219 @@ int ocerz_tcache_room(void)
     return ok;
 }
 
+static uint64_t slot_loc(uint64_t key)
+{
+    uint64_t i = slot_hash(key) & g_mask;
+    for (int k = 0; k < TC_PROBE; k++, i = (i + 1) & g_mask) {
+        uint64_t sk = __atomic_load_n(&g_slot[i].key, __ATOMIC_ACQUIRE);
+        if (!sk)
+            return 0;
+        if (sk == key)
+            return __atomic_load_n(&g_slot[i].loc, __ATOMIC_ACQUIRE);
+    }
+    return 0;
+}
+
+static int stored_head_ok(const TcStored *z, uint64_t key)
+{
+    return z && z->magic == TC_ZREC_MAGIC && z->key == key && z->size >= sizeof *z && z->size <= TC_REC_MAX &&
+           z->size % 8 == 0 && z->zlen <= z->size - sizeof *z && z->raw <= TC_REC_MAX - sizeof(OcerzTcRecHead) &&
+           z->raw % 8 == 0;
+}
+
+static int unpack(const TcStored *z, OcerzTcRecHead *r, uint8_t *scratch)
+{
+    if (z->sum != stored_sum(z))
+        return 0;
+    size_t got = z->zlen == z->raw
+        ? (memcpy(r + 1, z + 1, z->raw), (size_t)z->raw)
+        : compression_decode_buffer((uint8_t *)(r + 1), z->raw, (const uint8_t *)(z + 1), z->zlen, scratch,
+                                    COMPRESSION_LZ4_RAW);
+    if (got != z->raw)
+        return 0;
+    r->magic = OCERZ_TC_REC_MAGIC;
+    r->size = (uint32_t)(sizeof *r + z->raw);
+    r->key = z->key;
+    r->sum = z->sum;
+    return 1;
+}
+
+#define TC_WARM_AHEAD 1024
+
+typedef struct {
+    uint64_t key;
+    uintptr_t st;
+} TcWarm;
+
+static TcWarm *g_warm;
+static uint32_t *g_whash;
+static size_t g_nwarm, g_wmask, g_warm_at;
+static int g_warm_on;
+static OcerzTcRecHead *g_warm_last;
+
+static const OcerzTcRecHead *warm_take(uint64_t key)
+{
+    if (!__atomic_load_n(&g_warm_on, __ATOMIC_ACQUIRE))
+        return NULL;
+    size_t j = (size_t)(slot_hash(key) & g_wmask);
+    while (g_whash[j] && g_warm[g_whash[j] - 1].key != key) j = (j + 1) & g_wmask;
+    if (!g_whash[j])
+        return NULL;
+    size_t i = g_whash[j] - 1;
+    __atomic_store_n(&g_warm_at, __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+    uintptr_t v = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
+    return v > 1 ? (g_warm_last = (OcerzTcRecHead *)v) : NULL;
+}
+
 const OcerzTcRecHead *ocerz_tcache_find(uint64_t key)
 {
     const OcerzTcRecHead *found = NULL;
     pthread_mutex_lock(&g_lock);
-    if (open_store()) {
-        uint64_t i = slot_hash(key) & g_mask;
-        for (int k = 0; k < TC_PROBE; k++, i = (i + 1) & g_mask) {
-            uint64_t sk = __atomic_load_n(&g_slot[i].key, __ATOMIC_ACQUIRE);
-            if (!sk)
-                break;
-            if (sk != key)
-                continue;
-            uint64_t loc = __atomic_load_n(&g_slot[i].loc, __ATOMIC_ACQUIRE);
-            if (!loc)
-                break;
-            uint64_t no = loc >> TC_LOC_OFF_BITS, off = loc & ((1ull << TC_LOC_OFF_BITS) - 1);
-            const TcStored *z = (const TcStored *)(const void *)file_at(no, off, sizeof *z);
-            if (!z || z->magic != TC_ZREC_MAGIC || z->key != key || z->size < sizeof *z ||
-                z->size > TC_REC_MAX || z->size % 8 || z->zlen > z->size - sizeof *z ||
-                z->raw > TC_REC_MAX - sizeof(OcerzTcRecHead) || z->raw % 8)
-                break;
-            z = (const TcStored *)(const void *)file_at(no, off, z->size);
-            if (!z || z->sum != stored_sum(z))
-                break;
-            OcerzTcRecHead *r = (OcerzTcRecHead *)(void *)g_rbuf;
-            size_t got = z->zlen == z->raw
-                ? (memcpy(r + 1, z + 1, z->raw), (size_t)z->raw)
-                : compression_decode_buffer((uint8_t *)(r + 1), TC_REC_MAX - sizeof *r,
-                                            (const uint8_t *)(z + 1), z->zlen, g_dscratch,
-                                            COMPRESSION_LZ4_RAW);
-            if (got != z->raw)
-                break;
-            r->magic = OCERZ_TC_REC_MAGIC;
-            r->size = (uint32_t)(sizeof *r + z->raw);
-            r->key = key;
-            r->sum = z->sum;
-            found = r;
-            break;
-        }
+    free(g_warm_last);
+    g_warm_last = NULL;
+    if (!(found = warm_take(key)) && open_store()) {
+        uint64_t loc = slot_loc(key), no = loc >> TC_LOC_OFF_BITS, off = loc & ((1ull << TC_LOC_OFF_BITS) - 1);
+        const TcStored *z = loc ? (const TcStored *)(const void *)file_at(no, off, sizeof *z) : NULL;
+        if (stored_head_ok(z, key) && (z = (const TcStored *)(const void *)file_at(no, off, z->size)) != NULL &&
+            unpack(z, (OcerzTcRecHead *)(void *)g_rbuf, g_dscratch))
+            found = (const OcerzTcRecHead *)(const void *)g_rbuf;
     }
     pthread_mutex_unlock(&g_lock);
     return found;
+}
+
+/*
+ * The warm thread: the records a program's profile names, read, checked and
+ * decoded ahead of the translator, through mappings of its own (file_at may
+ * move the shared ones under it), at most TC_WARM_AHEAD past as many as the
+ * translator has asked for; those left that far behind, and all of them once
+ * nothing has been asked for in two seconds, are dropped.
+ */
+static const TcStored *warm_at(TcFile **mp, uint64_t *nm, uint64_t no, uint64_t off)
+{
+    if (no >= *nm) {
+        uint64_t n = *nm ? *nm : 64;
+        while (n <= no) n *= 2;
+        TcFile *nv = (TcFile *)realloc(*mp, n * sizeof *nv);
+        if (!nv)
+            return NULL;
+        for (uint64_t i = *nm; i < n; i++)
+            nv[i] = (TcFile){ NULL, 0, -1 };
+        *mp = nv;
+        *nm = n;
+    }
+    TcFile *f = &(*mp)[no];
+    const TcStored *z = off + sizeof *z <= f->len ? (const TcStored *)(const void *)(f->p + off) : NULL;
+    if (z && off + z->size <= f->len)
+        return z;
+    char path[1200];
+    struct stat st;
+    if (f->fd < 0) {
+        snprintf(path, sizeof path, "%s/d-%llu.td", g_dir, (unsigned long long)no);
+        f->fd = open(path, O_RDONLY | O_CLOEXEC);
+    }
+    void *p = f->fd >= 0 && fstat(f->fd, &st) == 0 && (uint64_t)st.st_size >= off + sizeof *z
+                  ? mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, f->fd, 0) : MAP_FAILED;
+    if (p == MAP_FAILED)
+        return NULL;
+    if (f->p)
+        munmap((void *)f->p, f->len);
+    f->p = (const uint8_t *)p;
+    f->len = (size_t)st.st_size;
+    z = (const TcStored *)(const void *)(f->p + off);
+    return off + z->size <= f->len ? z : NULL;
+}
+
+static size_t warm_build(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    size_t n = fd >= 0 && fstat(fd, &st) == 0 ? (size_t)st.st_size / 8 : 0, k = 0;
+    if (n > OCERZ_TC_PROF_MAX)
+        n = OCERZ_TC_PROF_MAX;
+    uint64_t *v = n ? (uint64_t *)malloc(n * 8) : NULL;
+    if (v && pread(fd, v, n * 8, 0) != (ssize_t)(n * 8))
+        n = 0;
+    if (fd >= 0)
+        close(fd);
+    size_t cap = 1;
+    while (cap < 2 * n) cap *= 2;
+    g_warm = n ? (TcWarm *)calloc(n, sizeof *g_warm) : NULL;
+    g_whash = n ? (uint32_t *)calloc(cap, sizeof *g_whash) : NULL;
+    g_wmask = cap - 1;
+    for (size_t i = 0; g_warm && g_whash && i < n; i++) {
+        uint64_t m = v[i] & (OCERZ_TC_PROF_PLAIN | OCERZ_TC_PROF_ORDERED);
+        if (m != OCERZ_TC_PROF_PLAIN && m != OCERZ_TC_PROF_ORDERED)
+            continue;
+        uint64_t key = (v[i] & OCERZ_TC_PROF_RIP) | (m == OCERZ_TC_PROF_PLAIN ? OCERZ_TC_KEY_PLAIN : 0);
+        size_t j = (size_t)(slot_hash(key) & g_wmask);
+        while (g_whash[j] && g_warm[g_whash[j] - 1].key != key) j = (j + 1) & g_wmask;
+        if (g_whash[j])
+            continue;
+        g_warm[k].key = key;
+        g_whash[j] = (uint32_t)++k;
+    }
+    free(v);
+    return g_warm && g_whash ? k : 0;
+}
+
+static void *warm_main(void *arg)
+{
+    TcFile *m = NULL;
+    uint64_t nm = 0;
+    size_t ds = compression_decode_scratch_buffer_size(COMPRESSION_LZ4_RAW), back = 0, seen = 0;
+    uint8_t *scratch = (uint8_t *)malloc(ds ? ds : 1);
+    g_nwarm = warm_build((const char *)arg);
+    free(arg);
+    uint64_t idle = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_mutex_lock(&g_lock);
+    int ok = g_nwarm && scratch && open_store();
+    pthread_mutex_unlock(&g_lock);
+    if (ok)
+        __atomic_store_n(&g_warm_on, 1, __ATOMIC_RELEASE);
+    for (size_t i = 0; ok && i < g_nwarm; i++) {
+        size_t at;
+        while (ok && i > (at = __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED)) + TC_WARM_AHEAD) {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (at != seen) {
+                seen = at;
+                idle = now;
+            }
+            ok = now - idle < 2000000000ull;
+            struct timespec ts = { 0, 200000 };
+            nanosleep(&ts, NULL);
+        }
+        for (; back + TC_WARM_AHEAD < at; back++) {
+            uintptr_t v = __atomic_exchange_n(&g_warm[back].st, 1, __ATOMIC_ACQ_REL);
+            if (v > 1)
+                free((void *)v);
+        }
+        if (!ok || __atomic_load_n(&g_warm[i].st, __ATOMIC_ACQUIRE))
+            continue;
+        uint64_t loc = slot_loc(g_warm[i].key), no = loc >> TC_LOC_OFF_BITS, off = loc & ((1ull << TC_LOC_OFF_BITS) - 1);
+        const TcStored *z = loc && no < (1ull << 24) ? warm_at(&m, &nm, no, off) : NULL;
+        if (!stored_head_ok(z, g_warm[i].key))
+            continue;
+        OcerzTcRecHead *r = (OcerzTcRecHead *)malloc(sizeof *r + z->raw);
+        uintptr_t zero = 0;
+        if (r && (!unpack(z, r, scratch) ||
+                  !__atomic_compare_exchange_n(&g_warm[i].st, &zero, (uintptr_t)r, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)))
+            free(r);
+    }
+    for (size_t i = back; i < g_nwarm; i++) {
+        uintptr_t v = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
+        if (v > 1)
+            free((void *)v);
+    }
+    for (uint64_t k = 0; k < nm; k++) {
+        if (m[k].p)
+            munmap((void *)m[k].p, m[k].len);
+        if (m[k].fd >= 0)
+            close(m[k].fd);
+    }
+    free(m);
+    free(scratch);
+    return NULL;
 }
 
 static void publish(uint64_t key, uint64_t loc)
@@ -944,7 +1142,7 @@ static void profile_execs_name(char *out, size_t n, uint64_t ident)
 }
 
 static os_unfair_lock g_plock = OS_UNFAIR_LOCK_INIT;
-static uint64_t *g_pset;
+static uint64_t *g_pset, *g_pord;
 static size_t g_pcap, g_pn, g_pwritten;
 static uint64_t g_pident;
 static char g_prips[1200];
@@ -1011,9 +1209,9 @@ static void profile_write(void)
             free(out);
             out = NULL;
         }
-        for (size_t i = 0; out && i < g_pcap && have + nout < OCERZ_TC_PROF_MAX; i++)
-            if (g_pset[i] && !pset_has(fset, fcap, g_pset[i]))
-                out[nout++] = g_pset[i];
+        for (size_t i = 0; out && i < g_pn && have + nout < OCERZ_TC_PROF_MAX; i++)
+            if (!pset_has(fset, fcap, g_pord[i]))
+                out[nout++] = g_pord[i];
         if (nout)
             (void)!pwrite(fd, out, nout * 8, (off_t)(have * 8));
         if (g_log > 0)
@@ -1044,8 +1242,17 @@ void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid)
     profile_rips_name(g_prips, sizeof g_prips, ident, cache_uuid);
     g_pident = ident;
     os_unfair_lock_unlock(&g_plock);
-    if (first && g_prips[0])
-        atexit(profile_atexit);
+    if (!first || !g_prips[0])
+        return;
+    atexit(profile_atexit);
+    char *path = getenv("OCERZ_NO_TCACHE_WARM") ? NULL : strdup(g_prips);
+    pthread_t t;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (path && pthread_create(&t, &at, warm_main, path) != 0)
+        free(path);
+    pthread_attr_destroy(&at);
 }
 
 void ocerz_tcache_profile_note(uint64_t v)
@@ -1053,8 +1260,10 @@ void ocerz_tcache_profile_note(uint64_t v)
     if (!g_prips[0])
         return;
     os_unfair_lock_lock(&g_plock);
-    if (g_pn < OCERZ_TC_PROF_MAX)
-        pset_add(&g_pset, &g_pcap, &g_pn, v);
+    if (!g_pord)
+        g_pord = (uint64_t *)malloc(OCERZ_TC_PROF_MAX * sizeof *g_pord);
+    if (g_pord && g_pn < OCERZ_TC_PROF_MAX && pset_add(&g_pset, &g_pcap, &g_pn, v))
+        g_pord[g_pn - 1] = v;
     os_unfair_lock_unlock(&g_plock);
 }
 
