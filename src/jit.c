@@ -684,6 +684,23 @@
  * walking the ordered model it never runs under.  With no profile -aot does
  * what it did, and OCERZ_NO_TCACHE_PROFILE=1 neither notes nor seeds.
  *
+ * Loading.  A record is copied into the arena, bound, and its own edges are
+ * chained, all before its code is made visible to instruction fetch, by one
+ * dc cvau / ic ivau sequence over both; only then is it published
+ * (cache_insert).  Patching the older blocks that were waiting for it
+ * (pending_drain) has to come later, since another thread may take such a
+ * branch as soon as it is written, and a load nearly always does it: 92% of
+ * the 41k loads of a python3 start patch at least one older block.  That word
+ * changes from a branch to the dispatcher into a branch to the new block, two
+ * unconditional Bs, which a core may fetch old or new while it changes and
+ * which are both right, so its invalidation joins the next load's sequence,
+ * or the next chain install, or happens the next time the dispatcher finds a
+ * block, whichever comes first; a conditional branch patched by the drain is
+ * still made visible at once.  Each load paid two barrier sequences and now
+ * pays one: a warm python3 start spends 41.8 ms in tc_load where it spent
+ * 44.4, and takes 210.6 ms where it took 214.7 (tclsh 116.5, was 120.4).
+ * OCERZ_NO_TCACHE_FOLD=1 brings the two sequences back.
+ *
  * ---- i386 ----
  * 32-bit blocks are compiled from a whitelist of instructions (m32_inline_ok),
  * with no superblocks and 0x67/16-bit addressing left to the interpreter.
@@ -19278,7 +19295,9 @@ static void chain_batch_begin(void)
  * one barrier pair for all of them, as stop_sites_sync does, where a
  * sys_icache_invalidate per word paid the barriers once for each: on Apple
  * silicon a call over one word costs about what it costs over a whole block.
- * The install still finishes, under jit_lock, before translate returns.
+ * The install still finishes, under jit_lock, before translate returns, except
+ * for the older blocks a loaded record's arrival patches, whose words wait for
+ * the next sequence (see "kept translations", Loading).
  * OCERZ_NO_CHAIN_SYNC_BATCH=1 calls sys_icache_invalidate for each word.
  */
 static void chain_sites_sync(uint32_t *const *sites, int n)
@@ -19323,12 +19342,40 @@ static void site_batch_store(SiteBatch *sb, uint32_t *site, uint32_t w)
     sb->site[sb->n++] = site;
 }
 
+static uint32_t *g_chain_defer[CHAIN_BATCH_MAX];
+static int g_chain_ndefer;
+static int g_chain_cond;
+
 static void chain_batch_end(void)
 {
     pthread_jit_write_protect_np(1);
+    while (g_chain_ndefer && g_chain_npatched < CHAIN_BATCH_MAX)
+        g_chain_patched[g_chain_npatched++] = g_chain_defer[--g_chain_ndefer];
     chain_sites_flush(g_chain_patched, g_chain_npatched);
     g_chain_npatched = 0;
     g_chain_batching = 0;
+}
+
+static void chain_defer_flush(void)
+{
+    chain_sites_flush(g_chain_defer, g_chain_ndefer);
+    __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
+}
+
+static void chain_sync_with_defer(const uint32_t *code, size_t bytes)
+{
+    uintptr_t lo = (uintptr_t)code & ~(uintptr_t)63, hi = (uintptr_t)code + bytes;
+    for (uintptr_t a = lo; a < hi; a += 64)
+        __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
+    for (int i = 0; i < g_chain_ndefer; i++)
+        __asm__ volatile("dc cvau, %0" :: "r"(g_chain_defer[i]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uintptr_t a = lo; a < hi; a += 64)
+        __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+    for (int i = 0; i < g_chain_ndefer; i++)
+        __asm__ volatile("ic ivau, %0" :: "r"(g_chain_defer[i]) : "memory");
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+    __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
 }
 
 static void chain_cond_short(uint32_t *cond_site, void *dst)
@@ -19349,6 +19396,7 @@ static void chain_cond_short(uint32_t *cond_site, void *dst)
     } else return;
     if (g_chain_batching) {
         *cond_site = nw;
+        g_chain_cond = 1;
         if (g_chain_npatched < CHAIN_BATCH_MAX) g_chain_patched[g_chain_npatched++] = cond_site;
         else sys_icache_invalidate(cond_site, 4);
     } else {
@@ -21740,14 +21788,12 @@ static uint32_t *tc_roundtrip(OcerzJit *jit, JitBlock *blk, uint32_t *entry)
     return c;
 }
 
-static void blk_chain_install(OcerzJit *jit, JitBlock *blk)
+static void blk_chain_edges(OcerzJit *jit, JitBlock *blk)
 {
-    if (g_no_chain)
-        return;
-    chain_batch_begin();
     for (int i = 0; i < blk->n_edges; i++) {
         uint32_t *cs = blk->edges[i].probing ? NULL : blk->edges[i].cond_site;
-        JitBlock *t = cache_lookup(jit, blk->edges[i].target_rip, blk_mode32(blk));
+        uint64_t tk = jit_key(blk->edges[i].target_rip, blk_mode32(blk));
+        JitBlock *t = tk == blk->key ? blk : cache_lookup(jit, blk->edges[i].target_rip, blk_mode32(blk));
         if (t && t->code) {
             void *dst = (void *)t->code;
             if (blk->edges[i].kind == EDGE_BODY) {
@@ -21765,11 +21811,18 @@ static void blk_chain_install(OcerzJit *jit, JitBlock *blk)
                 pred_add(t, blk, i);
             }
         } else {
-            pending_add(jit_key(blk->edges[i].target_rip, blk_mode32(blk)),
-                        blk->edges[i].patch_b, blk->edges[i].kind,
+            pending_add(tk, blk->edges[i].patch_b, blk->edges[i].kind,
                         blk->edges[i].pin_class, cs, blk->hoist_sig, blk, i);
         }
     }
+}
+
+static void blk_chain_install(OcerzJit *jit, JitBlock *blk)
+{
+    if (g_no_chain)
+        return;
+    chain_batch_begin();
+    blk_chain_edges(jit, blk);
     pending_drain(blk->key, blk);
     chain_batch_end();
 }
@@ -22323,8 +22376,13 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
         tc_free_blk(blk);
         return NULL;
     }
-    pthread_jit_write_protect_np(1);
-    sys_icache_invalidate(c, (size_t)words * 4);
+    static int fold = -1;
+    if (fold < 0)
+        fold = !getenv("OCERZ_NO_TCACHE_FOLD");
+    if (!fold) {
+        pthread_jit_write_protect_np(1);
+        sys_icache_invalidate(c, (size_t)words * 4);
+    }
     jit->code_cur = c + words;
 
 #define TC_AT(o) ((o) == TC_NONE ? NULL : c + (o))
@@ -22375,11 +22433,41 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
         jit->stop_blocks = blk;
     }
     if (!code_index_append_locked(jit, blk)) {
+        if (fold)
+            pthread_jit_write_protect_np(1);
         blk->code = NULL;
         return NULL;
     }
-    cache_insert(jit, blk);
-    blk_chain_install(jit, blk);
+    if (fold) {
+        if (!g_no_chain) {
+            g_chain_npatched = 0;
+            g_chain_batching = 1;
+            blk_chain_edges(jit, blk);
+            g_chain_npatched = 0;
+            g_chain_batching = 0;
+        }
+        pthread_jit_write_protect_np(1);
+        chain_sync_with_defer(c, (size_t)words * 4);
+        cache_insert(jit, blk);
+        if (!g_no_chain) {
+            chain_batch_begin();
+            g_chain_cond = 0;
+            pending_drain(blk->key, blk);
+            if (!g_chain_cond && g_chain_npatched <= CHAIN_BATCH_MAX - g_chain_ndefer) {
+                pthread_jit_write_protect_np(1);
+                for (int i = 0; i < g_chain_npatched; i++)
+                    g_chain_defer[g_chain_ndefer + i] = g_chain_patched[i];
+                __atomic_store_n(&g_chain_ndefer, g_chain_ndefer + g_chain_npatched, __ATOMIC_RELAXED);
+                g_chain_npatched = 0;
+                g_chain_batching = 0;
+            } else {
+                chain_batch_end();
+            }
+        }
+    } else {
+        cache_insert(jit, blk);
+        blk_chain_install(jit, blk);
+    }
     g_tc_n_load++;
     tc_prof_note(rip);
     return blk;
@@ -26208,6 +26296,7 @@ void ocerz_jit_postfork_child(void)
             __atomic_store_n(&t->dead, 1, __ATOMIC_RELAXED);
         }
     __atomic_store_n(&g_flush_req, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
     g_flush_mark = UINT64_MAX;
     g_flush_retry_ns = 0;
 }
@@ -26713,6 +26802,7 @@ static void jit_arena_reset_locked(OcerzJit *jit)
     jit->invmap_full = 0;
     gran_clear_all();
     pending_clear();
+    __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_flush_want, 0, __ATOMIC_RELAXED);
     g_n_ras_cells = 0;
     g_ras_slot_n = 0;
@@ -27134,6 +27224,11 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
         g_jl_owner_cpu = NULL;
         jl_unlock_step();
     } else {
+        if (__builtin_expect(__atomic_load_n(&g_chain_ndefer, __ATOMIC_RELAXED) != 0, 0) && !jl_held) {
+            jl_acquire(__LINE__);
+            chain_defer_flush();
+            jl_release();
+        }
         if (ocerz_jitstat > 0)
             js_hits++;
         if (ocerz_perfstat > 0)
