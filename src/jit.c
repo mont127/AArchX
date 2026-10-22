@@ -340,6 +340,12 @@
  * 0.35 s and icall from 0.74 to 0.44 (0.39 outside the window).
  * OCERZ_NO_LOW_RAS and OCERZ_NO_LOW_SPLICE turn the two halves off.
  *
+ * The block a direct call returns to is laid out at bl+4, in a reservation
+ * inside the caller (cont_reserve, "Continuation placement"), so a return no
+ * longer lands on a branch to it: fibn's call time drops 4.7%, xbench str 3%.
+ * Such a copy is one of several live blocks of its rip, its body and its
+ * prologue are two ranges (blk_ranges), and retiring it reopens the branch.
+ *
  * ---- bridged calls ----
  * In native mode a guest call into a system library lands on a synthesized
  * stub, `mov r11d, <export id>` then `jmp qword [rip + slot]`, whose slot holds
@@ -883,6 +889,21 @@ typedef struct JitInsnRef {
 } JitInsnRef;
 
 struct JitLaneRec { uint32_t off; uint16_t dirty; uint8_t l0[16]; uint8_t yc[16]; };
+typedef struct JitLayout {
+    struct JitBlock *caller, *child;
+    uint32_t *h;
+    uint32_t r, hits;
+    uint8_t edge, placed;
+    uint64_t rip;
+} JitLayout;
+#define CONT_TAG (-5)
+#define CONT_PROMOTE 4096
+static uint32_t cont_promote_n(void)
+{
+    static uint32_t n;
+    if (!n) { const char *e = getenv("OCERZ_CONT_PROMOTE"); n = e && strtoul(e, NULL, 0) ? (uint32_t)strtoul(e, NULL, 0) : CONT_PROMOTE; }
+    return n;
+}
 typedef struct JitBlock {
     uint64_t key;
     JitBlockFn code;
@@ -929,6 +950,8 @@ typedef struct JitBlock {
 
     uint8_t pin_class;
     uint8_t inv_hit;
+    uint16_t pro_w;                     /* a placed continuation's prologue words at code */
+    uint32_t cont_ctr;                  /* returns through its call's bl+4 left before it is promoted (cont_promote) */
     uint64_t glo, ghi;                  /* the guest span its instructions cover, spliced callees and far superblock legs included (block_gspan) */
 
     struct {
@@ -952,6 +975,7 @@ typedef struct JitBlock {
     uint16_t xmm_pinned;
     uint8_t ordered_loads;
     uint8_t slab;
+    JitLayout *lay;
 } JitBlock;
 
 static inline uint64_t blk_rip(const JitBlock *b) { return jit_key_rip(b->key); }
@@ -964,6 +988,42 @@ static inline const X86Insn *blk_insn_full(const JitBlock *b, int i)
     if (b->insns) return &b->insns[i];
     unsigned k = b->iref[i].keep;
     return k ? &b->kept[k - 1] : NULL;
+}
+
+/*
+ * A placed continuation (see "control flow") keeps its body, stubs and pool at
+ * lay->h, inside its caller, and only its prologue at code; offsets into it
+ * (insn_off, oslow, lanerec, push_fix) are from lay->h, and code_words counts
+ * from there.  Its caller owns its own words less the reservation.
+ */
+static inline int blk_is_cont(const JitBlock *b) { return b->lay && b->lay->caller != b; }
+static inline const uint32_t *blk_base(const JitBlock *b)
+{
+    return blk_is_cont(b) ? b->lay->h : (const uint32_t *)(const void *)b->code;
+}
+typedef struct { const uint32_t *lo, *hi; } CodeRange;
+static int blk_ranges(const JitBlock *b, CodeRange out[2])
+{
+    const uint32_t *c = (const uint32_t *)(const void *)b->code;
+    const JitLayout *L = b->lay;
+    if (!c) return 0;
+    if (!L) { out[0] = (CodeRange){ c, c + b->code_words }; return 1; }
+    if (L->caller != b) {
+        out[0] = (CodeRange){ L->h, L->h + b->code_words };
+        out[1] = (CodeRange){ c, c + b->pro_w };
+        return 2;
+    }
+    out[0] = (CodeRange){ c, L->h };
+    out[1] = (CodeRange){ L->h + L->r, c + b->code_words };
+    return 2;
+}
+static int blk_has_pc(const JitBlock *b, const uint32_t *p)
+{
+    CodeRange r[2];
+    int n = blk_ranges(b, r);
+    for (int i = 0; i < n; i++)
+        if (p >= r[i].lo && p < r[i].hi) return 1;
+    return 0;
 }
 
 #define INVMAP_RSHIFT 22
@@ -1307,6 +1367,14 @@ static uint64_t g_self_rip;
 static uint32_t *g_body_entry;
 static uint32_t *g_loop_entry;
 static uint32_t *g_stop_patch;
+static JitLayout *g_place;                  /* the reservation this translation fills, when it is a placed continuation */
+static uint32_t *g_place_pro;               /* its prologue, once the body has moved into the reservation */
+static uint32_t g_place_pro_w;
+static uint32_t *g_cont_h;                  /* the reservation this translation left after its call's bl */
+static uint32_t g_cont_r;
+static uint64_t g_cont_rip;
+static JitLayout *g_cont_new;               /* a caller with a reservation translate fills once it is installed */
+static uint32_t g_tail_gap;                 /* words emit_body_chain_tail leaves between its branch and its fallback */
 #define SIDE_MAX 6
 static struct { uint32_t *site; uint64_t taken; int idx; uint32_t *stub; uint32_t *patch_b;
                 int rec; uint32_t rec_ccop; int rec_src, rec_dst, rec_imm_pending; uint64_t rec_imm;
@@ -2015,6 +2083,8 @@ static uint64_t *ps_retsite_counter(uint64_t rip)
     return &ps_retsite[0].n;
 }
 static unsigned long long ps_chain_veneer;
+static unsigned long long ps_cont_res, ps_cont_res_words, ps_cont_place, ps_cont_waste, ps_cont_over,
+                          ps_cont_skip, ps_cont_detach, ps_cont_replace, ps_cont_promote;
 static uint64_t ps_t0;
 
 static __attribute__((noinline, cold, preserve_most)) void jit_trace_one(const X86Insn *insn)
@@ -17763,6 +17833,129 @@ static int emit_call_ret32(A64Buf *b, const X86Insn *insn,
     return 0;
 }
 
+/*
+ * Continuation placement.  A direct call that is not spliced ends its block in
+ * `bl callee`, and the callee's ret lands on the word after it, H, which was
+ * the continuation edge's branch to the return-address block: a taken branch
+ * on every return.  A caller starts out counting those returns instead: H
+ * decrements a counter in its JitBlock (flag-free, in scratch registers) and
+ * goes on to the edge's branch; after CONT_PROMOTE returns it leaves tagged
+ * for the dispatcher, which marks its key hot and retires it (cont_promote).
+ * The next translation of a hot caller leaves a reservation after H, and
+ * translate fills it at once with a copy of the return-address block whose
+ * body starts at H (its prologue, for the dispatcher, goes at code_cur and
+ * ends in a branch to H).  Until the copy is complete H holds the edge's
+ * branch, chained or not; then the edge is taken out of service (patch_b
+ * NULL, its pending entry dropped) and H becomes a nop, one store.  Retiring
+ * the copy puts the edge's fallback back in H and chains or pends the edge
+ * again, before anything can reuse the copy's words (cont_detach).  A copy
+ * that does not fit, or cannot be translated as a body (stop requested, not
+ * pin class 3), leaves H as it was.  The host RAS still holds bl+4 = H, so the
+ * return predictor is unaffected.
+ *
+ * Reserving and placing at every call cost a python3 start with the cache off
+ * 12%: 11.6k reservations (13 MB of arena) for 2.3k more translations and 500
+ * overflows, and counting through the dispatcher cost as much; promotion
+ * places 17 there, and 2 in fibn, 1 in xbench str, which are the ones that
+ * pay.  The reservation is sized from the block already translated at the
+ * return address, else from a decode that follows superblock legs as
+ * translate's does: 192 words and 12 per instruction, at most 768, which fits
+ * 98% of the continuations of a perl and a python3 run with 139 words spare.
+ * Neither the caller nor the copy is placed when the translation cache would
+ * keep it.  A call inside a copy reserves nothing.  OCERZ_NO_CONT_PLACE=1
+ * turns it all off, OCERZ_CONT_PROMOTE=n promotes after n returns (1: at
+ * once, as the tests do), OCERZ_CONT_WORDS=n fixes the size and
+ * OCERZ_CONTLOG=1 logs each copy.
+ */
+static int tc_usable(const OcerzJit *jit);
+static int tc_keepable(uint64_t rip, int mode32);
+static int cont_place_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_CONT_PLACE") ? 0 : 1;
+    return on;
+}
+
+static int cont_predecode(uint64_t rip)
+{
+    X86Insn insn;
+    volatile uint64_t pc = rip;
+    volatile int n = 0;
+    sigjmp_buf db;
+    sigjmp_buf *prev = ocerz_jit_decode_recover;
+    if (sigsetjmp(db, 0) == 0) {
+        ocerz_jit_decode_recover = &db;
+        for (int legs = 0; n < 96;) {
+            if (jit_decode(pc, &insn, 0) != OCERZ_OK)
+                break;
+            n++;
+            if (is_terminator(insn.op)) {
+                uint64_t t = insn.ops[0].imm;
+                if (insn.op != OCERZ_OP_JCC || insn.ops[0].kind != OCERZ_OPK_IMM || !superblock_enabled() ||
+                    !(t > pc + insn.len || (superblock_back_enabled() && t != rip && t < pc)) || ++legs > SIDE_MAX)
+                    break;
+            }
+            pc += insn.len;
+        }
+    }
+    ocerz_jit_decode_recover = prev;
+    return n;
+}
+
+#define CONT_HOT_N (1u << 15)
+static uint64_t g_cont_hot[CONT_HOT_N];
+static int cont_hot_has(uint64_t key)
+{
+    for (unsigned k = 0, i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 49); k < 64; k++, i = (i + 1) & (CONT_HOT_N - 1)) {
+        uint64_t v = __atomic_load_n(&g_cont_hot[i], __ATOMIC_RELAXED);
+        if (v == key) return 1;
+        if (!v) return 0;
+    }
+    return 0;
+}
+static void cont_hot_add(uint64_t key)
+{
+    for (unsigned k = 0, i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 49); k < 64; k++, i = (i + 1) & (CONT_HOT_N - 1)) {
+        uint64_t v = __atomic_load_n(&g_cont_hot[i], __ATOMIC_RELAXED);
+        if (v == key || (!v && __atomic_compare_exchange_n(&g_cont_hot[i], &v, key, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)))
+            return;
+    }
+}
+
+/* 0: neither; 1: count the returns (the caller is not hot yet); else the reservation's words. */
+static uint32_t cont_reserve(uint64_t retaddr)
+{
+    OcerzJit *jit = g_xlat_jit;
+    if (!cont_place_on() || g_place || g_xlat_mode32 || !jit || jit->stop_requested || !g_cur_blk ||
+        !xmm_global_enabled() || retaddr == g_self_rip ||
+        (ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP && tc_usable(jit)))
+        return 0;
+    if (ocerz_tcache_mode() != OCERZ_TC_OFF && tc_usable(jit)) {
+        uint64_t lo = g_tc_img_lo, hi = g_tc_img_hi, id = g_tc_img_id;
+        int keep = tc_keepable(retaddr, 0);
+        g_tc_img_lo = lo; g_tc_img_hi = hi; g_tc_img_id = id;
+        if (g_tc_on || keep)
+            return 0;
+    }
+    if (!cont_hot_has(g_cur_blk->key))
+        return 1;
+    uint32_t w;
+    static int fixed = -1;
+    if (fixed < 0) { const char *e = getenv("OCERZ_CONT_WORDS"); fixed = e ? (int)strtol(e, NULL, 0) : 0; }
+    const JitBlock *s = cache_lookup(jit, retaddr, 0);
+    if (fixed > 1) {
+        return (uint32_t)fixed;
+    } else if (s && s->code && s->body_code && s->pin_class == 3) {
+        w = s->code_words - (uint32_t)(s->body_code - blk_base(s)) + 24;
+    } else {
+        int n = cont_predecode(retaddr);
+        if (!n)
+            return 0;
+        w = 192 + 12 * (uint32_t)n;
+    }
+    return w < 64 ? 64 : w > 768 ? 768 : w;
+}
+
 static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
                          int *n_exits, uint32_t **epi_sites, int *n_epi)
 {
@@ -17825,7 +18018,36 @@ static int emit_call_ret(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
             a64_emit32(b, 0x94000000u);
             uint32_t *cont = a64_label(b);
             patch_local_adr(adr_site, cont, JT0);
+            uint32_t res = cont_reserve(retaddr), *trip = NULL;
+            if (res == 1) {
+                tc_imm64(b, JT1, TCR_BLK, offsetof(JitBlock, cont_ctr), (uint64_t)(uintptr_t)&g_cur_blk->cont_ctr);
+                a64_ldr(b, 4, JT2, JT1, 0);
+                a64_sub_imm(b, 0, JT2, JT2, 1);
+                a64_str(b, 4, JT2, JT1, 0);
+                trip = a64_label(b);
+                a64_cbz(b, 0, JT2, 0);
+                res = 0;
+            }
+            g_tail_gap = res;
             uint32_t *pb_ret = emit_body_chain_tail(b, retaddr, 0, epi_sites, n_epi);
+            if (trip) {
+                a64_patch_cbz(trip, a64_label(b));
+                g_tag_blk = g_cur_blk;
+                g_tag_idx = CONT_TAG;
+                emit_side_tag(b, 20);
+                g_tag_blk = NULL;
+                a64_mov_imm64(b, JT0, retaddr);
+                a64_str(b, 8, JT0, 20, RIP_OFF);
+                a64_mov_imm64(b, 0, OCERZ_STEP_PROFILE);
+                epi_sites[*n_epi] = a64_label(b);
+                a64_b(b, 0);
+                (*n_epi)++;
+            }
+            if (res && pb_ret == cont && !b->overflow) {
+                g_cont_h = cont;
+                g_cont_r = res;
+                g_cont_rip = retaddr;
+            }
             uint32_t *callee_fb = a64_label(b);
             *pb_callee = 0x94000000u | ((uint32_t)(callee_fb - pb_callee) & 0x03ffffffu);
             a64_mov_imm64(b, JT0, target);
@@ -19673,6 +19895,9 @@ static uint32_t *emit_body_chain_tail(A64Buf *b, uint64_t target_rip, int poll,
     }
     uint32_t *patch_b = a64_label(b);
     a64_b(b, 0);
+    for (; g_tail_gap > 1; g_tail_gap--)
+        a64_emit32(b, 0xd4200000u);
+    g_tail_gap = 0;
     uint32_t *fallback = a64_label(b);
     a64_patch_b(patch_b, fallback);
     if (intr)
@@ -21372,7 +21597,9 @@ static uint64_t tc_value(const OcerzJit *jit, const JitBlock *blk, int kind, uin
         break;
     }
     case TCR_BLK:
-        return (uint64_t)(uintptr_t)blk;
+        if (arg < sizeof *blk)
+            return (uint64_t)(uintptr_t)blk + arg;
+        break;
     case TCR_INSN:
         if (blk->insns && arg < (uint64_t)blk->n_insns)
             return (uint64_t)(uintptr_t)&blk->insns[arg];
@@ -21799,6 +22026,8 @@ static uint32_t *tc_roundtrip(OcerzJit *jit, JitBlock *blk, uint32_t *entry)
 static void blk_chain_edges(OcerzJit *jit, JitBlock *blk)
 {
     for (int i = 0; i < blk->n_edges; i++) {
+        if (!blk->edges[i].patch_b)
+            continue;
         uint32_t *cs = blk->edges[i].probing ? NULL : blk->edges[i].cond_site;
         uint64_t tk = jit_key(blk->edges[i].target_rip, blk_mode32(blk));
         JitBlock *t = tk == blk->key ? blk : cache_lookup(jit, blk->edges[i].target_rip, blk_mode32(blk));
@@ -22402,6 +22631,7 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
         }
     }
     blk->key = jit_key(rip, mode32);
+    blk->cont_ctr = cont_promote_n();
     blk->n_insns = (int)n;
     blk->n_kept = compact ? (uint16_t)r->n_kept : 0;
     blk->n_oslow = blk->oslow ? (int)r->n_oslow : 0;
@@ -22433,6 +22663,7 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
         return NULL;
     }
     memcpy(c, v.code, (size_t)words * 4);
+
     if (!tc_bind(jit, blk, c, v.rel, (int)r->n_rel, 1)) {
         pthread_jit_write_protect_np(1);
         tc_free_blk(blk);
@@ -22675,9 +22906,106 @@ static void tc_verify_rec(OcerzJit *jit, JitBlock *blk, const TcView *vp)
     }
 }
 
+static size_t live_index_of(const OcerzJit *jit, const JitBlock *blk);
+static void chain_edge_now(OcerzJit *jit, JitBlock *blk, int e);
+static void block_destroy(JitBlock *b);
+static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32);
+
+static void pending_drop(uint64_t key, const JitBlock *src, int edge)
+{
+    PendingChain **pp = &g_pending[(unsigned)(hash_key(key) & PEND_MASK)];
+    while (*pp) {
+        PendingChain *e = *pp;
+        if (e->target_key == key && e->src == src && e->edge == edge && !e->ras_slot) {
+            *pp = e->next;
+            free(e);
+        } else {
+            pp = &e->next;
+        }
+    }
+}
+
+/* The copy is complete and in the code index: take the caller's edge out of service and open H. */
+static void cont_publish(JitBlock *blk)
+{
+    JitLayout *L = g_place;
+    JitBlock *c = L->caller;
+    __atomic_store_n(&c->edges[L->edge].patch_b, (uint32_t *)NULL, __ATOMIC_RELEASE);
+    pending_drop(jit_key(L->rip, 0), c, L->edge);
+    __atomic_store_n(&L->child, blk, __ATOMIC_RELEASE);
+    L->placed = 1;
+    pthread_jit_write_protect_np(0);
+    __atomic_store_n(L->h, A64_NOP, __ATOMIC_RELEASE);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(L->h, 4);
+}
+
+/* H back to the edge's fallback, and the edge back in service.  L->child stays, since its words are still its. */
+static void cont_unplace(JitLayout *L)
+{
+    JitBlock *c = L->caller;
+    L->placed = 0;
+    pthread_jit_write_protect_np(0);
+    __atomic_store_n(L->h, c->edges[L->edge].fallback_insn, __ATOMIC_RELEASE);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(L->h, 4);
+    __atomic_store_n(&c->edges[L->edge].patch_b, L->h, __ATOMIC_RELEASE);
+}
+
+/* blk is being retired: if it is the copy H opens into, close H and chain the edge to whatever the cache holds now. */
+static void cont_detach(OcerzJit *jit, JitBlock *blk)
+{
+    JitLayout *L = blk->lay;
+    if (!L || L->caller == blk || L->child != blk || !L->placed)
+        return;
+    cont_unplace(L);
+    if (ocerz_perfstat > 0)
+        ps_cont_detach++;
+    if (!g_no_chain && live_index_of(jit, L->caller) != jit->n_live)
+        chain_edge_now(jit, L->caller, L->edge);
+}
+
+static void cont_place(OcerzJit *jit, JitLayout *L)
+{
+    JitBlock *c = L->caller;
+    uint32_t *pb = c->edges[L->edge].patch_b;
+    if (L->placed || !c->code || (pb && pb != L->h) || live_index_of(jit, c) == jit->n_live)
+        return;
+    const OcerzCPU *cpu = g_xlat_cpu;
+    int ftop = g_xlat_ftop, pm = g_plain_mem, m32 = g_xlat_mode32;
+    g_xlat_cpu = NULL;
+    g_xlat_ftop = -1;
+    g_plain_mem = jit->plain_mem || ocerz_dyldapi_memfn(L->rip);
+    g_place = L;
+    unsigned long long over = ps_cont_over;
+    translate_one(jit, L->rip, 0);
+    if (ocerz_perfstat > 0 && !L->placed && ps_cont_over == over)
+        ps_cont_skip++;
+    g_place = NULL;
+    g_place_pro = NULL;
+    g_xlat_cpu = cpu;
+    g_xlat_ftop = ftop;
+    g_plain_mem = pm;
+    g_xlat_mode32 = m32;
+}
+
 static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
 {
+    g_cont_new = NULL;
+    JitBlock *blk = translate_one(jit, rip, mode32);
+    JitLayout *L = g_cont_new;
+    g_cont_new = NULL;
+    if (L)
+        cont_place(jit, L);
+    return blk;
+}
+
+static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
+{
     g_xlat_mode32 = mode32;
+    g_cont_h = NULL;
+    g_place_pro = NULL;
+    g_place_pro_w = 0;
 
     if (ocerz_exc_trap_rip && rip == ocerz_exc_trap_rip)
         return NULL;
@@ -22724,7 +23052,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     }
 
     const OcerzTcRecHead *tc_hit = NULL;
-    int tcm = ocerz_tcache_mode();
+    int tcm = g_place ? OCERZ_TC_OFF : ocerz_tcache_mode();
     g_tc_rec = 0;
     g_tc_bad = 0;
     g_tc_learned = 0;
@@ -22855,6 +23183,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     memcpy(blk->insns, scratch, (size_t)n * sizeof(X86Insn));
     blk->n_insns = n;
     blk->key = jit_key(rip, mode32);
+    blk->cont_ctr = cont_promote_n();
     blk->edges = calloc(JIT_MAX_EDGES, sizeof *blk->edges);
     if (!blk->edges) {
         free(blk->insns);
@@ -23200,7 +23529,7 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
     uint32_t *entry = b.p;
     g_push_entry = entry;
     g_tc_entry = entry;
-    g_tc_on = (g_tc_rec || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP) ? tc_usable(jit) : 0;
+    g_tc_on = !g_place && (g_tc_rec || ocerz_tcache_mode() == OCERZ_TC_ROUNDTRIP) ? tc_usable(jit) : 0;
     if (g_tc_on && g_tc_img_hi) {
         a64_reloc_imm = tc_img_imm;
         a64_reloc_lo = g_tc_img_lo;
@@ -23251,7 +23580,26 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
         emit_xmm_pin_load_all(&b);
     uint32_t *body_noreload = NULL;
     if (!g_no_chain && !jit->stop_requested) {
-        g_body_entry = a64_label(&b);
+        if (g_place && g_pin_class == 3 && !b.overflow) {
+            uint32_t *H = g_place->h;
+            ptrdiff_t d = H - b.p;
+            if (d >= -(ptrdiff_t)(1 << 25) && d < (ptrdiff_t)(1 << 25)) {
+                a64_b(&b, (int32_t)d);
+                if (!b.overflow) {
+                    sys_icache_invalidate(entry, (size_t)((b.p - entry) * 4));
+                    g_place_pro = entry;
+                    g_place_pro_w = (uint32_t)(b.p - entry);
+                    jit->code_cur = b.p;
+                    b.start = H;
+                    b.p = H + 1;
+                    b.end = H + g_place->r;
+                    entry = H;
+                    g_push_entry = H;
+                    g_tc_entry = H;
+                }
+            }
+        }
+        g_body_entry = g_place_pro ? entry : a64_label(&b);
         emit_reload_mem_base(&b);
         body_noreload = a64_label(&b);
         {
@@ -23286,13 +23634,14 @@ static JitBlock *translate(OcerzJit *jit, uint64_t rip, int mode32)
           { const X86Insn *t = &blk->insns[n - 1];
             if ((t->op == OCERZ_OP_JCC || t->op == OCERZ_OP_JMP) && t->nops == 1 && t->ops[0].kind == OCERZ_OPK_IMM && t->ops[0].imm == rip) self_loop = 1; }
           if (la > 4 && g_body_entry && self_loop) {
-              size_t k = (size_t)(b.p - g_body_entry);
+              uint32_t *mv = g_body_entry + (g_place_pro != NULL);
+              size_t k = (size_t)(b.p - mv);
               size_t pad = ((uintptr_t)la - ((uintptr_t)b.p & (uintptr_t)(la - 1))) & (uintptr_t)(la - 1);
               pad /= 4;
               if (pad && b.p + pad < b.end) {
-                  memmove(g_body_entry + pad, g_body_entry, k * sizeof(uint32_t));
-                  for (size_t q = 0; q < pad; q++) g_body_entry[q] = 0xd503201fu;
-                  g_body_entry += pad;
+                  memmove(mv + pad, mv, k * sizeof(uint32_t));
+                  for (size_t q = 0; q < pad; q++) mv[q] = 0xd503201fu;
+                  if (!g_place_pro) g_body_entry += pad;
                   if (body_noreload) body_noreload += pad;
                   b.p += pad;
               }
@@ -24517,6 +24866,30 @@ promo_push_fallthrough:
     ocerz_jit_wx_open = 0;
     pthread_jit_write_protect_np(1);
 
+    /* A copy that overflowed its reservation, or the arena before it got there, is dropped: H stays as it is. */
+    if (g_place && (b.overflow || (g_place_pro && side_patch_oor))) {
+        if (!g_place_pro) {
+            jit->code_full = 1;
+            __atomic_store_n(&g_flush_want, 1, __ATOMIC_RELAXED);
+        } else if (jit->code_cur == g_place_pro + g_place_pro_w) {
+            jit->code_cur = g_place_pro;
+        }
+        g_place_pro = NULL;
+        g_pin = NULL; g_pin_hold = NULL; g_n_pinned = 0; g_pin_class = 0;
+        g_lowstack = 0;
+        g_lowptr = 0;
+        g_m32low = 0;
+        g_cur_blk = NULL;
+        g_pe_insns = NULL;
+        if (ENV_ON("OCERZ_CONTLOG"))
+            fprintf(stderr, "ocerz: CONT over rip=%#llx r=%u n=%d pred=%d\n", (unsigned long long)rip,
+                    g_place->r, n, cont_predecode(rip));
+        block_destroy(blk);
+        if (ocerz_perfstat > 0)
+            ps_cont_over++;
+        return NULL;
+    }
+
     if (side_patch_oor) {
         static int warned_oor;
         if (!warned_oor) {
@@ -24563,8 +24936,14 @@ promo_push_fallthrough:
     }
 
     sys_icache_invalidate(entry, (size_t)((b.p - entry) * 4));
-    jit->code_cur = b.p;
-    blk->code = (JitBlockFn)entry;
+    if (g_place_pro) {
+        blk->code = (JitBlockFn)g_place_pro;
+        blk->lay = g_place;
+        blk->pro_w = (uint16_t)g_place_pro_w;
+    } else {
+        jit->code_cur = b.p;
+        blk->code = (JitBlockFn)entry;
+    }
     blk->body_code = g_body_entry;
     blk->body_noreload = body_noreload;
     blk->hoist_sig = hoist_signature();
@@ -24705,6 +25084,21 @@ promo_push_fallthrough:
         a64_reloc_lo = a64_reloc_hi = 0;
     }
 
+    if (g_cont_h && blk->n_edges > 1 && blk->edges[1].patch_b == g_cont_h &&
+        blk->edges[1].target_rip == g_cont_rip && (blk->lay = (JitLayout *)calloc(1, sizeof *blk->lay))) {
+        blk->lay->caller = blk;
+        blk->lay->h = g_cont_h;
+        blk->lay->r = g_cont_r;
+        blk->lay->edge = 1;
+        blk->lay->rip = g_cont_rip;
+        g_cont_new = blk->lay;
+        if (ocerz_perfstat > 0) {
+            ps_cont_res++;
+            ps_cont_res_words += g_cont_r;
+        }
+    }
+    g_cont_h = NULL;
+
     if (!code_index_append_locked(jit, blk)) {
         static int warned;
         if (!warned) { warned = 1; fprintf(stderr, "ocerz: warning: JIT code index allocation failed; block %#llx runs interpreted\n", (unsigned long long)rip); }
@@ -24726,7 +25120,7 @@ promo_push_fallthrough:
         static int ec = -1;
         if (ec < 0) ec = getenv("OCERZ_EMITCHECK") ? 1 : 0;
         if (ec && blk->code) {
-            const uint32_t *cw = (const uint32_t *)blk->code;
+            const uint32_t *cw = blk_base(blk);
             for (uint32_t w = 0; w < blk->code_words; w++) {
                 uint32_t v = cw[w];
                 if ((v & 0x7c000000u) != 0x14000000u) continue;
@@ -24747,8 +25141,8 @@ promo_push_fallthrough:
                     for (int q = 0; q < blk->n_edges; q++)
                         fprintf(stderr, " [%d]tgt=%#llx pb=+%#lx cs=+%#lx", q,
                                 (unsigned long long)blk->edges[q].target_rip,
-                                blk->edges[q].patch_b ? (long)(blk->edges[q].patch_b - (uint32_t *)blk->code) : -1L,
-                                blk->edges[q].cond_site ? (long)(blk->edges[q].cond_site - (uint32_t *)blk->code) : -1L);
+                                blk->edges[q].patch_b ? (long)(blk->edges[q].patch_b - cw) : -1L,
+                                blk->edges[q].cond_site ? (long)(blk->edges[q].cond_site - cw) : -1L);
                     fprintf(stderr, " nool=%d nosl=%d nstop=%d\n", g_n_oolslow, g_n_oslow, blk->n_stop_extra);
                 }
             }
@@ -24761,6 +25155,16 @@ promo_push_fallthrough:
     }
     g_n_lanerec = 0;
     compact_block(blk);
+    if (g_place_pro && blk->code) {
+        cont_publish(blk);
+        if (ENV_ON("OCERZ_CONTLOG"))
+            fprintf(stderr, "ocerz: CONT place rip=%#llx r=%u used=%u n=%d pred=%d\n", (unsigned long long)rip,
+                    g_place->r, blk->code_words, n, cont_predecode(rip));
+        if (ocerz_perfstat > 0) {
+            ps_cont_place++;
+            ps_cont_waste += g_place->r - blk->code_words;
+        }
+    }
     cache_insert(jit, blk);
 
     if (tc_save) {
@@ -24829,8 +25233,20 @@ static const JitBlock *fault_block(const OcerzJit *jit, const uint32_t *pc)
         return NULL;
     const JitBlock *b = index->blocks[lo - 1];
     const uint32_t *base = (const uint32_t *)b->code;
-    if (!base || pc >= base + b->code_words)
+    if (!base)
         return NULL;
+    const JitLayout *L = b->lay;
+    if (!L)
+        return pc < base + b->code_words ? b : NULL;
+    if (L->caller != b)
+        return pc < base + b->pro_w ? b : NULL;
+    if (pc >= base + b->code_words)
+        return NULL;
+    if (pc >= L->h && pc < L->h + L->r) {
+        const JitBlock *c = __atomic_load_n(&L->child, __ATOMIC_ACQUIRE);
+        if (c && pc < L->h + c->code_words)
+            return c;
+    }
     return b;
 }
 
@@ -24907,7 +25323,7 @@ void ocerz_jit_fault_recover_regs(const struct OcerzVM *vm, const void *host_pc,
     }
     cpu->gpr[OCERZ_RSP] += (uint64_t)lazy_rsp_behind(b, host_pc);
     if (b->n_push_fix && b->code) {
-        uint32_t off = (uint32_t)((const uint32_t *)host_pc - (const uint32_t *)b->code);
+        uint32_t off = (uint32_t)((const uint32_t *)host_pc - blk_base(b));
         for (int i = 0; i < b->n_push_fix; i++)
             if (b->push_fix[i] == off) { cpu->gpr[OCERZ_RSP] += 8; break; }
     }
@@ -24939,7 +25355,7 @@ void ocerz_jit_fault_recover_xmm(const struct OcerzVM *vm, const void *host_pc,
     for (unsigned r = 0; r < 16; r++)
         if ((b->xmm_pinned >> r) & 1)
             memcpy(&cpu->xmm[r], v + (16 + r) * 16, 16);
-    uint32_t off = (uint32_t)((const uint32_t *)host_pc - (const uint32_t *)b->code);
+    uint32_t off = (uint32_t)((const uint32_t *)host_pc - blk_base(b));
     const struct JitLaneRec *rec = NULL;
     for (int k = 0; k < b->n_lanerec; k++) {
         if (b->lanerec[k].off > off) break;
@@ -24959,7 +25375,9 @@ static int fault_insn_index(const JitBlock *b, const uint32_t *pc)
 {
     if (!b || !b->insn_off)
         return -1;
-    const uint32_t *base = (const uint32_t *)b->code;
+    const uint32_t *base = blk_base(b);
+    if (blk_is_cont(b) && !(pc >= base && pc < base + b->code_words))
+        return -1;
     uint32_t off = (uint32_t)(pc - base);
     for (int k = 0; k < b->n_oslow; k++)
         if (off >= b->oslow[k].lo && off < b->oslow[k].hi)
@@ -25059,18 +25477,31 @@ void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
 
 static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk);
 
-static void retire_fault_blocks(struct OcerzVM *vm, OcerzJit *jit, uint64_t block_rip,
+static void retire_fault_blocks(struct OcerzVM *vm, OcerzJit *jit, const JitBlock *fb, uint64_t block_rip,
                                 uint64_t fault_rip, int mode32)
 {
     jl_acquire(__LINE__);
     JitBlock *b = cache_lookup(jit, block_rip, mode32);
     if (b && b->code)
         flip_retire_locked(vm, jit, b);
+    if (fb != b && blk_is_cont(fb))
+        flip_retire_locked(vm, jit, (JitBlock *)fb);
     if (fault_rip != block_rip) {
         JitBlock *f = cache_lookup(jit, fault_rip, mode32);
         if (f && f->code)
             flip_retire_locked(vm, jit, f);
     }
+    jl_release();
+    ocerz_vm_purge_jit_ras(vm);
+}
+
+/* A placed copy is one of several live blocks of its rip, so a fault in it may not be in the one the cache returns. */
+static void retire_stale_copy(struct OcerzVM *vm, OcerzJit *jit, const JitBlock *b)
+{
+    if (!blk_is_cont(b))
+        return;
+    jl_acquire(__LINE__);
+    flip_retire_locked(vm, jit, (JitBlock *)b);
     jl_release();
     ocerz_vm_purge_jit_ras(vm);
 }
@@ -25086,10 +25517,12 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     cp_mark(b->key);
     cp_mark(jit_key(fault_rip, blk_mode32(b)));
     if (ENV_ON("OCERZ_CP_NOINVAL")) return 1;
-    if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL"))
+    if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL")) {
+        retire_stale_copy(vm, jit, b);
         return 1;
+    }
     if (fresh && !ENV_ON("OCERZ_FAULT_INV_RANGE")) {
-        retire_fault_blocks(vm, jit, block_rip, fault_rip, blk_mode32(b));
+        retire_fault_blocks(vm, jit, b, block_rip, fault_rip, blk_mode32(b));
         return 1;
     }
     int prev = g_churn_suppress;
@@ -25115,10 +25548,12 @@ int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t
         fresh = !al_marked(b->key | AL_BLK_TAG);
         al_mark(b->key | AL_BLK_TAG);
     }
-    if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL"))
+    if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL")) {
+        retire_stale_copy(vm, jit, b);
         return 1;
+    }
     if (fresh && !ENV_ON("OCERZ_FAULT_INV_RANGE")) {
-        retire_fault_blocks(vm, jit, block_rip, fault_rip, blk_mode32(b));
+        retire_fault_blocks(vm, jit, b, block_rip, fault_rip, blk_mode32(b));
         return 1;
     }
     int prev = g_churn_suppress;
@@ -25294,7 +25729,7 @@ int ocerz_jit_fault_info(const struct OcerzVM *vm, const void *host_pc,
         return 0;
     memset(out, 0, sizeof(*out));
     out->block_rip = blk_rip(b);
-    out->host_word = (uint32_t)(pc - (const uint32_t *)b->code);
+    out->host_word = (uint32_t)(pc - blk_base(b));
     out->insn_index = fault_insn_index(b, pc);
     if (out->insn_index >= 0)
         out->insn_rip = blk_insn_rip(b, out->insn_index);
@@ -25376,6 +25811,8 @@ static void ps_report_atexit(void)
 
 static void block_destroy(JitBlock *b)
 {
+    if (b->lay && b->lay->caller == b)
+        free(b->lay);
     if (b->slab) {
         free(b->preds);
         free(b);
@@ -25488,8 +25925,8 @@ static void stopcheck(const JitBlock *b, const uint32_t *site, uint32_t insn, co
     else
         off = 0;
     const uint32_t *tgt = (const uint32_t *)((const uint8_t *)site + off);
-    const uint32_t *lo = (const uint32_t *)b->code, *hi = lo ? lo + b->code_words : NULL;
-    if (!lo || tgt < lo || tgt >= hi)
+    const uint32_t *lo = b->code ? blk_base(b) : NULL, *hi = lo ? lo + b->code_words : NULL;
+    if (!lo || !blk_has_pc(b, tgt))
         fprintf(stderr, "ocerz: STOPCHECK[%d] %s rip=%#llx site=%p insn=%08x tgt=%p block=[%p,%p)\n",
                 (int)getpid(), what, (unsigned long long)blk_rip(b), (const void *)site, insn,
                 (const void *)tgt, (const void *)lo, (const void *)hi);
@@ -25536,6 +25973,11 @@ static void invalidate_all_locked(OcerzJit *jit)
     int patched = 0;
     __atomic_add_fetch(&ocerz_jit_retire_count, 1, __ATOMIC_RELEASE);
 
+    for (size_t k = 0; k < jit->n_live; k++) {
+        JitLayout *L = jit->live[k]->lay;
+        if (L && L->child == jit->live[k] && L->placed)
+            cont_unplace(L);
+    }
     pthread_jit_write_protect_np(0);
     patched |= force_stop_sites_writable(jit);
     for (size_t i = 0; i < g_n_ras_cells; i++)
@@ -25801,31 +26243,43 @@ static uint32_t *chain_target(const OcerzJit *jit, uint32_t *site, uint32_t w)
     return t;
 }
 
-static int ptr_in_block_code(const JitBlock *b, const uint32_t *p)
+/*
+ * The code a set of retired blocks owns, as disjoint ranges sorted by address.
+ * A block is not one range once continuations are placed (blk_ranges): a copy
+ * lies inside its caller, and its caller's own words are on both sides of it.
+ */
+typedef struct { CodeRange *v; size_t n; } HitRanges;
+
+static int code_range_cmp(const void *pa, const void *pb)
 {
-    const uint32_t *lo = (const uint32_t *)(uintptr_t)b->code;
-    return p >= lo && p < lo + b->code_words;
+    const CodeRange *a = (const CodeRange *)pa, *b = (const CodeRange *)pb;
+    return a->lo < b->lo ? -1 : a->lo > b->lo;
 }
 
-static int ptr_in_hits(JitBlock *const *hits, size_t n_hits, const uint32_t *p)
+static int hit_ranges_build(HitRanges *hr, JitBlock *const *hits, size_t n_hits)
+{
+    hr->n = 0;
+    hr->v = (CodeRange *)malloc((n_hits ? n_hits : 1) * 2 * sizeof *hr->v);
+    if (!hr->v)
+        return 0;
+    for (size_t m = 0; m < n_hits; m++)
+        hr->n += (size_t)blk_ranges(hits[m], hr->v + hr->n);
+    qsort(hr->v, hr->n, sizeof *hr->v, code_range_cmp);
+    return 1;
+}
+
+static int ptr_in_ranges(const HitRanges *hr, const uint32_t *p)
 {
     if (!p) return 0;
-    size_t lo = 0, hi = n_hits;
+    size_t lo = 0, hi = hr->n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if ((const uint32_t *)(uintptr_t)hits[mid]->code <= p)
+        if (hr->v[mid].lo <= p)
             lo = mid + 1;
         else
             hi = mid;
     }
-    return lo > 0 && ptr_in_block_code(hits[lo - 1], p);
-}
-
-static int hit_code_cmp(const void *pa, const void *pb)
-{
-    const JitBlock *a = *(JitBlock *const *)pa, *b = *(JitBlock *const *)pb;
-    if ((uintptr_t)a->code < (uintptr_t)b->code) return -1;
-    return (uintptr_t)a->code > (uintptr_t)b->code;
+    return lo > 0 && p < hr->v[lo - 1].hi;
 }
 
 /*
@@ -25873,18 +26327,7 @@ static void retire_unlink_hits(OcerzJit *jit, JitBlock **hits, size_t n_hits)
 static unsigned g_retire_sweep;
 static int ras_entry_in_hits(const void *entry, void *arg)
 {
-    const struct { JitBlock **v; size_t n; } *set = arg;
-    const uint32_t *p = (const uint32_t *)((uintptr_t)entry & ~(uintptr_t)3);
-    size_t lo = 0, hi = set->n;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if ((const uint32_t *)set->v[mid]->code <= p) lo = mid + 1;
-        else hi = mid;
-    }
-    if (lo == 0)
-        return 0;
-    const JitBlock *b = set->v[lo - 1];
-    return b->code && p < (const uint32_t *)b->code + b->code_words;
+    return ptr_in_ranges((const HitRanges *)arg, (const uint32_t *)((uintptr_t)entry & ~(uintptr_t)3));
 }
 
 /* A PSC entry for a block sits in the column its own rip selects, bits 2-6,
@@ -25911,7 +26354,8 @@ static void psc_retire_cols(struct OcerzVM *vm, uint32_t cols)
     }
 }
 
-static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock **hits, size_t n_hits)
+static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock **hits, size_t n_hits,
+                                     const HitRanges *set)
 {
     __atomic_add_fetch(&ocerz_jit_retire_count, 1, __ATOMIC_RELEASE);
     invsrc_note(0, 1);
@@ -25925,14 +26369,12 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
         retire_unlink_hits(jit, hits, n_hits);
         return;
     }
-    qsort(hits, n_hits, sizeof *hits, hit_code_cmp);
     static int full_scan = -1;
     if (full_scan < 0) full_scan = getenv("OCERZ_RETIRE_SCAN") ? 1 : 0;
-    struct { JitBlock **v; size_t n; } set = { hits, n_hits };
     pthread_jit_write_protect_np(0);
     for (size_t i = 0; i < g_n_ras_cells; i++) {
         void *e = __atomic_load_n(g_ras_cells[i], __ATOMIC_RELAXED);
-        if (e && ras_entry_in_hits(e, &set))
+        if (e && ras_entry_in_hits(e, (void *)set))
             __atomic_store_n(g_ras_cells[i], (void *)NULL, __ATOMIC_RELEASE);
     }
     for (size_t m = 0; m < n_hits; m++) {
@@ -25961,13 +26403,13 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
         uint32_t *at = (sblk)->edges[i].patch_b; \
         uint32_t fallback = (sblk)->edges[i].fallback_insn; \
         if (at && fallback && *at != fallback && \
-            ptr_in_hits(hits, n_hits, chain_target(jit, at, *at))) { \
+            ptr_in_ranges(set, chain_target(jit, at, *at))) { \
             __atomic_store_n(at, fallback, __ATOMIC_RELEASE); \
             sys_icache_invalidate(at, 4); \
         } \
         uint32_t *cs = (sblk)->edges[i].cond_site; \
         if (cs && (sblk)->edges[i].cond_orig && *cs != (sblk)->edges[i].cond_orig && \
-            ptr_in_hits(hits, n_hits, chain_target(jit, cs, *cs))) { \
+            ptr_in_ranges(set, chain_target(jit, cs, *cs))) { \
             __atomic_store_n(cs, (sblk)->edges[i].cond_orig, __ATOMIC_RELEASE); \
             sys_icache_invalidate(cs, 4); \
         } \
@@ -25994,9 +26436,11 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
 #undef UNCHAIN_EDGE
     pthread_jit_write_protect_np(1);
     retire_unlink_hits(jit, hits, n_hits);
+    for (size_t m = 0; m < n_hits; m++)
+        cont_detach(jit, hits[m]);
     for (unsigned i = 0; i < g_ras_slot_n; i++) {
         void *e = __atomic_load_n(&g_ras_slots[i], __ATOMIC_RELAXED);
-        if (e && ras_entry_in_hits(e, &set))
+        if (e && ras_entry_in_hits(e, (void *)set))
             __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
     }
     ++g_retire_sweep;
@@ -26039,6 +26483,7 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     if (whole) { xlo = addr; xlen = len; }
     JitBlock **hits = NULL;
     size_t n_hit = 0;
+    HitRanges hr = { NULL, 0 };
     {
         static int ivlog = -1;
         static _Atomic unsigned long long ivn;
@@ -26103,11 +26548,11 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
             invalidate_all_locked(jit);
         } else if (n_hit > 0) {
             invalidated = 1;
-            if (noprec) {
+            if (noprec || !hit_ranges_build(&hr, hits, n_hit)) {
                 invalidated = 2;
                 invalidate_all_locked(jit);
             } else {
-                retire_hit_blocks_locked(vm, jit, hits, n_hit);
+                retire_hit_blocks_locked(vm, jit, hits, n_hit, &hr);
             }
         }
         if (n_hit != (size_t)-1)
@@ -26118,11 +26563,11 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     jl_release();
 
     if (invalidated == 1 && (g_retire_sweep & 255) != 0) {
-        struct { JitBlock **v; size_t n; } set = { hits, n_hit };
-        ocerz_vm_purge_jit_ras_if(vm, ras_entry_in_hits, &set);
+        ocerz_vm_purge_jit_ras_if(vm, ras_entry_in_hits, &hr);
     } else if (invalidated) {
         ocerz_vm_purge_jit_ras(vm);
     }
+    free(hr.v);
     if (n_hit != (size_t)-1)
         free(hits);
     if (invalidated && t0)
@@ -26221,7 +26666,7 @@ int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc
                     if (!sites[s])
                         continue;
                     const uint32_t *t = chain_target(jit, sites[s], *sites[s]);
-                    if (!t || ptr_in_block_code(b, t))
+                    if (!t || blk_has_pc(b, t))
                         continue;
                     JitBlock *tb = (JitBlock *)fault_block(jit, t);
                     int seen = !tb;
@@ -26251,7 +26696,7 @@ int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc
 static void sig_rechain(OcerzJit *jit, JitBlock *b, int e)
 {
     JitBlock *t = cache_lookup(jit, b->edges[e].target_rip, blk_mode32(b));
-    if (!t || !t->code)
+    if (!t || !t->code || !b->edges[e].patch_b)
         return;
     void *dst = (void *)t->code;
     if (b->edges[e].kind == EDGE_BODY) {
@@ -26299,7 +26744,7 @@ void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu)
     jl_acquire(__LINE__);
     for (uint32_t i = 0; i < cpu->sig_stop_n && !jit->stop_requested; i++) {
         JitBlock *b = (JitBlock *)cpu->sig_stop_blk[i];
-        if (cache_lookup(jit, cpu->sig_stop_rip[i], cpu->sig_stop_m32[i]) != b ||
+        if ((cache_lookup(jit, cpu->sig_stop_rip[i], cpu->sig_stop_m32[i]) != b && !blk_is_cont(b)) ||
             b->live_idx >= jit->n_live || jit->live[b->live_idx] != b)
             continue;
         sig_unstop_site(&sb, jit, b, b->stop_patch, b->stop_insn, b->stop_run);
@@ -26514,6 +26959,13 @@ static void ps_report(OcerzJit *jit)
             fprintf(stderr,
                     "ocerz: PERFSTAT[%d]   CHAIN activated=%llu veneered=%llu out_of_range=%llu (%.2f%% dropped)\n",
                     (int)getpid(), cok, ps_chain_veneer, cfar, 100.0 * (double)cfar / (double)ctot);
+        if (ps_cont_res || ps_cont_promote)
+            fprintf(stderr,
+                    "ocerz: PERFSTAT[%d]   CONT promoted=%llu reserved=%llu (%llu words) placed=%llu overflowed=%llu skipped=%llu"
+                    " wasted_words=%llu (%.1f/placed) detached=%llu replaced=%llu\n",
+                    (int)getpid(), ps_cont_promote, ps_cont_res, ps_cont_res_words, ps_cont_place, ps_cont_over, ps_cont_skip,
+                    ps_cont_waste, ps_cont_place ? (double)ps_cont_waste / (double)ps_cont_place : 0.0,
+                    ps_cont_detach, ps_cont_replace);
     }
     for (int i = 0; i < (int)(sizeof ps_shape / sizeof ps_shape[0]); i++) {
         unsigned long long easy = ps_shape[i][0], hard = ps_shape[i][1], s = easy + hard;
@@ -26566,8 +27018,7 @@ static void flip_report_atexit(void)
 }
 static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
 {
-    const uint32_t *lo = (const uint32_t *)blk->code, *hi = lo + blk->code_words;
-#define IN_BLK(p) ((const uint32_t *)(p) >= lo && (const uint32_t *)(p) < hi)
+#define IN_BLK(p) blk_has_pc(blk, (const uint32_t *)(p))
     size_t idx = live_index_of(jit, blk);
     if (idx == jit->n_live) return;
     SiteBatch sb;
@@ -26632,7 +27083,64 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
         if (IN_BLK(g_ras_slots[i]))
             __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
     psc_retire_cols(vm, 1u << psc_col(blk->key));
+    cont_detach(jit, blk);
 #undef IN_BLK
+}
+
+/*
+ * A copy retired for something translation learned (a flipped branch, a
+ * low-hoist bail, another x87 top) is translated into its reservation again,
+ * since the copy that replaces it is what every return through H wants: str's
+ * continuation flips one branch a few windows in, and without this its returns
+ * paid the branch at H for the rest of the run.  That reuses the old copy's
+ * words, so it is done only when nothing can still be running them: one JIT
+ * thread, at its top-level dispatcher (a thread created later cannot be inside
+ * them, since H no longer leads there and every chain into them was cut).  The
+ * old copy is retired, but it still names those words, so it is emptied of
+ * them first: its edges (other blocks' pred lists still name it) and stop
+ * sites, and the return-address cells and pending chains that point into the
+ * reservation.  OCERZ_NO_CONT_REPLACE=1 leaves H closed instead.
+ */
+static int cont_reuse_safe(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_CONT_REPLACE") ? 1 : 0;
+    JitThr *self = jit_thr();
+    if (off || __atomic_load_n(&self->frames, __ATOMIC_SEQ_CST) != 0)
+        return 0;
+    for (JitThr *t = __atomic_load_n(&g_jit_thr, __ATOMIC_ACQUIRE); t; t = t->next)
+        if (t != self && !__atomic_load_n(&t->dead, __ATOMIC_SEQ_CST))
+            return 0;
+    return 1;
+}
+
+static void cont_replace(OcerzJit *jit, JitLayout *L)
+{
+    if (!cont_reuse_safe())
+        return;
+    JitBlock *o = L->child;
+    const uint32_t *lo = L->h + 1, *hi = L->h + L->r;
+#define IN_RES(p) ((const uint32_t *)(p) >= lo && (const uint32_t *)(p) < hi)
+    o->n_edges = 0;
+    o->stop_patch = NULL;
+    o->n_stop_extra = 0;
+    for (size_t i = 0; i < g_n_ras_cells;)
+        if (IN_RES(g_ras_cells[i])) g_ras_cells[i] = g_ras_cells[--g_n_ras_cells];
+        else i++;
+    for (unsigned h = 0; h < PEND_SIZE; h++)
+        for (PendingChain **pp = &g_pending[h]; *pp;) {
+            PendingChain *e = *pp;
+            if (IN_RES(e->patch_b) || IN_RES(e->cond_site) || IN_RES(e->ras_slot)) {
+                *pp = e->next;
+                free(e);
+            } else {
+                pp = &e->next;
+            }
+        }
+#undef IN_RES
+    cont_place(jit, L);
+    if (ocerz_perfstat > 0 && L->placed)
+        ps_cont_replace++;
 }
 
 static void flip_retire_block(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
@@ -26641,12 +27149,29 @@ static void flip_retire_block(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
     g_flip_n_retire++;
     jl_acquire(__LINE__);
     int live = blk->code != NULL;
+    JitLayout *L = blk_is_cont(blk) && blk->lay->child == blk && blk->lay->placed ? blk->lay : NULL;
     if (live) flip_retire_locked(vm, jit, blk);
+    if (L && !L->placed) cont_replace(jit, L);
     jl_release();
     if (live) ocerz_vm_purge_jit_ras(vm);
     g_flip_ns_retire += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     if (live && ocerz_jit_time_xlat)
         __atomic_add_fetch(&ocerz_jit_retire_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
+}
+
+/*
+ * A caller's call returned through its bl+4 CONT_PROMOTE times: its key is
+ * marked hot and it is retired, so the next translation of it reserves room
+ * after the bl and has the continuation placed there at once.
+ */
+static void cont_promote(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
+{
+    if (cont_hot_has(blk->key))
+        return;
+    cont_hot_add(blk->key);
+    if (ocerz_perfstat > 0)
+        ps_cont_promote++;
+    flip_retire_block(vm, jit, blk);
 }
 
 static int flip_decide_locked(JitBlock *blk, int e, int tk, int ft, int logit)
@@ -26696,6 +27221,10 @@ static void flip_side_hit(struct OcerzVM *vm, OcerzJit *jit, OcerzCPU *cpu)
         if (k == -4) mark_add(&g_llhwide_marks, blk->key);
         else lowhoist_mark(blk->key);
         flip_retire_block(vm, jit, blk);
+        return;
+    }
+    if (k == CONT_TAG && blk) {
+        cont_promote(vm, jit, blk);
         return;
     }
     if (k == -3 && blk) {

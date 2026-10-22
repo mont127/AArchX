@@ -84,7 +84,7 @@ run_with_timeout() {
     return $?
 }
 
-declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order fork_exec shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow jit_misc2 jit_misc3 jit_align jit_align2 jit_nanabs jit_divtrap sigmask_test int3_test sse42_test rsp_ops fcntl_locks cvt_nan_batch fp_loop_nan fpb_defer_nan cvt_merge_nan machdep_rdx ret_flags mov_sreg far_sel_bits filemap_private bigenv stack_align jcc_chain_rec atomic_unaligned lddqu jcc_gap_fuse smc pop_rsp_mem avx_basic avx_jit sse_int_jit avx_sse128 avx_fp_jit simd_misc_jit bmi_jit avx_cmpblend_jit fpb_loop_nan fpb_undo_nan fault_xmm_pair vzeroupper_flag fault_lane movnt_stores punpck_qdq movhlpd side_exit_l0 xorpd_movhpd xf_epilogue tso_forms simd_pack_jit mmx_jit pair_flags)
+declare -a NAMES=(hello exit42 args alu branches strings fib sse mmap_test fileio memstress longblock signal_test signal_jump0 rip_test stack_test popmem_test fault_regs fault_resume fault_chain callret_fault imul_flags interrupt_test ras_stress link_spin fault_link fault_xlive fork_order fork_exec shared_order unaligned_order jit_ops jit_div jit_sse jit_cvt jit_sse2 nan_rules jit_mul jit_scan jit_rmw jit_bt jit_movq jit_narrow jit_misc2 jit_misc3 jit_align jit_align2 jit_nanabs jit_divtrap sigmask_test int3_test sse42_test rsp_ops fcntl_locks cvt_nan_batch fp_loop_nan fpb_defer_nan cvt_merge_nan machdep_rdx ret_flags mov_sreg far_sel_bits filemap_private bigenv stack_align jcc_chain_rec atomic_unaligned lddqu jcc_gap_fuse smc pop_rsp_mem avx_basic avx_jit sse_int_jit avx_sse128 avx_fp_jit simd_misc_jit bmi_jit avx_cmpblend_jit fpb_loop_nan fpb_undo_nan fault_xmm_pair vzeroupper_flag fault_lane movnt_stores punpck_qdq movhlpd side_exit_l0 xorpd_movhpd xf_epilogue tso_forms simd_pack_jit mmx_jit pair_flags cont_place cont_fork cont_spin)
 
 expected_exit() {
     case "$1" in
@@ -104,6 +104,7 @@ test_env() {
     case "$1" in
         interrupt_test) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;
         link_spin) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;
+        cont_spin) echo "OCERZ_TEST_ASYNC_STOP_MS=200" ;;
         *) echo "" ;;
     esac
 }
@@ -173,7 +174,7 @@ for name in "${NAMES[@]}"; do
     fi
 done
 
-for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_sse jit_misc2 unaligned_order tso_forms; do
+for name in jit_rmw jit_scan jit_ops jit_bt jit_align jit_align2 jit_movq jit_sse jit_misc2 unaligned_order tso_forms cont_place; do
     bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
     [ -x "$bin" ] && [ -f "$golden" ] || continue
     export OCERZ_NO_PLAIN_MEM=1
@@ -220,7 +221,22 @@ for name in $NAN_TESTS; do
     fi
 done
 
-for name in branches jit_ops jit_misc2 fib strings; do
+for name in cont_place cont_fork; do
+    bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
+    [ -x "$bin" ] && [ -f "$golden" ] || continue
+    export OCERZ_CONT_PROMOTE=1
+    run_with_timeout "$ACTUAL_OUT" "$ACTUAL_ERR" "$OCERZ" $JIT_FLAG "$bin"
+    rc=$?
+    unset OCERZ_CONT_PROMOTE
+    if [ "$rc" -eq 0 ] && cmp -s "$ACTUAL_OUT" "$golden"; then
+        echo "PASS $name (placed at once)"; PASS=$((PASS + 1))
+    else
+        echo "FAIL $name (placed at once: rc=$rc)"; FAIL=$((FAIL + 1))
+        diff "$golden" "$ACTUAL_OUT" | head -20 | sed 's/^/  | /' >&2
+    fi
+done
+
+for name in branches jit_ops jit_misc2 fib strings cont_place cont_fork; do
     bin="$BIN_DIR/$name"; golden="$EXPECT_DIR/$name.out"
     [ -x "$bin" ] && [ -f "$golden" ] || continue
     export OCERZ_JIT_CODE_KB=64
