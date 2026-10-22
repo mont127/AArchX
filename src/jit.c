@@ -12746,12 +12746,42 @@ static int emit_shiftd32(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
+/*
+ * The 16-bit forms by an immediate of 1-16 are translated too: bzip2's
+ * mainSort builds its keys with shld r9w,dx,8 in its hottest block, and each
+ * one went to the interpreter (33M of them on a 10 MB input, 1.29x of
+ * Rosetta).  The 16-bit pair is joined in a scratch register, shifted, and
+ * its low half inserted back; counts of 17-31 leave the result undefined and
+ * stay with the interpreter.  OCERZ_NO_SHIFTD16=1 interprets them all again.
+ */
 static int emit_shiftd(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (need != 0 || !g_defer || insn->nops != 3) return 0;
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1], *c = &insn->ops[2];
     if (insn->mode32 && d->size == 4)
         return emit_shiftd32(b, insn);
+    static int no16 = -1;
+    if (no16 < 0) no16 = getenv("OCERZ_NO_SHIFTD16") ? 1 : 0;
+    if (!no16 && d->kind == OCERZ_OPK_REG && !d->high8 && d->size == 2 &&
+        s->kind == OCERZ_OPK_REG && !s->high8 && s->size == 2 && c->kind == OCERZ_OPK_IMM &&
+        pin_slot(d->reg) >= 0 && pin_slot(s->reg) >= 0 &&
+        !(rsp_is_ptr() && (d->reg == OCERZ_RSP || s->reg == OCERZ_RSP))) {
+        unsigned cnt16 = (unsigned)c->imm & 31u;
+        if (cnt16 == 0) return 1;
+        if (cnt16 > 16) return 0;
+        int rd16 = pin_hreg(pin_slot(d->reg)), rs16 = pin_hreg(pin_slot(s->reg));
+        if (insn->op == OCERZ_OP_SHRD) {
+            a64_uxth(b, JT0, rd16);
+            a64_orr_reg(b, 0, JT0, JT0, rs16, 16);
+            a64_lsr_imm(b, 0, JT0, JT0, (int)cnt16);
+        } else {
+            a64_uxth(b, JT0, rs16);
+            a64_orr_reg(b, 0, JT0, JT0, rd16, 16);
+            a64_lsr_imm(b, 0, JT0, JT0, (int)(16 - cnt16));
+        }
+        a64_bfi(b, 1, rd16, JT0, 0, 16);
+        return 1;
+    }
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
     if (s->kind != OCERZ_OPK_REG || s->high8 || s->size != d->size || c->kind != OCERZ_OPK_IMM) return 0;
     if (pin_slot(d->reg) < 0 || pin_slot(s->reg) < 0) return 0;

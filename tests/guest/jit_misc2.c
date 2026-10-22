@@ -1,4 +1,4 @@
-/* leave, shld/shrd, bts/btr/btc (reg forms), pinsr/pextr, pmovsx/zx, roundss/sd/ps/pd. */
+/* leave, shld/shrd (16/32/64-bit), bts/btr/btc (reg forms), pinsr/pextr, pmovsx/zx, roundss/sd/ps/pd. */
 #include "gsys.h"
 static void put(const char *tag, g_u64 v) { g_puts(tag); g_puthex64(v); }
 __attribute__((noinline)) static g_u64 uses_leave(g_u64 a, g_u64 b) {
@@ -15,6 +15,10 @@ int main(void){
         r = v; __asm__ volatile("shrdq $13, %1, %0" : "+r"(r) : "r"(w) : "cc"); put("shrd64 ", r);
         r = v; __asm__ volatile("shldl $5, %k1, %k0" : "+r"(r) : "r"(w) : "cc"); put("shld32 ", r);
         r = v; __asm__ volatile("shrdl $31, %k1, %k0" : "+r"(r) : "r"(w) : "cc"); put("shrd32 ", r);
+        r = v; __asm__ volatile("shldw $8, %w1, %w0" : "+r"(r) : "r"(w) : "cc"); put("shld16 ", r);
+        r = v; __asm__ volatile("shrdw $3, %w1, %w0" : "+r"(r) : "r"(w) : "cc"); put("shrd16 ", r);
+        r = v; __asm__ volatile("shldw $16, %w1, %w0" : "+r"(r) : "r"(w) : "cc"); put("shld16x ", r);
+        r = v; __asm__ volatile("shrdw $1, %w1, %w0\n\tshldw $15, %w0, %w1" : "+r"(r), "+r"(w) : : "cc"); put("shd16 pair ", r ^ w);
         r = v; __asm__ volatile("btsq $63, %0\n\tsetc %b1" : "+r"(r), "=r"(c) :: "cc"); put("bts63 r ", r); put("bts63 c ", c & 0xff);
         r = v; __asm__ volatile("btrq $0, %0\n\tsetc %b1" : "+r"(r), "=r"(c) :: "cc"); put("btr0 r ", r); put("btr0 c ", c & 0xff);
         r = v; __asm__ volatile("btcl $17, %k0\n\tsetc %b1" : "+r"(r), "=r"(c) :: "cc"); put("btc17 r ", r); put("btc17 c ", c & 0xff);
