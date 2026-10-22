@@ -103,11 +103,20 @@
  * where they did last time.  OCERZ_GUEST_SLIDE moves both up by that many
  * bytes (rounded to a host page, at most 256 MB), which is how the translation
  * cache's image records are checked against a different slide.
+ *
+ * The x86 commpage is a template plus one live field: the boot time in
+ * microseconds at 0xc8 (_COMM_PAGE_BOOTTIME_USEC), read from the host's
+ * kern.boottime once.  Left zero, libsystem's _mach_boottime_usec fell back
+ * to sysctlbyname("kern.boottime") twice per call, and corecrypto's rng asks
+ * for CLOCK_MONOTONIC on every arc4random_buf: four sysctl traps and a
+ * gettimeofday each, 48% of a sqlite run that calls randomblob() per row.
  */
 #include "ocerz/mem.h"
 #include "ocerz/mode.h"
 
 #include <sys/mman.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -247,6 +256,8 @@ static uint32_t owner_n;
 static uint32_t owner_cap;
 static uint32_t owner_free;
 
+#define OCERZ_CP_BOOTTIME_USEC 0xc8
+
 void ocerz_commpage_init(void)
 {
     if (ocerz_commpage)
@@ -264,6 +275,12 @@ void ocerz_commpage_init(void)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     };
     memcpy(cp, tmpl, sizeof tmpl);
+    struct timeval bt;
+    size_t btl = sizeof bt;
+    if (sysctlbyname("kern.boottime", &bt, &btl, NULL, 0) == 0 && btl == sizeof bt) {
+        uint64_t us = (uint64_t)bt.tv_sec * 1000000u + (uint64_t)bt.tv_usec;
+        memcpy(cp + OCERZ_CP_BOOTTIME_USEC, &us, sizeof us);
+    }
     ocerz_commpage = cp;
 }
 
