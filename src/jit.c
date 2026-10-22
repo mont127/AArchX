@@ -20735,17 +20735,24 @@ static void dep_plain_mark(const X86Insn *insns, int n)
  * OCERZ_NO_STACK_RUN=1 goes back to pairs in the Wine layout only, and
  * OCERZ_NO_STACK_PAIR=1 turns both off.
  *
- * The stores are paired the way the pops will read them back.  A pop run
- * pairs upward from rsp, so a push run of odd length stores its first register
- * alone at the top and pairs the rest from the bottom.  Paired from the top,
- * fib's push rbp, push r14, push rbx left the ldp that pops rbx and r14
- * straddling the stur of rbx and half the stp of r14 and rbp: no single store
- * covers that load, so it cannot be forwarded, and every return waited for both
- * stores to reach the cache before rbx came back.  That wait was the whole
- * critical path of the call kernel: mirrored, fibn(42)-fibn(38) went from 0.57
- * to 0.51 s on an M4 Pro, where shaving the three rsp and rbp adjusts or the
- * return path's null check off the same frame measured nothing.
- * OCERZ_NO_STACK_RUN_MIRROR=1 pairs from the top again.
+ * Both runs pair from the top, the rsp the push run started from, because that
+ * is the end an epilogue's pops share with its prologue's pushes: the pops
+ * finish at the first register pushed, while where they start depends on
+ * whether an alignment slot is popped or added away.  So a pop run of odd
+ * length loads its first register alone and pairs the rest.  Pairing pops from
+ * rsp up, as they were, left fib's ldp of rbx and r14 straddling the stur of
+ * rbx and half the stp of r14 and rbp: no single store covers that load, so it
+ * cannot be forwarded, and every return waited for both stores to reach the
+ * cache before rbx came back.  That wait was the whole critical path of the
+ * call kernel: fibn(42)-fibn(38) takes 12% less time on an M4 Pro (0.60 to
+ * 0.53 s on a busy machine, 0.57 to 0.51 on a quiet one), where shaving the
+ * three rsp and rbp adjusts or the return path's null check off the same frame
+ * measured nothing.  Pairing the pushes from the bottom instead fixed fib's
+ * shape by 9% rather than 13% and made the frame that pops one slot fewer than
+ * it pushed straddle instead.  An 8-byte load out of a 16-byte store forwards
+ * late as well (fib with its pops split into single loads took 11% longer), so
+ * matching the pairs matters more than how many accesses there are.
+ * OCERZ_NO_STACK_RUN_MIRROR=1 pairs pop runs from rsp again.
  */
 #define STACK_RUN_MAX 16
 static int stack_pair_reg(const X86Insn *in, int op)
@@ -20804,13 +20811,12 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
     if (k < 2) return 0;
     static int nomirror = -1;
     if (nomirror < 0) nomirror = getenv("OCERZ_NO_STACK_RUN_MIRROR") ? 1 : 0;
-    int top = op == OCERZ_OP_PUSH && (k & 1) && !nomirror;
+    int bot = op == OCERZ_OP_POP && (k & 1) && !nomirror;
     int hs = pin_hreg(pin_slot(OCERZ_RSP));
     if (g_lazy_end >= 0) {
         int32_t at = g_rsp_pend;
         int j = 0;
         if (op == OCERZ_OP_PUSH) {
-            if (top) { a64_stur(b, 8, regs[0], hs, at - 8); j = 1; }
             for (; j + 1 < k; j += 2)
                 a64_stp_off(b, regs[j + 1], regs[j], hs, at - 8 * (j + 2));
             if (j < k)
@@ -20822,6 +20828,7 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
             }
             g_rsp_pend -= 8 * k;
         } else {
+            if (bot) { a64_ldur(b, 8, regs[0], hs, at); j = 1; }
             for (; j + 1 < k; j += 2)
                 a64_ldp_off(b, regs[j], regs[j + 1], hs, at + 8 * j);
             if (j < k)
@@ -20839,7 +20846,6 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
     }
     int j = 0;
     if (op == OCERZ_OP_PUSH) {
-        if (top) { a64_stur(b, 8, regs[0], base, -8); j = 1; }
         for (; j + 1 < k; j += 2)
             a64_stp_off(b, regs[j + 1], regs[j], base, -8 * (j + 2));
         if (j < k)
@@ -20851,6 +20857,7 @@ static int emit_stack_run(A64Buf *b, const X86Insn *insns, int i, int n)
         }
         a64_sub_imm(b, 1, hs, hs, 8 * k);
     } else {
+        if (bot) { a64_ldr(b, 8, regs[0], base, 0); j = 1; }
         for (; j + 1 < k; j += 2)
             a64_ldp_off(b, regs[j], regs[j + 1], base, 8 * j);
         if (j < k)
