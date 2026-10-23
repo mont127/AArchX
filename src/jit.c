@@ -26594,12 +26594,22 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
 
 void ocerz_jit_request_stop(struct OcerzVM *vm)
 {
+    ocerz_jit_request_stop_ex(vm, 1);
+}
+
+/* patch_sites 0: only the flag, for a process with no other guest thread to stop (ocerz_vm_request_exit). */
+void ocerz_jit_request_stop_ex(struct OcerzVM *vm, int patch_sites)
+{
     OcerzJit *jit = vm ? vm->jit : NULL;
     if (!jit)
         return;
 
     jl_acquire(__LINE__);
     jit->stop_requested = 1;
+    if (!patch_sites) {
+        jl_release();
+        return;
+    }
     pthread_jit_write_protect_np(0);
     int patched = force_stop_sites_writable(jit);
     pthread_jit_write_protect_np(1);

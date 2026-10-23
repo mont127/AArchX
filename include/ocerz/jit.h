@@ -56,6 +56,7 @@ void ocerz_jit_prefork(void);
 void ocerz_jit_postfork(void);
 
 void ocerz_jit_request_stop(struct OcerzVM *vm);
+void ocerz_jit_request_stop_ex(struct OcerzVM *vm, int patch_sites);
 int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc);
 void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu);
 

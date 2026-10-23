@@ -4275,14 +4275,29 @@ void ocerz_unstick_start(void)
     }
 }
 
+/*
+ * Exit stops every other guest thread: their loops leave at the stop sites
+ * ocerz_jit_request_stop rewrites, and the signal below interrupts their
+ * waits.  A process whose only guest thread is the one exiting has nobody to
+ * stop, and rewriting every stop site and invalidating the whole arena cost a
+ * warm tclsh start 3 ms of its 87, so then only the flag is set.
+ */
 void ocerz_vm_request_exit(OcerzVM *vm, int code)
 {
     vm->exit_code = code;
     __atomic_store_n(&vm->exited, 1, __ATOMIC_SEQ_CST);
 
-    ocerz_jit_request_stop(vm);
-
     pthread_t self = pthread_self();
+    static int all = -1;
+    if (all < 0)
+        all = getenv("OCERZ_EXIT_STOP_ALL") ? 1 : 0;
+    pthread_mutex_lock(&g_cpus_lock);
+    int others = 0;
+    for (int i = 0; i < g_cpus_n; i++)
+        others += !pthread_equal(g_cpu_threads[i], self);
+    pthread_mutex_unlock(&g_cpus_lock);
+    ocerz_jit_request_stop_ex(vm, others || all);
+
     pthread_mutex_lock(&g_cpus_lock);
     for (int i = 0; i < g_cpus_n; i++)
         __atomic_store_n(&g_cpus[i]->interrupt, 1, __ATOMIC_SEQ_CST);
