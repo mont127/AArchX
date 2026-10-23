@@ -343,9 +343,10 @@
  * The block a direct call returns to is laid out at bl+4, in a reservation
  * inside the caller (cont_reserve, "Continuation placement"), so a return no
  * longer lands on a branch to it: fibn's time per call drops 8%, to Rosetta's,
- * and xbench str's 2-5% (M5).  Such a copy is one of several live blocks of
- * its rip, its body and its prologue are two ranges (blk_ranges), and
- * retiring it reopens the branch.
+ * and xbench str's 2-5% (M5).  Only code the translation cache does not keep
+ * is placed so far.  Such a copy is one of several live blocks of its rip,
+ * its body and its prologue are two ranges (blk_ranges), and retiring it
+ * reopens the branch.
  *
  * ---- bridged calls ----
  * In native mode a guest call into a system library lands on a synthesized

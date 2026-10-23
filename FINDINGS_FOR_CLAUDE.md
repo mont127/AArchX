@@ -16,8 +16,13 @@ flush/static-hole reuse.
 
 Phase 1 (place hot continuations during normal translation,
 `OCERZ_NO_CONT_PLACE=1` to turn it off) is complete, gated and measured, and
-worth keeping. Phase 2 is not needed for anything measured. Nesting was tried
-and dropped. Nothing is pushed.
+worth keeping, but it only reaches code the translation cache does not keep:
+static programs, JIT-generated code, the low-base layouts. A real program's
+code (its images and the shared cache) is keepable, and `cont_reserve` places
+nothing keepable while the cache is on, which is the default: a call-heavy
+perl script gets 14 placements with `OCERZ_TCACHE=off` and 0 with the cache
+on. Phase 2 is what brings it to real programs. Nesting was tried and
+dropped. Pushed as `bl4-continuation` on mont127/AArchX.
 
 Commits on top of the WIP (`38211eba`, `af069598`):
 
@@ -74,11 +79,18 @@ calling a sub 1.5M times did not move at any of them (its hot calls are
 indirect). Low thresholds cost startup; 4096 and 16384 are within noise, so
 4096 stays.
 
-Warm runs: callers made hot in a run are retired and translated again, not
-loaded from the translation cache, so they are placed with the cache on as
-well (fibn 2 placements, perl 28, in every run). Phase 2 (persisting placed
-pairs) would only matter for callers the cache keeps, which `cont_reserve`
-never counts or places; nothing measured here needed it.
+The cache: every workload above except perl_warm, gzip and bzip2 ran with
+`OCERZ_TCACHE=off`. fibn and xbench are static and never enter the store, so
+they place the same with the cache on; perl, gzip and bzip2 with the cache on
+placed nothing, which is why they did not move. (`OCERZ_PERFSTAT=1` turns the
+cache off, `tc_usable`; count placements with `OCERZ_CONTLOG=1` instead.
+An earlier version of this file said warm runs placed too, from PERFSTAT
+runs; that was the cache being off.)
+
+Phase 2, then, is the open work: a caller the cache keeps has to be counted
+and promoted, its reservation and the copy kept as a pair (both records, or
+one record with the copy inside), and a load has to restore the pair or
+neither.
 
 ## Nesting: tried, dropped
 
