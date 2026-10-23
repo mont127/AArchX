@@ -100,8 +100,13 @@
  * stops growing at OCERZ_TC_PROF_MAX entries.  A second file, named for the
  * identity alone (.execs), lists the programs this one was seen to execute
  * (python3's xcrun shim runs python3.9, which runs Python.app; ruby runs
- * /bin/sh and uname), one path a line.  A writer that finds all of its own
- * entries already there writes nothing, and keeping profiles costs a warm
+ * /bin/sh and uname), one path a line.  A third (.images) lists the disk
+ * dylibs and bundles its launches loaded, statically or by dlopen (ruby's
+ * Ruby.framework and the encoding and extension bundles it opens), so -aot
+ * does those, and a fourth (.path) the executable's own path, so -aot-all can
+ * find every program with a profile.  Both are noted in memory and written
+ * with the rips.  A writer that finds all of its own entries already there
+ * writes nothing, and keeping profiles costs a warm
  * launch nothing measurable (python3 0.187 s with and without, tclsh 0.109
  * and 0.108).  src/jit.c ("Ahead of time") says how -aot uses them.
  * OCERZ_NO_TCACHE_PROFILE=1 writes and reads none and, like the profiles
@@ -1141,11 +1146,78 @@ static void profile_execs_name(char *out, size_t n, uint64_t ident)
         out[0] = 0;
 }
 
+static void profile_images_name(char *out, size_t n, uint64_t ident)
+{
+    char leaf[40];
+    snprintf(leaf, sizeof leaf, "%016llx.images", (unsigned long long)ident);
+    if (!profile_path(out, n, leaf))
+        out[0] = 0;
+}
+
+#define PROF_LINES_MAX (256 << 10)
+
+/* Appends to the line file name each of the n paths it does not hold yet, under an exclusive flock. */
+static void profile_lines_add(const char *name, char *const *paths, size_t n)
+{
+    char dir[1200];
+    if (!n || !name[0] || !profile_path(dir, sizeof dir, NULL) || mkdirs(dir) != 0)
+        return;
+    int fd = open(name, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return;
+    struct stat st;
+    if (flock(fd, LOCK_EX) == 0 && fstat(fd, &st) == 0 && st.st_size < PROF_LINES_MAX) {
+        size_t have = (size_t)st.st_size, add = 0;
+        char *buf = (char *)malloc(have + 2);
+        if (buf && pread(fd, buf + 1, have, 0) == (ssize_t)have) {
+            buf[0] = '\n';
+            buf[have + 1] = 0;
+            for (size_t k = 0; k < n; k++) {
+                size_t pl = strlen(paths[k]);
+                const char *line = NULL;
+                for (const char *p = strstr(buf, paths[k]); p && !line; p = strstr(p + 1, paths[k]))
+                    if (p[-1] == '\n' && p[pl] == '\n')
+                        line = p;
+                if (line || have + add + pl + 1 > PROF_LINES_MAX)
+                    continue;
+                char *rec = (char *)malloc(pl + 1);
+                if (!rec)
+                    continue;
+                memcpy(rec, paths[k], pl);
+                rec[pl] = '\n';
+                (void)!pwrite(fd, rec, pl + 1, (off_t)(have + add));
+                add += pl + 1;
+                free(rec);
+            }
+        }
+        free(buf);
+    }
+    close(fd);
+}
+
+static char *profile_lines_read(const char *name)
+{
+    int fd = name[0] ? open(name, O_RDONLY | O_CLOEXEC) : -1;
+    struct stat st;
+    char *buf = NULL;
+    if (fd >= 0 && flock(fd, LOCK_SH) == 0 && fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size <= PROF_LINES_MAX &&
+        (buf = (char *)malloc((size_t)st.st_size + 1)) != NULL) {
+        ssize_t got = pread(fd, buf, (size_t)st.st_size, 0);
+        buf[got > 0 ? got : 0] = 0;
+    }
+    if (fd >= 0)
+        close(fd);
+    return buf;
+}
+
 static os_unfair_lock g_plock = OS_UNFAIR_LOCK_INIT;
 static uint64_t *g_pset, *g_pord;
 static size_t g_pcap, g_pn, g_pwritten;
 static uint64_t g_pident;
 static char g_prips[1200];
+static char **g_pimg;                       /* the disk images this process loaded, for .images */
+static size_t g_pimg_n, g_pimg_cap, g_pimg_written;
+static char g_ppath[1024];                  /* the main executable, for .path, until it is written */
 
 static int pset_add(uint64_t **set, size_t *cap, size_t *n, uint64_t v)
 {
@@ -1185,6 +1257,28 @@ static int pset_has(const uint64_t *set, size_t cap, uint64_t v)
 static void profile_write(void)
 {
     os_unfair_lock_lock(&g_plock);
+    if (g_prips[0] && g_pident && g_ppath[0]) {
+        char leaf[40], name[1200], dir[1200];
+        snprintf(leaf, sizeof leaf, "%016llx.path", (unsigned long long)g_pident);
+        int fd = profile_path(dir, sizeof dir, NULL) && mkdirs(dir) == 0 && profile_path(name, sizeof name, leaf)
+                     ? open(name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)
+                     : -1;
+        if (fd >= 0) {
+            size_t pl = strlen(g_ppath);
+            g_ppath[pl] = '\n';
+            if (write(fd, g_ppath, pl + 1) == (ssize_t)(pl + 1))
+                g_ppath[0] = 0;
+            else
+                g_ppath[pl] = 0;
+            close(fd);
+        }
+    }
+    if (g_prips[0] && g_pident && g_pimg_written < g_pimg_n) {
+        char name[1200];
+        profile_images_name(name, sizeof name, g_pident);
+        profile_lines_add(name, g_pimg + g_pimg_written, g_pimg_n - g_pimg_written);
+        g_pimg_written = g_pimg_n;
+    }
     if (!g_prips[0] || g_pwritten == g_pn) {
         os_unfair_lock_unlock(&g_plock);
         return;
@@ -1231,7 +1325,7 @@ static void profile_atexit(void)
     profile_write();
 }
 
-void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid)
+void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid, const char *path)
 {
     if (!ident || !cache_uuid || profile_off())
         return;
@@ -1241,17 +1335,19 @@ void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid)
     int first = !g_prips[0];
     profile_rips_name(g_prips, sizeof g_prips, ident, cache_uuid);
     g_pident = ident;
+    if (path && path[0] == '/' && !strchr(path, '\n') && strlen(path) < sizeof g_ppath - 1)
+        snprintf(g_ppath, sizeof g_ppath, "%s", path);
     os_unfair_lock_unlock(&g_plock);
     if (!first || !g_prips[0])
         return;
     atexit(profile_atexit);
-    char *path = getenv("OCERZ_NO_TCACHE_WARM") ? NULL : strdup(g_prips);
+    char *rips = getenv("OCERZ_NO_TCACHE_WARM") ? NULL : strdup(g_prips);
     pthread_t t;
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    if (path && pthread_create(&t, &at, warm_main, path) != 0)
-        free(path);
+    if (rips && pthread_create(&t, &at, warm_main, rips) != 0)
+        free(rips);
     pthread_attr_destroy(&at);
 }
 
@@ -1265,6 +1361,91 @@ void ocerz_tcache_profile_note(uint64_t v)
     if (g_pord && g_pn < OCERZ_TC_PROF_MAX && pset_add(&g_pset, &g_pcap, &g_pn, v))
         g_pord[g_pn - 1] = v;
     os_unfair_lock_unlock(&g_plock);
+}
+
+void ocerz_tcache_profile_image(const char *path)
+{
+    if (!path || !path[0] || path[0] != '/' || strchr(path, '\n') || profile_off())
+        return;
+    os_unfair_lock_lock(&g_plock);
+    size_t i = 0;
+    while (i < g_pimg_n && strcmp(g_pimg[i], path))
+        i++;
+    if (i == g_pimg_n) {
+        if (g_pimg_n == g_pimg_cap) {
+            size_t nc = g_pimg_cap ? 2 * g_pimg_cap : 64;
+            char **nv = (char **)realloc(g_pimg, nc * sizeof *nv);
+            if (nv) {
+                g_pimg = nv;
+                g_pimg_cap = nc;
+            }
+        }
+        char *d = g_pimg_n < g_pimg_cap ? strdup(path) : NULL;
+        if (d)
+            g_pimg[g_pimg_n++] = d;
+    }
+    os_unfair_lock_unlock(&g_plock);
+}
+
+typedef struct { uint64_t ident; time_t mtime; char *path; } ProfProg;
+
+static int prof_prog_cmp(const void *pa, const void *pb)
+{
+    const ProfProg *a = (const ProfProg *)pa, *b = (const ProfProg *)pb;
+    return a->mtime < b->mtime ? 1 : a->mtime > b->mtime ? -1 : 0;
+}
+
+char *ocerz_tcache_profile_programs(void)
+{
+    char dir[1200];
+    if (profile_off() || !profile_path(dir, sizeof dir, NULL))
+        return NULL;
+    DIR *dp = opendir(dir);
+    if (!dp)
+        return NULL;
+    ProfProg *v = NULL;
+    size_t n = 0, cap = 0, bytes = 1;
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        char *end = NULL, name[1400];
+        uint64_t ident = strtoull(de->d_name, &end, 16);
+        if (!ident || end != de->d_name + 16 || strcmp(end, ".path"))
+            continue;
+        snprintf(name, sizeof name, "%s/%s", dir, de->d_name);
+        char *path = profile_lines_read(name);
+        struct stat st;
+        char *nl = path ? strchr(path, '\n') : NULL;
+        if (!nl || stat(name, &st) != 0 || (n == cap && !(v = (ProfProg *)reallocf(v, (cap = cap ? 2 * cap : 64) * sizeof *v)))) {
+            free(path);
+            if (!v)
+                break;
+            continue;
+        }
+        *nl = 0;
+        v[n++] = (ProfProg){ ident, st.st_mtimespec.tv_sec, path };
+        bytes += strlen(path) + 18;
+    }
+    closedir(dp);
+    char *out = v && n ? (char *)malloc(bytes) : NULL;
+    size_t at = 0;
+    if (out) {
+        qsort(v, n, sizeof *v, prof_prog_cmp);
+        for (size_t k = 0; k < n; k++)
+            at += (size_t)snprintf(out + at, bytes - at, "%016llx %s\n", (unsigned long long)v[k].ident, v[k].path);
+    }
+    for (size_t k = 0; k < n; k++)
+        free(v[k].path);
+    free(v);
+    return out;
+}
+
+char *ocerz_tcache_profile_images(uint64_t ident)
+{
+    char name[1200];
+    if (!ident || profile_off())
+        return NULL;
+    profile_images_name(name, sizeof name, ident);
+    return profile_lines_read(name);
 }
 
 void ocerz_tcache_profile_exec(const char *path)

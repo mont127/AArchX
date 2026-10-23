@@ -28,7 +28,7 @@
  *
  * A profile is what -aot learns from a program's earlier runs.
  * ocerz_tcache_profile_open names the program (an identity of its main
- * executable) and the shared cache (its UUID), and starts a thread that reads
+ * executable, and its path) and the shared cache (its UUID), and starts a thread that reads
  * the records the profile lists ahead of ocerz_tcache_find; from then on
  * ocerz_tcache_profile_note collects shared-cache rips, each with
  * OCERZ_TC_PROF_PLAIN or OCERZ_TC_PROF_ORDERED for the memory model it was
@@ -37,6 +37,11 @@
  * executes.  ocerz_tcache_profile_read hands back a profile's entries (one
  * rip may come twice, once per model), and ocerz_tcache_profile_execs the
  * programs, one path a line, in a string for the caller to free.
+ * ocerz_tcache_profile_image notes a disk image this process loaded, by
+ * dlopen or as a dependency, and ocerz_tcache_profile_images hands back the
+ * ones a program's launches loaded, the same way.  ocerz_tcache_profile_programs
+ * lists every program with a profile, "<identity> <path>" a line, the most
+ * recently launched first.
  */
 #ifndef OCERZ_TCACHE_H
 #define OCERZ_TCACHE_H
@@ -70,10 +75,13 @@ void ocerz_tcache_flush(void);
 void ocerz_tcache_child(void);
 const char *ocerz_tcache_dir(int for_write);
 int ocerz_tcache_room(void);
-void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid);
+void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid, const char *path);
 void ocerz_tcache_profile_note(uint64_t v);
 void ocerz_tcache_profile_exec(const char *path);
 size_t ocerz_tcache_profile_read(uint64_t ident, const uint8_t *cache_uuid, uint64_t **out);
+void ocerz_tcache_profile_image(const char *path);
+char *ocerz_tcache_profile_images(uint64_t ident);
+char *ocerz_tcache_profile_programs(void);
 char *ocerz_tcache_profile_execs(uint64_t ident);
 
 #endif

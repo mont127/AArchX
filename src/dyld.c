@@ -4323,8 +4323,10 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
     d->seq = ++g_dimg_seq;
     dimg_changed();
 
-    if (ocerz_mode == OCERZ_MODE_CACHE)
+    if (ocerz_mode == OCERZ_MODE_CACHE) {
         ocerz_dyldapi_register_image(d->load_base, d->path);
+        ocerz_tcache_profile_image(d->path);
+    }
     if (!g_ndl.active)
         canonicalize_objc_selrefs(d);
     protect_ro_segments(d);
@@ -4459,8 +4461,10 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path, 
     }
     if (d->cf_off == 0)
         apply_classic_fixups(d, cache);
-    if (ocerz_mode == OCERZ_MODE_CACHE)
+    if (ocerz_mode == OCERZ_MODE_CACHE) {
         ocerz_dyldapi_register_image(d->load_base, d->path);
+        ocerz_tcache_profile_image(d->path);
+    }
     canonicalize_objc_selrefs(d);
     protect_ro_segments(d);
     if (getenv("OCERZ_DLPATH"))
@@ -6938,12 +6942,26 @@ static size_t aot_profile(OcerzCache *cache, AotVec *pseed, size_t *dropped)
 
 /* -aot: the images are mapped and bound as for a launch; their code is
  * translated into the store instead of run. */
+static int aot_seen(const DynImage **seen, int *n, const DynImage *d)
+{
+    for (int i = 0; i < *n; i++)
+        if (seen[i] == d)
+            return 1;
+    if (*n < DYN_DIMG_MAX)
+        seen[(*n)++] = d;
+    return 0;
+}
+
 static int aot_run(struct OcerzVM *vm, OcerzCache *cache, int first)
 {
     AotVec seed = { 0 }, rng = { 0 }, pseed = { 0 };
-    int nimg = 0;
+    int nimg = 0, nseen = 0, nprofimg = 0;
+    const DynImage **seen = calloc(DYN_DIMG_MAX, sizeof *seen);
+    if (!seen)
+        return 1;
     if (g_main_dimg_valid && first) {
         aot_image(&g_main_dimg, &seed, &rng);
+        aot_seen(seen, &nseen, &g_main_dimg);
         nimg++;
     }
     for (int k = first; k < g_aot_n; k++) {
@@ -6952,25 +6970,48 @@ static int aot_run(struct OcerzVM *vm, OcerzCache *cache, int first)
         DynImage *d = load_disk_dylib(cache, p, g_main_dimg_valid ? &g_main_dimg : NULL, NULL);
         if (!d)
             fprintf(stderr, "ocerz: -aot: cannot load %s\n", p);
-        else if (!g_aot_deps && !d->is_virtual) {
+        else if (!d->is_virtual && !aot_seen(seen, &nseen, d)) {
             aot_image(d, &seed, &rng);
             nimg++;
         }
     }
-    for (int i = 0; g_aot_deps && i < g_dimgs_n; i++)
-        if (!g_dimgs[i].is_virtual && g_dimgs[i].slice) {
+    /* the disk images the program's launches loaded, by dlopen as well as statically (the profile's
+     * .images); with none recorded, every disk image it loads statically, as -aot-deps does */
+    int deps = g_aot_deps;
+    char *pimg = g_main_dimg_valid && first && !getenv("OCERZ_AOT_NO_PROFILE_IMAGES")
+                     ? ocerz_tcache_profile_images(profile_ident(g_main_dimg.slice, g_main_dimg.path))
+                     : NULL;
+    for (char *p = pimg, *e; p && *p && (e = strchr(p, '\n')); p = e + 1) {
+        *e = 0;
+        if (access(p, R_OK) != 0)
+            continue;
+        DynImage *d = load_disk_dylib(cache, p, &g_main_dimg, NULL);
+        if (d && !d->is_virtual && !aot_seen(seen, &nseen, d)) {
+            aot_image(d, &seed, &rng);
+            nimg++;
+            nprofimg++;
+        }
+    }
+    if (g_main_dimg_valid && first && !pimg)
+        deps = 1;
+    free(pimg);
+    for (int i = 0; deps && i < g_dimgs_n; i++)
+        if (!g_dimgs[i].is_virtual && g_dimgs[i].slice && !aot_seen(seen, &nseen, &g_dimgs[i])) {
             aot_image(&g_dimgs[i], &seed, &rng);
             nimg++;
         }
+    free(seen);
     size_t dropped = 0, nprof = aot_profile(cache, &pseed, &dropped);
     OcerzJitAotStats st;
     int rc = ocerz_jit_aot(vm, seed.v, seed.n, (const uint64_t (*)[2])rng.v, (int)(rng.n / 2), pseed.v, pseed.n, &st);
     if (rc != 0)
         fprintf(stderr, "ocerz: -aot needs the JIT and the translation cache on, in cache mode\n");
     else
-        fprintf(stderr, "ocerz: -aot %s: %d image%s, %zu entries, %zu profiled (%zu dropped), %llu blocks in %d memory"
-                        " model%s (%llu profiled, %llu kept, %llu already kept), %llu not translated, %llu ms%s\n",
-                g_aot_paths[0], nimg, nimg == 1 ? "" : "s", seed.n, nprof ? pseed.n : 0, dropped,
+        fprintf(stderr, "ocerz: -aot %s: %d image%s (%d from the profile%s), %zu entries, %zu profiled (%zu dropped),"
+                        " %llu blocks in %d memory model%s (%llu profiled, %llu kept, %llu already kept), %llu not translated,"
+                        " %llu ms%s\n",
+                g_aot_paths[0], nimg, nimg == 1 ? "" : "s", nprofimg, deps ? ", the rest static dependencies" : "",
+                seed.n, nprof ? pseed.n : 0, dropped,
                 (unsigned long long)st.blocks, st.models ? st.models : 1, st.models > 1 ? "s" : "",
                 (unsigned long long)st.profiled, (unsigned long long)st.saved, (unsigned long long)st.present,
                 (unsigned long long)st.failed, (unsigned long long)st.ms, st.full ? "; stopped at half the store's room" : "");
@@ -7181,7 +7222,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     if (g_aot_n)
         return aot_run(vm, &cache, 1);
     if (ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled)
-        ocerz_tcache_profile_open(profile_ident(g_main_dimg.slice, g_main_dimg.path), ocerz_cache_uuid());
+        ocerz_tcache_profile_open(profile_ident(g_main_dimg.slice, g_main_dimg.path), ocerz_cache_uuid(), g_main_dimg.path);
 
     uint64_t environ_addr = ocerz_cache_resolve(&cache, "_environ");
     if (environ_addr) {

@@ -76,8 +76,13 @@
  *
  * `ocerz -aot image...` fills the translation cache with the images' code
  * without running it (src/dyld.c loads, src/jit.c translates; see "Ahead of
- * time" there), and -aot-deps does the same for every disk dylib the images
- * load as well.  An executable is loaded as the main image of a process, so
+ * time" there), and with them the disk dylibs and bundles the program's
+ * earlier launches loaded, by dlopen too (its profile's .images), or, when
+ * there is no record of any, every disk dylib it loads statically;
+ * -aot-deps does every static one whatever the profile says.  `ocerz
+ * -aot-all` does every program that has a profile (its .path), the most
+ * recently launched first, which is what a new build of ocerz, whose store
+ * starts empty, wants run once.  An executable is loaded as the main image of a process, so
  * with more than one each image is done by a child of its own, one after the
  * other; a dylib or bundle named after a single executable is loaded into that
  * executable's process, and one named alone gets a process with no main image.
@@ -167,6 +172,37 @@ static int aot_execs(int n, char **images, char **out, int cap)
     return no;
 }
 
+/* -aot-all: every program with a profile, the most recently launched first,
+ * each in a process of its own.  A program whose file is gone, or is another
+ * build now (its identity changed), is passed over; programs it executed have
+ * profiles of their own, so their children get OCERZ_AOT_NO_EXECS=1. */
+static int aot_all(const char *self)
+{
+    char *list = ocerz_tcache_profile_programs();
+    int done = 0, skipped = 0, failed = 0;
+    setenv("OCERZ_AOT_NO_EXECS", "1", 1);
+    for (char *line = list ? strtok(list, "\n") : NULL; line; line = strtok(NULL, "\n")) {
+        char *sp = strchr(line, ' '), abs[PATH_MAX];
+        if (!sp)
+            continue;
+        *sp = 0;
+        uint64_t ident = strtoull(line, NULL, 16);
+        char *path = sp + 1;
+        if (!realpath(path, abs) || ocerz_dyld_file_ident(abs) != ident) {
+            skipped++;
+            continue;
+        }
+        if (aot_spawn(self, 0, 1, &path) != 0)
+            failed++;
+        else
+            done++;
+    }
+    free(list);
+    fprintf(stderr, "ocerz: -aot-all: %d program%s done, %d gone or rebuilt since, %d failed\n", done,
+            done == 1 ? "" : "s", skipped, failed);
+    return failed ? 1 : 0;
+}
+
 /* -aot with more than one program: each image in a process of its own, since
  * each program is loaded as the main image of one. */
 static int aot_main(OcerzVM *vm, int n, char **images, int deps, const char *self)
@@ -206,6 +242,7 @@ static void usage(void)
 {
     fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--] program [args...]\n"
                     "       ocerz -aot|-aot-deps image [image...]\n"
+                    "       ocerz -aot-all\n"
                     "       ocerz version\n");
 }
 
@@ -484,6 +521,8 @@ int main(int argc, char **argv)
             load_path = argv[++i];
         } else if (strcmp(argv[i], "-aot") == 0 || strcmp(argv[i], "-aot-deps") == 0) {
             aot = argv[i][4] ? 2 : 1;
+        } else if (strcmp(argv[i], "-aot-all") == 0) {
+            aot = 3;
         } else {
             usage();
             return 64;
@@ -504,7 +543,12 @@ int main(int argc, char **argv)
     }
     OCERZ_LOG("mode: %s\n", ocerz_mode == OCERZ_MODE_NATIVE ? "native" : "cache");
     ocerz_afp_enable();
-    if (i >= argc) {
+    if (aot == 3 && i >= argc) {
+        char selfpath[PATH_MAX];
+        uint32_t sl = sizeof selfpath;
+        return aot_all(_NSGetExecutablePath(selfpath, &sl) == 0 ? selfpath : argv[0]);
+    }
+    if (i >= argc || aot == 3) {
         usage();
         return 64;
     }

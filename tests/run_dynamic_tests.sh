@@ -1101,6 +1101,39 @@ else
         fail=$((fail+1))
     fi
 fi
+# A launch's profile also names the disk images it loaded, a bundle it
+# dlopened included (.images), and the program itself (.path).  With the store
+# gone, as after a rebuild of ocerz, -aot-all must find the program from its
+# profile and do the bundle as well, and the next launch must find every image
+# block it asks for.
+aoti_dir="$TMP/dtcache_aot_images"
+mkdir -p "$aoti_dir"
+if ! clang -arch x86_64 -O2 -o "$aoti_dir/main" tests/dynamic/tcache_plugin_main.c 2>/dev/null ||
+   ! clang -arch x86_64 -O2 -bundle -o "$aoti_dir/plugin.bundle" tests/dynamic/tcache_plugin.c 2>/dev/null; then
+    echo "FAIL dtcache_aot_images (build)"; fail=$((fail+1))
+else
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$aoti_dir/store" OCERZ_TCACHE_MIN_FREE_MB=0 \
+        run_bounded "$aoti_dir/first.out" "$aoti_dir/first.err" "$OCERZ" "$aoti_dir/main" "$aoti_dir/plugin.bundle"
+    first_code=$?
+    rm -rf "$aoti_dir"/store/tc-*
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$aoti_dir/store" OCERZ_TCACHE_MIN_FREE_MB=0 \
+        run_bounded "$aoti_dir/all.out" "$aoti_dir/all.err" "$OCERZ" -aot-all
+    all_code=$?
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$aoti_dir/store" OCERZ_TCACHE_LOG="$aoti_dir/run.log" OCERZ_TCACHE_MIN_FREE_MB=0 \
+        run_bounded "$aoti_dir/run.out" "$aoti_dir/run.err" "$OCERZ" "$aoti_dir/main" "$aoti_dir/plugin.bundle"
+    run_code=$?
+    if [ "$first_code" = 0 ] && [ "$all_code" = 0 ] && [ "$run_code" = 0 ] && [ "$(cat "$aoti_dir/run.out")" = OK ] &&
+       grep -q '1 program done' "$aoti_dir/all.err" && grep -q '(1 from the profile)' "$aoti_dir/all.err" &&
+       awk '/images asked=/ { split($4, a, "="); split($5, b, "="); asked += a[2]; got += b[2] }
+            END { exit !(asked > 0 && got == asked) }' "$aoti_dir/run.log"; then
+        echo "PASS dtcache_aot_images"; pass=$((pass+1))
+    else
+        echo "FAIL dtcache_aot_images (first exit=$first_code -aot-all exit=$all_code run exit=$run_code" \
+             "out='$(cat "$aoti_dir/run.out")' $(grep -h 'aot' "$aoti_dir/all.err" | tr '\n' ' ')" \
+             "$(grep -h 'images asked=' "$aoti_dir/run.log" | head -1))"
+        fail=$((fail+1))
+    fi
+fi
 # With a free-space floor no disk can meet, the cache must not write a byte and
 # the program must still run; the floor is what kept the cache from filling a
 # nearly full disk.

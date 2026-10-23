@@ -689,8 +689,23 @@
  * against warm 0.24, 0.12, 0.23 and 0.040; -aot itself takes 0.23 s and 100
  * MB of store for ruby or tclsh, 0.85 s and 217 MB for python3's three
  * programs, and 0.49 s and 160 MB for sqlite3, which took 0.89 s and 238 MB
- * walking the ordered model it never runs under.  With no profile -aot does
- * what it did, and OCERZ_NO_TCACHE_PROFILE=1 neither notes nor seeds.
+ * walking the ordered model it never runs under.  OCERZ_NO_TCACHE_PROFILE=1
+ * neither notes nor seeds.
+ *
+ * -aot of an executable alone left the code most programs run out: perl's
+ * and ruby's interpreters are disk dylibs, and ruby opens a dozen bundles
+ * (encodings, stringio, json) by dlopen, which no static walk finds.  So a
+ * launch notes the disk images it loads, those dlopened included, in the
+ * profile's .images (src/tcache.c), and -aot does them along with the named
+ * images; with no record of any it does the program's static dependencies,
+ * as -aot-deps always does.  The first launch after -aot then takes perl
+ * 0.021 s (0.032 when -aot did the executable alone), ruby 0.163 (0.249),
+ * tclsh 0.088 and sqlite3 0.033, against warm 0.019, 0.169, 0.086 and 0.032.
+ * A launch also records its executable's path (.path), and -aot-all does
+ * every program that has a profile: a new build of ocerz starts with an empty
+ * store, whose launches were as slow as cold ones (perl 0.049 s, ruby 0.313,
+ * tclsh 0.219, sqlite3 0.071) and after -aot-all are warm ones (0.021, 0.165,
+ * 0.087, 0.034).  Doing those four took 1.6 s.
  *
  * Loading.  A record is copied into the arena, bound, and its own edges are
  * chained, all before its code is made visible to instruction fetch, by one
