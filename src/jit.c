@@ -996,7 +996,8 @@ static inline const X86Insn *blk_insn_full(const JitBlock *b, int i)
  * (insn_off, oslow, lanerec, push_fix) are from lay->h, and code_words counts
  * from there.  Its caller owns its own words less the reservation.
  */
-static inline int blk_is_cont(const JitBlock *b) { return b->lay && b->lay->caller != b; }
+/* pro_w, not lay->caller: the caller frees lay, and teardown can destroy it before the copy (block_destroy) */
+static inline int blk_is_cont(const JitBlock *b) { return b->lay && b->pro_w; }
 static inline const uint32_t *blk_base(const JitBlock *b)
 {
     return blk_is_cont(b) ? b->lay->h : (const uint32_t *)(const void *)b->code;
@@ -1008,7 +1009,7 @@ static int blk_ranges(const JitBlock *b, CodeRange out[2])
     const JitLayout *L = b->lay;
     if (!c) return 0;
     if (!L) { out[0] = (CodeRange){ c, c + b->code_words }; return 1; }
-    if (L->caller != b) {
+    if (b->pro_w) {
         out[0] = (CodeRange){ L->h, L->h + b->code_words };
         out[1] = (CodeRange){ c, c + b->pro_w };
         return 2;
@@ -22956,7 +22957,7 @@ static void cont_unplace(JitLayout *L)
 static void cont_detach(OcerzJit *jit, JitBlock *blk)
 {
     JitLayout *L = blk->lay;
-    if (!L || L->caller == blk || L->child != blk || !L->placed)
+    if (!L || !blk->pro_w || L->child != blk || !L->placed)
         return;
     cont_unplace(L);
     if (ocerz_perfstat > 0)
@@ -25238,7 +25239,7 @@ static const JitBlock *fault_block(const OcerzJit *jit, const uint32_t *pc)
     const JitLayout *L = b->lay;
     if (!L)
         return pc < base + b->code_words ? b : NULL;
-    if (L->caller != b)
+    if (b->pro_w)
         return pc < base + b->pro_w ? b : NULL;
     if (pc >= base + b->code_words)
         return NULL;
@@ -25811,7 +25812,7 @@ static void ps_report_atexit(void)
 
 static void block_destroy(JitBlock *b)
 {
-    if (b->lay && b->lay->caller == b)
+    if (b->lay && !b->pro_w)
         free(b->lay);
     if (b->slab) {
         free(b->preds);
