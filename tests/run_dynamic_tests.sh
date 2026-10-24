@@ -1038,7 +1038,8 @@ run_cpp_file_case dweak_main_first tests/dynamic/weak_main_first.cpp 'OK'
 run_cpp_file_case dweak_main_first_classic tests/dynamic/weak_main_first.cpp 'OK' -Wl,-no_fixup_chains
 # tcache_work.c against one fresh translation cache directory, five runs (with
 # no free-space floor, so a full disk on the test machine is not a failure): one
-# that records, one that must load what the first stored, one under
+# that records, and leaves its program's image record keys in its profile's
+# .keys for the warm thread, one that must load what the first stored, one under
 # OCERZ_TCACHE=verify that must find no block differing from its record except
 # in shape, one under OCERZ_TCACHE=roundtrip that must find no reference its
 # relocations miss, and one more verify with the program and its dylibs moved by
@@ -1071,6 +1072,9 @@ run_tcache_case() {
             why="nothing loaded: $(grep -h 'loaded=' "$log" | head -1)"
         elif [ $i = 2 ] && [ "$name" = dtcache ] && ! grep -q 'images asked=[0-9]* in=[1-9]' "$log"; then
             why="no image record loaded: $(grep -h 'images asked=' "$log" | head -1)"
+        elif [ $i = 1 ] && [ "$name" = dtcache ] &&
+             [ "$(cat "$dir"/store/profiles/*.keys 2>/dev/null | od -An -v -tx8 | tr -s ' ' '\n' | grep -c '^[2367abef]')" = 0 ]; then
+            why="no image record key in the profile's .keys"
         elif { [ $i = 3 ] || [ $i = 5 ]; } && ! awk '/TCACHE.*loaded=/ { for (f = 3; f <= NF; f++) { split($f, a, "="); t[a[1]] += a[2] } }
                                   END { exit !(t["verify_ok"] > 0 && t["verify_bad"] == 0) }' "$log"; then
             why="verify: $(grep -h 'VERIFY\|loaded=' "$log" | head -2 | tr '\n' ' ')"

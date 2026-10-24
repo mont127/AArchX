@@ -22325,7 +22325,7 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
 static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words, g_tc_n_prep;
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
 enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
-static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
+static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iwarm, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
 static _Atomic unsigned long long g_tc_n_sfind, g_tc_n_sload;
 
 static int tc_fixed(uint64_t a);
@@ -22439,12 +22439,14 @@ static void tc_summary(void)
                 (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
                 (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
     fprintf(g_tc_lf, "ocerz: TCACHE[%d] images asked=%llu in=%llu out=%llu same=%llu variant=%llu unkeepable edge=%llu"
-                     " insn=%llu dep=%llu ras=%llu elide=%llu code=%llu\n",
-            (int)getpid(), (unsigned long long)g_tc_n_ifind, (unsigned long long)g_tc_n_iload, (unsigned long long)g_tc_n_iput,
+                     " insn=%llu dep=%llu ras=%llu elide=%llu code=%llu warm=%llu\n",
+            (int)getpid(), (unsigned long long)g_tc_n_ifind, (unsigned long long)g_tc_n_iload,
+            (unsigned long long)g_tc_n_iput,
             (unsigned long long)g_tc_n_ivok, (unsigned long long)g_tc_n_ivvar,
             (unsigned long long)g_tc_n_ibad[TCI_EDGE], (unsigned long long)g_tc_n_ibad[TCI_INSN],
             (unsigned long long)g_tc_n_ibad[TCI_DEP], (unsigned long long)g_tc_n_ibad[TCI_RAS],
-            (unsigned long long)g_tc_n_ibad[TCI_ELIDE], (unsigned long long)g_tc_n_ibad[TCI_CODE]);
+            (unsigned long long)g_tc_n_ibad[TCI_ELIDE], (unsigned long long)g_tc_n_ibad[TCI_CODE],
+            (unsigned long long)g_tc_n_iwarm);
     fprintf(g_tc_lf, "ocerz: TCACHE[%d] shared asked=%llu in=%llu\n", (int)getpid(),
             (unsigned long long)g_tc_n_sfind, (unsigned long long)g_tc_n_sload);
     fflush(g_tc_lf);
@@ -22695,9 +22697,21 @@ static int tc_keepable(uint64_t rip, int mode32)
 /* Set while the record being loaded came out of the warm set: the profile names it already, so it is not noted again. */
 static int g_tc_from_profile;
 
+/*
+ * A launch's records go into its profile twice: a shared-cache block's rip,
+ * tagged with its memory model, for -aot (.rips), and every block's record key,
+ * a disk image's as well, for the warm thread (.keys, built from when there is
+ * one).  perl's 2.7k libperl and program records were found and decoded on the
+ * guest's thread at each launch, being in no profile.  A record the warm set
+ * held is not noted again in the list the set came from.
+ */
 static void tc_prof_note(uint64_t rip)
 {
-    if (!g_tc_from_profile && !g_tc_img_hi && !ocerz_low_base && !(g_tc_key & OCERZ_TC_KEY_M32))
+    if (ocerz_low_base || (g_tc_key & OCERZ_TC_KEY_M32))
+        return;
+    if (!g_tc_from_profile || !ocerz_tcache_warm_keys())
+        ocerz_tcache_profile_note_key(g_tc_key);
+    if (!g_tc_from_profile && !g_tc_img_hi)
         ocerz_tcache_profile_note(rip | (g_tc_key & OCERZ_TC_KEY_PLAIN ? OCERZ_TC_PROF_PLAIN : OCERZ_TC_PROF_ORDERED));
 }
 
@@ -23990,6 +24004,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
             tc_hit_warm = tc_hit && ocerz_tcache_found_warm();
             tc_hit_prep = tc_hit_warm ? (TcPrep *)ocerz_tcache_take_prep() : NULL;
             g_tc_n_ifind += g_tc_img_hi != 0;
+            g_tc_n_iwarm += tc_hit_warm && g_tc_img_hi;
             g_tc_n_sfind += !g_tc_img_hi && !ocerz_low_base;
         }
         {

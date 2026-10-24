@@ -301,7 +301,7 @@ static int env_ignored(const char *kv)
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
         "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=", "OCERZ_NO_TCACHE_FOLD=", "OCERZ_NO_TCACHE_SLAB=",
         "OCERZ_NO_TCACHE_WARM=", "OCERZ_NO_CONT_PLACE=", "OCERZ_EXIT_STOP_ALL=", "OCERZ_AOT_NO_PROFILE_IMAGES=", "OCERZ_TCACHE_AHEAD=", "OCERZ_NO_WX_HOLD=",
-        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=", "OCERZ_NO_TCACHE_PREP=",
+        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=", "OCERZ_NO_TCACHE_PREP=", "OCERZ_NO_TCACHE_KEYS=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
@@ -823,6 +823,8 @@ OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key, void **prep)
     *prep = NULL;
     pthread_mutex_lock(&g_lock);
     size_t i = g_warm_last_i + 1;
+    while (g_warm_last_i != SIZE_MAX && i < g_nwarm && (g_warm[i].key & (OCERZ_TC_KEY_IMAGE | OCERZ_TC_KEY_M32)))
+        i++;   /* the translator asks for those, in their image's context */
     if (__atomic_load_n(&g_warm_on, __ATOMIC_ACQUIRE) && g_warm_last_i != SIZE_MAX && i < g_nwarm &&
         __atomic_load_n(&g_warm[i].st, __ATOMIC_ACQUIRE) > 1) {
         uintptr_t v = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
@@ -901,9 +903,28 @@ static const TcStored *warm_at(TcFile **mp, uint64_t *nm, uint64_t no, uint64_t 
     return off + z->size <= f->len ? z : NULL;
 }
 
+static int g_warm_keys;   /* the warm set came from the profile's .keys (warm_build) */
+
+/* <profile>.keys beside <profile>.rips: every record a launch loaded or kept, by key, in order (profile_note_key). */
+static void profile_keys_name(char *out, size_t n, const char *rips)
+{
+    size_t l = strlen(rips);
+    if (l < 5 || l + 1 > n || strcmp(rips + l - 5, ".rips")) {
+        out[0] = 0;
+        return;
+    }
+    memcpy(out, rips, l - 5);
+    memcpy(out + l - 5, ".keys", 6);
+}
+
 static size_t warm_build(const char *path)
 {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    char kpath[1200];
+    profile_keys_name(kpath, sizeof kpath, path);
+    int fd = kpath[0] && !getenv("OCERZ_NO_TCACHE_KEYS") ? open(kpath, O_RDONLY | O_CLOEXEC) : -1;
+    g_warm_keys = fd >= 0;
+    if (fd < 0)
+        fd = open(path, O_RDONLY | O_CLOEXEC);
     struct stat st;
     size_t n = fd >= 0 && fstat(fd, &st) == 0 ? (size_t)st.st_size / 8 : 0, k = 0;
     if (n > OCERZ_TC_PROF_MAX)
@@ -919,12 +940,21 @@ static size_t warm_build(const char *path)
     g_whash = n ? (uint32_t *)calloc(cap, sizeof *g_whash) : NULL;
     g_wmask = cap - 1;
     for (size_t i = 0; g_warm && g_whash && i < n; i++) {
-        uint64_t m = v[i] & (OCERZ_TC_PROF_PLAIN | OCERZ_TC_PROF_ORDERED);
-        if (m != OCERZ_TC_PROF_PLAIN && m != OCERZ_TC_PROF_ORDERED)
-            continue;
-        if (g_pord_start)
-            m = OCERZ_TC_PROF_ORDERED;   /* the launch runs ordered from the start */
-        uint64_t key = (v[i] & OCERZ_TC_PROF_RIP) | (m == OCERZ_TC_PROF_PLAIN ? OCERZ_TC_KEY_PLAIN : 0);
+        uint64_t key;
+        if (g_warm_keys) {
+            key = v[i];
+            if (!key)
+                continue;
+            if (g_pord_start)
+                key &= ~OCERZ_TC_KEY_PLAIN;   /* the launch runs ordered from the start */
+        } else {
+            uint64_t m = v[i] & (OCERZ_TC_PROF_PLAIN | OCERZ_TC_PROF_ORDERED);
+            if (m != OCERZ_TC_PROF_PLAIN && m != OCERZ_TC_PROF_ORDERED)
+                continue;
+            if (g_pord_start)
+                m = OCERZ_TC_PROF_ORDERED;   /* the launch runs ordered from the start */
+            key = (v[i] & OCERZ_TC_PROF_RIP) | (m == OCERZ_TC_PROF_PLAIN ? OCERZ_TC_KEY_PLAIN : 0);
+        }
         size_t j = (size_t)(slot_hash(key) & g_wmask);
         while (g_whash[j] && g_warm[g_whash[j] - 1].key != key) j = (j + 1) & g_wmask;
         if (g_whash[j])
@@ -1302,6 +1332,8 @@ static char *profile_lines_read(const char *name)
 static os_unfair_lock g_plock = OS_UNFAIR_LOCK_INIT;
 static uint64_t *g_pset, *g_pord;
 static size_t g_pcap, g_pn, g_pwritten;
+static uint64_t *g_kset, *g_kord;           /* the same in record keys, images' too, for .keys */
+static size_t g_kcap, g_kn, g_kwritten;
 static uint64_t g_pident;
 static char g_prips[1200];
 static char **g_pimg;                       /* the disk images this process loaded, for .images */
@@ -1381,6 +1413,44 @@ static void profile_ord_decide(void)
                 (long long)g_pord_ms);
 }
 
+/* Adds to the profile file at path the entries of ord (n, also in set) it does not hold yet, in their order. */
+static void profile_merge(const char *path, const uint64_t *ord, size_t n, const uint64_t *set, size_t cap)
+{
+    char dir[1200];
+    int fd = -1;
+    if (profile_path(dir, sizeof dir, NULL) && mkdirs(dir) == 0)
+        fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    struct stat st;
+    if (fd >= 0 && flock(fd, LOCK_EX) == 0 && fstat(fd, &st) == 0) {
+        size_t have = (size_t)st.st_size / 8, fcap = 0, fn = 0, nout = 0;
+        uint64_t *old = have && have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(have * 8) : NULL;
+        uint64_t *fset = NULL, *out = have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(n * 8) : NULL;
+        size_t held = 0;
+        if (old && pread(fd, old, have * 8, 0) == (ssize_t)(have * 8))
+            for (size_t i = 0; i < have; i++)
+                held += pset_has(set, cap, old[i]);
+        for (size_t i = 0; held < n && old && i < have; i++)
+            if (old[i])
+                pset_add(&fset, &fcap, &fn, old[i]);
+        if (held >= n) {
+            free(out);
+            out = NULL;
+        }
+        for (size_t i = 0; out && i < n && have + nout < OCERZ_TC_PROF_MAX; i++)
+            if (!pset_has(fset, fcap, ord[i]))
+                out[nout++] = ord[i];
+        if (nout)
+            (void)!pwrite(fd, out, nout * 8, (off_t)(have * 8));
+        if (g_log > 0)
+            fprintf(stderr, "ocerz: TCACHE[%d] profile %s: %zu held, %zu added\n", (int)getpid(), path, have, nout);
+        free(old);
+        free(fset);
+        free(out);
+    }
+    if (fd >= 0)
+        close(fd);
+}
+
 static void profile_write(void)
 {
     os_unfair_lock_lock(&g_plock);
@@ -1407,44 +1477,16 @@ static void profile_write(void)
         profile_lines_add(name, g_pimg + g_pimg_written, g_pimg_n - g_pimg_written);
         g_pimg_written = g_pimg_n;
     }
-    if (!g_prips[0] || g_pwritten == g_pn) {
-        os_unfair_lock_unlock(&g_plock);
-        return;
-    }
-    char dir[1200];
-    int fd = -1;
-    if (profile_path(dir, sizeof dir, NULL) && mkdirs(dir) == 0)
-        fd = open(g_prips, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    struct stat st;
-    if (fd >= 0 && flock(fd, LOCK_EX) == 0 && fstat(fd, &st) == 0) {
-        size_t have = (size_t)st.st_size / 8, fcap = 0, fn = 0, nout = 0;
-        uint64_t *old = have && have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(have * 8) : NULL;
-        uint64_t *fset = NULL, *out = have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(g_pn * 8) : NULL;
-        size_t held = 0;
-        if (old && pread(fd, old, have * 8, 0) == (ssize_t)(have * 8))
-            for (size_t i = 0; i < have; i++)
-                held += pset_has(g_pset, g_pcap, old[i]);
-        for (size_t i = 0; held < g_pn && old && i < have; i++)
-            if (old[i])
-                pset_add(&fset, &fcap, &fn, old[i]);
-        if (held >= g_pn) {
-            free(out);
-            out = NULL;
-        }
-        for (size_t i = 0; out && i < g_pn && have + nout < OCERZ_TC_PROF_MAX; i++)
-            if (!pset_has(fset, fcap, g_pord[i]))
-                out[nout++] = g_pord[i];
-        if (nout)
-            (void)!pwrite(fd, out, nout * 8, (off_t)(have * 8));
-        if (g_log > 0)
-            fprintf(stderr, "ocerz: TCACHE[%d] profile %s: %zu held, %zu added\n", (int)getpid(), g_prips, have, nout);
-        free(old);
-        free(fset);
-        free(out);
+    if (g_prips[0] && g_pwritten != g_pn) {
+        profile_merge(g_prips, g_pord, g_pn, g_pset, g_pcap);
         g_pwritten = g_pn;
     }
-    if (fd >= 0)
-        close(fd);
+    char keys[1200];
+    profile_keys_name(keys, sizeof keys, g_prips);
+    if (keys[0] && g_kwritten != g_kn) {
+        profile_merge(keys, g_kord, g_kn, g_kset, g_kcap);
+        g_kwritten = g_kn;
+    }
     os_unfair_lock_unlock(&g_plock);
 }
 
@@ -1495,6 +1537,23 @@ void ocerz_tcache_note_ordered(void)
 {
     if (g_popen_ns && g_pord_ms < 0)
         g_pord_ms = (int64_t)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_popen_ns) / 1000000);
+}
+
+void ocerz_tcache_profile_note_key(uint64_t key)
+{
+    if (!g_prips[0] || !key)
+        return;
+    os_unfair_lock_lock(&g_plock);
+    if (!g_kord)
+        g_kord = (uint64_t *)malloc(OCERZ_TC_PROF_MAX * sizeof *g_kord);
+    if (g_kord && g_kn < OCERZ_TC_PROF_MAX && pset_add(&g_kset, &g_kcap, &g_kn, key))
+        g_kord[g_kn - 1] = key;
+    os_unfair_lock_unlock(&g_plock);
+}
+
+int ocerz_tcache_warm_keys(void)
+{
+    return g_warm_keys;
 }
 
 void ocerz_tcache_profile_note(uint64_t v)
