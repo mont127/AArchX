@@ -21551,7 +21551,8 @@ static unsigned long long g_promo_seq[JIT_MAX_BLOCK_INSNS];
  * access is a load addressed through the register it loaded, with nothing but
  * register arithmetic between that leaves the register alone, can be a plain
  * ldr: that next load cannot pass it, and is itself an acquire, or plain by the
- * same rule, so nothing later passes either.  The last load of every chain
+ * same rule, so nothing later passes either.  A release store may come between
+ * (dep_store_release).  The last load of every chain
  * stays an acquire.  p = next[p], obj->a->b and a vtable's function pointer
  * are such chains.  OCERZ_NO_DEP_PLAIN=1 turns it off, and OCERZ_DEP_PLAIN_LOG=1
  * names each load made plain as it is translated.
@@ -21585,6 +21586,37 @@ static int dep_reg_only(const X86Insn *in, int reg)
     int writes = in->op != OCERZ_OP_CMP && in->op != OCERZ_OP_TEST;
     return !(writes && (in->ops[0].reg & 15) == reg);
 }
+/*
+ * A store between the load and the load it addresses keeps the rule sound when
+ * the store is a release, as every scalar store is in ordered memory but those
+ * through rsp: the release orders the plain load before it, as x86 has a load
+ * before a later store.  A plain store, through rsp or of a vector, could pass
+ * the plain load, so it ends the run as before.  An interpreter's op that pops
+ * its operand stack loads the stack pointer, stores it back moved and then
+ * loads through it.
+ * OCERZ_NO_DEP_STORE=1 ends the run at any store.
+ */
+static int dep_store_release(const X86Insn *in)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_DEP_STORE") ? 1 : 0;
+    if (off)
+        return 0;
+    if (in->op != OCERZ_OP_MOV || in->nops != 2 || in->lock || in->rep || in->mode32 || in->seg != OCERZ_SEG_NONE ||
+        in->addrsize != 8)
+        return 0;
+    const X86Operand *d = &in->ops[0], *v = &in->ops[1];
+    if (d->kind != OCERZ_OPK_MEM || (d->size != 1 && d->size != 2 && d->size != 4 && d->size != 8))
+        return 0;
+    if (v->kind != OCERZ_OPK_REG && v->kind != OCERZ_OPK_IMM)
+        return 0;
+    if (v->kind == OCERZ_OPK_REG && (v->reg & ~15))
+        return 0;
+    if (d->index != OCERZ_REG_NONE && (d->index & 15) == OCERZ_RSP)
+        return 0;
+    return d->riprel || (d->base != OCERZ_REG_NONE && (d->base & 15) != OCERZ_RSP);
+}
+
 static void dep_plain_mark(const X86Insn *insns, int n)
 {
     static int off = -1, log = -1;
@@ -21605,7 +21637,8 @@ static void dep_plain_mark(const X86Insn *insns, int n)
                     fprintf(stderr, "ocerz: DEP_PLAIN %#llx\n", (unsigned long long)insns[i].rip);
                 break;
             }
-            if (!dep_reg_only(m, r)) break;
+            if (!dep_reg_only(m, r) && !dep_store_release(m))
+                break;
         }
     }
 }

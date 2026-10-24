@@ -1009,6 +1009,16 @@ else
     echo "FAIL ddep_order_plain (loads ${dep_l1:-?} ${dep_l2:-?} ${dep_l3:-?}; $(grep -c DEP_PLAIN "$TMP/ddep_order.log.err") plain)"
     fail=$((fail+1))
 fi
+# Between the first two loads, a store to a global, a release in ordered memory, keeps the first one
+# plain; a store through rsp, which stays plain, does not.
+if read -r _ dep_r1 dep_s1 < <(grep '^stores ' "$TMP/ddep_order.log.err") &&
+   grep -q "DEP_PLAIN $dep_r1\$" "$TMP/ddep_order.log.err" &&
+   ! grep -q "DEP_PLAIN $dep_s1\$" "$TMP/ddep_order.log.err"; then
+    echo "PASS ddep_order_store (a release store between keeps the load plain, a stack store does not)"; pass=$((pass+1))
+else
+    echo "FAIL ddep_order_store (stores ${dep_r1:-?} ${dep_s1:-?})"
+    fail=$((fail+1))
+fi
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 export OCERZ_TSO_NARROW=1

@@ -13,7 +13,10 @@
  * The litmus part rarely trips even on a broken rule, so the program also
  * prints the three loads' addresses, and run_dynamic_tests.sh checks against
  * OCERZ_DEP_PLAIN_LOG that only the first, which the second depends on, was
- * made plain.
+ * made plain.  Two more readers put a store between the first two loads: one
+ * to a global, a release in ordered memory, which keeps the first load before
+ * it, so the first load is still made plain; one through rsp, which stays plain
+ * and could pass it, so the first load stays an acquire.
  */
 #include <pthread.h>
 #include <stdint.h>
@@ -25,7 +28,7 @@
 struct node { int64_t round; };
 
 struct node *g_head;
-int64_t g_data;
+int64_t g_data, g_sink;
 static struct node *nodes;
 static volatile int done;
 
@@ -44,7 +47,7 @@ static void *writer(void *a)
     return NULL;
 }
 
-extern char dep_l1[], dep_l2[], dep_l3[];
+extern char dep_l1[], dep_l2[], dep_l3[], dep_r1[], dep_s1[];
 
 __attribute__((noinline)) static void *reader(void *a)
 {
@@ -66,23 +69,59 @@ __attribute__((noinline)) static void *reader(void *a)
     return (void *)(intptr_t)(bad + (seen ? 0 : 1));
 }
 
+/* The first reader with a release store (rel) or a stack store between its first two loads. */
+__attribute__((noinline)) static void *reader_st(void *a)
+{
+    int rel = a != NULL;
+    long bad = 0, seen = 0;
+#pragma clang loop unroll(disable)
+    while (!done) {
+        int64_t round, data;
+        if (rel)
+            __asm__ volatile(
+                "_dep_r1: movq _g_head(%%rip), %%rax\n\t"
+                "movq %%rax, _g_sink(%%rip)\n\t"
+                "movq (%%rax), %0\n\t"
+                "movq _g_data(%%rip), %1\n\t"
+                : "=&r"(round), "=&r"(data) : : "rax", "memory");
+        else
+            __asm__ volatile(
+                "_dep_s1: movq _g_head(%%rip), %%rax\n\t"
+                "movq %%rax, -8(%%rsp)\n\t"
+                "movq (%%rax), %0\n\t"
+                "movq _g_data(%%rip), %1\n\t"
+                : "=&r"(round), "=&r"(data) : : "rax", "memory");
+        if (round) {
+            seen++;
+            if (data < round) bad++;
+        }
+    }
+    return (void *)(intptr_t)(bad + (seen ? 0 : 1));
+}
+
 int main(void)
 {
     nodes = calloc(ROUNDS + 1, sizeof *nodes);
     static struct node zero;
     g_head = &zero;
-    pthread_t w, r;
-    void *bad;
+    pthread_t w, r, rr, rs;
+    void *bad, *bad_r, *bad_s;
     pthread_create(&r, NULL, reader, NULL);
+    pthread_create(&rr, NULL, reader_st, (void *)1);
+    pthread_create(&rs, NULL, reader_st, NULL);
     pthread_create(&w, NULL, writer, NULL);
     pthread_join(w, NULL);
     pthread_join(r, &bad);
-    if (bad) {
-        printf("dep_order bad=%ld\n", (long)(intptr_t)bad);
+    pthread_join(rr, &bad_r);
+    pthread_join(rs, &bad_s);
+    if (bad || bad_r || bad_s) {
+        printf("dep_order bad=%ld release-store bad=%ld stack-store bad=%ld\n", (long)(intptr_t)bad,
+               (long)(intptr_t)bad_r, (long)(intptr_t)bad_s);
         return 1;
     }
     printf("OK\n");
     fprintf(stderr, "loads %#llx %#llx %#llx\n", (unsigned long long)(uintptr_t)dep_l1,
             (unsigned long long)(uintptr_t)dep_l2, (unsigned long long)(uintptr_t)dep_l3);
+    fprintf(stderr, "stores %#llx %#llx\n", (unsigned long long)(uintptr_t)dep_r1, (unsigned long long)(uintptr_t)dep_s1);
     return 0;
 }
