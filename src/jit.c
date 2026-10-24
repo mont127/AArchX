@@ -19879,11 +19879,23 @@ static uint32_t *g_chain_patched[CHAIN_BATCH_MAX];
 static int g_chain_npatched;
 static int g_chain_batching;
 
+/*
+ * Write access to the arena for this thread, unless a run of loads holds it
+ * open (g_wx_hold, tc_load_ahead): each switch costs about as much as a
+ * record's parse, and a load made three.
+ */
+static int g_wx_hold;
+static void jit_wx(int protect)
+{
+    if (!g_wx_hold)
+        pthread_jit_write_protect_np(protect);
+}
+
 static void chain_batch_begin(void)
 {
     g_chain_npatched = 0;
     g_chain_batching = 1;
-    pthread_jit_write_protect_np(0);
+    jit_wx(0);
 }
 
 /*
@@ -19944,7 +19956,7 @@ static int g_chain_cond;
 
 static void chain_batch_end(void)
 {
-    pthread_jit_write_protect_np(1);
+    jit_wx(1);
     while (g_chain_ndefer && g_chain_npatched < CHAIN_BATCH_MAX)
         g_chain_patched[g_chain_npatched++] = g_chain_defer[--g_chain_ndefer];
     chain_sites_flush(g_chain_patched, g_chain_npatched);
@@ -19996,9 +20008,9 @@ static void chain_cond_short(uint32_t *cond_site, void *dst)
         if (g_chain_npatched < CHAIN_BATCH_MAX) g_chain_patched[g_chain_npatched++] = cond_site;
         else sys_icache_invalidate(cond_site, 4);
     } else {
-        pthread_jit_write_protect_np(0);
+        jit_wx(0);
         *cond_site = nw;
-        pthread_jit_write_protect_np(1);
+        jit_wx(1);
         sys_icache_invalidate(cond_site, 4);
     }
 }
@@ -20047,11 +20059,11 @@ static uint32_t *veneer_make(OcerzJit *jit, const uint32_t *site, const void *ds
         return NULL;
     uint32_t *v = (uint32_t *)((uint8_t *)jit->veneer_pool[best] + jit->veneer_used[best] * VENEER_BYTES);
     uint64_t target = (uint64_t)(uintptr_t)dst;
-    if (!batching) pthread_jit_write_protect_np(0);
+    if (!batching) jit_wx(0);
     v[0] = 0x58000040u | (uint32_t)JTA;
     v[1] = 0xd61f0000u | ((uint32_t)JTA << 5);
     memcpy(&v[2], &target, 8);
-    if (!batching) pthread_jit_write_protect_np(1);
+    if (!batching) jit_wx(1);
     sys_icache_invalidate(v, VENEER_BYTES);
     jit->veneer_used[best]++;
     return v;
@@ -20086,15 +20098,15 @@ static void chain_activate(uint32_t *patch_b, void *dst)
         else
             sys_icache_invalidate(patch_b, 4);
     } else {
-        pthread_jit_write_protect_np(0);
+        jit_wx(0);
         ok = a64_try_patch_b(patch_b, (uint32_t *)dst);
-        pthread_jit_write_protect_np(1);
+        jit_wx(1);
         if (!ok && g_xlat_jit) {
             uint32_t *v = veneer_make(g_xlat_jit, patch_b, dst, 0);
             if (v) {
-                pthread_jit_write_protect_np(0);
+                jit_wx(0);
                 ok = a64_try_patch_b(patch_b, v);
-                pthread_jit_write_protect_np(1);
+                jit_wx(1);
                 veneered = ok;
             }
         }
@@ -22183,6 +22195,7 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
     return bad;
 }
 
+static _Atomic unsigned long long g_tc_n_ahead;
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
 enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
 static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
@@ -22291,9 +22304,9 @@ static void tc_summary(void)
                 (unsigned long long)g_tc_n_pcrel, (unsigned long long)g_tc_n_const,
                 (unsigned long long)g_tc_n_mism, (unsigned long long)g_tc_n_full);
     else
-        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
                          " verify_variant=%llu verify_bad=%llu\n",
-                (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_put,
+                (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_ahead, (unsigned long long)g_tc_n_put,
                 (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
                 (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
     fprintf(g_tc_lf, "ocerz: TCACHE[%d] images asked=%llu in=%llu out=%llu same=%llu variant=%llu unkeepable edge=%llu"
@@ -23015,7 +23028,7 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
             blk->pushelide[i].ra = tc_rip(blk->pushelide[i].ra);
     }
 
-    pthread_jit_write_protect_np(0);
+    jit_wx(0);
     if (!ENV_ON("OCERZ_NO_DISPATCH_STUB")) {
         if (mode32) { if (!jit->dispatch_stub32) emit_dispatch_stub(jit, 1); }
         else        { if (!jit->dispatch_stub)   emit_dispatch_stub(jit, 0); }
@@ -23024,14 +23037,14 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
     uint8_t *pp = (uint8_t *)jit->code_cur;
     uint32_t *c = (uint32_t *)(void *)(pp + (((uintptr_t)r->entry_mod - (uintptr_t)pp) & 63));
     if (jit->code_full || (uint8_t *)(c + words) > (uint8_t *)jit->code_end) {
-        pthread_jit_write_protect_np(1);
+        jit_wx(1);
         tc_free_blk(blk);
         return NULL;
     }
     memcpy(c, v.code, (size_t)words * 4);
 
     if (!tc_bind(jit, blk, c, v.rel, (int)r->n_rel, 1)) {
-        pthread_jit_write_protect_np(1);
+        jit_wx(1);
         tc_free_blk(blk);
         return NULL;
     }
@@ -23039,7 +23052,7 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
     if (fold < 0)
         fold = !getenv("OCERZ_NO_TCACHE_FOLD");
     if (!fold) {
-        pthread_jit_write_protect_np(1);
+        jit_wx(1);
         sys_icache_invalidate(c, (size_t)words * 4);
     }
     jit->code_cur = c + words;
@@ -23093,7 +23106,7 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
     }
     if (!code_index_append_locked(jit, blk)) {
         if (fold)
-            pthread_jit_write_protect_np(1);
+            jit_wx(1);
         blk->code = NULL;
         return NULL;
     }
@@ -23105,15 +23118,14 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
             g_chain_npatched = 0;
             g_chain_batching = 0;
         }
-        pthread_jit_write_protect_np(1);
-        chain_sync_with_defer(c, (size_t)words * 4);
+        chain_sync_with_defer(c, (size_t)words * 4);   /* by address: write access does not matter */
         cache_insert(jit, blk);
         if (!g_no_chain) {
             chain_batch_begin();
             g_chain_cond = 0;
             pending_drain(blk->key, blk);
             if (!g_chain_cond && g_chain_npatched <= CHAIN_BATCH_MAX - g_chain_ndefer) {
-                pthread_jit_write_protect_np(1);
+                jit_wx(1);
                 for (int i = 0; i < g_chain_npatched; i++)
                     g_chain_defer[g_chain_ndefer + i] = g_chain_patched[i];
                 __atomic_store_n(&g_chain_ndefer, g_chain_ndefer + g_chain_npatched, __ATOMIC_RELAXED);
@@ -23123,6 +23135,7 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
                 chain_batch_end();
             }
         }
+        jit_wx(1);
     } else {
         cache_insert(jit, blk);
         blk_chain_install(jit, blk);
@@ -23130,6 +23143,57 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
     g_tc_n_load++;
     tc_prof_note(rip);
     return blk;
+}
+
+/*
+ * After a miss loaded a record the warm thread had decoded, the next ones its
+ * profile names are loaded too, while the JIT lock is held anyway: they are
+ * the blocks the launch ran next last time.  Each such block costs the guest
+ * no trip out of translated code, no lookup, lock or find, and its exits chain
+ * as it goes in.  The same checks as a miss's load: a shared-cache record of
+ * the process's memory model, not loaded yet, nothing learned against it.
+ * OCERZ_TCACHE_AHEAD=<n> loads up to n (32), 0 none.
+ */
+static void tc_load_ahead(OcerzJit *jit)
+{
+    static int max = -1;
+    if (max < 0) { const char *e = getenv("OCERZ_TCACHE_AHEAD"); max = e ? atoi(e) : 8; }
+    int pm = g_plain_mem;
+    uint64_t pk = g_tc_key, plo = g_tc_img_lo, phi = g_tc_img_hi, pid = g_tc_img_id;
+    static int hold = -1;
+    if (hold < 0) hold = getenv("OCERZ_NO_WX_HOLD") ? 0 : 1;
+    if (hold) {
+        pthread_jit_write_protect_np(0);
+        g_wx_hold = 1;
+    }
+    for (int k = 0; k < max; k++) {
+        uint64_t key = 0;
+        OcerzTcRecHead *rec = ocerz_tcache_warm_next(&key);
+        if (!rec)
+            break;
+        uint64_t rip = key & ~OCERZ_TC_KEY_PLAIN, jk = jit_key(rip, 0);
+        int ok = !(key & (OCERZ_TC_KEY_M32 | OCERZ_TC_KEY_IMAGE)) && !cache_lookup(jit, rip, 0) &&
+                 tc_keepable(rip, 0) && !g_tc_img_hi && !al_marked(jk) && !al_marked(jk | AL_BLK_TAG) &&
+                 !cp_marked(jk) && !tc_noload_has(jk);
+        if (ok) {
+            g_plain_mem = jit->plain_mem || ocerz_dyldapi_memfn(rip);
+            ok = tc_key(rip, 0) == key;
+        }
+        if (ok) {
+            g_tc_key = key;
+            g_tc_n_ahead += tc_load(jit, rec, rip, 0) != NULL;
+        }
+        free(rec);
+    }
+    if (hold) {
+        g_wx_hold = 0;
+        pthread_jit_write_protect_np(1);
+    }
+    g_plain_mem = pm;
+    g_tc_key = pk;
+    g_tc_img_lo = plo;
+    g_tc_img_hi = phi;
+    g_tc_img_id = pid;
 }
 
 static void tc_verify_rec(OcerzJit *jit, JitBlock *blk, const TcView *vp);
@@ -23418,6 +23482,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
     }
 
     const OcerzTcRecHead *tc_hit = NULL;
+    int tc_hit_warm = 0;
     int tcm = g_place ? OCERZ_TC_OFF : ocerz_tcache_mode();
     g_tc_rec = 0;
     g_tc_bad = 0;
@@ -23438,6 +23503,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
         uint64_t jk = jit_key(rip, mode32);
         if (!al_marked(jk) && !al_marked(jk | AL_BLK_TAG) && !cp_marked(jk) && !tc_noload_has(jk)) {
             tc_hit = ocerz_tcache_find(g_tc_key);
+            tc_hit_warm = tc_hit && ocerz_tcache_found_warm();
             g_tc_n_ifind += g_tc_img_hi != 0;
             g_tc_n_sfind += !g_tc_img_hi && !ocerz_low_base;
         }
@@ -23455,6 +23521,8 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
                 __atomic_add_fetch(&ocerz_jit_xlat_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
             if (lb) {
                 g_tc_rec = 0;
+                if (tc_hit_warm && !mode32)
+                    tc_load_ahead(jit);
                 return lb;
             }
         }

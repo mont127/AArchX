@@ -83,5 +83,7 @@ void ocerz_tcache_profile_image(const char *path);
 char *ocerz_tcache_profile_images(uint64_t ident);
 char *ocerz_tcache_profile_programs(void);
 char *ocerz_tcache_profile_execs(uint64_t ident);
+OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key);
+int ocerz_tcache_found_warm(void);
 
 #endif

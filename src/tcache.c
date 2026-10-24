@@ -300,7 +300,7 @@ static int env_ignored(const char *kv)
         "OCERZ_TCACHE_MAX_MB=", "OCERZ_TCACHE_MIN_FREE_MB=", "OCERZ_GUESTPROF=", "OCERZ_GUESTPROF_PERIOD=", "OCERZ_LOWBASE=",
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
         "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=", "OCERZ_NO_TCACHE_FOLD=", "OCERZ_NO_TCACHE_SLAB=",
-        "OCERZ_NO_TCACHE_WARM=", "OCERZ_NO_CONT_PLACE=", "OCERZ_EXIT_STOP_ALL=", "OCERZ_AOT_NO_PROFILE_IMAGES=", "OCERZ_NO_INLINE_STMXCSR=",
+        "OCERZ_NO_TCACHE_WARM=", "OCERZ_NO_CONT_PLACE=", "OCERZ_EXIT_STOP_ALL=", "OCERZ_AOT_NO_PROFILE_IMAGES=", "OCERZ_NO_INLINE_STMXCSR=", "OCERZ_TCACHE_AHEAD=", "OCERZ_NO_WX_HOLD=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
@@ -751,6 +751,7 @@ static uint32_t *g_whash;
 static size_t g_nwarm, g_wmask, g_warm_at;
 static int g_warm_on;
 static OcerzTcRecHead *g_warm_last;
+static size_t g_warm_last_i = SIZE_MAX;   /* the warm entry ocerz_tcache_find last handed out */
 
 static const OcerzTcRecHead *warm_take(uint64_t key)
 {
@@ -763,7 +764,39 @@ static const OcerzTcRecHead *warm_take(uint64_t key)
     size_t i = g_whash[j] - 1;
     __atomic_store_n(&g_warm_at, __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
     uintptr_t v = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
+    if (v > 1)
+        g_warm_last_i = i;
     return v > 1 ? (g_warm_last = (OcerzTcRecHead *)v) : NULL;
+}
+
+/* Whether the last ocerz_tcache_find answered from the warm set. */
+int ocerz_tcache_found_warm(void)
+{
+    return g_warm_last_i != SIZE_MAX;
+}
+
+/*
+ * The decoded record the profile names next after the one ocerz_tcache_find
+ * last handed out of the warm set, and its key; the caller owns it (free) and
+ * may take the one after with another call.  NULL once the next is not ready.
+ */
+OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key)
+{
+    OcerzTcRecHead *r = NULL;
+    pthread_mutex_lock(&g_lock);
+    size_t i = g_warm_last_i + 1;
+    if (__atomic_load_n(&g_warm_on, __ATOMIC_ACQUIRE) && g_warm_last_i != SIZE_MAX && i < g_nwarm &&
+        __atomic_load_n(&g_warm[i].st, __ATOMIC_ACQUIRE) > 1) {
+        uintptr_t v = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
+        if (v > 1) {
+            r = (OcerzTcRecHead *)v;
+            *key = g_warm[i].key;
+            g_warm_last_i = i;
+            __atomic_store_n(&g_warm_at, __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return r;
 }
 
 const OcerzTcRecHead *ocerz_tcache_find(uint64_t key)
@@ -772,6 +805,7 @@ const OcerzTcRecHead *ocerz_tcache_find(uint64_t key)
     pthread_mutex_lock(&g_lock);
     free(g_warm_last);
     g_warm_last = NULL;
+    g_warm_last_i = SIZE_MAX;
     if (!(found = warm_take(key)) && open_store()) {
         uint64_t loc = slot_loc(key), no = loc >> TC_LOC_OFF_BITS, off = loc & ((1ull << TC_LOC_OFF_BITS) - 1);
         const TcStored *z = loc ? (const TcStored *)(const void *)file_at(no, off, sizeof *z) : NULL;
