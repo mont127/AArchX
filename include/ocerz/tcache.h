@@ -80,6 +80,7 @@ void ocerz_tcache_profile_note(uint64_t v);
 void ocerz_tcache_profile_note_key(uint64_t key);
 int ocerz_tcache_warm_keys(void);
 int ocerz_tcache_profile_ordered(void);
+size_t ocerz_tcache_profile_entries(void);
 void ocerz_tcache_note_ordered(void);
 void ocerz_tcache_profile_exec(const char *path);
 size_t ocerz_tcache_profile_read(uint64_t ident, const uint8_t *cache_uuid, uint64_t **out);

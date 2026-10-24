@@ -301,7 +301,7 @@ static int env_ignored(const char *kv)
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
         "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=", "OCERZ_NO_TCACHE_FOLD=", "OCERZ_NO_TCACHE_SLAB=",
         "OCERZ_NO_TCACHE_WARM=", "OCERZ_NO_CONT_PLACE=", "OCERZ_EXIT_STOP_ALL=", "OCERZ_AOT_NO_PROFILE_IMAGES=", "OCERZ_TCACHE_AHEAD=", "OCERZ_NO_WX_HOLD=",
-        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=", "OCERZ_NO_TCACHE_PREP=", "OCERZ_NO_TCACHE_KEYS=",
+        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=", "OCERZ_NO_TCACHE_PREP=", "OCERZ_NO_TCACHE_KEYS=", "OCERZ_NO_JIT_PREFAULT=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
@@ -754,6 +754,7 @@ static size_t g_nwarm, g_wmask, g_warm_at;
 static int g_warm_on;
 static OcerzTcRecHead *g_warm_last;
 static int g_pord_start;   /* this launch started ordered: its profile has a .ord (profile_ord_decide) */
+static size_t g_pentries;  /* records the profile names, when it opened (ocerz_tcache_profile_entries) */
 static size_t g_warm_last_i = SIZE_MAX;   /* the warm entry ocerz_tcache_find last handed out */
 static void *g_warm_last_prep;
 static void *(*g_prep_fn)(const OcerzTcRecHead *, uint64_t);
@@ -1515,6 +1516,13 @@ void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid, const 
     g_popen_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     g_popen_pid = getpid();
     g_pord_start = ord[0] && !getenv("OCERZ_NO_TCACHE_ORDSTART") && access(ord, F_OK) == 0;
+    {
+        char keys[1200];
+        struct stat st;
+        profile_keys_name(keys, sizeof keys, g_prips);
+        if ((keys[0] && stat(keys, &st) == 0) || stat(g_prips, &st) == 0)
+            g_pentries = (size_t)st.st_size / 8;
+    }
     if (g_log > 0 && g_pord_start)
         fprintf(stderr, "ocerz: TCACHE[%d] %s: starting ordered\n", (int)getpid(), ord);
     atexit(profile_atexit);
@@ -1526,6 +1534,12 @@ void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid, const 
     if (rips && pthread_create(&t, &at, warm_main, rips) != 0)
         free(rips);
     pthread_attr_destroy(&at);
+}
+
+/* How many records the program's profile names (.keys, else .rips), counted when it opened. */
+size_t ocerz_tcache_profile_entries(void)
+{
+    return g_pentries;
 }
 
 int ocerz_tcache_profile_ordered(void)

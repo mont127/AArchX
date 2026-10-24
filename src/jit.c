@@ -27869,6 +27869,61 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
 }
 
 /*
+ * A JIT page's first touch is a page fault, 2 to 5 us on the M5 for a
+ * zero-filled 16 KB of MAP_JIT memory, and a warm launch writes its code into
+ * fresh pages one after another, tclsh 18 MB of them, and hashes 30k blocks
+ * into an 8 MB bucket table at random: those faults were inside the record
+ * copies and the cache inserts of the guest's thread.  When the program's
+ * profile opens, a thread of its own touches the bucket table and as much of
+ * the arena past code_cur as the profile's records will fill (about 700 bytes
+ * each, at most 64 MB), with an atomic add of 0 to one word of each page, which
+ * leaves whatever the guest's thread writes there meanwhile as it is.
+ * OCERZ_NO_JIT_PREFAULT=1 leaves the faults where they were.
+ */
+typedef struct { uint8_t *lo, *hi, *buckets; size_t nbuckets; } JitPrefault;
+
+static void *jit_prefault_main(void *arg)
+{
+    JitPrefault *pf = (JitPrefault *)arg;
+    for (size_t o = 0; o < pf->nbuckets; o += 16384)
+        __atomic_fetch_add((uint64_t *)(void *)(pf->buckets + o), 0, __ATOMIC_RELAXED);
+    pthread_jit_write_protect_np(0);
+    for (uint8_t *p = pf->lo; p < pf->hi; p += 16384)
+        __atomic_fetch_add((uint32_t *)(void *)p, 0u, __ATOMIC_RELAXED);
+    pthread_jit_write_protect_np(1);
+    free(pf);
+    return NULL;
+}
+
+void ocerz_jit_prefault(struct OcerzVM *vm, size_t records)
+{
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    if (!jit || !records || getenv("OCERZ_NO_JIT_PREFAULT"))
+        return;
+    size_t want = records * 700;
+    if (want > ((size_t)64 << 20))
+        want = (size_t)64 << 20;
+    JitPrefault *pf = (JitPrefault *)malloc(sizeof *pf);
+    if (!pf)
+        return;
+    jl_acquire(__LINE__);
+    uint8_t *lo = (uint8_t *)(((uintptr_t)jit->code_cur + 16383) & ~(uintptr_t)16383);
+    uint8_t *end = (uint8_t *)jit->code_end;
+    pf->lo = lo;
+    pf->hi = lo + want < end ? lo + want : end;
+    pf->buckets = (uint8_t *)(void *)jit->buckets;
+    pf->nbuckets = sizeof jit->buckets;
+    jl_release();
+    pthread_t t;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pf->lo >= pf->hi || pthread_create(&t, &at, jit_prefault_main, pf) != 0)
+        free(pf);
+    pthread_attr_destroy(&at);
+}
+
+/*
  * The program's earlier launches needed ordered memory early (tcache.c,
  * profile_ord_decide), so this one translates ordered from the start, before
  * there is a plain block to throw away; nothing is "required" yet, and the

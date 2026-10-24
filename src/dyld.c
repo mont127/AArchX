@@ -7249,6 +7249,8 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         ocerz_tcache_profile_open(profile_ident(g_main_dimg.slice, g_main_dimg.path), ocerz_cache_uuid(), g_main_dimg.path);
     if (ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled && ocerz_tcache_profile_ordered())
         ocerz_jit_start_ordered(vm);
+    if (ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled)
+        ocerz_jit_prefault(vm, ocerz_tcache_profile_entries());
 
     uint64_t environ_addr = ocerz_cache_resolve(&cache, "_environ");
     if (environ_addr) {
