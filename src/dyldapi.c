@@ -149,10 +149,18 @@ static uint64_t g_objc_init_cb;
 static uint64_t g_objc_init_info;
 static uint64_t *g_objc_dlopen_mapped;
 static int g_objc_dlopen_mapped_n;
+/*
+ * g_objc_dlopen_mapped as a set, and the images whose whole closure libobjc
+ * has been given (objc_closure_done), both the size of g_closure_hash.
+ */
+static uint64_t *g_objc_mapped_hash, *g_objc_cdone_hash;
 
 static uint32_t g_main_bv_platform, g_main_bv_minos, g_main_bv_sdk;
 
 static void hinfo_diag(const char *tag, uint64_t mh);
+static void objc_note_mapped(uint64_t mh);
+static void objc_note_closure_done(uint64_t mh);
+static int in_cache(uint64_t a);
 static void closure_add(uint64_t mh);
 static int hinfo_ro_index(uint64_t mh);
 static uint64_t objc_index_loaded(uint32_t idx);
@@ -955,7 +963,9 @@ int ocerz_dyldapi_setup(struct OcerzCache *cache)
     g_closure_hash = (uint64_t *)calloc(hsz, sizeof *g_closure_hash);
     g_objc_dlopen_mapped = (uint64_t *)calloc((size_t)g_closure_cap,
                                               sizeof *g_objc_dlopen_mapped);
-    if (!g_closure_mh || !g_closure_hash || !g_objc_dlopen_mapped)
+    g_objc_mapped_hash = (uint64_t *)calloc(hsz, sizeof *g_objc_mapped_hash);
+    g_objc_cdone_hash = (uint64_t *)calloc(hsz, sizeof *g_objc_cdone_hash);
+    if (!g_closure_mh || !g_closure_hash || !g_objc_dlopen_mapped || !g_objc_mapped_hash || !g_objc_cdone_hash)
         return OCERZ_ENOMEM;
     g_closure_hash_mask = hsz - 1;
 
@@ -1345,8 +1355,11 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
     }
 
     for (int k = 0; k < n; k++)
-        if (g_objc_dlopen_mapped_n < g_closure_cap)
-            g_objc_dlopen_mapped[g_objc_dlopen_mapped_n++] = mhs[k];
+        objc_note_mapped(mhs[k]);
+    if (n < PRELOAD_MAX)
+        for (int i = 0; i < g_closure_n; i++)
+            if (in_cache(g_closure_mh[i]))
+                objc_note_closure_done(g_closure_mh[i]);
 
     cpu->rip = caller_ret;
     cpu->gpr[OCERZ_RSP] = ret_rsp;
@@ -1356,12 +1369,48 @@ static int api_objc_register_callbacks(struct OcerzVM *vm, OcerzCPU *cpu)
 
 static int objc_image_already_loaded(uint64_t mh)
 {
-    if (!g_objc_dlopen_mapped)
-        return 0;
-    for (int i = 0; i < g_objc_dlopen_mapped_n; i++)
-        if (g_objc_dlopen_mapped[i] == mh)
-            return 1;
-    return 0;
+    return set_has(g_objc_mapped_hash, g_closure_hash_mask, mh);
+}
+
+static void hash_put(uint64_t *seen, unsigned mask, uint64_t mh)
+{
+    if (!seen || !mh || set_has(seen, mask, mh))
+        return;
+    unsigned i = (unsigned)((mh * 0x9E3779B97F4A7C15ull) >> 40) & mask;
+    for (; seen[i]; i = (i + 1) & mask)
+        ;
+    seen[i] = mh;
+}
+
+static void objc_note_mapped(uint64_t mh)
+{
+    if (g_objc_dlopen_mapped_n < g_closure_cap) {
+        g_objc_dlopen_mapped[g_objc_dlopen_mapped_n++] = mh;
+        hash_put(g_objc_mapped_hash, g_closure_hash_mask, mh);
+    }
+}
+
+/*
+ * An image whose closure libobjc has seen in full: every image with ObjC
+ * metadata it reaches has been mapped, so ocerz_dyldapi_objc_map_one has
+ * nothing to send for it.  That holds for each cache image of the launch's
+ * closure once the initial batch went (disk images are added to the closure
+ * without their links, so they never count), and for each image of a walk
+ * once its batch went.  The load phase asked for every image of a launch in
+ * turn, and each walked its whole closure, a few hundred images of path
+ * lookups, to find nothing: 7 ms of a tclsh start.  OCERZ_NO_OBJC_CDONE=1
+ * walks every time.
+ */
+static int objc_closure_done(uint64_t mh)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_OBJC_CDONE") ? 1 : 0;
+    return !off && set_has(g_objc_cdone_hash, g_closure_hash_mask, mh);
+}
+
+static void objc_note_closure_done(uint64_t mh)
+{
+    hash_put(g_objc_cdone_hash, g_closure_hash_mask, mh);
 }
 
 static uint64_t objc_index_loaded(uint32_t idx);
@@ -1434,7 +1483,7 @@ void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
         fprintf(stderr, "ocerz: OBJCMAP1 mh=%#llx cb=%d cache=%d already=%d\n",
                 (unsigned long long)mh, g_objc_mapped_cb ? 1 : 0, g_cache ? 1 : 0,
                 mh ? objc_image_already_loaded(mh) : -1);
-    if (!g_objc_mapped_cb || !mh || !g_cache || objc_image_already_loaded(mh))
+    if (!g_objc_mapped_cb || !mh || !g_cache || objc_image_already_loaded(mh) || objc_closure_done(mh))
         return;
     uint64_t *walk = (uint64_t *)calloc((size_t)g_closure_cap, sizeof *walk);
     uint64_t *seen = (uint64_t *)calloc((size_t)g_closure_hash_mask + 1, sizeof *seen);
@@ -1450,6 +1499,9 @@ void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
         if (!objc_image_already_loaded(walk[i]) &&
             find_section_any(walk[i], "__objc_imageinfo"))
             batch[bn++] = walk[i];
+    for (int i = 0; i < wn; i++)
+        if (in_cache(walk[i]))
+            objc_note_closure_done(walk[i]);
     free(walk);
     free(seen);
     if (getenv("OCERZ_OBJCLOG")) {
@@ -1467,8 +1519,7 @@ void ocerz_dyldapi_objc_map_one(struct OcerzVM *vm, uint64_t mh)
         return;
     }
     for (int k = 0; k < bn; k++)
-        if (g_objc_dlopen_mapped_n < g_closure_cap)
-            g_objc_dlopen_mapped[g_objc_dlopen_mapped_n++] = batch[k];
+        objc_note_mapped(batch[k]);
     objc_drive_map_images(vm, batch, bn);
     free(batch);
 }
