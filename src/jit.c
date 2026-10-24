@@ -3088,8 +3088,21 @@ static int decoded_call_region_entry(uint64_t rip)
     return compatible;
 }
 
+/*
+ * A block of a disk image being recorded keeps only deps inside its image or
+ * the shared cache (tc_img_why), and learning a successor's flags decodes it,
+ * so a successor in another image, the libruby a call from ruby's own code
+ * reaches through its stub, made the block a dep it cannot keep: 451 of ruby's
+ * blocks were translated afresh at every launch.  Such a successor's flags are
+ * taken as live instead.  OCERZ_NO_TCACHE_XIMG_LIVE=1 decodes it as before.
+ */
+static int tc_fixed(uint64_t a);
 static uint64_t xlive_succ_live_d(OcerzJit *jit, uint64_t rip, int depth)
 {
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_TCACHE_XIMG_LIVE") ? 1 : 0;
+    if (!off && g_tc_rec && g_tc_img_hi && !tc_in_img(rip) && !tc_fixed(rip))
+        return OCERZ_FL_ALL;
     JitBlock *t = jit ? cache_lookup(jit, rip, g_xlat_mode32) : NULL;
     if (g_xlive_log < 0) g_xlive_log = getenv("OCERZ_XLIVELOG") ? 1 : 0;
     if (t && t->code && g_xlive_log) fprintf(stderr, "ocerz: XLIVE cached rip=%#llx entry_live=%#x n_insns=%d\n", (unsigned long long)rip, t->entry_live, t->n_insns);
@@ -22325,7 +22338,7 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
 static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words, g_tc_n_prep;
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
 enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
-static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iwarm, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
+static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iwarm, g_tc_n_iahead, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
 static _Atomic unsigned long long g_tc_n_sfind, g_tc_n_sload;
 
 static int tc_fixed(uint64_t a);
@@ -22439,14 +22452,14 @@ static void tc_summary(void)
                 (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
                 (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
     fprintf(g_tc_lf, "ocerz: TCACHE[%d] images asked=%llu in=%llu out=%llu same=%llu variant=%llu unkeepable edge=%llu"
-                     " insn=%llu dep=%llu ras=%llu elide=%llu code=%llu warm=%llu\n",
+                     " insn=%llu dep=%llu ras=%llu elide=%llu code=%llu warm=%llu ahead=%llu\n",
             (int)getpid(), (unsigned long long)g_tc_n_ifind, (unsigned long long)g_tc_n_iload,
             (unsigned long long)g_tc_n_iput,
             (unsigned long long)g_tc_n_ivok, (unsigned long long)g_tc_n_ivvar,
             (unsigned long long)g_tc_n_ibad[TCI_EDGE], (unsigned long long)g_tc_n_ibad[TCI_INSN],
             (unsigned long long)g_tc_n_ibad[TCI_DEP], (unsigned long long)g_tc_n_ibad[TCI_RAS],
             (unsigned long long)g_tc_n_ibad[TCI_ELIDE], (unsigned long long)g_tc_n_ibad[TCI_CODE],
-            (unsigned long long)g_tc_n_iwarm);
+            (unsigned long long)g_tc_n_iwarm, (unsigned long long)g_tc_n_iahead);
     fprintf(g_tc_lf, "ocerz: TCACHE[%d] shared asked=%llu in=%llu\n", (int)getpid(),
             (unsigned long long)g_tc_n_sfind, (unsigned long long)g_tc_n_sload);
     fflush(g_tc_lf);
@@ -23339,8 +23352,9 @@ static JitBlock *tc_build_blk(const TcView *vp, uint64_t rip, int mode32)
 /*
  * A record the warm thread decoded, parsed and built there (tcache.c calls
  * this on its thread, ocerz_tcache_set_prep): a load on the guest's thread
- * then only checks, places, binds, chains and inserts it.  Shared-cache
- * records only, which never move (tc_reloc_begin still checks).
+ * then only checks, places, binds, chains and inserts it.  A disk image's
+ * record is built as kept; its key and the slide to where its image is now
+ * are the load's (tc_load_prepped).
  */
 typedef struct TcPrep {
     TcView v;
@@ -23352,7 +23366,7 @@ static void *tc_prep(const OcerzTcRecHead *h, uint64_t key)
     TcPrep *p = (TcPrep *)malloc(sizeof *p);
     if (!p)
         return NULL;
-    if (!tc_parse(h, &p->v) || p->v.r->img_hi || !(p->blk = tc_build_blk(&p->v, key & ~OCERZ_TC_KEY_PLAIN, 0))) {
+    if (!tc_parse(h, &p->v) || !(p->blk = tc_build_blk(&p->v, key & ~OCERZ_TC_KEY_PLAIN, 0))) {
         free(p);
         return NULL;
     }
@@ -23389,15 +23403,23 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
     return tc_load_built(jit, vp, rip, mode32, NULL);
 }
 
-/* A load of a record tc_prep made: the deps and the image check are the guest thread's, as for any load. */
+/*
+ * A load of a record tc_prep made: the deps and the image check are the guest
+ * thread's, as for any load, and so is what depends on where the record's image
+ * is now, its key and the slide tc_load_built applies (g_tc_rd).
+ */
 static JitBlock *tc_load_prepped(OcerzJit *jit, const OcerzTcRecHead *h, TcPrep *p, uint64_t rip)
 {
     JitBlock *b = NULL;
-    if (!tc_reloc_begin(&p->v, rip) || g_tc_rd || (const void *)p->v.r != (const void *)h) {
+    if (!tc_reloc_begin(&p->v, rip) || (const void *)p->v.r != (const void *)h) {
         g_tc_n_rej++;
         tc_free_blk(p->blk);
-    } else if ((b = tc_load_built(jit, &p->v, rip, 0, p->blk)) && !ocerz_low_base) {
-        g_tc_n_sload++;
+    } else {
+        p->blk->key = jit_key(rip, 0);
+        if ((b = tc_load_built(jit, &p->v, rip, 0, p->blk)) && g_tc_img_hi)
+            g_tc_n_iload++;
+        else if (b && !ocerz_low_base)
+            g_tc_n_sload++;
     }
     g_tc_rlo = g_tc_rhi = g_tc_rd = 0;
     free(p);
@@ -23630,13 +23652,34 @@ static void tc_batch_end(OcerzJit *jit)
 }
 
 /*
+ * Where a disk image's record is now: its first instruction's rip as kept,
+ * moved by however far its image (by identity) is from where it was then.
+ * 0 when that image is not loaded.
+ */
+static uint64_t tc_image_rec_rip(const OcerzTcRecHead *h, const TcPrep *p)
+{
+    TcView v;
+    if (p)
+        v = p->v;
+    else if (!tc_parse(h, &v))
+        return 0;
+    uint64_t lo, hi, at = v.r->flags & TCF_COMPACT ? v.iref[0].rip : v.insns[0].rip;
+    if (!v.r->img_hi || at - v.r->img_lo >= v.r->img_hi - v.r->img_lo ||
+        !ocerz_dyld_image_of_ident(v.r->img_id, &lo, &hi) || hi - lo != v.r->img_hi - v.r->img_lo)
+        return 0;
+    return at - v.r->img_lo + lo;
+}
+
+/*
  * After a miss loaded a record the warm thread had decoded, the next ones its
  * profile names are loaded too, while the JIT lock is held anyway: they are
  * the blocks the launch ran next last time.  Each such block costs the guest
  * no trip out of translated code, no lookup, lock or find, and its exits chain
  * as it goes in.  The same checks as a miss's load: a shared-cache record of
  * the process's memory model, not loaded yet, nothing learned against it.
- * OCERZ_TCACHE_AHEAD=<n> loads up to n (32), 0 none.
+ * A disk image's record is loaded where its image is now (tc_image_rec_rip);
+ * a 32-bit one waits for the translator.
+ * OCERZ_TCACHE_AHEAD=<n> loads up to n (8), 0 none.
  */
 static void tc_load_ahead(OcerzJit *jit)
 {
@@ -23662,9 +23705,11 @@ static void tc_load_ahead(OcerzJit *jit)
         OcerzTcRecHead *rec = ocerz_tcache_warm_next(&key, &prep);
         if (!rec)
             break;
-        uint64_t rip = key & ~OCERZ_TC_KEY_PLAIN, jk = jit_key(rip, 0);
-        int ok = !(key & (OCERZ_TC_KEY_M32 | OCERZ_TC_KEY_IMAGE)) && !cache_lookup(jit, rip, 0) && !tcb_find(jk) &&
-                 tc_keepable(rip, 0) && !g_tc_img_hi && !al_marked(jk) && !al_marked(jk | AL_BLK_TAG) &&
+        int img = (key & OCERZ_TC_KEY_IMAGE) != 0;
+        uint64_t rip = img ? tc_image_rec_rip(rec, (const TcPrep *)prep) : key & ~OCERZ_TC_KEY_PLAIN;
+        uint64_t jk = jit_key(rip, 0);
+        int ok = !(key & OCERZ_TC_KEY_M32) && rip && !cache_lookup(jit, rip, 0) && !tcb_find(jk) &&
+                 tc_keepable(rip, 0) && (g_tc_img_hi != 0) == img && !al_marked(jk) && !al_marked(jk | AL_BLK_TAG) &&
                  !cp_marked(jk) && !tc_noload_has(jk);
         if (ok) {
             g_plain_mem = jit->plain_mem || ocerz_dyldapi_memfn(rip);
@@ -23672,7 +23717,9 @@ static void tc_load_ahead(OcerzJit *jit)
         }
         if (ok) {
             g_tc_key = key;
-            g_tc_n_ahead += (prep ? tc_load_prepped(jit, rec, (TcPrep *)prep, rip) : tc_load(jit, rec, rip, 0)) != NULL;
+            int got = (prep ? tc_load_prepped(jit, rec, (TcPrep *)prep, rip) : tc_load(jit, rec, rip, 0)) != NULL;
+            g_tc_n_ahead += got;
+            g_tc_n_iahead += got && img;
             g_tc_n_prep += prep != NULL;
             prep = NULL;
         }

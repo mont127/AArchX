@@ -823,8 +823,8 @@ OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key, void **prep)
     *prep = NULL;
     pthread_mutex_lock(&g_lock);
     size_t i = g_warm_last_i + 1;
-    while (g_warm_last_i != SIZE_MAX && i < g_nwarm && (g_warm[i].key & (OCERZ_TC_KEY_IMAGE | OCERZ_TC_KEY_M32)))
-        i++;   /* the translator asks for those, in their image's context */
+    while (g_warm_last_i != SIZE_MAX && i < g_nwarm && (g_warm[i].key & OCERZ_TC_KEY_M32))
+        i++;   /* the translator asks for those itself */
     if (__atomic_load_n(&g_warm_on, __ATOMIC_ACQUIRE) && g_warm_last_i != SIZE_MAX && i < g_nwarm &&
         __atomic_load_n(&g_warm[i].st, __ATOMIC_ACQUIRE) > 1) {
         uintptr_t v = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
@@ -1007,7 +1007,7 @@ static void *warm_main(void *arg)
             continue;
         }
         void *(*prep)(const OcerzTcRecHead *, uint64_t) = __atomic_load_n(&g_prep_fn, __ATOMIC_ACQUIRE);
-        g_warm[i].prep = r && prep && !(g_warm[i].key & (OCERZ_TC_KEY_M32 | OCERZ_TC_KEY_IMAGE)) ? prep(r, g_warm[i].key) : NULL;
+        g_warm[i].prep = r && prep && !(g_warm[i].key & OCERZ_TC_KEY_M32) ? prep(r, g_warm[i].key) : NULL;
         if (r && !__atomic_compare_exchange_n(&g_warm[i].st, &zero, (uintptr_t)r, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             warm_drop((uintptr_t)r, g_warm[i].prep);
     }

@@ -34,7 +34,8 @@
  * address in an image that has no symbol table, as a synthesized one has not.
  * ocerz_dyld_image_ident answers, for the translation cache, the extent of the
  * disk image whose segments hold an address and an identity that changes when
- * the file does: its LC_UUID, or its path, size, mtime and load commands.
+ * the file does: its LC_UUID, or its path, size, mtime and load commands, and
+ * ocerz_dyld_image_of_ident where the image with such an identity is now.
  * ocerz_dyld_aot is -aot's loader: the images are mapped and bound as for a
  * launch, no initializer runs, and their code goes to ocerz_jit_aot instead;
  * ocerz_dyld_filetype answers an x86_64 slice's MH_ file type, or -1.
@@ -75,6 +76,7 @@ uint64_t ocerz_dyld_guest_export(const char *install_name, const char *sym, int 
 unsigned ocerz_dyld_generation(void);
 const char *ocerz_dyld_image_overlapping(uint64_t lo, uint64_t hi, int exec_only, uint64_t *base_out);
 int ocerz_dyld_image_ident(uint64_t addr, uint64_t *lo, uint64_t *hi, uint64_t *ident);
+int ocerz_dyld_image_of_ident(uint64_t ident, uint64_t *lo, uint64_t *hi);
 uint64_t ocerz_dyld_trie_resolve(const uint8_t *slice, uint64_t load_base,
                                  const char *sym, int *found);
 extern uint64_t ocerz_exc_trap_rip;

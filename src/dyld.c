@@ -1022,10 +1022,37 @@ static uint64_t ident_mix(uint64_t h, const void *p, size_t n)
     return h;
 }
 
+static uint64_t dimg_tc_ident(DynImage *d);
+
 int ocerz_dyld_image_ident(uint64_t addr, uint64_t *lo, uint64_t *hi, uint64_t *ident)
 {
     DynImage *d = dimg_containing(addr);
-    if (!d || d->is_virtual || !d->slice || d->ext_slice != d->slice || d->ext_slide != d->slide ||
+    uint64_t id = d ? dimg_tc_ident(d) : 0;
+    if (!id)
+        return 0;
+    *lo = d->ext_lo;
+    *hi = d->ext_hi;
+    *ident = id;
+    return 1;
+}
+
+/* The image whose identity ocerz_dyld_image_ident gave as ident, where it is now. */
+int ocerz_dyld_image_of_ident(uint64_t ident, uint64_t *lo, uint64_t *hi)
+{
+    for (int i = -1; ident && i < g_dimgs_n; i++) {
+        DynImage *d = i < 0 ? (g_main_dimg_valid ? &g_main_dimg : NULL) : &g_dimgs[i];
+        if (d && dimg_tc_ident(d) == ident) {
+            *lo = d->ext_lo;
+            *hi = d->ext_hi;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint64_t dimg_tc_ident(DynImage *d)
+{
+    if (d->is_virtual || !d->slice || d->ext_slice != d->slice || d->ext_slide != d->slide ||
         d->ext_hi <= d->ext_lo)
         return 0;
     if (!d->tc_ident) {
@@ -1055,10 +1082,7 @@ int ocerz_dyld_image_ident(uint64_t addr, uint64_t *lo, uint64_t *hi, uint64_t *
         }
         d->tc_ident = h ? h : 1;
     }
-    *lo = d->ext_lo;
-    *hi = d->ext_hi;
-    *ident = d->tc_ident;
-    return 1;
+    return d->tc_ident;
 }
 
 static uint64_t profile_ident(const uint8_t *slice, const char *path)

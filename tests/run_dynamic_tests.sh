@@ -1042,9 +1042,10 @@ run_cpp_file_case dweak_main_first_classic tests/dynamic/weak_main_first.cpp 'OK
 # .keys for the warm thread, one that must load what the first stored, one under
 # OCERZ_TCACHE=verify that must find no block differing from its record except
 # in shape, one under OCERZ_TCACHE=roundtrip that must find no reference its
-# relocations miss, and one more verify with the program and its dylibs moved by
+# relocations miss, one more verify with the program and its dylibs moved by
 # OCERZ_GUEST_SLIDE, so a record of the program's own code is checked at
-# another slide.  The second run of the slid variant must load records of the
+# another slide, and a last plain run at a third slide, whose warm thread
+# hands out and whose loader takes ahead records of an image that moved.  The second run of the slid variant must load records of the
 # program itself (images in=), the low variant's are kept by absolute address.
 run_tcache_case() {
     local name="$1" want_out="$2"
@@ -1055,11 +1056,12 @@ run_tcache_case() {
         echo "FAIL $name (build)"; fail=$((fail+1)); return
     fi
     local i=0 mode log got_code got_out why slide
-    for mode in on on verify roundtrip verify; do
+    for mode in on on verify roundtrip verify on; do
         i=$((i + 1))
         log="$dir/run$i.log"
         slide=0
         [ $i = 5 ] && slide=0x400000
+        [ $i = 6 ] && slide=0x800000
         OCERZ_TCACHE=$mode OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG="$log" OCERZ_TCACHE_MIN_FREE_MB=0 \
             OCERZ_GUEST_SLIDE=$slide run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name"
         got_code=$?
