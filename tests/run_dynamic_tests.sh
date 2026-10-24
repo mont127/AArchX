@@ -1137,6 +1137,58 @@ run_tcache_ord_case() {
 }
 
 run_tcache_ord_case dtcache_ordstart
+# tcache_patch.c against one fresh store: plain, patched (atoi's page made
+# writable and rewritten before the first call, which must reach the patch;
+# with nothing loaded ahead, so atoi's record is found at that call, after the
+# patch), then "wait" five times, each from the store the patched run left: the
+# program sleeps until the warm thread has read every record and the next miss
+# loads all of them ahead, the patched atoi's too, whose dep in the program
+# (where the patched run had it) faults in its deps check inside the run of
+# loads, which must leave the JIT's pages writable.  Whether atoi's record is
+# among the ones loaded ahead depends on what loaded before the sleep (about
+# half the time), hence five tries.  A copy on APFS is a clone whose pages
+# are not in memory, which leaves the warm thread behind the program and loads
+# far fewer records ahead, so each copy is read through first.
+run_tcache_patch_case() {
+    local name="$1" dir="$TMP/$1" i arg why
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -O1 -o "$dir/$name" tests/dynamic/tcache_patch.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    for i in 1 2 3 4 5 6 7; do
+        arg=wait
+        [ $i = 1 ] && arg=plain
+        [ $i = 2 ] && arg=patch
+        if [ $i = 2 ]; then
+            OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_MIN_FREE_MB=0 \
+                OCERZ_TCACHE_AHEAD=0 OCERZ_NO_TCACHE_WARM=1 \
+                run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name" $arg
+            rm -rf "$dir/patched"
+            cp -R "$dir/store" "$dir/patched"
+        elif [ $i = 1 ]; then
+            OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_MIN_FREE_MB=0 \
+                run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name" $arg
+        else
+            rm -rf "$dir/store"
+            cp -R "$dir/patched" "$dir/store"
+            cat "$dir/store"/*/* >/dev/null
+            OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_MIN_FREE_MB=0 \
+                OCERZ_TCACHE_AHEAD=100000 \
+                run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name" $arg
+        fi
+        why=""
+        if [ "$(cat "$dir/run$i.out")" != OK ]; then
+            why="got out='$(cat "$dir/run$i.out")' $(grep -h 'guest crash' "$dir/run$i.err" | head -1)"
+        fi
+        if [ -z "$why" ]; then
+            echo "PASS $name-$i-$arg"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$i-$arg ($why)"; fail=$((fail+1))
+        fi
+    done
+}
+
+run_tcache_patch_case dtcache_patch
 run_tcache_case dtcache_low 'OK' -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000
 # ocerz -aot fills a fresh store with tcache_work's own code without running
 # it; the launch after it, at another slide, must print OK and find every block

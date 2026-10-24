@@ -23722,9 +23722,13 @@ static void tc_load_ahead(OcerzJit *jit)
     uint64_t pk = g_tc_key, plo = g_tc_img_lo, phi = g_tc_img_hi, pid = g_tc_img_id;
     static int hold = -1;
     if (hold < 0) hold = getenv("OCERZ_NO_WX_HOLD") ? 0 : 1;
+    /* a deps check that faults (a dep in an image now mapped elsewhere) leaves
+       through ocerz_jit_decode_recover, so the handler must reopen the pages */
+    int pwo = ocerz_jit_wx_open;
     if (hold) {
         pthread_jit_write_protect_np(0);
         g_wx_hold = 1;
+        ocerz_jit_wx_open = 1;
     }
     static int batch = -1;
     if (batch < 0) batch = getenv("OCERZ_NO_TCACHE_BATCH") ? 0 : 1;
@@ -23763,6 +23767,7 @@ static void tc_load_ahead(OcerzJit *jit)
     g_tcb_on = 0;
     g_tc_from_profile = 0;
     if (hold) {
+        ocerz_jit_wx_open = pwo;
         g_wx_hold = 0;
         pthread_jit_write_protect_np(1);
     }
