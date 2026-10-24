@@ -18345,7 +18345,8 @@ static uint32_t cont_reserve(uint64_t retaddr)
     if (fixed > 1) {
         return (uint32_t)fixed;
     } else if (s && s->code && s->body_code && s->pin_class == 3) {
-        w = s->code_words - (uint32_t)(s->body_code - blk_base(s)) + 24;
+        /* a placed copy cannot share the epilogue its model shares (epi_share) */
+        w = s->code_words - (uint32_t)(s->body_code - blk_base(s)) + 24 + (s->epi_shared ? s->epi_w - 1u : 0u);
     } else {
         int n = cont_predecode(retaddr);
         if (!n)
