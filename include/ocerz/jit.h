@@ -61,6 +61,7 @@ int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc
 void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu);
 
 void ocerz_jit_require_ordered(struct OcerzVM *vm);
+void ocerz_jit_start_ordered(struct OcerzVM *vm);
 void ocerz_jit_invalidate_all(struct OcerzVM *vm);
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len);
 extern uint64_t ocerz_jit_retire_count;

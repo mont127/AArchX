@@ -826,6 +826,8 @@
 #include "ocerz/m32.h"
 
 #include <sys/mman.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 #include <mach/mach_time.h>
 #include <mach/thread_act.h>
 #include <mach/mach_init.h>
@@ -22487,6 +22489,19 @@ static uint32_t *tc_roundtrip(OcerzJit *jit, JitBlock *blk, uint32_t *entry)
     return c;
 }
 
+/* The records tc_load_ahead loads in one go, not in the cache yet (tc_batch_end). */
+#define TC_BATCH_MAX 64
+static JitBlock *g_tcb_blk[TC_BATCH_MAX];
+static int g_tcb_n, g_tcb_on;
+
+static JitBlock *tcb_find(uint64_t key)
+{
+    for (int i = 0; i < g_tcb_n; i++)
+        if (g_tcb_blk[i]->key == key)
+            return g_tcb_blk[i];
+    return NULL;
+}
+
 static void blk_chain_edges(OcerzJit *jit, JitBlock *blk)
 {
     for (int i = 0; i < blk->n_edges; i++) {
@@ -22495,6 +22510,8 @@ static void blk_chain_edges(OcerzJit *jit, JitBlock *blk)
         uint32_t *cs = blk->edges[i].probing ? NULL : blk->edges[i].cond_site;
         uint64_t tk = jit_key(blk->edges[i].target_rip, blk_mode32(blk));
         JitBlock *t = tk == blk->key ? blk : cache_lookup(jit, blk->edges[i].target_rip, blk_mode32(blk));
+        if (!t && g_tcb_n)
+            t = tcb_find(tk);
         if (t && t->code) {
             void *dst = (void *)t->code;
             if (blk->edges[i].kind == EDGE_BODY) {
@@ -23372,6 +23389,13 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
         blk->code = NULL;
         return NULL;
     }
+    if (fold && g_tcb_on && g_tcb_n < TC_BATCH_MAX) {
+        jit_wx(1);
+        g_tcb_blk[g_tcb_n++] = blk;
+        g_tc_n_load++;
+        tc_prof_note(rip);
+        return blk;
+    }
     if (fold) {
         if (!g_no_chain) {
             g_chain_npatched = 0;
@@ -23408,6 +23432,58 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
 }
 
 /*
+ * The end of a batch tc_load_ahead loaded: the blocks chain to each other and
+ * to what is in the cache, then one barrier pair makes all of their words and
+ * the chain words older loads deferred visible to instruction fetch, where
+ * each block paid its own (half of an 860-byte block's sync is the two
+ * barriers, 190 ns against 80 without them), and only then do they go into
+ * the cache, where another thread's dispatch can find them, and patch the
+ * exits waiting for them (the words of those, one more pair).
+ */
+static void tc_batch_end(OcerzJit *jit)
+{
+    int n = g_tcb_n;
+    if (!n)
+        return;
+    if (!g_no_chain) {
+        chain_batch_begin();
+        for (int i = 0; i < n; i++) {
+            g_chain_npatched = 0;   /* all inside the batch's own words */
+            blk_chain_edges(jit, g_tcb_blk[i]);
+        }
+        g_chain_npatched = 0;
+        g_chain_batching = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        uintptr_t lo = (uintptr_t)g_tcb_blk[i]->code & ~(uintptr_t)63, hi = (uintptr_t)g_tcb_blk[i]->code + g_tcb_blk[i]->code_words * 4u;
+        for (uintptr_t a = lo; a < hi; a += 64)
+            __asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
+    }
+    for (int i = 0; i < g_chain_ndefer; i++)
+        __asm__ volatile("dc cvau, %0" :: "r"(g_chain_defer[i]) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (int i = 0; i < n; i++) {
+        uintptr_t lo = (uintptr_t)g_tcb_blk[i]->code & ~(uintptr_t)63, hi = (uintptr_t)g_tcb_blk[i]->code + g_tcb_blk[i]->code_words * 4u;
+        for (uintptr_t a = lo; a < hi; a += 64)
+            __asm__ volatile("ic ivau, %0" :: "r"(a) : "memory");
+    }
+    for (int i = 0; i < g_chain_ndefer; i++)
+        __asm__ volatile("ic ivau, %0" :: "r"(g_chain_defer[i]) : "memory");
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+    __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
+    g_tcb_n = 0;
+    for (int i = 0; i < n; i++)
+        cache_insert(jit, g_tcb_blk[i]);
+    if (!g_no_chain) {
+        chain_batch_begin();
+        for (int i = 0; i < n; i++)
+            pending_drain(g_tcb_blk[i]->key, g_tcb_blk[i]);
+        chain_batch_end();
+    }
+    jit_wx(1);
+}
+
+/*
  * After a miss loaded a record the warm thread had decoded, the next ones its
  * profile names are loaded too, while the JIT lock is held anyway: they are
  * the blocks the launch ran next last time.  Each such block costs the guest
@@ -23428,13 +23504,18 @@ static void tc_load_ahead(OcerzJit *jit)
         pthread_jit_write_protect_np(0);
         g_wx_hold = 1;
     }
+    static int batch = -1;
+    if (batch < 0) batch = getenv("OCERZ_NO_TCACHE_BATCH") ? 0 : 1;
+    g_tcb_on = batch;
     for (int k = 0; k < max; k++) {
         uint64_t key = 0;
+        if (g_tcb_n == TC_BATCH_MAX)
+            tc_batch_end(jit);
         OcerzTcRecHead *rec = ocerz_tcache_warm_next(&key);
         if (!rec)
             break;
         uint64_t rip = key & ~OCERZ_TC_KEY_PLAIN, jk = jit_key(rip, 0);
-        int ok = !(key & (OCERZ_TC_KEY_M32 | OCERZ_TC_KEY_IMAGE)) && !cache_lookup(jit, rip, 0) &&
+        int ok = !(key & (OCERZ_TC_KEY_M32 | OCERZ_TC_KEY_IMAGE)) && !cache_lookup(jit, rip, 0) && !tcb_find(jk) &&
                  tc_keepable(rip, 0) && !g_tc_img_hi && !al_marked(jk) && !al_marked(jk | AL_BLK_TAG) &&
                  !cp_marked(jk) && !tc_noload_has(jk);
         if (ok) {
@@ -23447,6 +23528,8 @@ static void tc_load_ahead(OcerzJit *jit)
         }
         free(rec);
     }
+    tc_batch_end(jit);
+    g_tcb_on = 0;
     if (hold) {
         g_wx_hold = 0;
         pthread_jit_write_protect_np(1);
@@ -27528,10 +27611,21 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
     if (!vm)
         return;
     if (ENV_ON("OCERZ_ORDERLOG") && !vm->jit_ordered_required) {
-        fprintf(stderr, "ocerz: ORDERED memory required from here (caller %p)\n", __builtin_return_address(0));
+        struct kinfo_proc kp;
+        size_t kl = sizeof kp;
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        double ms = sysctl(mib, 4, &kp, &kl, NULL, 0) == 0
+                        ? (now.tv_sec - kp.kp_proc.p_starttime.tv_sec) * 1e3 + (now.tv_usec - kp.kp_proc.p_starttime.tv_usec) / 1e3
+                        : -1;
+        fprintf(stderr, "ocerz: ORDERED memory required from here (caller %p, %.1f ms into the process)\n",
+                __builtin_return_address(0), ms);
         void *bt[8]; int n = backtrace(bt, 8); backtrace_symbols_fd(bt, n, 2);
     }
 
+    if (!vm->jit_ordered_required)
+        ocerz_tcache_note_ordered();
     vm->jit_ordered_required = 1;
     vm->jit_plain_mem = 0;
 
@@ -27549,6 +27643,31 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
     }
     jl_release();
 
+    ocerz_vm_purge_jit_ras(vm);
+}
+
+/*
+ * The program's earlier launches needed ordered memory early (tcache.c,
+ * profile_ord_decide), so this one translates ordered from the start, before
+ * there is a plain block to throw away; nothing is "required" yet, and the
+ * event that requires it later finds the model already in place.
+ */
+void ocerz_jit_start_ordered(struct OcerzVM *vm)
+{
+    if (!vm)
+        return;
+    vm->jit_plain_mem = 0;
+    OcerzJit *jit = vm->jit;
+    if (!jit)
+        return;
+    jl_acquire(__LINE__);
+    if (jit->plain_mem) {
+        jit->plain_mem = 0;
+        g_plain_mem = 0;
+        if (jit->n_live)   /* none yet at the profile's opening: the tables need no clearing */
+            invalidate_all_locked(jit);
+    }
+    jl_release();
     ocerz_vm_purge_jit_ras(vm);
 }
 

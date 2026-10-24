@@ -77,6 +77,8 @@ const char *ocerz_tcache_dir(int for_write);
 int ocerz_tcache_room(void);
 void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid, const char *path);
 void ocerz_tcache_profile_note(uint64_t v);
+int ocerz_tcache_profile_ordered(void);
+void ocerz_tcache_note_ordered(void);
 void ocerz_tcache_profile_exec(const char *path);
 size_t ocerz_tcache_profile_read(uint64_t ident, const uint8_t *cache_uuid, uint64_t **out);
 void ocerz_tcache_profile_image(const char *path);

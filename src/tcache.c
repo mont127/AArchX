@@ -300,7 +300,8 @@ static int env_ignored(const char *kv)
         "OCERZ_TCACHE_MAX_MB=", "OCERZ_TCACHE_MIN_FREE_MB=", "OCERZ_GUESTPROF=", "OCERZ_GUESTPROF_PERIOD=", "OCERZ_LOWBASE=",
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
         "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=", "OCERZ_NO_TCACHE_FOLD=", "OCERZ_NO_TCACHE_SLAB=",
-        "OCERZ_NO_TCACHE_WARM=", "OCERZ_NO_CONT_PLACE=", "OCERZ_EXIT_STOP_ALL=", "OCERZ_AOT_NO_PROFILE_IMAGES=", "OCERZ_NO_INLINE_STMXCSR=", "OCERZ_TCACHE_AHEAD=", "OCERZ_NO_WX_HOLD=",
+        "OCERZ_NO_TCACHE_WARM=", "OCERZ_NO_CONT_PLACE=", "OCERZ_EXIT_STOP_ALL=", "OCERZ_AOT_NO_PROFILE_IMAGES=", "OCERZ_TCACHE_AHEAD=", "OCERZ_NO_WX_HOLD=",
+        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
@@ -751,6 +752,7 @@ static uint32_t *g_whash;
 static size_t g_nwarm, g_wmask, g_warm_at;
 static int g_warm_on;
 static OcerzTcRecHead *g_warm_last;
+static int g_pord_start;   /* this launch started ordered: its profile has a .ord (profile_ord_decide) */
 static size_t g_warm_last_i = SIZE_MAX;   /* the warm entry ocerz_tcache_find last handed out */
 
 static const OcerzTcRecHead *warm_take(uint64_t key)
@@ -880,6 +882,8 @@ static size_t warm_build(const char *path)
         uint64_t m = v[i] & (OCERZ_TC_PROF_PLAIN | OCERZ_TC_PROF_ORDERED);
         if (m != OCERZ_TC_PROF_PLAIN && m != OCERZ_TC_PROF_ORDERED)
             continue;
+        if (g_pord_start)
+            m = OCERZ_TC_PROF_ORDERED;   /* the launch runs ordered from the start */
         uint64_t key = (v[i] & OCERZ_TC_PROF_RIP) | (m == OCERZ_TC_PROF_PLAIN ? OCERZ_TC_KEY_PLAIN : 0);
         size_t j = (size_t)(slot_hash(key) & g_wmask);
         while (g_whash[j] && g_warm[g_whash[j] - 1].key != key) j = (j + 1) & g_wmask;
@@ -1172,6 +1176,18 @@ static void profile_rips_name(char *out, size_t n, uint64_t ident, const uint8_t
         out[0] = 0;
 }
 
+/* <profile>.ord beside <profile>.rips: the program needs ordered memory early (profile_ord_decide). */
+static void profile_ord_name(char *out, size_t n, const char *rips)
+{
+    size_t l = strlen(rips);
+    if (l < 5 || l + 1 > n || strcmp(rips + l - 5, ".rips")) {
+        out[0] = 0;
+        return;
+    }
+    memcpy(out, rips, l - 5);
+    memcpy(out + l - 5, ".ord", 5);
+}
+
 static void profile_execs_name(char *out, size_t n, uint64_t ident)
 {
     char leaf[40];
@@ -1252,6 +1268,10 @@ static char g_prips[1200];
 static char **g_pimg;                       /* the disk images this process loaded, for .images */
 static size_t g_pimg_n, g_pimg_cap, g_pimg_written;
 static char g_ppath[1024];                  /* the main executable, for .path, until it is written */
+static int g_pord_done;                     /* .ord was decided */
+static int64_t g_pord_ms = -1;              /* when the program first needed ordered memory, ms into its profile */
+static uint64_t g_popen_ns;
+static pid_t g_popen_pid;
 
 static int pset_add(uint64_t **set, size_t *cap, size_t *n, uint64_t v)
 {
@@ -1288,9 +1308,44 @@ static int pset_has(const uint64_t *set, size_t cap, uint64_t v)
     return set[j] != 0;
 }
 
+/*
+ * A program that went ordered within ORD_EARLY_MS of its profile opening
+ * (tclsh registers a workqueue at 26 ms, ruby forks uname at 34) leaves a
+ * .ord beside its profile, and its next launch starts ordered
+ * (ocerz_tcache_profile_ordered): it had run 12.2k plain blocks, every one
+ * of which the switch threw away, and 5.7k of them were loaded again
+ * ordered.  A launch that started so and then needed ordered memory late
+ * or never takes the file away again.  A forked child decides nothing; its
+ * parent does.
+ */
+#define ORD_EARLY_MS 100
+
+static void profile_ord_decide(void)
+{
+    if (g_pord_done || !g_prips[0] || !g_popen_ns || g_popen_pid != getpid())
+        return;
+    g_pord_done = 1;
+    int want = g_pord_ms >= 0 && g_pord_ms <= ORD_EARLY_MS;
+    char ord[1200], dir[1200];
+    profile_ord_name(ord, sizeof ord, g_prips);
+    if (want == g_pord_start || !ord[0] || getenv("OCERZ_NO_TCACHE_ORDSTART"))
+        return;
+    if (!want)
+        (void)unlink(ord);
+    else if (profile_path(dir, sizeof dir, NULL) && mkdirs(dir) == 0) {
+        int fd = open(ord, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+        if (fd >= 0)
+            close(fd);
+    }
+    if (g_log > 0)
+        fprintf(stderr, "ocerz: TCACHE[%d] %s %s (ordered at %lld ms)\n", (int)getpid(), want ? "wrote" : "removed", ord,
+                (long long)g_pord_ms);
+}
+
 static void profile_write(void)
 {
     os_unfair_lock_lock(&g_plock);
+    profile_ord_decide();
     if (g_prips[0] && g_pident && g_ppath[0]) {
         char leaf[40], name[1200], dir[1200];
         snprintf(leaf, sizeof leaf, "%016llx.path", (unsigned long long)g_pident);
@@ -1374,6 +1429,13 @@ void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid, const 
     os_unfair_lock_unlock(&g_plock);
     if (!first || !g_prips[0])
         return;
+    char ord[1200];
+    profile_ord_name(ord, sizeof ord, g_prips);
+    g_popen_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    g_popen_pid = getpid();
+    g_pord_start = ord[0] && !getenv("OCERZ_NO_TCACHE_ORDSTART") && access(ord, F_OK) == 0;
+    if (g_log > 0 && g_pord_start)
+        fprintf(stderr, "ocerz: TCACHE[%d] %s: starting ordered\n", (int)getpid(), ord);
     atexit(profile_atexit);
     char *rips = getenv("OCERZ_NO_TCACHE_WARM") ? NULL : strdup(g_prips);
     pthread_t t;
@@ -1383,6 +1445,17 @@ void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid, const 
     if (rips && pthread_create(&t, &at, warm_main, rips) != 0)
         free(rips);
     pthread_attr_destroy(&at);
+}
+
+int ocerz_tcache_profile_ordered(void)
+{
+    return g_pord_start;
+}
+
+void ocerz_tcache_note_ordered(void)
+{
+    if (g_popen_ns && g_pord_ms < 0)
+        g_pord_ms = (int64_t)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_popen_ns) / 1000000);
 }
 
 void ocerz_tcache_profile_note(uint64_t v)
@@ -1541,6 +1614,12 @@ size_t ocerz_tcache_profile_read(uint64_t ident, const uint8_t *cache_uuid, uint
     }
     if (fd >= 0)
         close(fd);
+    char ord[1200];
+    profile_ord_name(ord, sizeof ord, name);
+    if (n && ord[0] && access(ord, F_OK) == 0)
+        for (size_t i = 0; i < n; i++)
+            if ((*out)[i] & OCERZ_TC_PROF_PLAIN)
+                (*out)[i] = ((*out)[i] & ~OCERZ_TC_PROF_PLAIN) | OCERZ_TC_PROF_ORDERED;
     return n;
 }
 

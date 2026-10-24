@@ -1085,6 +1085,41 @@ run_tcache_case() {
 }
 
 run_tcache_case dtcache 'OK'
+# tcache_ordstart.c four times against one fresh store: a launch with a thread
+# made at once must leave a .ord beside its profile, the next must start
+# ordered, a "single" launch must take the note away and the one after it
+# must start plain.
+run_tcache_ord_case() {
+    local name="$1" dir="$TMP/$1" i arg want why
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -O1 -o "$dir/$name" tests/dynamic/tcache_ordstart.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    for i in 1 2 3 4; do
+        arg=threads
+        [ $i -ge 3 ] && arg=single
+        OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_MIN_FREE_MB=0 \
+            run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name" $arg
+        why=""
+        if [ "$(cat "$dir/run$i.out")" != OK ]; then
+            why="got out='$(cat "$dir/run$i.out")'"
+        else
+            case $i in
+                1) grep -q 'TCACHE.* wrote .*\.ord' "$dir/run$i.err" || why="no .ord written" ;;
+                2) grep -q 'starting ordered' "$dir/run$i.err" || why="did not start ordered" ;;
+                3) grep -q 'TCACHE.* removed .*\.ord' "$dir/run$i.err" || why="the .ord was not removed" ;;
+                4) ! grep -q 'starting ordered' "$dir/run$i.err" || why="started ordered with no .ord" ;;
+            esac
+        fi
+        if [ -z "$why" ]; then
+            echo "PASS $name-$i-$arg"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$i-$arg ($why)"; fail=$((fail+1))
+        fi
+    done
+}
+
+run_tcache_ord_case dtcache_ordstart
 run_tcache_case dtcache_low 'OK' -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000
 # ocerz -aot fills a fresh store with tcache_work's own code without running
 # it; the launch after it, at another slide, must print OK and find every block
