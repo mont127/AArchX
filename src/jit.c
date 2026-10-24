@@ -2674,6 +2674,7 @@ static void jit_table_full(const char *what)
 }
 static uint64_t xlive_decode_entry_d(uint64_t rip, int depth);
 static uint64_t xlive_resolve(uint64_t live, const X86Insn *insns, int upto);
+static int jmp_reg_flags_dead(const X86Insn *insns, int n);
 static int ret_flags_live_at(uint64_t rip);
 static int g_xlive_log = -1;
 /*
@@ -2927,6 +2928,8 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
             live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1);
         else if (t->op == OCERZ_OP_JMP && !t->mode32 && slot_value_now(&t->ops[0], &slot_to))
             live = xlive_succ_live_d(g_xlat_jit, slot_to, depth + 1);
+        else if (jmp_reg_flags_dead(insns, n))
+            live = 0;
         else if (t->op == OCERZ_OP_JCC && t->ops[0].kind == OCERZ_OPK_IMM)
             live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1) |
                    xlive_succ_live_d(g_xlat_jit, t->rip + t->len, depth + 1);
@@ -7790,9 +7793,27 @@ static int nzcv_gap_load(const X86Insn *in)
     default: return 0;
     }
 }
+/*
+ * A side exit reading the producer's flags may sit in the window too: cmp,
+ * je to one place, jb to another is how compilers write a three-way branch,
+ * and the second jcc read the flags back from a record the first one's fall
+ * through had to store (bzip2's sort loop, a byte compare against a pointer).
+ * Its translation is a b.cond on the forwarded NZCV, which keeps it, so the
+ * window carries on past it (nzcv_gap_ok says when).  OCERZ_NO_NZCV_JCC_GAP=1
+ * ends the window at a jcc again.
+ */
+static int nzcv_jcc_gap_on(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_NZCV_JCC_GAP") ? 1 : 0;
+    return !off;
+}
+static int fpb_class(const X86Insn *in, int *packed, int *dbl, int *from_mem, int *sqrt_like);
 static int nzcv_gap_shape(const X86Insn *in)
 {
     if (nzcv_gap_max() == 0) return 0;
+    if (in->op == OCERZ_OP_JCC)
+        return nzcv_jcc_gap_on() && in->ops[0].kind == OCERZ_OPK_IMM && !in->mode32 && g_pin_class == 3;
     if (in->op == OCERZ_OP_CMOVCC) {
         const X86Operand *d = &in->ops[0], *sr = &in->ops[1];
         return d->kind == OCERZ_OPK_REG && !d->high8 && (d->size == 4 || d->size == 8) &&
@@ -7810,7 +7831,14 @@ static int nzcv_dc_for(unsigned kind, unsigned cc);
 static int nzcv_gap_ok(const X86Insn *insns, int m, int k)
 {
     const X86Insn *in = &insns[m];
-    if (in->op == OCERZ_OP_CMOVCC || in->op == OCERZ_OP_SETCC) {
+    if (in->op == OCERZ_OP_JCC) {
+        /* no FP batch can be open: one checks its NaNs at a side exit, with a compare */
+        for (int j = 0; j < m; j++) {
+            int pk, dbl, fm, sq;
+            if (fpb_class(&insns[j], &pk, &dbl, &fm, &sq) > 0) return 0;
+        }
+    }
+    if (in->op == OCERZ_OP_CMOVCC || in->op == OCERZ_OP_SETCC || in->op == OCERZ_OP_JCC) {
         if (!nzcv_gap_shape(in)) return 0;
         if (nzcv_fuse_producer(insns, m) != k) return 0;
         const X86Insn *p = &insns[k];
@@ -16372,6 +16400,22 @@ static int can_fuse_cmp_test_jcc(const X86Insn *producer,
 static int flag_neutral_ok(const X86Insn *in);
 static int jcc_gap_ok(const X86Insn *in);
 static int insn_writes_reg(const X86Insn *in, unsigned reg);
+/*
+ * Whether a consumer after the jcc at j takes producer k's NZCV through it
+ * (nzcv_gap_ok): then k and that jcc are not fused into one compare-and-exit,
+ * which may test a register (cbz, tbz) and leaves no forwarding state, but
+ * emitted as a compare whose NZCV the jcc and the consumer both branch on.
+ */
+static int nzcv_producer_of(const X86Insn *insns, int ci);
+static int nzcv_forwards_past(const X86Insn *insns, int k, int j, int n)
+{
+    if (!nzcv_jcc_gap_on())
+        return 0;
+    for (int c = j + 1; c < n && c <= j + NZCV_GAP_MAX + 1; c++)
+        if (nzcv_producer_of(insns, c) == k)
+            return 1;
+    return 0;
+}
 static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)
 {
     if (g_xlat_mode32)
@@ -16387,6 +16431,7 @@ static int side_gap_fuse_ok(const X86Insn *insns, int i, int n)
     if (!jcc_gap_ok(&insns[i + 1])) return 0;
     if (p->ops[0].kind == OCERZ_OPK_REG && insn_writes_reg(&insns[i + 1], p->ops[0].reg)) return 0;
     if (p->ops[1].kind == OCERZ_OPK_REG && insn_writes_reg(&insns[i + 1], p->ops[1].reg)) return 0;
+    if (nzcv_forwards_past(insns, i, i + 2, n)) return 0;
     return 1;
 }
 static int side_fuse_ok(const X86Insn *insns, int i, int n)
@@ -16401,6 +16446,7 @@ static int side_fuse_ok(const X86Insn *insns, int i, int n)
     if (!g_defer || j->ops[0].kind != OCERZ_OPK_IMM || j->ops[0].imm == g_self_rip) return 0;
     if (!can_fuse_cmp_test_jcc(p, j, g_self_rip)) return 0;
     if (p->addrsize != 8) return 0;
+    if (nzcv_forwards_past(insns, i, i + 1, n)) return 0;
     return 1;
 }
 static int insn_writes_reg(const X86Insn *in, unsigned reg)
@@ -21856,6 +21902,35 @@ static int ret_flags_live_at(uint64_t rip)
     return ret_flags_live();
 }
 
+static int ret_flag_producer(unsigned op);
+static int insn_writes_reg(const X86Insn *in, unsigned reg);
+/*
+ * Flags at a jmp through a register that the block's last flag writer
+ * computed: they come from working out the target (movsxd rax, [table+idx*4];
+ * add rax, table; jmp rax), so nothing at any of its targets can mean them.
+ * SQLite's VM switch stored the add's record before every opcode it
+ * dispatched.  Flags from a compare or test before such a jmp, or from any
+ * writer of some other register, stay live, as they may be an answer.
+ * OCERZ_NO_JMPREG_FLAGS_DEAD=1 keeps them all live.
+ */
+static int jmp_reg_flags_dead(const X86Insn *insns, int n)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_JMPREG_FLAGS_DEAD") ? 1 : 0;
+    const X86Insn *t = &insns[n - 1];
+    if (off || t->op != OCERZ_OP_JMP || t->ops[0].kind != OCERZ_OPK_REG || t->ops[0].high8 || t->mode32)
+        return 0;
+    for (int k = n - 2; k >= 0; k--) {
+        uint64_t def, use;
+        ocerz_flags_defuse(&insns[k], &def, &use);
+        if (!(def & JIT_ARITH_FLAGS))
+            continue;
+        return (def & JIT_ARITH_FLAGS) == JIT_ARITH_FLAGS && !ret_flag_producer(insns[k].op) &&
+               insns[k].ops[0].size == 8 && insn_writes_reg(&insns[k], t->ops[0].reg);
+    }
+    return 0;
+}
+
 /* Whether an instruction that writes the flags may be returning an answer in them (ret_seam_live). */
 static int ret_flag_producer(unsigned op)
 {
@@ -24139,6 +24214,8 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
                 seam_seed = xlive_succ_live(jit, term->ops[0].imm);
             else if (!mode32 && slot_value_now(&term->ops[0], &slot_to))
                 seam_seed = xlive_succ_live(jit, slot_to);
+            else if (jmp_reg_flags_dead(blk->insns, n))
+                seam_seed = 0;
             break;
         }
         case OCERZ_OP_JCC: {
