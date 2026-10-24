@@ -22280,7 +22280,7 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
     return bad;
 }
 
-static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words;
+static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words, g_tc_n_prep;
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
 enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
 static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
@@ -22390,10 +22390,10 @@ static void tc_summary(void)
                 (unsigned long long)g_tc_n_pcrel, (unsigned long long)g_tc_n_const,
                 (unsigned long long)g_tc_n_mism, (unsigned long long)g_tc_n_full);
     else
-        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu, %llu words, %llu sharing an epilogue) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu, prepped %llu, %llu words, %llu sharing an epilogue) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
                          " verify_variant=%llu verify_bad=%llu\n",
                 (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_ahead,
-                (unsigned long long)g_tc_n_words, (unsigned long long)g_tc_n_epis, (unsigned long long)g_tc_n_put,
+                (unsigned long long)g_tc_n_prep, (unsigned long long)g_tc_n_words, (unsigned long long)g_tc_n_epis, (unsigned long long)g_tc_n_put,
                 (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
                 (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
     fprintf(g_tc_lf, "ocerz: TCACHE[%d] images asked=%llu in=%llu out=%llu same=%llu variant=%llu unkeepable edge=%llu"
@@ -22650,9 +22650,12 @@ static int tc_keepable(uint64_t rip, int mode32)
     return tc_fixed(rip) || (!mode32 && tc_image_of(rip));
 }
 
+/* Set while the record being loaded came out of the warm set: the profile names it already, so it is not noted again. */
+static int g_tc_from_profile;
+
 static void tc_prof_note(uint64_t rip)
 {
-    if (!g_tc_img_hi && !ocerz_low_base && !(g_tc_key & OCERZ_TC_KEY_M32))
+    if (!g_tc_from_profile && !g_tc_img_hi && !ocerz_low_base && !(g_tc_key & OCERZ_TC_KEY_M32))
         ocerz_tcache_profile_note(rip | (g_tc_key & OCERZ_TC_KEY_PLAIN ? OCERZ_TC_PROF_PLAIN : OCERZ_TC_PROF_ORDERED));
 }
 
@@ -23193,20 +23196,22 @@ static JitBlock *tc_load(OcerzJit *jit, const OcerzTcRecHead *h, uint64_t rip, i
     return b;
 }
 
-static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int mode32)
+/*
+ * The block a record describes, as far as it does not depend on where its
+ * words go: what tc_load_rec copies out of the record into one allocation
+ * (the slab) or several.  Nothing here reads or writes the JIT's state, so the
+ * warm thread runs it too (tc_prep).
+ */
+static int g_tc_slab = -1;
+
+static JitBlock *tc_build_blk(const TcView *vp, uint64_t rip, int mode32)
 {
     const TcView v = *vp;
     const TcRec *r = v.r;
-    if (!tc_deps_check(v.dep, r->n_dep, r->dep_hash)) {
-        g_tc_n_stale++;
-        return NULL;
-    }
-    uint32_t n = r->n_insns, words = r->code_words;
+    uint32_t n = r->n_insns;
     int fail = 0, compact = (r->flags & TCF_COMPACT) != 0;
     size_t ne = r->n_edges ? r->n_edges : 1;
-    static int slab = -1;
-    if (slab < 0)
-        slab = !getenv("OCERZ_NO_TCACHE_SLAB");
+    int slab = g_tc_slab;
     JitBlock *blk;
     if (slab) {
         size_t total = TC_R16(sizeof *blk) + TC_R16(ne * sizeof *blk->edges) + TC_R16(n * sizeof(uint32_t)) +
@@ -23272,6 +23277,91 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
     blk->n_lanerec = blk->lanerec ? (int)r->n_lanerec : 0;
     blk->n_push_fix = blk->push_fix ? (uint16_t)r->n_push_fix : 0;
     blk->n_pushelide = blk->pushelide ? (uint16_t)r->n_pushelide : 0;
+    return blk;
+}
+
+/*
+ * A record the warm thread decoded, parsed and built there (tcache.c calls
+ * this on its thread, ocerz_tcache_set_prep): a load on the guest's thread
+ * then only checks, places, binds, chains and inserts it.  Shared-cache
+ * records only, which never move (tc_reloc_begin still checks).
+ */
+typedef struct TcPrep {
+    TcView v;
+    JitBlock *blk;
+} TcPrep;
+
+static void *tc_prep(const OcerzTcRecHead *h, uint64_t key)
+{
+    TcPrep *p = (TcPrep *)malloc(sizeof *p);
+    if (!p)
+        return NULL;
+    if (!tc_parse(h, &p->v) || p->v.r->img_hi || !(p->blk = tc_build_blk(&p->v, key & ~OCERZ_TC_KEY_PLAIN, 0))) {
+        free(p);
+        return NULL;
+    }
+    return p;
+}
+
+static void tc_unprep(void *pp)
+{
+    TcPrep *p = (TcPrep *)pp;
+    if (p) {
+        tc_free_blk(p->blk);
+        free(p);
+    }
+}
+
+static int g_tc_prep_on = -1;
+
+static void tc_prep_init(void)
+{
+    if (g_tc_slab < 0)
+        g_tc_slab = !getenv("OCERZ_NO_TCACHE_SLAB");
+    (void)cont_promote_n();
+    if (g_tc_prep_on < 0) {
+        g_tc_prep_on = !getenv("OCERZ_NO_TCACHE_PREP");
+        if (g_tc_prep_on)
+            ocerz_tcache_set_prep(tc_prep, tc_unprep);
+    }
+}
+
+static JitBlock *tc_load_built(OcerzJit *jit, const TcView *vp, uint64_t rip, int mode32, JitBlock *blk);
+
+static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int mode32)
+{
+    return tc_load_built(jit, vp, rip, mode32, NULL);
+}
+
+/* A load of a record tc_prep made: the deps and the image check are the guest thread's, as for any load. */
+static JitBlock *tc_load_prepped(OcerzJit *jit, const OcerzTcRecHead *h, TcPrep *p, uint64_t rip)
+{
+    JitBlock *b = NULL;
+    if (!tc_reloc_begin(&p->v, rip) || g_tc_rd || (const void *)p->v.r != (const void *)h) {
+        g_tc_n_rej++;
+        tc_free_blk(p->blk);
+    } else if ((b = tc_load_built(jit, &p->v, rip, 0, p->blk)) && !ocerz_low_base) {
+        g_tc_n_sload++;
+    }
+    g_tc_rlo = g_tc_rhi = g_tc_rd = 0;
+    free(p);
+    return b;
+}
+
+static JitBlock *tc_load_built(OcerzJit *jit, const TcView *vp, uint64_t rip, int mode32, JitBlock *blk)
+{
+    const TcView v = *vp;
+    const TcRec *r = v.r;
+    if (!tc_deps_check(v.dep, r->n_dep, r->dep_hash)) {
+        g_tc_n_stale++;
+        tc_free_blk(blk);
+        return NULL;
+    }
+    uint32_t n = r->n_insns, words = r->code_words;
+    if (g_tc_slab < 0)
+        g_tc_slab = !getenv("OCERZ_NO_TCACHE_SLAB");
+    if (!blk && !(blk = tc_build_blk(vp, rip, mode32)))
+        return NULL;
     if (g_tc_rd) {
         for (uint32_t i = 0; blk->insns && i < n; i++)
             tc_insn_shift(&blk->insns[i]);
@@ -23507,11 +23597,13 @@ static void tc_load_ahead(OcerzJit *jit)
     static int batch = -1;
     if (batch < 0) batch = getenv("OCERZ_NO_TCACHE_BATCH") ? 0 : 1;
     g_tcb_on = batch;
+    g_tc_from_profile = 1;
     for (int k = 0; k < max; k++) {
         uint64_t key = 0;
         if (g_tcb_n == TC_BATCH_MAX)
             tc_batch_end(jit);
-        OcerzTcRecHead *rec = ocerz_tcache_warm_next(&key);
+        void *prep = NULL;
+        OcerzTcRecHead *rec = ocerz_tcache_warm_next(&key, &prep);
         if (!rec)
             break;
         uint64_t rip = key & ~OCERZ_TC_KEY_PLAIN, jk = jit_key(rip, 0);
@@ -23524,12 +23616,16 @@ static void tc_load_ahead(OcerzJit *jit)
         }
         if (ok) {
             g_tc_key = key;
-            g_tc_n_ahead += tc_load(jit, rec, rip, 0) != NULL;
+            g_tc_n_ahead += (prep ? tc_load_prepped(jit, rec, (TcPrep *)prep, rip) : tc_load(jit, rec, rip, 0)) != NULL;
+            g_tc_n_prep += prep != NULL;
+            prep = NULL;
         }
+        tc_unprep(prep);
         free(rec);
     }
     tc_batch_end(jit);
     g_tcb_on = 0;
+    g_tc_from_profile = 0;
     if (hold) {
         g_wx_hold = 0;
         pthread_jit_write_protect_np(1);
@@ -23828,6 +23924,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
 
     const OcerzTcRecHead *tc_hit = NULL;
     int tc_hit_warm = 0;
+    TcPrep *tc_hit_prep = NULL;
     int tcm = g_place ? OCERZ_TC_OFF : ocerz_tcache_mode();
     g_tc_rec = 0;
     g_tc_bad = 0;
@@ -23849,6 +23946,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
         if (!al_marked(jk) && !al_marked(jk | AL_BLK_TAG) && !cp_marked(jk) && !tc_noload_has(jk)) {
             tc_hit = ocerz_tcache_find(g_tc_key);
             tc_hit_warm = tc_hit && ocerz_tcache_found_warm();
+            tc_hit_prep = tc_hit_warm ? (TcPrep *)ocerz_tcache_take_prep() : NULL;
             g_tc_n_ifind += g_tc_img_hi != 0;
             g_tc_n_sfind += !g_tc_img_hi && !ocerz_low_base;
         }
@@ -23861,7 +23959,14 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
         }
         if (tc_hit && tcm == OCERZ_TC_ON) {
             uint64_t t0 = ocerz_jit_time_xlat ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
-            JitBlock *lb = tc_load(jit, tc_hit, rip, mode32);
+            g_tc_from_profile = tc_hit_warm;
+            JitBlock *lb = tc_hit_prep && !mode32 ? tc_load_prepped(jit, tc_hit, tc_hit_prep, rip)
+                                                  : tc_load(jit, tc_hit, rip, mode32);
+            g_tc_from_profile = 0;
+            g_tc_n_prep += tc_hit_prep && !mode32;
+            if (mode32)
+                tc_unprep(tc_hit_prep);
+            tc_hit_prep = NULL;
             if (ocerz_jit_time_xlat)
                 __atomic_add_fetch(&ocerz_jit_xlat_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
             if (lb) {
@@ -23871,6 +23976,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
                 return lb;
             }
         }
+        tc_unprep(tc_hit_prep);
     }
 
     static int g_jitmeasure = -1;
@@ -26607,6 +26713,8 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
     jit->vm = vm;
     jit->plain_mem = !vm->jit_ordered_required &&
         (vm->jit_plain_mem || getenv("OCERZ_PLAIN_MEM") != NULL);
+    if (ocerz_tcache_mode() == OCERZ_TC_ON)
+        tc_prep_init();
     size_t bytes = jit_code_bytes();
     void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);

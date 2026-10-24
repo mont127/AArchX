@@ -581,6 +581,46 @@ static size_t pcidx_add_image(PcRange **r, size_t n, size_t *cap, uint64_t mh)
     return n;
 }
 
+static void pcidx_finish(PcIndex *ni, PcRange *r, size_t n)
+{
+    if (n)
+        qsort(r, n, sizeof *r, pcrange_cmp);
+    ni->maxhi = n ? malloc(n * sizeof *ni->maxhi) : NULL;
+    for (size_t i = 0; ni->maxhi && i < n; i++)
+        ni->maxhi[i] = i && ni->maxhi[i - 1] > r[i].hi ? ni->maxhi[i - 1] : r[i].hi;
+    ni->r = r;
+    ni->n = ni->maxhi || !n ? n : 0;
+}
+
+/*
+ * Two indexes: every image of the shared cache, made once (they never move),
+ * and the closure's images outside the cache (the program, its disk dylibs
+ * and bundles), made again whenever the closure grows.  It was one index of
+ * both, made again for every growth, ~3500 images' load commands and a sort
+ * each time: 5.5 ms of a 28 ms sqlite3 launch.  The closure's cache images
+ * are in the first already, so the answers are the same.
+ */
+static PcIndex *g_pcidx_cache;
+
+static const PcIndex *pcidx_cache(void)
+{
+    PcIndex *cur = __atomic_load_n(&g_pcidx_cache, __ATOMIC_ACQUIRE);
+    if (cur || !g_cache)
+        return cur;
+    pthread_mutex_lock(&g_pcidx_lock);
+    cur = g_pcidx_cache;
+    if (!cur && (cur = calloc(1, sizeof *cur)) != NULL) {
+        size_t n = 0, cap = 0;
+        PcRange *r = NULL;
+        for (uint32_t i = 0; i < g_cache->images_cnt; i++)
+            n = pcidx_add_image(&r, n, &cap, ocerz_cache_image_addr(g_cache, i, NULL));
+        pcidx_finish(cur, r, n);
+        __atomic_store_n(&g_pcidx_cache, cur, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&g_pcidx_lock);
+    return cur;
+}
+
 static const PcIndex *pcidx_current(void)
 {
     PcIndex *cur = __atomic_load_n(&g_pcidx, __ATOMIC_ACQUIRE);
@@ -596,17 +636,9 @@ static const PcIndex *pcidx_current(void)
             ni->closure_n = g_closure_n;
             ni->closure_mh = g_closure_mh;
             for (int i = 0; i < g_closure_n; i++)
-                n = pcidx_add_image(&r, n, &cap, g_closure_mh[i]);
-            if (g_cache)
-                for (uint32_t i = 0; i < g_cache->images_cnt; i++)
-                    n = pcidx_add_image(&r, n, &cap, ocerz_cache_image_addr(g_cache, i, NULL));
-            if (n)
-                qsort(r, n, sizeof *r, pcrange_cmp);
-            ni->maxhi = n ? malloc(n * sizeof *ni->maxhi) : NULL;
-            for (size_t i = 0; ni->maxhi && i < n; i++)
-                ni->maxhi[i] = i && ni->maxhi[i - 1] > r[i].hi ? ni->maxhi[i - 1] : r[i].hi;
-            ni->r = r;
-            ni->n = ni->maxhi || !n ? n : 0;
+                if (!g_cache || !in_cache(g_closure_mh[i]))
+                    n = pcidx_add_image(&r, n, &cap, g_closure_mh[i]);
+            pcidx_finish(ni, r, n);
             __atomic_store_n(&g_pcidx, ni, __ATOMIC_RELEASE);
             cur = ni;
         }
@@ -615,9 +647,8 @@ static const PcIndex *pcidx_current(void)
     return cur;
 }
 
-static uint64_t image_for_pc(uint64_t pc)
+static uint64_t pcidx_find(const PcIndex *ix, uint64_t pc)
 {
-    const PcIndex *ix = pcidx_current();
     if (!ix || !ix->n)
         return 0;
     size_t lo = 0, hi = ix->n;
@@ -632,6 +663,12 @@ static uint64_t image_for_pc(uint64_t pc)
         if (pc < ix->r[k - 1].hi)
             return ix->r[k - 1].mh;
     return 0;
+}
+
+static uint64_t image_for_pc(uint64_t pc)
+{
+    uint64_t mh = pcidx_find(pcidx_current(), pc);
+    return mh ? mh : pcidx_find(pcidx_cache(), pc);
 }
 
 static void image_nearest_symbol(uint64_t mh, uint64_t addr,

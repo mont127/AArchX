@@ -301,7 +301,7 @@ static int env_ignored(const char *kv)
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
         "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=", "OCERZ_NO_TCACHE_FOLD=", "OCERZ_NO_TCACHE_SLAB=",
         "OCERZ_NO_TCACHE_WARM=", "OCERZ_NO_CONT_PLACE=", "OCERZ_EXIT_STOP_ALL=", "OCERZ_AOT_NO_PROFILE_IMAGES=", "OCERZ_TCACHE_AHEAD=", "OCERZ_NO_WX_HOLD=",
-        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=",
+        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=", "OCERZ_NO_TCACHE_PREP=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
@@ -745,6 +745,7 @@ static int unpack(const TcStored *z, OcerzTcRecHead *r, uint8_t *scratch)
 typedef struct {
     uint64_t key;
     uintptr_t st;
+    void *prep;   /* what the JIT's hook made of the record (ocerz_tcache_set_prep), owned with it */
 } TcWarm;
 
 static TcWarm *g_warm;
@@ -754,6 +755,38 @@ static int g_warm_on;
 static OcerzTcRecHead *g_warm_last;
 static int g_pord_start;   /* this launch started ordered: its profile has a .ord (profile_ord_decide) */
 static size_t g_warm_last_i = SIZE_MAX;   /* the warm entry ocerz_tcache_find last handed out */
+static void *g_warm_last_prep;
+static void *(*g_prep_fn)(const OcerzTcRecHead *, uint64_t);
+static void (*g_prep_drop)(void *);
+
+/*
+ * A hook the warm thread runs on each record it decodes, off the guest's
+ * thread: the JIT parses the record there and builds the block's metadata
+ * (src/jit.c, tc_prep).  Whoever takes a record takes what the hook made
+ * of it with it, and drop frees one nobody took.
+ */
+void ocerz_tcache_set_prep(void *(*prep)(const OcerzTcRecHead *rec, uint64_t key), void (*drop)(void *))
+{
+    g_prep_drop = drop;
+    __atomic_store_n(&g_prep_fn, prep, __ATOMIC_RELEASE);
+}
+
+static void warm_drop(uintptr_t v, void *prep)
+{
+    if (v > 1) {
+        free((void *)v);
+        if (prep && g_prep_drop)
+            g_prep_drop(prep);
+    }
+}
+
+/* What the hook made of the record the last ocerz_tcache_find handed out of the warm set; the caller owns it. */
+void *ocerz_tcache_take_prep(void)
+{
+    void *p = g_warm_last_prep;
+    g_warm_last_prep = NULL;
+    return p;
+}
 
 static const OcerzTcRecHead *warm_take(uint64_t key)
 {
@@ -766,8 +799,10 @@ static const OcerzTcRecHead *warm_take(uint64_t key)
     size_t i = g_whash[j] - 1;
     __atomic_store_n(&g_warm_at, __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
     uintptr_t v = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
-    if (v > 1)
+    if (v > 1) {
         g_warm_last_i = i;
+        g_warm_last_prep = g_warm[i].prep;
+    }
     return v > 1 ? (g_warm_last = (OcerzTcRecHead *)v) : NULL;
 }
 
@@ -782,9 +817,10 @@ int ocerz_tcache_found_warm(void)
  * last handed out of the warm set, and its key; the caller owns it (free) and
  * may take the one after with another call.  NULL once the next is not ready.
  */
-OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key)
+OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key, void **prep)
 {
     OcerzTcRecHead *r = NULL;
+    *prep = NULL;
     pthread_mutex_lock(&g_lock);
     size_t i = g_warm_last_i + 1;
     if (__atomic_load_n(&g_warm_on, __ATOMIC_ACQUIRE) && g_warm_last_i != SIZE_MAX && i < g_nwarm &&
@@ -793,6 +829,7 @@ OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key)
         if (v > 1) {
             r = (OcerzTcRecHead *)v;
             *key = g_warm[i].key;
+            *prep = g_warm[i].prep;
             g_warm_last_i = i;
             __atomic_store_n(&g_warm_at, __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
         }
@@ -808,6 +845,9 @@ const OcerzTcRecHead *ocerz_tcache_find(uint64_t key)
     free(g_warm_last);
     g_warm_last = NULL;
     g_warm_last_i = SIZE_MAX;
+    if (g_warm_last_prep && g_prep_drop)
+        g_prep_drop(g_warm_last_prep);
+    g_warm_last_prep = NULL;
     if (!(found = warm_take(key)) && open_store()) {
         uint64_t loc = slot_loc(key), no = loc >> TC_LOC_OFF_BITS, off = loc & ((1ull << TC_LOC_OFF_BITS) - 1);
         const TcStored *z = loc ? (const TcStored *)(const void *)file_at(no, off, sizeof *z) : NULL;
@@ -922,11 +962,8 @@ static void *warm_main(void *arg)
             struct timespec ts = { 0, 200000 };
             nanosleep(&ts, NULL);
         }
-        for (; back + TC_WARM_AHEAD < at; back++) {
-            uintptr_t v = __atomic_exchange_n(&g_warm[back].st, 1, __ATOMIC_ACQ_REL);
-            if (v > 1)
-                free((void *)v);
-        }
+        for (; back + TC_WARM_AHEAD < at; back++)
+            warm_drop(__atomic_exchange_n(&g_warm[back].st, 1, __ATOMIC_ACQ_REL), g_warm[back].prep);
         if (!ok || __atomic_load_n(&g_warm[i].st, __ATOMIC_ACQUIRE))
             continue;
         uint64_t loc = slot_loc(g_warm[i].key), no = loc >> TC_LOC_OFF_BITS, off = loc & ((1ull << TC_LOC_OFF_BITS) - 1);
@@ -935,15 +972,17 @@ static void *warm_main(void *arg)
             continue;
         OcerzTcRecHead *r = (OcerzTcRecHead *)malloc(sizeof *r + z->raw);
         uintptr_t zero = 0;
-        if (r && (!unpack(z, r, scratch) ||
-                  !__atomic_compare_exchange_n(&g_warm[i].st, &zero, (uintptr_t)r, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)))
+        if (r && !unpack(z, r, scratch)) {
             free(r);
+            continue;
+        }
+        void *(*prep)(const OcerzTcRecHead *, uint64_t) = __atomic_load_n(&g_prep_fn, __ATOMIC_ACQUIRE);
+        g_warm[i].prep = r && prep && !(g_warm[i].key & (OCERZ_TC_KEY_M32 | OCERZ_TC_KEY_IMAGE)) ? prep(r, g_warm[i].key) : NULL;
+        if (r && !__atomic_compare_exchange_n(&g_warm[i].st, &zero, (uintptr_t)r, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            warm_drop((uintptr_t)r, g_warm[i].prep);
     }
-    for (size_t i = back; i < g_nwarm; i++) {
-        uintptr_t v = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
-        if (v > 1)
-            free((void *)v);
-    }
+    for (size_t i = back; i < g_nwarm; i++)
+        warm_drop(__atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL), g_warm[i].prep);
     for (uint64_t k = 0; k < nm; k++) {
         if (m[k].p)
             munmap((void *)m[k].p, m[k].len);
