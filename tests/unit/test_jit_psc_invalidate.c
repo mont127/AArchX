@@ -5,7 +5,11 @@
  * jump site's direct-mapped {rip, body} cache entry.  The target is then
  * invalidated, and the next entry must not reach the retired body: a code
  * pointer cached at the branch site is exactly the kind of thing an
- * invalidation can leave dangling.
+ * invalidation can leave dangling.  The jump is a page away from its target,
+ * so the invalidation leaves the jump's block, and its cache, in place (on
+ * one page with it, the jump's block was retired too and its cache never read),
+ * and at an offset whose call-site column (psc_cols) is not its jmp-site one,
+ * so a retire that bumped only the call site's fails it.
  */
 #include "ocerz/cpu.h"
 #include "ocerz/interp.h"
@@ -20,8 +24,8 @@
 #include <sys/mman.h>
 
 #define CODE_BASE 0x240000000ull
-#define SOURCE_RIP (CODE_BASE + 0x00)
-#define TARGET_RIP (CODE_BASE + 0x40)
+#define SOURCE_RIP (CODE_BASE + 0x4000)
+#define TARGET_RIP (CODE_BASE + 0x100)
 #define DONE_RIP   (CODE_BASE + 0x80)
 #define STACK_TOP  (CODE_BASE + 0x8000)
 

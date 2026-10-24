@@ -972,6 +972,7 @@ run_file_case dlane_fault_guard tests/dynamic/lane_fault_guard.c 'OK' -Wl,-no_pi
 run_file_case dsmc_io tests/dynamic/smc_io.c 'OK'
 run_file_case dsmc_high tests/dynamic/smc_high.c 'OK'
 run_file_case dsmc_ras tests/dynamic/smc_ras.c 'OK'
+run_file_case dpsc_call_retire tests/dynamic/psc_call_retire.c 'OK'
 run_file_case dsmc_chain tests/dynamic/smc_chain.c 'OK'
 # every chain through a veneer, as far targets are chained in a big process
 export OCERZ_FORCE_VENEER=1

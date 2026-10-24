@@ -2683,6 +2683,23 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth);
 static uint64_t xlive_resolve(uint64_t live, const X86Insn *insns, int upto);
 static int jmp_reg_flags_dead(const X86Insn *insns, int n);
 static int ret_flags_live_at(uint64_t rip);
+/*
+ * An indirect call ends a block with its flags dead, as the translator's own
+ * exit liveness has it (seam_seed): this is the decoding side's copy.  It
+ * decides for a block whose successor is not translated yet and for every
+ * block being recorded, which decodes its successors so their bytes are deps
+ * instead of reading their entry_live.  Without it a recorded block before a
+ * dispatch call kept every flag: an inc or dec there rebuilt CF from a
+ * record on each trip, and a warm run's loop ran 22% slower than a cold one.
+ * OCERZ_NO_XLIVE_ICALL=1 keeps them live.
+ */
+static int xlive_icall_dead(const X86Insn *t)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_XLIVE_ICALL") ? 1 : 0;
+    return !off && t->op == OCERZ_OP_CALL && t->ops[0].kind != OCERZ_OPK_IMM && !t->mode32 &&
+           !ret_flags_live_at(t->rip);
+}
 static int g_xlive_log = -1;
 /*
  * Flags reaching a ret are dead unless the last instruction to write them was
@@ -2936,6 +2953,8 @@ static uint64_t xlive_decode_entry_d(uint64_t rip, int depth)
         else if (t->op == OCERZ_OP_JMP && !t->mode32 && slot_value_now(&t->ops[0], &slot_to))
             live = xlive_succ_live_d(g_xlat_jit, slot_to, depth + 1);
         else if (jmp_reg_flags_dead(insns, n))
+            live = 0;
+        else if (xlive_icall_dead(t))
             live = 0;
         else if (t->op == OCERZ_OP_JCC && t->ops[0].kind == OCERZ_OPK_IMM)
             live = xlive_succ_live_d(g_xlat_jit, t->ops[0].imm, depth + 1) |
@@ -18751,6 +18770,28 @@ static void emit_indirect_leave_br(A64Buf *b, int code_reg)
     a64_br(b, code_reg);
 }
 
+/*
+ * A target's PSC column in the emitted code (psc_cols has both kinds): bits
+ * 2..6 of the target, or at an indirect call bits 2..6 of target ^ target >>
+ * 5.  A function's entry is 16-byte aligned, so bits 2..6 alone put the ops a
+ * dispatch loop calls through one site in 8 columns, where they evicted each
+ * other: a Perl-shaped loop of 11 ops missed 62% of its calls (24% mixed) and
+ * spent 42% of its time in the miss path.  A jmp's targets, a switch's cases,
+ * spread over bits 2..6 already, and mixing cost the xbench vm switch 13%.
+ * OCERZ_NO_PSC_MIX=1 indexes calls by bits 2..6 too.
+ */
+static int psc_mix_on(void);
+
+static void emit_psc_col(A64Buf *b, int rd, int rs, int call)
+{
+    if (!call || !psc_mix_on()) {
+        a64_ubfx(b, 1, rd, rs, 2, 5);
+        return;
+    }
+    a64_emit32(b, 0xca400000u | ((uint32_t)(rs & 31) << 16) | (5u << 10) | ((uint32_t)(rs & 31) << 5) | (uint32_t)(rd & 31));
+    a64_ubfx(b, 1, rd, rd, 2, 5);
+}
+
 static uint32_t **g_ind_call_cont;
 static uint32_t *g_ind_call_tocont;
 static int g_ind_treg = JT1;
@@ -18783,7 +18824,7 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
         g_raslit[g_n_raslit].rt = JT2;
         g_n_raslit++;
         a64_emit32(b, 0x58000000u | (uint32_t)JT2);
-        a64_ubfx(b, 1, JTT, treg, 2, 5);
+        emit_psc_col(b, JTT, treg, g_ind_call_cont != NULL);
         a64_add_reg(b, 1, JT2, JT2, JTT, 4);
         a64_ldr_regoff(b, 8, JTT, 19, JTT, 1);
         a64_ldp_off(b, JTU, JT0, JT2, 0);
@@ -18819,7 +18860,7 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
         a64_b(b, 0);
         (*n_epi)++;
         a64_patch_bcond(psc_miss, a64_label(b));
-        a64_ubfx(b, 1, JT0, treg, 2, 5);
+        emit_psc_col(b, JT0, treg, g_ind_call_cont != NULL);
         a64_add_reg(b, 1, JT0, 19, JT0, 3);
         a64_ldar(b, 8, JT0, JT0);
     }
@@ -27280,9 +27321,19 @@ static int ras_entry_in_hits(const void *entry, void *arg)
    body.  Retiring bumps those columns' generations after the blocks have left
    the hash table, so a miss that refills from the table never tags a retired
    body with a current generation.  A generation that wraps clears its column. */
-static unsigned psc_col(uint64_t key)
+static int psc_mix_on(void)
 {
-    return (unsigned)((key >> 2) & (PSC_N - 1));
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_PSC_MIX") ? 0 : 1;
+    return on;
+}
+/* The columns a block's entries can be in: a jmp site's and a call site's. */
+static uint32_t psc_cols(uint64_t key)
+{
+    uint32_t c = 1u << ((key >> 2) & (PSC_N - 1));
+    if (psc_mix_on())
+        c |= 1u << (((key ^ (key >> 5)) >> 2) & (PSC_N - 1));
+    return c;
 }
 static void psc_retire_cols(struct OcerzVM *vm, uint32_t cols)
 {
@@ -27392,7 +27443,7 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
     uint32_t cols = 0;
     for (size_t m = 0; m < n_hits; m++)
         if (hits[m]->code)
-            cols |= 1u << psc_col(hits[m]->key);
+            cols |= psc_cols(hits[m]->key);
     psc_retire_cols(vm, cols);
 }
 
@@ -28117,7 +28168,7 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
     for (unsigned i = 0; i < g_ras_slot_n; i++)
         if (IN_BLK(g_ras_slots[i]))
             __atomic_store_n(&g_ras_slots[i], NULL, __ATOMIC_RELEASE);
-    psc_retire_cols(vm, 1u << psc_col(blk->key));
+    psc_retire_cols(vm, psc_cols(blk->key));
     cont_detach(jit, blk);
 #undef IN_BLK
 }
