@@ -385,8 +385,8 @@ static void print_thrown(uint32_t ue)
         if (p < 0x1000 || p >= M32_HANDLE_LO)
             continue;
         char out[256];
-        for (; n < sizeof out - 1; n++) {
-            uint16_t c;
+        for (; n < sizeof out - 1 && ocerz_addr_readable(p + 2 * n) && ocerz_addr_readable(p + 2 * n + 1); n++) {
+            uint16_t c;   /* only words that point at readable memory: SuperTuxKart's do not all */
             memcpy(&c, m32_h(p + 2 * n), 2);
             if (!c || c > 0x7e || (c < 0x20 && c != '\n'))
                 break;

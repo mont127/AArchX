@@ -74,6 +74,95 @@ static void gl_init(void)
                      __ATOMIC_RELEASE);
 }
 
+/*
+ * Vertex and element arrays in buffer objects.  With a buffer bound to GL_ARRAY_BUFFER, a gl*Pointer's pointer is an
+ * offset into it, and with one bound to GL_ELEMENT_ARRAY_BUFFER, so is a glDraw*Elements' indices pointer.  m32 made
+ * every such pointer a window address: GL then read at the buffer's storage plus the window's base, and Nexuiz's
+ * benchmark demo faulted in gleRunVertexSubmitImmediate whenever a surface drew from its buffers.  Each context's two
+ * bindings are kept as the guest binds them (asking GL would wait on its multithreaded engine); with a vertex array
+ * object bound, the element binding is the object's and GL is asked.  Deleting a bound buffer unbinds it.
+ */
+static uint32_t bound(unsigned target);
+
+typedef struct Binds { void *ctx; uint32_t array, element, vao; } Binds;
+static Binds g_binds[64];
+static pthread_mutex_t g_bind_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread Binds *t_binds;
+
+static Binds *binds(void)
+{
+    gl_init();
+    void *ctx = gl.current ? gl.current() : NULL;
+    if (t_binds && t_binds->ctx == ctx)
+        return t_binds;
+    Binds *b = NULL;
+    pthread_mutex_lock(&g_bind_lock);
+    for (int i = 0; i < 64 && !b; i++)
+        if (g_binds[i].ctx == ctx)
+            b = &g_binds[i];
+    for (int i = 0; i < 64 && !b; i++)
+        if (!g_binds[i].ctx) {
+            b = &g_binds[i];
+            *b = (Binds){ ctx, 0, 0, 0 };
+        }
+    pthread_mutex_unlock(&g_bind_lock);
+    t_binds = b;
+    return b;
+}
+
+int m32_gl_ptr_kind(const char *name)
+{
+    static const char *const arrays[] = { "_glVertexPointer", "_glNormalPointer", "_glColorPointer", "_glIndexPointer",
+        "_glTexCoordPointer", "_glEdgeFlagPointer", "_glFogCoordPointer", "_glFogCoordPointerEXT",
+        "_glSecondaryColorPointer", "_glSecondaryColorPointerEXT", "_glVertexAttribPointer", "_glVertexAttribPointerARB",
+        "_glVertexAttribIPointer", "_glVertexAttribIPointerEXT", "_glInterleavedArrays", NULL };
+    static const char *const elements[] = { "_glDrawElements", "_glDrawRangeElements", "_glDrawRangeElementsEXT",
+        "_glDrawElementsInstanced", "_glDrawElementsInstancedARB", "_glDrawElementsInstancedEXT",
+        "_glDrawElementsBaseVertex", "_glDrawRangeElementsBaseVertex", "_glDrawElementsInstancedBaseVertex", NULL };
+    if (strncmp(name, "_gl", 3))
+        return M32_GL_NONE;
+    for (int i = 0; arrays[i]; i++)
+        if (!strcmp(name, arrays[i]))
+            return M32_GL_ARRAY;
+    for (int i = 0; elements[i]; i++)
+        if (!strcmp(name, elements[i]))
+            return M32_GL_ELEMENT;
+    if (!strcmp(name, "_glBindBuffer") || !strcmp(name, "_glBindBufferARB"))
+        return M32_GL_BIND;
+    if (!strcmp(name, "_glBindVertexArray") || !strcmp(name, "_glBindVertexArrayAPPLE"))
+        return M32_GL_BIND_VAO;
+    return M32_GL_NONE;
+}
+
+uint64_t m32_gl_ptr(int kind, uint32_t g)
+{
+    Binds *b = binds();
+    uint32_t buffer = !b ? 0 : kind == M32_GL_ARRAY ? b->array : b->vao ? bound(0x8893) : b->element;
+    return buffer ? g : (uint64_t)(uintptr_t)m32_host(g);
+}
+
+void m32_gl_bound(int kind, uint32_t target, uint32_t buffer)
+{
+    Binds *b = binds();
+    if (!b)
+        return;
+    if (kind == M32_GL_BIND_VAO)
+        b->vao = target;   /* glBindVertexArray(array): one argument */
+    else if (target == 0x8892)
+        b->array = buffer;
+    else if (target == 0x8893 && !b->vao)
+        b->element = buffer;
+}
+
+static void unbind_deleted(uint32_t buffer)
+{
+    Binds *b = binds();
+    if (b && b->array == buffer)
+        b->array = 0;
+    if (b && b->element == buffer)
+        b->element = 0;
+}
+
 /* buffers are shared by the contexts of a share group, so their shadows are too */
 static void *share_group(void)
 {
@@ -99,7 +188,8 @@ static uint32_t bound(unsigned target)
     default: q = target; break;       /* GL_COPY_READ/WRITE_BUFFER and the rest bind under their own name */
     }
     int b = 0;
-    gl.getiv(q, &b);
+    if (gl.getiv)
+        gl.getiv(q, &b);
     return (uint32_t)b;
 }
 
@@ -288,6 +378,8 @@ static int sp_glDeleteBuffers(struct OcerzVM *vm, OcerzCPU *cpu)
         }
     }
     pthread_mutex_unlock(&g_lock);
+    for (int32_t i = 0; names && i < n && i < 65536; i++)
+        unbind_deleted(m32_rd(names + 4 * (uint32_t)i));
     if (n >= 0)
         gl.delete_buffers(n, names ? (const uint32_t *)m32_h(names) : NULL);
     RET(0);
@@ -397,7 +489,38 @@ CGL_CTX_CALL(CGLSetCurrentContext)
 CGL_CTX_CALL(CGLLockContext)
 CGL_CTX_CALL(CGLUnlockContext)
 
+/* glutInit(int *argcp, char **argv): GLUT reads the whole argument vector and takes its own options out of it, and the
+ * guest's vector holds 4-byte pointers; crossed, GLUT read argv[0] alone right.  The host gets a vector of its own, and
+ * the guest's count and vector come back without what GLUT took. */
+static int sp_glutInit(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static void (*init)(int *, char **);
+    if (!init)
+        init = (void (*)(int *, char **))ocerz_bridge_host_symbol("/System/Library/Frameworks/GLUT.framework/Versions/A/GLUT",
+                                                                  "glutInit");
+    uint32_t pargc = m32_arg(cpu, 0), argv = m32_arg(cpu, 1);
+    int argc = pargc ? (int32_t)m32_rd(pargc) : 0, was = argc;
+    if (argc < 0 || argc > 4096 || !argv)
+        argc = was = 0;
+    char **hv = calloc((size_t)argc + 1, sizeof *hv);
+    for (int i = 0; hv && i < argc; i++)
+        hv[i] = m32_rd(argv + 4 * (uint32_t)i) ? m32_h(m32_rd(argv + 4 * (uint32_t)i)) : NULL;
+    if (init && hv)
+        init(&argc, hv);
+    for (int i = 0; hv && i < argc && i < was; i++)
+        m32_wr(argv + 4 * (uint32_t)i, m32_handle(hv[i]));
+    if (hv && argc < was)
+        m32_wr(argv + 4 * (uint32_t)argc, 0);
+    if (pargc && hv)
+        m32_wr(pargc, (uint32_t)argc);
+    free(hv);
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 const M32SpecialEntry m32_gl_specials[] = {
+    { "_glutInit", sp_glutInit },
     { "_CGLSetCurrentContext", sp_CGLSetCurrentContext }, { "_CGLLockContext", sp_CGLLockContext },
     { "_CGLUnlockContext", sp_CGLUnlockContext },
     { "_CGLSetParameter", sp_CGLSetParameter },

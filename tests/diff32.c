@@ -1226,6 +1226,28 @@ static void t_pairs(Gen *g)
     }
 }
 
+/* add, adc and sbb into memory, as i386 code adds 64-bit values (add [m], lo; adc [m+4], hi): the JIT translates an
+ * adc or sbb into memory whose flags are dead, so half the time a cmp kills them and half the time a setc or an adc
+ * reads them (src/jit.c emit_rmw_mem) */
+static void t_adcmem(Gen *g)
+{
+    if (room(g) < 48) return;
+    for (int k = 0, n = 1 + (int)rndn(g, 3); k < n; k++) {
+        MF m;
+        pick_mem(g, &m, 0);
+        unsigned w = rndn(g, 4);   /* 0: byte, 1: word, else dword */
+        emit_prefixes(g, w == 1, &m, 0);
+        unsigned kind = rndn(g, 4), ext = rndn(g, 2) ? 2 : 3;   /* /2 adc, /3 sbb */
+        if (kind == 0) { eb(g, w == 0 ? 0x00 : 0x01); emit_modrm(g, rany(g), &m); }
+        else if (kind == 1) { eb(g, (w == 0 ? 0x10 : 0x11) | (ext == 3 ? 0x08 : 0)); emit_modrm(g, rany(g), &m); }
+        else if (kind == 2 || w == 0) { eb(g, w == 0 ? 0x80 : 0x83); emit_modrm(g, ext, &m); eb(g, rnd(g)); }
+        else { eb(g, 0x81); emit_modrm(g, ext, &m); if (w == 1) ew(g, rnd(g)); else ed(g, rnd(g)); }
+    }
+    if (rndn(g, 2)) { eb(g, 0x39); eb(g, 0xc0 | (rany(g) << 3) | rany(g)); }          /* cmp r, r: flags dead */
+    else if (rndn(g, 2)) { eb(g, 0x0f); eb(g, 0x92); eb(g, 0xc0 | rbyte_avoid(g)); }  /* setc: CF read */
+    else { eb(g, 0x11); eb(g, 0xc0 | (rany(g) << 3) | rdst(g)); }                     /* adc r, r: CF read */
+}
+
 static void t_movshift(Gen *g)
 {
     if (room(g) < 40) return;
@@ -1697,7 +1719,7 @@ static const struct { Tmpl fn; int weight; } TEMPLATES[] = {
     { t_0f,     14 }, { t_seg,    10 }, { t_cx8,    4 },
     { t_btmem,   4 }, { t_cmpjcc, 10 }, { t_cntloop, 5 },
     { t_ccuse,  10 }, { t_pairs,   5 }, { t_movshift, 3 },
-    { t_x87,     6 }, { t_icall,   4 },
+    { t_x87,     6 }, { t_icall,   4 }, { t_adcmem,  5 },
 };
 #define NTEMPLATES ((int)(sizeof TEMPLATES / sizeof TEMPLATES[0]))
 

@@ -26,7 +26,7 @@ not backported.
 
 | Version | Supported |
 | --- | --- |
-| `main` (0.7.3) | yes |
+| `main` (0.9) | yes |
 | 0.1 and earlier | no |
 
 ## Reporting a vulnerability

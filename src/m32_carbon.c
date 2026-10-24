@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <stddef.h>
 
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
@@ -380,6 +381,52 @@ static int sp_AEProcessAppleEvent(struct OcerzVM *vm, OcerzCPU *cpu)
     return ret_value(cpu, fn ? (uint32_t)(int32_t)fn(&r) : (uint32_t)-50);
 }
 
+/* GetProcessInformation(const ProcessSerialNumber *, ProcessInfoRec *) -> OSErr.  The i386 ProcessInfoRec is 60 bytes
+ * of 4-byte fields, its processName at 4 and an FSSpec * last (68 with the extended record's two memory totals); the
+ * arm64 one has 8-byte pointers and an FSRef * last.  Crossed as a pointer, HIServices read the guest's record as its
+ * own and followed its characters as a pointer (Adium at launch).  The record crosses field by field; the name is
+ * written into the guest's buffer, and the FSSpec, which 64-bit code has no way to make, is left as it was. */
+#pragma pack(push, 2)   /* as Processes.h declares it: the pointers unaligned, 72 bytes (80 extended) */
+typedef struct HostProcessInfoRec {
+    uint32_t length;
+    uint8_t *name;
+    uint32_t psn[2], type, signature, mode;
+    void *location;
+    uint32_t size, free_mem, launcher[2], launch_date, active_time;
+    void *app_ref;
+    uint32_t temp_total, purgeable_total;   /* ProcessInfoExtendedRec */
+} HostProcessInfoRec;
+#pragma pack(pop)
+_Static_assert(sizeof(HostProcessInfoRec) == 80, "arm64 ProcessInfoExtendedRec");
+
+static int sp_GetProcessInformation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static int16_t (*fn)(const void *, HostProcessInfoRec *);
+    if (!fn)
+        *(void **)&fn = carbon_fn("GetProcessInformation");
+    uint32_t psn = m32_arg(cpu, 0), g = m32_arg(cpu, 1);
+    if (!fn || !g)
+        return ret_value(cpu, (uint32_t)-50);   /* paramErr */
+    int extended = m32_rd(g) >= 68;
+    HostProcessInfoRec r;
+    memset(&r, 0, sizeof r);
+    r.length = extended ? (uint32_t)sizeof r : (uint32_t)offsetof(HostProcessInfoRec, temp_total);
+    r.name = m32_rd(g + 4) ? m32_h(m32_rd(g + 4)) : NULL;
+    int16_t err = fn(psn ? m32_host(psn) : NULL, &r);
+    if (!err) {
+        const uint32_t words[] = { r.psn[0], r.psn[1], r.type, r.signature, r.mode, 0, r.size, r.free_mem, r.launcher[0],
+                                   r.launcher[1], r.launch_date, r.active_time };
+        for (uint32_t i = 0; i < sizeof words / sizeof words[0]; i++)
+            m32_wr(g + 8 + 4 * i, words[i]);
+        if (extended) {
+            m32_wr(g + 60, r.temp_total);
+            m32_wr(g + 64, r.purgeable_total);
+        }
+    }
+    return ret_value(cpu, (uint32_t)(int32_t)err);
+}
+
 /* ---- the Text Encoding Converter ---- */
 
 typedef int32_t (*TecConvert)(void *, unsigned long, const void *, uint32_t, unsigned long, const unsigned long *,
@@ -441,7 +488,56 @@ static int sp_ConvertFromPStringToUnicode(struct OcerzVM *vm, OcerzCPU *cpu)
     return ret_value(cpu, (uint32_t)st);
 }
 
+/* _LSCopyDefaultSchemeHandlerURL(CFStringRef scheme, CFURLRef *app): LaunchServices' private call, the default
+ * handler of a URL scheme, which Firefox 3.6 imports to ask whether it is the default browser.  m32 had no
+ * declaration for it, answered 0, noErr, and left *app as it was: Firefox handed that garbage to CFBundleCreate.  It is
+ * now LSCopyDefaultApplicationURLForURL on "scheme:", or kLSApplicationNotFoundErr (-10814) with *app NULL. */
+static int sp_LSCopyDefaultSchemeHandlerURL(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static void *(*with_format)(void *, void *, void *, ...), *(*url_with_string)(void *, void *, void *);
+    static void *(*app_for_url)(void *, uint32_t, void **), (*cf_release)(void *);
+    static void *(*cfstr)(void *, const char *, uint32_t);
+    if (!with_format) {
+        url_with_string = (void *(*)(void *, void *, void *))dlsym(RTLD_DEFAULT, "CFURLCreateWithString");
+        app_for_url = (void *(*)(void *, uint32_t, void **))carbon_fn("LSCopyDefaultApplicationURLForURL");
+        cf_release = (void (*)(void *))dlsym(RTLD_DEFAULT, "CFRelease");
+        cfstr = (void *(*)(void *, const char *, uint32_t))dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+        with_format = (void *(*)(void *, void *, void *, ...))dlsym(RTLD_DEFAULT, "CFStringCreateWithFormat");
+    }
+    void *scheme = m32_host(m32_arg(cpu, 0)), *app = NULL;
+    if (scheme && with_format && url_with_string && app_for_url && cf_release && cfstr) {
+        void *fmt = cfstr(NULL, "%@:", 0x08000100);
+        void *s = fmt ? with_format(NULL, NULL, fmt, scheme) : NULL;
+        void *url = s ? url_with_string(NULL, s, NULL) : NULL;
+        app = url ? app_for_url(url, 0xFFFFFFFF, NULL) : NULL;   /* kLSRolesAll */
+        if (url)
+            cf_release(url);
+        if (s)
+            cf_release(s);
+        if (fmt)
+            cf_release(fmt);
+    }
+    if (m32_arg(cpu, 1))
+        m32_wr(m32_arg(cpu, 1), m32_handle(app));
+    return ret_value(cpu, app ? 0 : (uint32_t)-10814);
+}
+
+/* GetScriptManagerVariable(short selector) -> long: smKCHRCache (38) is the address of the keyboard's KCHR, a pointer
+ * the long holds, which the i386 int cut to 32 bits; SDL 1.2 handed it to KeyTranslate, which faulted in HIToolbox
+ * (AssaultCube).  It answers 0, no KCHR, as on a Mac with Unicode layouts alone, and callers use their own key
+ * tables; the other selectors are numbers and pass through. */
+static int sp_GetScriptManagerVariable(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    long (*fn)(short) = (long (*)(short))carbon_fn("GetScriptManagerVariable");
+    short sel = (short)m32_arg(cpu, 0);
+    return ret_value(cpu, sel == 38 || !fn ? 0 : (uint32_t)fn(sel));
+}
+
 const M32SpecialEntry m32_carbon_specials[] = {
+    { "__LSCopyDefaultSchemeHandlerURL", sp_LSCopyDefaultSchemeHandlerURL },
+    { "_GetScriptManagerVariable", sp_GetScriptManagerVariable },
     { "_ConvertFromUnicodeToText", sp_ConvertFromUnicodeToText },
     { "_ConvertFromTextToUnicode", sp_ConvertFromTextToUnicode },
     { "_ConvertFromUnicodeToPString", sp_ConvertFromUnicodeToPString },
@@ -450,6 +546,7 @@ const M32SpecialEntry m32_carbon_specials[] = {
     { "_WaitNextEvent", sp_WaitNextEvent }, { "_GetNextEvent", sp_GetNextEvent }, { "_EventAvail", sp_EventAvail },
     { "_ConvertEventRefToEventRecord", sp_ConvertEventRefToEventRecord },
     { "_AEProcessAppleEvent", sp_AEProcessAppleEvent },
+    { "_GetProcessInformation", sp_GetProcessInformation },
     { NULL, NULL }
 };
 

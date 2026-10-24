@@ -618,6 +618,26 @@ static int sp_CreateUserPaneControl(struct OcerzVM *vm, OcerzCPU *cpu)
 
 static int sp_Nothing(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
 
+/* StillDown: whether the mouse button is down, from the session's state (CGEventSourceButtonState, button 0) */
+static int sp_StillDown(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static bool (*state)(int32_t, uint32_t);
+    if (!state)
+        state = (bool (*)(int32_t, uint32_t))dlsym(RTLD_DEFAULT, "CGEventSourceButtonState");
+    RET(state && state(0, 0));   /* kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft */
+}
+
+/* GetThemeScrollBarArrowStyle and GetThemeScrollBarThumbStyle: Aqua's own, arrows together at the lower right (1)
+ * and a proportional thumb (1), as the Macs these programs were written for had them */
+static int sp_ThemeStyleOne(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    if (A(0))
+        *(uint16_t *)m32_h(A(0)) = 1;
+    RET(0);
+}
+
 const M32SpecialEntry m32_controls_specials[] = {
     { "_EnableMenuCommand", sp_EnableMenuCommand }, { "_IsMenuCommandEnabled", sp_IsMenuCommandEnabled },
     { "_SetItemCmd", sp_SetItemCmd }, { "_GetItemCmd", sp_GetItemCmd },
@@ -639,5 +659,7 @@ const M32SpecialEntry m32_controls_specials[] = {
     { "_HandleControlClick", sp_HandleControlClick }, { "_TrackControl", sp_TrackControl },
     { "_CreateUserPaneControl", sp_CreateUserPaneControl },
     { "_SetEventMask", sp_Nothing }, { "_TXNInitTextension", sp_Nothing }, { "_SetWindowGroupParent", sp_Nothing },
+    { "_StillDown", sp_StillDown }, { "_GetThemeScrollBarArrowStyle", sp_ThemeStyleOne },
+    { "_GetThemeScrollBarThumbStyle", sp_ThemeStyleOne },
     { NULL, NULL }
 };

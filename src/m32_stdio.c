@@ -46,6 +46,14 @@ void m32_save_errno(OcerzCPU *cpu)
     m32_wr(errno_slot(), (uint32_t)e);
 }
 
+/* Before a call: the host's errno is the guest's, so a call that sets no errno leaves the guest's as it was, as on a
+ * Mac.  m32_save_errno after it had copied whatever the host's errno last was: libvorbisfile clears errno, reads, and
+ * takes 0 bytes with a non-zero errno for a read error, and SuperTuxKart's music never loaded. */
+void m32_load_errno(void)
+{
+    errno = (int)m32_rd(errno_slot());
+}
+
 static int sp___error(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     m32_ret(cpu, errno_slot(), 0, 0);
@@ -654,7 +662,15 @@ static int to_zone(OcerzCPU *cpu, uint32_t off)
 
 static int sp_malloc(struct OcerzVM *vm, OcerzCPU *cpu) { if (g_gzone) return to_zone(cpu, 12); RET(m32_malloc(m32_arg(cpu, 0))); }
 static int sp_calloc(struct OcerzVM *vm, OcerzCPU *cpu) { if (g_gzone) return to_zone(cpu, 16); RET(m32_calloc(m32_arg(cpu, 0), m32_arg(cpu, 1))); }
-static int sp_valloc(struct OcerzVM *vm, OcerzCPU *cpu) { if (g_gzone) return to_zone(cpu, 20); RET(m32_memalign(4096, m32_arg(cpu, 0))); }
+/* valloc: aligned to the page size the guest is told (m32_page_size): GLib's slice allocator takes a valloc'd page and
+ * asserts it is aligned to sysconf(_SC_PAGESIZE), and when the two disagreed Wesnoth stopped there ("GSlice:
+ * assertion failed: aligned_memory == (gpointer) addr") */
+static int sp_valloc(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (g_gzone)
+        return to_zone(cpu, 20);
+    RET(m32_memalign(m32_page_size(), m32_arg(cpu, 0)));
+}
 static int sp_free(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t p = m32_arg(cpu, 0);
@@ -865,8 +881,19 @@ static int sp_wcsnrtombs(struct OcerzVM *vm, OcerzCPU *cpu) { return src_conv(cp
 static int sp_mbsrtowcs(struct OcerzVM *vm, OcerzCPU *cpu) { return src_conv(cpu, 0, 0); }
 static int sp_mbsnrtowcs(struct OcerzVM *vm, OcerzCPU *cpu) { return src_conv(cpu, 1, 0); }
 
+/* __srget(fp): the guest twin's _r stays 0 or less, so i386's getc and getc_unlocked macros call it for every
+ * character, and libc's __srget refills the buffer first: each call answered the first character of the next 4 KB and
+ * dropped the rest.  Pango read its config files that way and parsed none of them (Wesnoth: "pango.aliases:1: Line is
+ * not of the form KEY=VALUE").  It is the next character of the host's stream, getc. */
+static int sp___srget(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    FILE *f = (FILE *)m32_host(m32_arg(cpu, 0));
+    RET(f ? (uint32_t)getc(f) : (uint32_t)EOF);
+}
+
 const M32SpecialEntry m32_stdio_specials[] = {
-    { "___error", sp___error },
+    { "___error", sp___error }, { "___srget", sp___srget },
     { "_wcsrtombs", sp_wcsrtombs }, { "_wcsnrtombs", sp_wcsnrtombs },
     { "_mbsrtowcs", sp_mbsrtowcs }, { "_mbsnrtowcs", sp_mbsnrtowcs },
     { "_printf", sp_printf }, { "_vprintf", sp_vprintf }, { "_fprintf", sp_fprintf }, { "_vfprintf", sp_vfprintf },

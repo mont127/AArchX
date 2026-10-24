@@ -827,6 +827,31 @@ static const char *flat_type(Flat *f, CXType t, int depth, int level, long long 
     return r;
 }
 
+/* One structure's members.  cap, when not 0, is the most any member is aligned to: a structure declared under
+ * #pragma pack(2) (Carbon's ProcessInfoRec, AEDesc) has its arm64 pointers at offsets natural alignment would not
+ * give, and its notation says so with the digit after its brace, "{2up}" (m32 only: --guest i386). */
+static const char *flat_members(Flat *f, FieldList *fl, int depth, int level, long long cap, long long *off,
+                                long long *al)
+{
+    for (int i = 0; i < fl->n; i++) {
+        if (clang_Cursor_isBitField(fl->v[i]))
+            return "struct-bitfield";
+        long long msize = 0, malign = 1;
+        const char *r = flat_type(f, clang_getCursorType(fl->v[i]), depth, level, &msize, &malign);
+        if (r)
+            return r;
+        if (cap && malign > cap)
+            malign = cap;
+        *off = align_up(*off, malign);
+        if (clang_Cursor_getOffsetOfField(fl->v[i]) != *off * 8)
+            f->layout_bad = 1;
+        *off += msize;
+        if (malign > *al)
+            *al = malign;
+    }
+    return NULL;
+}
+
 static const char *flat_record(Flat *f, CXType rec, int depth, int level, long long *size,
                                long long *align)
 {
@@ -841,22 +866,23 @@ static const char *flat_record(Flat *f, CXType rec, int depth, int level, long l
     fields_of(rec, &fl);
     const char *r = fl.n == 0 ? "struct-empty" : NULL;
     long long off = 0, al = 1;
+    size_t start = f->out->n;
+    Flat before = *f;
     buf_addc(f->out, '{');
-    for (int i = 0; !r && i < fl.n; i++) {
-        if (clang_Cursor_isBitField(fl.v[i])) {
-            r = "struct-bitfield";
-            break;
-        }
-        long long msize = 0, malign = 1;
-        r = flat_type(f, clang_getCursorType(fl.v[i]), depth, level, &msize, &malign);
-        if (r)
-            break;
-        off = align_up(off, malign);
-        if (clang_Cursor_getOffsetOfField(fl.v[i]) != off * 8)
-            f->layout_bad = 1;
-        off += msize;
-        if (malign > al)
-            al = malign;
+    if (!r)
+        r = flat_members(f, &fl, depth, level, 0, &off, &al);
+    if (!r && g_guest32 && (f->layout_bad > before.layout_bad || align_up(off, al) != real_size) &&
+        real_align < al && (real_align == 1 || real_align == 2 || real_align == 4)) {
+        f->out->n = start;   /* packed: again, no member aligned past the structure */
+        f->out->s[start] = 0;
+        f->members = before.members;
+        f->layout_bad = before.layout_bad;
+        f->align_only = before.align_only;
+        buf_addc(f->out, '{');
+        buf_addc(f->out, (char)('0' + real_align));
+        off = 0;
+        al = 1;
+        r = flat_members(f, &fl, depth, level, real_align, &off, &al);
     }
     free(fl.v);
     if (r)

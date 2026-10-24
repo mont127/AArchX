@@ -1,0 +1,7 @@
+#!/bin/sh
+# Nexuiz.app's executable, cut down: no debugger variable, the game started directly and then by exec.  ocerz runs the
+# script on /bin/sh's x86_64 slice, so the i386 game it starts is ocerz's to run; run natively, /bin/sh handed it to
+# the kernel, which refused it ("Bad CPU type in executable").
+./ret42 "$@"
+echo "game exit $?"
+exec ./ret42

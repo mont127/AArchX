@@ -4,19 +4,25 @@
 # line in the shell profile (~/.zprofile or ~/.bash_profile), and no password
 # is asked for.
 #
-#   curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
-#   curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall
+#   CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh
+#   CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall
 #
 # AARCHX_HOME           where to install (default ~/.aarchx)
 # AARCHX_VERSION        a release tag such as v0.7 (default: the latest release)
 # AARCHX_NO_MODIFY_PATH set to 1 to leave the shell profile alone
 # AARCHX_NO_APP         set to 1 to leave AArchX.app out of ~/Applications
+# AARCHX_NO_32BIT_RUNTIMES set to 1 to skip the 32-bit C++ and X11 runtimes
 # AARCHX_URL            the archive to install instead of the release's
 #
 # The archive is fetched with curl, so macOS does not quarantine it and
 # Gatekeeper does not stop the unsigned ocerz binary.
 
 set -eu
+
+# Apple's TLS, not the LibreSSL that macOS's curl uses by default: in October 2026 the keys of eight eMudhra
+# intermediate CAs turned out to be public, so anyone can sign a certificate for any site with them.  Apple
+# distrusts them, but only in its own TLS; through LibreSSL /usr/bin/curl still accepts what they sign.
+export CURL_SSL_BACKEND=secure-transport
 
 REPO=mont127/AArchX
 ASSET=aarchx-macos-arm64.tar.gz
@@ -111,6 +117,23 @@ install() {
     mv "$tmp/x/aarchx" "$home"
     say "installed $("$home/ocerz" version) in $home"
 
+    # The C++ and X11 libraries 32-bit games need and macOS no longer has: MacPorts' packages, which no release
+    # carries, fetched and unpacked here (about 15 MB; no Xcode tools needed).  An earlier install's copy is kept, and
+    # a failed fetch leaves everything else working.
+    if [ -d "$tmp/old/runtime/guest32" ] && [ ! -e "$home/runtime/guest32" ]; then
+        mv "$tmp/old/runtime/guest32" "$home/runtime/guest32"
+    fi
+    if [ "${AARCHX_NO_32BIT_RUNTIMES:-0}" != 1 ] && [ -x "$home/tools/fetch_guest32_cxx.sh" ]; then
+        say "fetching the 32-bit C++ and X11 runtimes from MacPorts"
+        if "$home/tools/fetch_guest32_cxx.sh" >/dev/null && "$home/tools/fetch_guest32_x11.sh" >/dev/null; then
+            say "installed the 32-bit runtimes in $home/runtime/guest32"
+        else
+            say "could not fetch the 32-bit runtimes, which 32-bit C++ games need; run"
+            say "  $home/tools/fetch_guest32_cxx.sh && $home/tools/fetch_guest32_x11.sh"
+            say "later to add them"
+        fi
+    fi
+
     if [ -d "$home/AArchX.app" ]; then
         app=$HOME/Applications/AArchX.app
         if [ "${AARCHX_NO_APP:-0}" = 1 ]; then
@@ -166,7 +189,7 @@ install() {
     say "Run an Intel program:"
     say "  ocerz /Applications/Some.app"
     say "  ocerz -native ./some_tool"
-    say "Uninstall: curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall"
+    say "Uninstall: CURL_SSL_BACKEND=secure-transport curl -fsSL https://mont127.github.io/AArchX/install.sh | sh -s -- --uninstall"
 }
 
 case "${1:-}" in

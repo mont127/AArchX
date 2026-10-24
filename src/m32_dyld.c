@@ -6,6 +6,7 @@
  * included) is applied at load, so dyld_stub_binder is never reached and each __la_symbol_ptr holds its final
  * target from the first call on.
  */
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <mach-o/fat.h>
@@ -459,6 +460,8 @@ static void index_symbols(M32Image *img)
 }
 
 /* Load an i386 image from path. The main executable maps at its own addresses. */
+static int runtime_libstdcxx(const char *path);
+
 M32Image *m32_image_load(const char *path, int is_main)
 {
     size_t len = 0, slen = 0;
@@ -482,6 +485,7 @@ M32Image *m32_image_load(const char *path, int is_main)
         free(img);
         return NULL;
     }
+    img->runtime_cxx = runtime_libstdcxx(path);
     if (img->has_main)
         img->entry_main = img->base + img->entry_main_off;   /* entryoff counts from the mach header */
     if (img->entry_thread)
@@ -520,7 +524,10 @@ static uint32_t legacy_symbol(M32Image *img, uint32_t symidx, const char **name_
     *weak = (desc & N_WEAK_REF) != 0;
     if ((nl[4] & N_TYPE) == N_SECT)   /* defined here: its own address */
         return le32(nl + 8) + (uint32_t)img->slide;
-    return m32_resolve(img, legacy_ordinal(desc), name, *weak);
+    /* an image linked with -flat_namespace (no MH_TWOLEVEL: Wesnoth's GLib and Pango) records no library for an
+     * import; dyld looks each one up in every image, then the system, which a two-level ordinal of 0 would not */
+    uint32_t mh_flags = le32(img->file + 24);
+    return m32_resolve(img, (mh_flags & MH_TWOLEVEL) ? legacy_ordinal(desc) : BIND_SPECIAL_DYLIB_FLAT_LOOKUP, name, *weak);
 }
 
 static int legacy_fixups(M32Image *img)
@@ -655,6 +662,7 @@ int m32_image_fixup(M32Image *img)
     int bad = bind_stream(img, img->bind_off, img->bind_size, 0, 0);
     bad += bind_stream(img, img->lazy_off, img->lazy_size, 1, 0);
     bind_stream(img, img->weak_off, img->weak_size, 0, 1);
+    m32_fstream_fixup(img);
     m32_cf_alias_strings(img);
     m32_tlv_register(img);
     m32_objc_load(img);
@@ -683,10 +691,86 @@ static void guest32_root(void)
     }
 }
 
+/* the runtime's libstdc++ (tools/fetch_guest32_cxx.sh), which src/m32_fstream.c gives Apple's file streams: the file
+ * the runtime's /usr/lib name leads to, a symlink into MacPorts' layout since the fetch needs no Xcode tools (an image's
+ * path is its real path), or the name itself as older fetches wrote it */
+static int runtime_libstdcxx(const char *path)
+{
+    guest32_root();
+    char want[1100], real[1100];
+    snprintf(want, sizeof want, "%s/usr/lib/libstdc++.6.dylib", g_guest32_root);
+    return g_guest32_root[0] && (!strcmp(path, want) || (realpath(want, real) && !strcmp(path, real)));
+}
+
+/* fontconfig from runtime/guest32 (tools/fetch_guest32_x11.sh) looks for /opt/local/etc/fonts/fonts.conf, where it
+ * was built; the fonts.conf installed beside it names the Mac's font folders, and is the one used unless the user
+ * named another */
+void m32_fontconfig_default(void)
+{
+    guest32_root();
+    char conf[1100];
+    snprintf(conf, sizeof conf, "%s/usr/X11R6/etc/fonts/fonts.conf", g_guest32_root);
+    if (g_guest32_root[0] && !getenv("FONTCONFIG_FILE") && access(conf, R_OK) == 0)
+        setenv("FONTCONFIG_FILE", conf, 0);
+}
+
 static int file_exists(const char *p)
 {
     struct stat st;
     return stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* an LC_RPATH entry, a directory: @executable_path and @loader_path expanded as text.  m32_resolve_path resolves
+ * files only, and a directory rpath (Adium's @executable_path/../Frameworks) came back unexpanded, so no @rpath
+ * library of it was found */
+static void rpath_dir(const M32Image *img, const char *rp, char *out, size_t outlen)
+{
+    if (!strncmp(rp, "@executable_path/", 17)) {
+        snprintf(out, outlen, "%s/%s", g_exe_dir, rp + 17);
+    } else if (!strncmp(rp, "@loader_path/", 13)) {
+        char dir[1024];
+        snprintf(dir, sizeof dir, "%s", img->path);
+        char *slash = strrchr(dir, '/');
+        if (slash)
+            *slash = 0;
+        snprintf(out, outlen, "%s/%s", dir, rp + 13);
+    } else {
+        snprintf(out, outlen, "%s", rp);
+    }
+}
+
+/* A leaf name alone, as DarkPlaces asks for zlib ("libz.dylib"), is looked for as dyld looks: in
+ * DYLD_FALLBACK_LIBRARY_PATH, by default ~/lib, /usr/local/lib and /usr/lib.  An i386 image there is the guest's; one
+ * in /usr/lib is our runtime's (runtime/guest32) or else a system library, bridged, if the host has it.  Nexuiz found
+ * no zlib and read none of its data.  So is the leaf of a library that is not where its path says, as dyld falls
+ * back: LinCity-NG's Mac build links libiconv, libz, libstdc++, libgcc_s and even libSystem from its own Frameworks,
+ * which it does not carry, and ran on the ones in /usr/lib. */
+static int fallback_path(const char *name, char *out, size_t outlen)
+{
+    char def[1100], cand[2048];
+    const char *home = getenv("HOME"), *fb = getenv("DYLD_FALLBACK_LIBRARY_PATH");
+    snprintf(def, sizeof def, "%s/lib:/usr/local/lib:/usr/lib", home ? home : "");
+    for (const char *d = fb && *fb ? fb : def; d && *d; d = strchr(d, ':') ? strchr(d, ':') + 1 : NULL) {
+        size_t n = strcspn(d, ":");
+        if (!n)
+            continue;
+        snprintf(cand, sizeof cand, "%.*s/%s", (int)n, d, name);
+        if (!strncmp(cand, "/usr/lib/", 9)) {
+            char ours[3200];
+            guest32_root();
+            snprintf(ours, sizeof ours, "%s%s", g_guest32_root, cand);
+            if (g_guest32_root[0] && file_exists(ours) && realpath(ours, out))
+                return 0;
+            void *h = dlopen(cand, RTLD_LAZY | RTLD_LOCAL);
+            if (h) {
+                out[0] = 0;   /* a system library */
+                (void)outlen;
+                return 0;
+            }
+        } else if (file_exists(cand) && (slices(cand) & 1) && realpath(cand, out))
+            return 0;
+    }
+    return -1;
 }
 
 /* expand @executable_path, @loader_path and @rpath; out is empty when the name is a system library */
@@ -697,6 +781,11 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
     /* as dyld does, a library's leaf name in the DYLD_LIBRARY_PATH directories first (Valve's hl2.sh points it at the
      * game's bin); only an i386 image counts, so the host's own libraries on that path are passed over */
     const char *dl = getenv("DYLD_LIBRARY_PATH"), *leaf = strrchr(name, '/');
+    char bare[1024];
+    if (!leaf && name[0] != '@') {   /* a leaf name alone ("libz.dylib") */
+        snprintf(bare, sizeof bare, "/%s", name);
+        leaf = bare;
+    }
     for (const char *d = dl; d && *d && leaf; d = strchr(d, ':') ? strchr(d, ':') + 1 : NULL) {
         size_t n = strcspn(d, ":");
         snprintf(buf, sizeof buf, "%.*s%s", (int)n, d, leaf);
@@ -717,14 +806,20 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
             const M32Image *img = pass == 0 ? loader : (m32_nimages ? m32_images[0] : NULL);
             for (int i = 0; img && i < img->nrpath; i++) {
                 char rp[1024], cand[2048];
-                m32_resolve_path(img, img->rpath[i], rp, sizeof rp);
-                if (!rp[0])
-                    snprintf(rp, sizeof rp, "%s", img->rpath[i]);
+                rpath_dir(img, img->rpath[i], rp, sizeof rp);
                 snprintf(cand, sizeof cand, "%s/%s", rp, name + 7);
                 if (file_exists(cand) && realpath(cand, out))
                     return 0;
             }
         }
+        /* An image already loaded under exactly that install name is the one, as dyld reuses it: Wine's
+         * ntdll.dll.so names @rpath/libwine.1.dylib and has no rpath that finds it, and the loader chain whose
+         * rpaths would (libwine's own, wine's) is not the one m32 searches */
+        for (int i = 0; i < m32_nimages; i++)
+            if (!strcmp(m32_images[i]->install_name, name)) {
+                snprintf(out, outlen, "%s", m32_images[i]->path);
+                return 0;
+            }
         return -1;
     } else {
         guest32_root();
@@ -737,7 +832,9 @@ int m32_resolve_path(const M32Image *loader, const char *name, char *out, size_t
     }
     if (file_exists(buf) && realpath(buf, out))
         return 0;
-    return -1;
+    if (!strchr(name, '/') && name[0] != '@')
+        return fallback_path(name, out, outlen);
+    return leaf && leaf[1] ? fallback_path(leaf + 1, out, outlen) : -1;
 }
 
 static M32Image *find_loaded(const char *path)
@@ -746,6 +843,20 @@ static M32Image *find_loaded(const char *path)
         if (!strcmp(m32_images[i]->path, path))
             return m32_images[i];
     return NULL;
+}
+
+/* A program's own OpenAL library is the system's.  A bundled one (SuperTuxKart's is Apple's old open-source OpenAL)
+ * mixes as i386 code, crossing into an AUGraph and called back into the guest for every buffer; the OpenAL macOS ships
+ * is the same C API, crossed like any other library, and mixes natively (AssaultCube plays through it).  A bundled
+ * libopenal*.dylib or OpenAL.framework becomes it (OCERZ_NO_M32_SYSTEM_OPENAL=1 loads the program's own). */
+#define SYSTEM_OPENAL "/System/Library/Frameworks/OpenAL.framework/Versions/A/OpenAL"
+static int bundled_openal(const char *path)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_SYSTEM_OPENAL") != NULL;
+    const char *base = strrchr(path, '/');
+    return !off && base && (!strncmp(base + 1, "libopenal", 9) || strstr(path, "/OpenAL.framework/"));
 }
 
 /* load every guest dependency of img, recursively; returns -1 when a required one is missing */
@@ -758,6 +869,10 @@ static int load_deps(M32Image *img)
                 continue;
             fprintf(stderr, "ocerz: m32: %s: cannot find %s\n", img->path, img->deps[i]);
             return -1;
+        }
+        if (path[0] && bundled_openal(path)) {
+            img->deps[i] = strdup(SYSTEM_OPENAL);
+            path[0] = 0;
         }
         if (!path[0]) {   /* system: open it now, so the classes of one used only for them (WebKit) exist */
             ocerz_bridge_host_library(img->deps[i]);
@@ -847,10 +962,29 @@ static uint32_t nlist_lookup(M32Image *img, const char *name)
     return 0;
 }
 
+/* whether img is a GCC support library (libgcc_*): our runtime's (runtime/guest32/usr/lib) or one a program brings */
+static int guest_libgcc(const M32Image *img)
+{
+    const char *base = strrchr(img->path, '/');
+    return base && !strncmp(base + 1, "libgcc_", 7);
+}
+
 static uint32_t lookup_in(M32Image *img, const char *name, int depth)
 {
     if (depth > 8)
         return 0;
+    /* One unwinder for every frame: a program built with Apple's GCC imports _Unwind_Resume and the rest from
+     * libgcc_s, which our runtime's GCC libraries answer with their own unwinder, while libstdc++'s throw goes through
+     * m32's (src/m32_unwind.c), and the two do not know each other's state: SuperTuxKart aborted inside libgcc's
+     * unwinder after its first throw.  A libgcc_s the program bundles is the same: Pingus's found no frame to unwind
+     * its first exception through and aborted.  GCC's arithmetic helpers stay where they are. */
+    if (!strncmp(name, "__Unwind_", 9) && guest_libgcc(img) && m32_special(name))
+        return m32_export("/usr/lib/libSystem.B.dylib", name);
+    if (img->runtime_cxx) {   /* Apple's file streams */
+        uint32_t f = m32_fstream_symbol(img, name);
+        if (f)
+            return f;
+    }
     uint32_t v = img->export_size ? trie_lookup(img, name, depth) : nlist_lookup(img, name);
     for (int i = 0; !v && i < img->ndeps; i++)   /* LC_REEXPORT_DYLIB */
         if (img->dep_reexport[i])
@@ -868,6 +1002,10 @@ uint32_t m32_resolve(M32Image *img, int ordinal, const char *name, int weak_impo
 {
     uint32_t v = 0;
     const char *lib = NULL;
+    /* ___dso_handle, which old linkers left as an import, is the importing image's own header, as dyld answers it:
+     * C++'s __cxa_atexit keys an image's destructors by it (Armagetron Advanced) */
+    if (!strcmp(name, "___dso_handle"))
+        return img->base;
     if (ordinal > 0 && ordinal <= img->ndeps) {
         lib = img->deps[ordinal - 1];
         M32Image *d = img->dep_img[ordinal - 1];
@@ -982,11 +1120,42 @@ M32Image *m32_adopt_program(uint32_t mh, const char *path)
     return img;
 }
 
+/* m32_images[from..] in dependency order, each after every image it depends on, as dyld binds and initializes them.
+ * Reverse load order is not that: Adium's executable loads AIUtilities as its own dependency before Adium.framework,
+ * which needs it, so Adium.framework's classes were set up first and their superclasses from AIUtilities were
+ * missing. */
+static void dep_visit(M32Image *img, int from, M32Image **out, int *n, M32Image **seen, int *nseen)
+{
+    for (int i = 0; i < *nseen; i++)
+        if (seen[i] == img)
+            return;
+    int mine = 0;
+    for (int i = from; i < m32_nimages && !mine; i++)
+        mine = m32_images[i] == img;
+    if (!mine || *nseen >= M32_MAX_IMAGES)
+        return;
+    seen[(*nseen)++] = img;
+    for (int k = 0; k < img->ndeps; k++)
+        if (img->dep_img[k])
+            dep_visit(img->dep_img[k], from, out, n, seen, nseen);
+    out[(*n)++] = img;
+}
+
+int m32_dep_order(int from, M32Image **out)
+{
+    static M32Image *seen[M32_MAX_IMAGES];
+    int n = 0, nseen = 0;
+    for (int i = m32_nimages - 1; i >= from; i--)
+        dep_visit(m32_images[i], from, out, &n, seen, &nseen);
+    return n;
+}
+
 int m32_fixup_all(int from)
 {
-    int bad = 0;
-    for (int i = m32_nimages - 1; i >= from; i--)
-        bad += m32_image_fixup(m32_images[i]);
+    static M32Image *order[M32_MAX_IMAGES];
+    int bad = 0, n = m32_dep_order(from, order);
+    for (int i = 0; i < n; i++)
+        bad += m32_image_fixup(order[i]);
     return bad;
 }
 
@@ -1114,8 +1283,10 @@ static uint32_t dl_open(struct OcerzVM *vm, const char *name, int only_loaded)
                 m32_fixup_all(from);
                 uint32_t init_args[5] = { m32_rd(m32_argc_var), m32_rd(m32_argv_var), m32_rd(m32_environ_var), 0, 0 };
                 pthread_mutex_unlock(&g_dl_lock);
-                for (int i = m32_nimages - 1; i >= from; i--)
-                    m32_run_initializers(vm, m32_images[i], init_args);
+                static M32Image *order[M32_MAX_IMAGES];
+                int n = m32_dep_order(from, order);
+                for (int i = 0; i < n; i++)
+                    m32_run_initializers(vm, order[i], init_args);
                 run_add_image_callbacks(vm, from, 0, g_nadd_image_cb);
                 pthread_mutex_lock(&g_dl_lock);
                 handle = img->base;
@@ -1133,11 +1304,20 @@ static int sp_dlopen(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* A function m32 cannot call - no declaration to cross it by, or a shape it cannot carry - is not there to dlsym: a
+ * program probing for an optional function takes its own fallback, where the trap would answer 0.  cairo's Quartz
+ * backend asks for CGContextGetType that way and, given the trap, took every bitmap context for some other kind
+ * (OCERZ_NO_M32_DLSYM_NULL=1 hands out the traps again).  Data stays: its placeholder stands for the host variable. */
 static uint32_t system_symbol(const char *lib, const char *sym)
 {
+    static int traps = -1;
+    if (traps < 0)
+        traps = getenv("OCERZ_NO_M32_DLSYM_NULL") != NULL;
     uint32_t v = m32_export(lib, sym);
     uint32_t id = v - (uint32_t)OCERZ_DYLDAPI_LO;
     M32Export *e = v - OCERZ_DYLDAPI_LO < OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO ? m32_export_by_id(id) : NULL;
+    if (e && e->kind == M32_EX_BAD && !e->data && !traps)
+        return 0;
     return e && e->kind == M32_EX_UNRESOLVED ? 0 : v;
 }
 
@@ -1356,6 +1536,17 @@ static int sp_image_slide(struct OcerzVM *vm, OcerzCPU *cpu)
     m32_ret(cpu, i < (uint32_t)m32_nimages ? (uint32_t)m32_images[i]->slide : 0, 0, 0);
     return OCERZ_STEP_OK;
 }
+/* intptr_t _dyld_get_image_slide(const struct mach_header *): the slide of the image whose header that is, 0 for
+ * one m32 did not load */
+static int sp_image_slide_of(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t mh = m32_arg(cpu, 0), slide = 0;
+    for (int i = 0; i < m32_nimages; i++)
+        if (m32_images[i]->base == mh)
+            slide = (uint32_t)m32_images[i]->slide;
+    m32_ret(cpu, slide, 0, 0);
+    return OCERZ_STEP_OK;
+}
 static int sp_register_add_image(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t fn = m32_arg(cpu, 0);
@@ -1440,10 +1631,47 @@ static int sp_getsectdatafromheader(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* uint8_t *getsegmentdata(const struct mach_header *, const char *segname, unsigned long *size): the segment of an
+ * i386 header, read in the window, slid by what its __TEXT, which the header starts, was slid by.  The host's walks
+ * 64-bit load commands, and over a 32-bit header it read past the image (Wine looks up its own segments). */
+static int sp_getsegmentdata(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t mh = m32_arg(cpu, 0), szp = m32_arg(cpu, 2), text = 0, addr = 0, size = 0;
+    const char *want = m32_arg(cpu, 1) ? (const char *)m32_h(m32_arg(cpu, 1)) : "";
+    int have_text = 0, found = 0;
+    uint32_t ncmds = mh ? m32_rd(mh + 16) : 0, at = mh + 28;
+    for (uint32_t i = 0; i < ncmds && i < 1024; i++) {
+        uint32_t cmd = m32_rd(at), cmdsize = m32_rd(at + 4);
+        if (cmd == 0x1 /* LC_SEGMENT */) {
+            const char *seg = (const char *)m32_h(at + 8);
+            if (!strncmp(seg, "__TEXT", 16)) {
+                text = m32_rd(at + 24);
+                have_text = 1;
+            }
+            if (!found && !strncmp(seg, want, 16)) {
+                addr = m32_rd(at + 24);
+                size = m32_rd(at + 28);
+                found = 1;
+            }
+        }
+        if (cmdsize < 8)
+            break;
+        at += cmdsize;
+    }
+    if (szp)
+        m32_wr(szp, found ? size : 0);
+    m32_ret(cpu, found ? addr + (have_text ? mh - text : 0) : 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+
 const M32SpecialEntry m32_dyld_specials[] = {
+    { "_getsegmentdata", sp_getsegmentdata },
     { "__dyld_func_lookup", sp_dyld_func_lookup },
     { "_dlopen", sp_dlopen }, { "_dlsym", sp_dlsym }, { "_dlclose", sp_dlclose }, { "_dlerror", sp_dlerror },
     { "_dladdr", sp_dladdr },
+    /* dyld's own names for them, which Wine's preloader asks _dyld_func_lookup for: it has no libSystem to call */
+    { "__dyld_dlopen", sp_dlopen }, { "__dyld_dlsym", sp_dlsym }, { "__dyld_dladdr", sp_dladdr },
+    { "__dyld_get_image_slide", sp_image_slide_of },
     { "_NSAddImage", sp_NSAddImage }, { "_NSLookupSymbolInImage", sp_NSLookupSymbolInImage },
     { "_NSLinkEditError", sp_NSLinkEditError },
     { "_NSCreateObjectFileImageFromFile", sp_NSCreateObjectFileImageFromFile }, { "_NSLinkModule", sp_NSLinkModule },

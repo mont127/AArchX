@@ -374,23 +374,76 @@ static int bundle_executable(const char *dir, char *out, size_t n)
     return len > 0 && (size_t)len < n && stat(out, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+/* whether path is an x86_64 Mach-O or a universal file with an x86_64 slice */
+static int has_x86_64(const char *path)
+{
+    uint8_t buf[4096];
+    int fd = open(path, O_RDONLY);
+    ssize_t got = fd >= 0 ? pread(fd, buf, sizeof buf, 0) : -1;
+    if (fd >= 0)
+        close(fd);
+    if (got < 8)
+        return 0;
+    uint32_t magic = *(const uint32_t *)buf;
+    if (magic == MH_MAGIC_64)
+        return ((const struct mach_header_64 *)buf)->cputype == CPU_TYPE_X86_64;
+    if (magic != FAT_CIGAM)
+        return 0;
+    uint32_t n = __builtin_bswap32(*(const uint32_t *)(buf + 4));
+    for (uint32_t i = 0; i < n && 8 + (i + 1) * sizeof(struct fat_arch) <= (size_t)got; i++)
+        if ((int32_t)__builtin_bswap32((uint32_t)((const struct fat_arch *)(buf + 8))[i].cputype) == CPU_TYPE_X86_64)
+            return 1;
+    return 0;
+}
+
 /*
  * A launch script rather than a program.  Steam's %command% for a Source game on the Mac is hl2.sh, which sets
  * DYLD_LIBRARY_PATH and starts the game as `${GAME_DEBUGGER} <game> <args>`.  The script runs as itself with
  * GAME_DEBUGGER naming this ocerz and the flags before the script, so `ocerz -native %command%` serves those games as
  * it serves the rest; a GAME_DEBUGGER already set wins.  The scripts expand it unquoted, so an ocerz path with a space
- * would split: it is refused with a message instead.  -1 when path is not a script.
+ * would split: it is refused with a message instead.
+ *
+ * Any other script (Nexuiz.app's executable: set DYLD_LIBRARY_PATH, then `exec "$0"-bin "$@"`) runs on its
+ * interpreter's x86_64 slice under this ocerz with the same flags, so the programs it starts are ocerz's to run: run
+ * natively, /bin/sh handed the i386 game to the kernel, which refused it ("Bad CPU type in executable").  An
+ * interpreter with no x86_64 slice runs the script natively, as before.  -1 when path is not a script.
  */
 static int run_launch_script(const char *path, char **argv, int first)
 {
-    char magic[2];
+    char text[65536];
     int fd = open(path, O_RDONLY);
     if (fd < 0)
         return -1;
-    ssize_t got = read(fd, magic, sizeof magic);
+    ssize_t got = read(fd, text, sizeof text - 1);
     close(fd);
-    if (got != 2 || magic[0] != '#' || magic[1] != '!')
+    if (got < 2 || text[0] != '#' || text[1] != '!')
         return -1;
+    text[got] = 0;
+    char line[1024], interp[PATH_MAX] = "", iarg[256] = "";
+    snprintf(line, sizeof line, "%.*s", (int)strcspn(text + 2, "\r\n"), text + 2);   /* the #! line alone */
+    sscanf(line, " %1023[^ \t] %255[^\n]", interp, iarg);
+    for (size_t k = strlen(iarg); k && (iarg[k - 1] == ' ' || iarg[k - 1] == '\t'); k--)
+        iarg[k - 1] = 0;
+    if (!strstr(text, "$GAME_DEBUGGER") && !strstr(text, "${GAME_DEBUGGER") && interp[0] == '/' && has_x86_64(interp)) {
+        char self[PATH_MAX], real[PATH_MAX];
+        uint32_t size = sizeof self;
+        int argc = first;
+        while (argv[argc])
+            argc++;
+        char **nargv = calloc((size_t)argc + 4, sizeof *nargv);
+        if (nargv && _NSGetExecutablePath(self, &size) == 0 && realpath(self, real)) {
+            int n = 0;
+            nargv[n++] = real;
+            for (int k = 1; k < first; k++)
+                nargv[n++] = argv[k];
+            nargv[n++] = interp;
+            if (iarg[0])
+                nargv[n++] = iarg;
+            for (int k = first; k < argc; k++)
+                nargv[n++] = argv[k];
+            execv(real, nargv);
+        }
+    }
     if (!getenv("GAME_DEBUGGER")) {
         char self[PATH_MAX], real[PATH_MAX], debugger[PATH_MAX + 256];
         uint32_t size = sizeof self;
@@ -572,6 +625,14 @@ int main(int argc, char **argv)
     int script = run_launch_script(load_path, argv, i);
     if (script >= 0)
         return script;
+    /* An i386 program has no x86 shared cache to map and crosses into arm64 frameworks on every call, so it runs in
+     * native mode unless asked otherwise.  Cache mode's NaN results from FPCR.AH cost it two FPCR writes per call
+     * (about 17 ns on an M5), more than the checks they save: Nexuiz's benchmark demo took 8% more cycles. */
+    if (!mode_from_flag && !(getenv("OCERZ_MODE") && *getenv("OCERZ_MODE")) && ocerz_mode != OCERZ_MODE_NATIVE &&
+        ocerz_peek_dynamic(load_path) == -2 && m32_is_i386(load_path)) {
+        ocerz_mode = OCERZ_MODE_NATIVE;
+        ocerz_afp_enable();
+    }
 
     apply_wine_defaults(load_path);
 

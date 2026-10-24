@@ -223,6 +223,15 @@ display, as under Rosetta:
 - a global load or store is resolved at translation time, four host
   instructions instead of fourteen or eighteen.
 
+**32-bit Mac games** run through m32 (October 2026). From Steam, Batman:
+Arkham Asylum, Left 4 Dead 2 and Call of Duty: Modern Warfare 3 play; see
+[32-bit Mac games from Steam](32-bit-steam-games.md). Free games downloaded as
+they were released play too: AssaultCube, SuperTuxKart, Neverball and
+Neverputt, Battle for Wesnoth, Teeworlds and Nexuiz (started from its `.app`,
+whose executable is a shell script). Their sound plays. 32-bit apps such as
+Adium, VLC 1.1.12 and Kega Fusion open their windows. What each needed is in
+[32-bit Mac programs](m32.md).
+
 ## Wine and i386
 
 Wine 11.8 runs x86-64 and i386 PE applications through AArchX. With a WoW64 prefix,

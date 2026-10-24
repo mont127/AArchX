@@ -523,6 +523,15 @@ static void ob_return(OcerzCPU *cpu, uint64_t rax)
     cpu->gpr[OCERZ_RAX] = rax;
 }
 
+/* OCERZ_NO_OBJC_SEND_CACHE=1 decides every send in full, as before t_ob_fast */
+static int ob_fast_off(void)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_OBJC_SEND_CACHE") != NULL;
+    return off;
+}
+
 static int ob_logging(void)
 {
     static int en = -1;
@@ -1295,6 +1304,24 @@ static unsigned ob_send_hash(void *cls, void *sel)
     uint64_t k = ((uint64_t)(uintptr_t)cls >> 3) ^ (((uint64_t)(uintptr_t)sel >> 3) * 0x9e3779b97f4a7c15ull);
     return (unsigned)((k ^ (k >> 29)) & (OB_SEND_BUCKETS - 1));
 }
+
+/* What a plain send decides from its class, its selector and the implementation libobjc answers for the two:
+ * whether that implementation is guest code to jump to, and, for a method with nothing to convert beyond the
+ * registers its signature names, the signature and the selector's name.  ob_send_via decides once per thread per
+ * (class, selector, implementation) and keeps the answer here, so a repeated send pays for class_getMethodImplementation
+ * and the call alone.  g_ob_generation, which every bridged change to a class's methods bumps, retires an entry, and a
+ * different implementation for the pair (a guest class defined late, a host swizzle) misses it.  A slot of the
+ * callback bank is never rebound, so the guest function behind an implementation stays what it was. */
+#define OB_FAST_SLOTS 256
+typedef struct ObFast {
+    void *cls, *sel, *nimp;
+    uint64_t generation;
+    uint64_t gimp;
+    const ObSend *send;
+    const char *selname;
+    int stret;
+} ObFast;
+static __thread ObFast t_ob_fast[OB_FAST_SLOTS];
 
 static const ObShape *ob_shape(const char *notation)
 {
@@ -2178,14 +2205,29 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
      * so does a method whose types do not cross at all, whose native
      * implementation is the dead one (ocerz/objcbridge.h).
      */
+    ObFast *fast = NULL;
     if (!imp) {
         void *nimp = ((void *(*)(void *, void *))ob_need(&g_ob_class_getMethodImplementation))(cls, sel);
         uint64_t gimp = 0;
-        if (nimp && nimp == ocerz_objcbridge_dead_imp())
+        uint64_t generation = atomic_load(&g_ob_generation);
+        if (kind == OB_PLAIN && nimp && !ob_fast_off()) {
+            fast = &t_ob_fast[ob_send_hash(cls, sel) & (OB_FAST_SLOTS - 1)];
+            if (fast->cls == cls && fast->sel == sel && fast->nimp == nimp && fast->generation == generation)
+                gimp = fast->gimp;
+            else
+                fast->cls = NULL;
+        }
+        if (fast && fast->cls) {
+        } else if (nimp && nimp == ocerz_objcbridge_dead_imp()) {
             gimp = ocerz_objcbridge_dead_guest_imp(cls, sel);
-        else if (nimp && !(ocerz_abi_callback_sig(nimp, &gimp) && gimp)) {
+            fast = NULL;
+        } else if (nimp && !(ocerz_abi_callback_sig(nimp, &gimp) && gimp)) {
             uint64_t g = ocerz_h2g(nimp);
             gimp = ocerz_abi_is_guest_code(g) ? g : 0;
+        }
+        if (fast && !fast->cls) {
+            *fast = (ObFast){ .cls = cls, .sel = sel, .nimp = nimp, .generation = generation, .gimp = gimp,
+                              .stret = -1 };
         }
         if (gimp) {
             if (kind != OB_PLAIN)
@@ -2196,7 +2238,25 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
         }
     }
 
-    send = ob_method(cls, sel, &scratch);
+    if (fast && fast->send && fast->stret == stret && !ob_logging()) {
+        const OcerzAbiSig *fsig = &fast->send->shape->sig;
+        ocerz_bridge_lower(&outer);
+        ocerz_bridge_raise(&outer, OCERZ_OBJC_LIBOBJC, fast->selname, fast->send->shape->notation, fn);
+        void *raised = NULL;
+        if (ob_eh()) {
+            ObGuarded g = { cpu, fsig, fn, NULL, 0, fast->selname };
+            if (ocerz_objc_guarded(ob_guarded_body, &g, &raised)) {
+                ocerz_bridge_lower(&outer);
+                return ob_eh_throw(vm, cpu, raised ? ocerz_h2g(raised) : 0, 1);
+            }
+        } else {
+            ob_perform(cpu, fsig, fn, NULL, 0, 0, fast->selname);
+        }
+        ocerz_bridge_lower(&outer);
+        return ob_settle(vm, cpu);
+    }
+
+    const ObSend *looked = send = ob_method(cls, sel, &scratch);
     if (!send && imp && imp_types) {
         ob_describe(cls, sel, imp_types, "implementation", &scratch);
         send = &scratch;
@@ -2298,6 +2358,12 @@ static int ob_send_via(struct OcerzVM *vm, OcerzCPU *cpu, ObKind kind, int stret
         bundle_id = (void *)(uintptr_t)ob_named(sig, cpu, 2, 'p');
     if (answers_imp)
         asked = (void *)(uintptr_t)ob_named(sig, cpu, 2, 'p');
+    if (fast && fast->cls && send == looked && send != &scratch && !v && !send->fnptrs && !answers_imp &&
+        !bundle_lookup && !ob_logging()) {
+        fast->send = send;
+        fast->selname = selname;
+        fast->stret = stret;
+    }
     void *raised = NULL;
     if (ob_eh()) {
         ObGuarded g = { cpu, sig, fn, slots, nslots, selname };

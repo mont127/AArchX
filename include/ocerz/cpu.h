@@ -189,5 +189,11 @@ void ocerz_cpu_dump(const OcerzCPU *cpu, FILE *out);
 void ocerz_apply_mxcsr_round(uint32_t mxcsr);
 void ocerz_afp_enable(void);
 int ocerz_afp(void);
+/* m32 runs host frameworks on guest threads: host code must not see FPCR.AH, and translated code needs it.  host
+ * clears it for a call into host code, guest sets it for host code calling guest code; each answers the FPCR to
+ * hand back to ocerz_afp_restore afterwards (src/cpu.c). */
+uint64_t ocerz_afp_host(void);
+uint64_t ocerz_afp_guest(void);
+void ocerz_afp_restore(uint64_t fpcr);
 
 #endif

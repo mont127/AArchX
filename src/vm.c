@@ -111,8 +111,13 @@
  * left alone, because those never return EINTR on their own and apps rightly do
  * not expect it.  OCERZ_UNSTICK_ALL=1 kicks those too.  A native-mode ulock wait
  * (bridge.c) sets block_sigonly instead: it is kicked only once a guest signal
- * is pending for it, which is how a signal that landed between the guest's last
- * check and the kernel wait still reaches its handler.  The same no-op handler
+ * is pending for it.  Any blocked cpu with a guest signal pending for 50 ms is
+ * kicked, read and recvmsg included: that is a signal that landed between the
+ * guest's last check and the kernel wait (or whose host handler restarted it),
+ * and the EINTR lets its handler run; a call the handler asked to restart
+ * (SA_RESTART) is made again rather than returning it (syscall.c).  A SIGUSR1
+ * into a thread parked in read(), as wineserver suspends one, was lost about
+ * once in thirty runs of tests/dynamic/thread_signal.c.  The same no-op handler
  * doubles as a context-synchronization event, so a thread spinning in JIT code
  * observes the stop-site patches made by ocerz_jit_request_stop.
  *
@@ -726,7 +731,7 @@ void ocerz_guestprof_final(void)
 static void guestprof_start(OcerzVM *vm)
 {
     static int started;
-    if (started || !vm || !getenv("OCERZ_GUESTPROF"))
+    if (started || !vm || !ENV_SET("OCERZ_GUESTPROF"))
         return;
     started = 1;
     g_gp_vm = vm;
@@ -1091,6 +1096,32 @@ uint32_t ocerz_take_pending_async_sig_mask(uint32_t accept)
 static __thread sigjmp_buf *g_sig_recover;
 
 static __thread int t_jit_escape_r;
+
+/* Guest loops running on this thread: ocerz_vm_run_cpu's and the callback loop's.  The outermost clears the host
+ * signal mask; a callback nested inside one is called by a native function that guest code called, which leaves the
+ * mask as it found it, so the callback skips the clear and its syscall. */
+static __thread int t_guest_loops;
+
+/* XNU's sigreturn with this infostyle only clears the thread's on-signal-stack flag (bsd/dev/arm/unix_signal.c in
+ * Apple's open-source XNU); libc's siglongjmp does the same when it leaves a handler. */
+#define OCERZ_UC_RESET_ALT_STACK 0x80000000
+extern int __sigreturn(void *uctx, int infostyle, uintptr_t token);
+
+/* A callback's recovery point is taken without the signal mask (sigsetjmp(jb, 0)), which spares the sigprocmask and
+ * sigaltstack calls a mask-saving sigsetjmp makes on every callback.  A jump back to it comes from crash_handler, which
+ * may have run on the signal stack, or from ocerz_vm_jit_escape; this does what siglongjmp of a mask-saving buffer
+ * would have: the host mask empty, as the callback's entry left it, and the thread off the signal stack unless the
+ * recovery point is on it. */
+static void callback_recovered(const void *frame)
+{
+    sigset_t empty;
+    sigemptyset(&empty);
+    pthread_sigmask(SIG_SETMASK, &empty, NULL);
+    stack_t ss;
+    if (sigaltstack(NULL, &ss) == 0 && (ss.ss_flags & SS_ONSTACK) &&
+        ((uintptr_t)frame < (uintptr_t)ss.ss_sp || (uintptr_t)frame >= (uintptr_t)ss.ss_sp + ss.ss_size))
+        __sigreturn(NULL, (int)OCERZ_UC_RESET_ALT_STACK, 0);
+}
 
 void ocerz_vm_jit_escape(int r)
 {
@@ -2303,7 +2334,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
             g_cur_cpu->sig_last_fault = gaddr;
             g_cur_cpu->sig_repeat = 0;
         }
-        int looping = ++g_cur_cpu->sig_repeat > OCERZ_SIG_MAX_REPEAT;
+        /* A fault at one address again and again is a loop only under Wine, whose foreign workers fault on a
+         * dispatcher state they cannot repair.  Any other program with a handler is entitled to fault there as
+         * often as it likes: a garbage collector's write barrier or a safepoint poll protects a page, takes the
+         * fault, unprotects it and goes on, and a Mac delivers every one of them. */
+        int looping = ++g_cur_cpu->sig_repeat > OCERZ_SIG_MAX_REPEAT && ocerz_wine_process;
 
         int no_wine_teb = g_cur_cpu->sig_altstack_sp == 0;
         if (!no_wine_teb) {
@@ -2791,6 +2826,29 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     }
                     t = str_into(t, "\n");
                     write(2, tb, (size_t)(t - tb));
+                    /* OCERZ_WILDDUMP=1: the host frames too, walked by frame pointer, each read through the kernel so
+                     * a bad one ends the walk instead of faulting again (the fault is in host code, which the guest
+                     * report's walk cannot follow) */
+                    if (uc && getenv("OCERZ_WILDDUMP")) {
+                        t = tb;
+                        t = str_into(t, "ocerz: WILD-HOST-BT ");
+                        t = hex_into(t, uc->uc_mcontext->__ss.__pc);
+                        t = str_into(t, " ");
+                        t = hex_into(t, uc->uc_mcontext->__ss.__lr);
+                        uint64_t fp = uc->uc_mcontext->__ss.__fp;
+                        for (int i = 0; i < 24 && fp && !(fp & 7); i++) {
+                            uint64_t fr[2];
+                            mach_vm_size_t got = 0;
+                            if (mach_vm_read_overwrite(mach_task_self(), fp, sizeof fr, (mach_vm_address_t)(uintptr_t)fr,
+                                                       &got) != KERN_SUCCESS || got != sizeof fr || !fr[1])
+                                break;
+                            t = str_into(t, " ");
+                            t = hex_into(t, fr[1]);
+                            fp = fr[0];
+                        }
+                        t = str_into(t, "\n");
+                        write(2, tb, (size_t)(t - tb));
+                    }
                 }
             }
             if (getenv("OCERZ_WILDDUMP"))
@@ -3609,6 +3667,26 @@ static void call_sentinel_init(void)
     OCERZ_LOG("vm: call sentinel page at %#llx\n", (unsigned long long)g_call_sentinel);
 }
 
+/* A callback's cpu starts as a copy of its caller's, less two rings it has no use for, which are 6 of the struct's 8 KB
+ * and made copying it most of what a callback cost.  Its return-address stack starts empty: a translated ret pops
+ * only what the callback's own calls pushed, finds ras_top 0 below that and looks its target up, as it would after a
+ * mismatch (where the ring wraps without that check, it starts zeroed instead).  Its syscall ring starts over. */
+static void cpu_copy_for_call(OcerzCPU *dst, const OcerzCPU *src)
+{
+    const size_t ras0 = offsetof(OcerzCPU, ras), ras1 = offsetof(OcerzCPU, fp_ckpt);
+    const size_t ring0 = offsetof(OcerzCPU, sysring), ring1 = offsetof(OcerzCPU, sysring_n);
+    _Static_assert(offsetof(OcerzCPU, ras) < offsetof(OcerzCPU, fp_ckpt) &&
+                   offsetof(OcerzCPU, fp_ckpt) < offsetof(OcerzCPU, sysring) &&
+                   offsetof(OcerzCPU, sysring) < offsetof(OcerzCPU, sysring_n), "OcerzCPU's rings moved");
+    memcpy(dst, src, ras0);
+    memcpy((char *)dst + ras1, (const char *)src + ras1, ring0 - ras1);
+    memcpy((char *)dst + ring1, (const char *)src + ring1, sizeof *dst - ring1);
+    dst->ras_top = 0;
+    dst->sysring_n = 0;
+    if (ocerz_jit_ras_wraps())
+        memset(dst->ras, 0, sizeof dst->ras);
+}
+
 static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ngpr, int nxmm,
                         uint64_t stack_top, const uint64_t *context, uint32_t m32_sentinel)
 {
@@ -3616,7 +3694,8 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     pthread_once(&g_call_sentinel_once, call_sentinel_init);
     const uint64_t sentinel = m32_sentinel ? m32_sentinel : g_call_sentinel;
     OcerzCPU *prev_cpu = g_cur_cpu;
-    OcerzCPU local = prev_cpu ? *prev_cpu : vm->cpu;
+    OcerzCPU local;
+    cpu_copy_for_call(&local, prev_cpu ? prev_cpu : &vm->cpu);
     local.sig_pending = prev_cpu ? __atomic_exchange_n(&prev_cpu->sig_pending, 0, __ATOMIC_SEQ_CST) : 0;
     memset(local.sig_host_rcvd, 0, sizeof local.sig_host_rcvd);
     memset(local.sig_delivered, 0, sizeof local.sig_delivered);
@@ -3697,10 +3776,17 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
     sigjmp_buf jb;
     sigjmp_buf *prev_recover = g_sig_recover;
     g_sig_recover = &jb;
-    ocerz_host_sigmask_clear("callback");
+    const int outer_loops = t_guest_loops;
+    const int cheap = !ENV_SET("OCERZ_NO_CHEAP_CALLBACK");
+    if (!outer_loops || !cheap)
+        ocerz_host_sigmask_clear("callback");
+    t_guest_loops = outer_loops + 1;
     uint64_t jmark = ocerz_jit_thread_mark();
     int esc_r;
-    if (sigsetjmp(jb, 1) == 2)
+    int jumped = cheap ? sigsetjmp(jb, 0) : sigsetjmp(jb, 1);
+    if (jumped && cheap)
+        callback_recovered(&jb);
+    if (jumped == 2)
         esc_r = t_jit_escape_r;
     else
         esc_r = 0;
@@ -3865,6 +3951,7 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
         prev_cpu->host_kport = prev_kport;
         pthread_mutex_unlock(&g_cpus_lock);
     }
+    t_guest_loops = outer_loops;
     g_sig_recover = prev_recover;
     if (prev_cpu && vm->jit_ordered_required)
         __atomic_store_n(&prev_cpu->ras_top, 0, __ATOMIC_RELEASE);
@@ -3877,8 +3964,10 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
                 prev_cpu->nested_sig_handback++;
             }
             for (int s = 1; s < 32; s++) {
-                __atomic_fetch_add(&prev_cpu->sig_host_rcvd[s], local.sig_host_rcvd[s], __ATOMIC_RELAXED);
-                __atomic_fetch_add(&prev_cpu->sig_delivered[s], local.sig_delivered[s], __ATOMIC_RELAXED);
+                if (local.sig_host_rcvd[s])
+                    __atomic_fetch_add(&prev_cpu->sig_host_rcvd[s], local.sig_host_rcvd[s], __ATOMIC_RELAXED);
+                if (local.sig_delivered[s])
+                    __atomic_fetch_add(&prev_cpu->sig_delivered[s], local.sig_delivered[s], __ATOMIC_RELAXED);
             }
         } else if (left) {
             __atomic_or_fetch(&g_pending_async_mask, (uint32_t)(left << 1), __ATOMIC_SEQ_CST);
@@ -4192,8 +4281,8 @@ static void *ocerz_unstick_thread(void *arg)
         for (int i = 0; i < g_cpus_n; i++) {
             uint64_t t0 = g_cpus[i]->block_since_ns;
             int sigonly = g_cpus[i]->block_sigonly;
-            int due = sigonly ? (g_cpus[i]->sig_pending & ~g_cpus[i]->sig_mask) && now - t0 > 50ull * 1000 * 1000
-                              : now - t0 > 800ull * 1000 * 1000 && (kick_all || !g_cpus[i]->block_nokick);
+            int signalled = (g_cpus[i]->sig_pending & ~g_cpus[i]->sig_mask) && now - t0 > 50ull * 1000 * 1000;
+            int due = signalled || (!sigonly && now - t0 > 800ull * 1000 * 1000 && (kick_all || !g_cpus[i]->block_nokick));
             if (t0 && due) {
                 g_cpus[i]->block_since_ns = now;
                 if (lg)
@@ -4353,6 +4442,8 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     pthread_threadid_np(NULL, &cpu->host_tid);
     cpu->cur_sys_class = -1;
     ocerz_host_sigmask_clear("run_cpu");
+    const int outer_loops = t_guest_loops;
+    t_guest_loops = outer_loops + 1;
     uint64_t jmark = ocerz_jit_thread_mark();
     int esc_r;
     switch (sigsetjmp(jb, 1)) {
@@ -4468,6 +4559,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
                     (unsigned long long)vm->insn_count);
             if (cpu->mode32)
                 exit(125);
+            t_guest_loops = outer_loops;
             g_sig_recover = prev_recover;
             g_cur_cpu = prev_cpu;
             ocerz_cpu_unregister(cpu);
@@ -4476,6 +4568,7 @@ int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
     }
     if (cpu->sig_stop_n)
         ocerz_jit_signal_unstop(vm, cpu);
+    t_guest_loops = outer_loops;
     g_sig_recover = prev_recover;
     g_cur_cpu = prev_cpu;
     ocerz_cpu_unregister(cpu);

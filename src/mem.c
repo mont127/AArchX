@@ -2420,6 +2420,30 @@ int ocerz_addr_prot(uint64_t gaddr)
     return (int)((state & MEM_SLOT_PROT_MASK) >> MEM_SLOT_PROT_SHIFT);
 }
 
+/* 1 if a mapping, of any protection, or an allocation's guard covers the guest page at gaddr, 0 if it is free,
+ * -1 outside the arena: what mincore and an mmap hint ask, where ocerz_addr_prot sees only readable data */
+int ocerz_addr_mapped(uint64_t gaddr)
+{
+    if (gaddr == UINT64_MAX)
+        return -1;
+    const MemRegion *r = region_for_range(round_down(gaddr), round_up(gaddr + 1));
+    if (!r)
+        return -1;
+    return slot_load(r, slot_index(r, gaddr)) != 0;
+}
+
+/* Raises the address ocerz_map_anywhere hands memory out from, leaving what lies below to fixed mappings. */
+void ocerz_mem_set_alloc_floor(uint64_t floor)
+{
+    map_lock_acquire();
+    if (floor > alloc_floor && floor < ocerz_arena_hi) {
+        alloc_floor = floor;
+        if (bump_next < floor)
+            bump_next = floor;
+    }
+    map_lock_release();
+}
+
 int ocerz_addr_readable(uint64_t gaddr)
 {
     int prot = ocerz_addr_prot(gaddr);

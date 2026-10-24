@@ -386,6 +386,7 @@
  * SIGUSR1 the server had sent and the client had lost (see vm.c).
  */
 #include "ocerz/syscall.h"
+#include "ocerz/m32.h"
 #include "ocerz/cache.h"
 #include "ocerz/vm.h"
 #include "ocerz/mem.h"
@@ -4413,6 +4414,8 @@ __thread int g_ocerz_deliver_src;
 int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_code,
                          uint32_t err)
 {
+    if (cpu->mode32 && m32_active)   /* an i386 program's handler, its frame i386's (m32_libsystem.c) */
+        return m32_signal_fault(cpu, sig, fault_addr, si_code, err);
     if (!guest_sig_catchable(sig))
         return 0;
     GuestSigact *sa = &guest_sigact[sig];
@@ -8860,11 +8863,40 @@ static void sysring_exit(OcerzCPU *cpu, uint32_t at, int class, int num)
     ocerz_bigring_push(cpu, e);
 }
 
+/* The calls XNU restarts (ERESTART) when a signal whose handler has SA_RESTART interrupts them, where select, poll,
+ * kevent, the sleeps and the semaphore and ulock waits return EINTR whatever the handler asked. */
+static int restartable_bsd(int num)
+{
+    switch (num) {
+    case 3: case 4: case 5: case 7: case 27: case 28: case 29: case 30: case 120: case 121: case 133: case 153:
+    case 154: case 396: case 397: case 398: case 400: case 401: case 402: case 403: case 404: case 411: case 412:
+    case 413: case 414: case 415:
+        return 1;
+    }
+    return 0;
+}
+
+/* whether every signal ready for the guest (as deliver_async_signals takes them) has a handler installed with
+ * SA_RESTART, so the call they interrupted is made again once they are handled; native mode's bridge asks too */
+int ocerz_signals_restart(OcerzCPU *cpu)
+{
+    uint64_t ready = (__atomic_load_n(&cpu->sig_pending, __ATOMIC_SEQ_CST) & ~cpu->sig_mask) |
+                     (uint64_t)((ocerz_peek_pending_async_sig() & async_accept(cpu->sig_mask)) >> 1);
+    for (uint64_t r = ready; r; r &= r - 1) {
+        int sig = __builtin_ctzll(r) + 1;
+        if (sig >= OCERZ_NSIG || guest_sigact[sig].handler <= 1 || !(guest_sigact[sig].flags & DARWIN_SA_RESTART))
+            return 0;
+    }
+    return ready != 0;
+}
+
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t rax = cpu->gpr[OCERZ_RAX];
     int class = (int)((rax >> 24) & 0xff);
     int num = (int)(rax & 0xffffff);
+    const uint64_t args[6] = { cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX], cpu->gpr[OCERZ_R10],
+                               cpu->gpr[OCERZ_R8], cpu->gpr[OCERZ_R9] };
     uint32_t ring_at = sysring_enter(cpu, class, num);
     peekguard(cpu, class, num, "entry");
 
@@ -9006,6 +9038,22 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 
     peekguard(cpu, class, num, "exit");
     sysring_exit(cpu, ring_at, class, num);
+    /* A call a signal interrupted (EINTR), whose handlers asked for SA_RESTART, goes back onto its syscall instruction
+     * with its number and arguments: the handler deliver_async_signals sets up returns there and the call is made
+     * again, as XNU restarts it.  A signal that lands between the guest's last check and the kernel wait is not run
+     * until the unstick monitor (vm.c) interrupts the wait, and a read whose handler was installed with SA_RESTART
+     * must not see the EINTR that took. */
+    if (rc == OCERZ_STEP_OK && class == 2 && restartable_bsd(num) && (cpu->rflags & OCERZ_CF) &&
+        cpu->gpr[OCERZ_RAX] == EINTR && ocerz_signals_restart(cpu)) {
+        cpu->gpr[OCERZ_RAX] = rax;
+        cpu->gpr[OCERZ_RDI] = args[0];
+        cpu->gpr[OCERZ_RSI] = args[1];
+        cpu->gpr[OCERZ_RDX] = args[2];
+        cpu->gpr[OCERZ_R10] = args[3];
+        cpu->gpr[OCERZ_R8] = args[4];
+        cpu->gpr[OCERZ_R9] = args[5];
+        cpu->rip -= 2;   /* syscall is 0f 05 */
+    }
     if (rc == OCERZ_STEP_OK)
         deliver_async_signals(vm, cpu, ocerz_take_pending_async_sig_mask(async_accept(cpu->sig_mask)));
     ocerz_vm_suspend_point(cpu);

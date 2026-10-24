@@ -62,6 +62,8 @@ HOST(CTFontGetUnderlineThickness); HOST(CTFontGetBoundingBox); HOST(CTFontGetGly
 HOST(CTFontGetAdvancesForGlyphs); HOST(CTFontGetBoundingRectsForGlyphs);
 HOST(CTLineCreateWithAttributedString); HOST(CTLineDraw); HOST(CTLineGetGlyphRuns); HOST(CTLineGetTypographicBounds);
 HOST(CTRunGetGlyphCount); HOST(CTRunGetGlyphs); HOST(CTRunGetPositions); HOST(CTRunGetStringIndices);
+HOST(CTFontCreateWithGraphicsFont); HOST(CTFontCreatePathForGlyph); HOST(CGFontGetAscent); HOST(CGFontGetDescent);
+HOST(CGFontGetLeading);
 static CFStringRef k_font, k_color, k_underline;
 
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
@@ -92,6 +94,8 @@ static void load(void)
     L(ct, CTLineCreateWithAttributedString); L(ct, CTLineDraw); L(ct, CTLineGetGlyphRuns);
     L(ct, CTLineGetTypographicBounds); L(ct, CTRunGetGlyphCount); L(ct, CTRunGetGlyphs); L(ct, CTRunGetPositions);
     L(ct, CTRunGetStringIndices);
+    L(ct, CTFontCreateWithGraphicsFont); L(ct, CTFontCreatePathForGlyph); L(cg, CGFontGetAscent);
+    L(cg, CGFontGetDescent); L(cg, CGFontGetLeading);
 #undef L
     CFStringRef *f = ct ? dlsym(ct, "kCTFontAttributeName") : NULL, *c = ct ? dlsym(ct, "kCTForegroundColorAttributeName") : NULL,
                 *u = ct ? dlsym(ct, "kCTUnderlineStyleAttributeName") : NULL;
@@ -413,6 +417,68 @@ static int sp_ATSFontGetTable(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(NO_ERR);
 }
 
+/* ---- CoreGraphics' private font calls ---- */
+
+/* cairo's Quartz font backend (Gecko 1.9's text) looks these up with dlsym and makes no font unless all are there.
+ * No SDK declares them, so the databases have no notation for them and CGFontGetGlyphPath not even a record: Firefox
+ * 3.6's dlsym found no CGFontGetGlyphPath, cairo made no font at all, and Firefox aborted with "unable to find a usable
+ * font".  They keep the contracts cairo's source gives them, on CoreText:
+ *   void CGFontGetGlyphsForUnichars(CGFontRef, const UniChar[], CGGlyph[], size_t), ...ForUnicodes in 10.4
+ *   CGPathRef CGFontGetGlyphPath(CGFontRef, const CGAffineTransform *, int, CGGlyph): the outline at an em of 1
+ *   const struct { int ascent, descent, leading; } *CGFontGetHMetrics(CGFontRef): font units, descent negative */
+static CTFontRef ct_font(uint32_t cg, double size)
+{
+    void *f = ready() ? m32_host(cg) : NULL;
+    return f ? CTFontCreateWithGraphicsFont_((CGFontRef)f, size, NULL, NULL) : NULL;
+}
+
+static int sp_CGFontGetGlyphsForUnichars(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t n = A(3);
+    if (!A(1) || !A(2) || !n || n > 1u << 24)
+        RET(0);
+    uint16_t *glyphs = m32_h(A(2));
+    memset(glyphs, 0, 2 * (size_t)n);   /* a character the font lacks is glyph 0 */
+    CTFontRef f = ct_font(A(0), 12);
+    if (f)
+        CTFontGetGlyphsForCharacters_(f, (const UniChar *)m32_h(A(1)), glyphs, n);
+    release(f);
+    RET(0);
+}
+
+static int sp_CGFontGetGlyphPath(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    CGAffineTransform t = { 1, 0, 0, 1, 0, 0 };
+    if (A(1)) {   /* six floats on i386 */
+        const float *m = m32_h(A(1));
+        t = (CGAffineTransform){ m[0], m[1], m[2], m[3], m[4], m[5] };
+    }
+    CTFontRef f = ct_font(A(0), 1);
+    CGPathRef p = f ? CTFontCreatePathForGlyph_(f, (CGGlyph)A(3), &t) : NULL;
+    release(f);
+    RET(p ? m32_handle((void *)p) : 0);
+}
+
+static int sp_CGFontGetHMetrics(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    enum { CELLS = 16 };   /* read at once by the caller: a ring of cells, not one per font */
+    static uint32_t cells;
+    static _Atomic uint32_t next;
+    void *f = ready() ? m32_host(A(0)) : NULL;
+    if (!f)
+        RET(0);
+    if (!cells)
+        cells = m32_static_alloc(CELLS * 12, 4);
+    uint32_t c = cells + 12 * (next++ % CELLS);
+    m32_wr(c, (uint32_t)CGFontGetAscent_((CGFontRef)f));
+    m32_wr(c + 4, (uint32_t)CGFontGetDescent_((CGFontRef)f));
+    m32_wr(c + 8, (uint32_t)CGFontGetLeading_((CGFontRef)f));
+    RET(c);
+}
+
 static int sp_identity(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(A(0)); }
 static int sp_GetAppFont(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(1); }
 static int sp_GetSysFont(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
@@ -634,6 +700,59 @@ static int sp_ATSUCreateTextLayoutWithTextPtr(struct OcerzVM *vm, OcerzCPU *cpu)
     }
     if (out)
         m32_wr(out, m32_handle(l));
+    RET(NO_ERR);
+}
+/* ATSUCreateTextLayout(ATSUTextLayout *), ATSUSetTextPointerLocation(layout, text, offset, length, totalLength) and
+ * ATSUSetRunStyle(layout, style, runStart, runLength): a layout made empty and given its text and runs afterwards, as
+ * Pango's ATSUI renderer makes them (Wesnoth); a run over the whole text replaces the runs, one starting where the
+ * last ended is appended */
+static int sp_ATSUCreateTextLayout(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = ready() ? calloc(1, sizeof *l) : NULL;
+    if (!l)
+        RET(PARAM_ERR);
+    if (A(0))
+        m32_wr(A(0), m32_handle(l));
+    RET(NO_ERR);
+}
+static int sp_ATSUSetTextPointerLocation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = m32_host(A(0));
+    if (!l)
+        RET(INVALID_LAYOUT);
+    l->text = A(1);
+    l->offset = range_start(A(2));
+    l->length = A(3) == 0xffffffffu ? A(4) - l->offset : A(3);
+    RET(NO_ERR);
+}
+static int sp_ATSUSetRunStyle(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    AtsuLayout *l = m32_host(A(0));
+    AtsuStyle *st = m32_host(A(1));
+    uint32_t start = range_start(A(2)), len = A(3), end = 0;
+    if (!l)
+        RET(INVALID_LAYOUT);
+    for (uint32_t i = 0; i < l->runs && l->run_len[i] != 0xffffffffu; i++)
+        end += l->run_len[i];
+    int whole = start == 0 && (len == 0xffffffffu || len >= l->length);
+    if (whole)
+        l->runs = 0;
+    else if (start != end)   /* ponytail: a run inside the others restyles nothing */
+        RET(NO_ERR);
+    uint32_t *lens = realloc(l->run_len, ((size_t)l->runs + 2) * sizeof *lens);
+    AtsuStyle **styles = realloc(l->run_style, ((size_t)l->runs + 2) * sizeof *styles);
+    if (lens)
+        l->run_len = lens;
+    if (styles)
+        l->run_style = styles;
+    if (!lens || !styles)
+        RET(PARAM_ERR);
+    l->run_len[l->runs] = whole ? 0xffffffffu : len;
+    l->run_style[l->runs] = st;
+    l->runs++;
     RET(NO_ERR);
 }
 static int sp_ATSUDisposeTextLayout(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -1001,9 +1120,13 @@ const M32SpecialEntry m32_atsu_specials[] = {
     { "_GetThemeFont", sp_GetThemeFont }, { "_CGFontCreateWithPlatformFont", sp_CGFontCreateWithPlatformFont },
     { "_ATSFontGetTable", sp_ATSFontGetTable }, { "_ATSUGetGlyphInfo", sp_ATSUGetGlyphInfo },
     { "_ATSUGetGlyphBounds", sp_ATSUGetGlyphBounds }, { "_ATSUSetFontFeatures", sp_ATSUSetFontFeatures },
+    { "_CGFontGetGlyphsForUnichars", sp_CGFontGetGlyphsForUnichars },
+    { "_CGFontGetGlyphsForUnicodes", sp_CGFontGetGlyphsForUnichars }, { "_CGFontGetGlyphPath", sp_CGFontGetGlyphPath },
+    { "_CGFontGetHMetrics", sp_CGFontGetHMetrics },
     { "_ATSUSetAttributes", sp_ATSUSetAttributes },
     { "_ATSUCreateTextLayoutWithTextPtr", sp_ATSUCreateTextLayoutWithTextPtr },
-    { "_ATSUDisposeTextLayout", sp_ATSUDisposeTextLayout },
+    { "_ATSUDisposeTextLayout", sp_ATSUDisposeTextLayout }, { "_ATSUCreateTextLayout", sp_ATSUCreateTextLayout },
+    { "_ATSUSetTextPointerLocation", sp_ATSUSetTextPointerLocation }, { "_ATSUSetRunStyle", sp_ATSUSetRunStyle },
     { "_ATSUSetLayoutControls", sp_ATSUSetLayoutControls },
     { "_ATSUSetTransientFontMatching", sp_ATSUSetTransientFontMatching }, { "_ATSUDrawText", sp_ATSUDrawText },
     { "_ATSUDirectGetLayoutDataArrayPtrFromTextLayout", sp_ATSUDirectGetLayoutDataArrayPtrFromTextLayout },

@@ -88,7 +88,7 @@ $(APIS_STAMP): $(APIS_INPUTS)
 
 APIS32_LIBS := libSystem CoreFoundation libobjc Foundation CoreGraphics AppKit libz SystemConfiguration Security CFNetwork WebKit \
 	CoreServices CoreMedia CoreVideo libiconv IOKit Carbon AudioToolbox libbz2 CoreAudio ForceFeedback QuartzCore \
-	OpenGL libGL Accelerate ApplicationServices CoreText OpenAL AudioUnit libcurl ImageIO
+	OpenGL libGL Accelerate ApplicationServices CoreText OpenAL AudioUnit libcurl ImageIO GLUT
 APIS32_STAMP := runtime/apis32/.generated-$(APIS_VER)
 
 apis32: apis $(APIS32_STAMP)

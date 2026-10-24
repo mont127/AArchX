@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,13 +27,20 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <getopt.h>
+#include <sys/event.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 
+#include "ocerz/decode.h"
+#include "ocerz/flags.h"
 #include "ocerz/interp.h"
 #include "ocerz/m32.h"
 #include "ocerz/m32_objc.h"
 #include "ocerz/syscall.h"
 #include "ocerz/types.h"
 #include "ocerz/vm.h"
+#include "ocerz/x87.h"
 
 /* OCERZ_M32LOG=calls or exit: who ended the process (games quit quietly when a check fails) */
 static void log_exit(OcerzCPU *cpu, const char *how)
@@ -86,6 +94,33 @@ static int sp_SetFrontProcess(struct OcerzVM *vm, OcerzCPU *cpu)
     if (self)
         m32_activate_soon();
     m32_ret(cpu, (uint32_t)(int32_t)(set_front ? set_front(psn) : 0), 0, 0);
+    return OCERZ_STEP_OK;
+}
+
+/* CoreGraphics' private process calls SDL 1.2's main makes a program started outside a bundle a foreground app with:
+ * CPSGetCurrentProcess is GetCurrentProcess (a CPSProcessSerNum is a ProcessSerialNumber), CPSEnableForegroundOperation
+ * TransformProcessType to a foreground application, and CPSSetFrontProcess SetFrontProcess.  m32 had no declaration
+ * for them and answered 0 without doing anything, so such a program stayed in the background without a menu bar. */
+static int sp_CPSGetCurrentProcess(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static short (*current)(void *);
+    if (!current)
+        current = (short (*)(void *))dlsym(RTLD_DEFAULT, "GetCurrentProcess");
+    uint32_t psn = m32_arg(cpu, 0);
+    m32_ret(cpu, psn && current ? (uint32_t)(int32_t)current(m32_h(psn)) : (uint32_t)-50, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_CPSEnableForegroundOperation(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    static int32_t (*transform)(const void *, uint32_t);
+    if (!transform)
+        transform = (int32_t (*)(const void *, uint32_t))dlsym(RTLD_DEFAULT, "TransformProcessType");
+    uint32_t psn = m32_arg(cpu, 0);
+    if (psn && transform)
+        transform(m32_h(psn), 1);   /* kProcessTransformToForegroundApplication; already one is no error to SDL */
+    m32_ret(cpu, 0, 0, 0);
     return OCERZ_STEP_OK;
 }
 
@@ -664,17 +699,39 @@ static int sp_fcntl(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 
 /* ---- memory mappings: inside the window, never the host's own address space ----
- * Host pages are 16 KB and i386 ones 4 KB: lengths round up to 16 KB, and mprotect/madvise are accepted without
- * effect (ponytail: a guard page an allocator protects stays writable; nothing we run relies on the fault). */
+ * Host pages are 16 KB and i386 ones 4 KB: lengths round up to 16 KB.  An mprotect that asks for write access gets
+ * it for the host pages it touches (an image's __TEXT, which m32 maps read and execute, is one Wine writes after
+ * unprotecting it); one that takes access away, and madvise, are accepted without effect (ponytail: a guard page an
+ * allocator protects stays writable; nothing we run relies on the fault). */
 #define M32_MAP_FAILED 0xffffffffu
 static uint32_t map_len(uint32_t len) { return (len + 0x3fffu) & ~0x3fffu; }
-/* [a, b) of the 16 KB host page at page, for a fixed anonymous mapping: zeroed, the page mapped if it was not */
+/* [a, b) of the 16 KB host page at page, for a fixed anonymous mapping: zeroed, the page mapped if it was not and
+ * made writable if it was not (Wine maps a builtin DLL's header page over the start of its read-only image) */
 static int map_part(uint32_t page, uint32_t a, uint32_t b)
 {
     if (!ocerz_addr_readable(page))
         return ocerz_map_fixed(page, 0x4000, PROT_READ | PROT_WRITE) != OCERZ_OK;
+    if (ocerz_protect(page, 0x4000, PROT_READ | PROT_WRITE) != OCERZ_OK)
+        return 1;
     memset(m32_h(a), 0, b - a);
     return 0;
+}
+
+static int sp_mprotect(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t g = m32_arg(cpu, 0), len = m32_arg(cpu, 1);
+    int prot = (int)m32_arg(cpu, 2);
+    if ((g & 0xfff) || (uint64_t)g + len > M32_HANDLE_LO) {
+        errno = EINVAL;
+        RETV(0xffffffffu);
+    }
+    if ((prot & PROT_WRITE) && len) {
+        uint32_t lo = g & ~0x3fffu, hi = (uint32_t)(((uint64_t)g + len + 0x3fff) & ~0x3fffull);
+        for (uint32_t p = lo; p < hi; p += 0x4000)
+            if (ocerz_addr_readable(p))
+                ocerz_protect(p, 0x4000, PROT_READ | PROT_WRITE);
+    }
+    RETV(0);
 }
 
 /* mmap from i386 code, the bridged call's and a raw system call's (src/m32_selfload.c): the guest address, or
@@ -686,6 +743,15 @@ uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint
         return M32_MAP_FAILED;
     }
     uint32_t size = map_len(len), g;
+    /* A hint is taken where the range is free, as macOS takes it: Wine's preloader reserves the address ranges
+     * Windows programs need that way, and a range given out anywhere else is no use to it. */
+    if (!(flags & MAP_FIXED) && want && !(want & 0xfff) && (uint64_t)want + len <= M32_HANDLE_LO) {
+        int free_range = 1;
+        for (uint64_t a = want; free_range && a < (uint64_t)want + len; a += 0x1000)
+            free_range = ocerz_addr_mapped(a) == 0;
+        if (free_range)
+            flags |= MAP_FIXED;
+    }
     if (flags & MAP_FIXED) {
         /* 4 KB pages, as on the Intel Macs (MW3's VirtualAlloc commits and decommits single pages): the 16 KB host
          * pages wholly inside are mapped afresh, and of a host page the range covers only partly, just the covered
@@ -746,6 +812,32 @@ static int sp_munmap(struct OcerzVM *vm, OcerzCPU *cpu)
         ocerz_unmap(g, map_len(len));   /* ponytail: a partial 4 KB unmap keeps the host page */
     RETV(0);
 }
+/* Foundation's page calls hand out memory the program writes, which has to be in the window: SDL 1.2's main
+ * converts its arguments to UTF-16 in NSAllocateMemoryPages' pages (Armagetron Advanced), and given host pages it
+ * got a handle cell instead and wrote past it */
+static int sp_NSAllocateMemoryPages(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t n = m32_arg(cpu, 0);
+    uint32_t g = n ? m32_mmap(0, n, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0) : 0;
+    m32_ret(cpu, g == M32_MAP_FAILED ? 0 : g, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSDeallocateMemoryPages(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t g = m32_arg(cpu, 0), n = m32_arg(cpu, 1);
+    if (g && !(g & 0x3fff))
+        ocerz_unmap(g, map_len(n));
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_NSCopyMemoryPages(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t s = m32_arg(cpu, 0), d = m32_arg(cpu, 1), n = m32_arg(cpu, 2);
+    if (s && d && n)
+        memmove(m32_h(d), m32_h(s), n);
+    m32_ret(cpu, 0, 0, 0);
+    return OCERZ_STEP_OK;
+}
 static int sp_vm_allocate(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t addrp = m32_arg(cpu, 1), size = map_len(m32_arg(cpu, 2)), flags = m32_arg(cpu, 3);
@@ -802,19 +894,103 @@ static int sp_longjmp(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
-/* ---- signals: handlers are recorded, not delivered (no i386 signal frames yet) ---- */
-static uint32_t g_sig_handler[NSIG];
+/* ---- signals ----
+ * A handler for an asynchronous signal (SIGINT, SIGTERM, SIGALRM, SIGCHLD, ...) runs at the guest's next crossing into
+ * the host: the host's handler only marks the signal, for the whole process since the kernel picks any thread, and
+ * m32_trap calls the guest's handler there as a nested call, before the call the guest was making.  A call blocked in
+ * the host (nanosleep, pause, read) is interrupted first, as on a Mac.  SDL 1.2 turns SIGINT and SIGTERM into its
+ * quit event this way, so a game asked to stop saves its settings and quits.  The handler gets (sig) or, with
+ * SA_SIGINFO, (sig, siginfo, ucontext) with only si_signo filled in.  A fault's handler (SIGSEGV, SIGBUS, SIGFPE,
+ * SIGILL, SIGTRAP) runs at the fault instead (below).  OCERZ_NO_M32_SIGNALS=1 records the asynchronous handlers
+ * only; OCERZ_NO_M32_FAULT_HANDLERS=1 leaves a fault to ocerz's crash report, as a program's crash handler (SDL's
+ * parachute) would otherwise take it. */
+static uint32_t g_sig_handler[NSIG], g_sig_flags[NSIG];
+volatile uint32_t m32_sig_pending;          /* signals caught for the guest, not yet run */
+static __thread uint32_t t_sig_running;     /* signals whose handler is running on this thread */
+
+static int fault_signal(uint32_t sig)
+{
+    return sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE || sig == SIGILL || sig == SIGTRAP;
+}
+static int g_faults_off = -1;   /* OCERZ_NO_M32_FAULT_HANDLERS, read before any fault can ask */
+
+static int async_signal(uint32_t sig)
+{
+    switch (sig) {
+    case SIGHUP: case SIGINT: case SIGQUIT: case SIGTERM: case SIGALRM: case SIGVTALRM: case SIGPROF:
+    case SIGCHLD: case SIGWINCH: case SIGUSR1: case SIGUSR2: case SIGPIPE: case SIGCONT: case SIGINFO:
+    case SIGURG: case SIGIO: case SIGTSTP:
+        return 1;
+    }
+    return 0;
+}
+
+static void host_signal(int sig) { __atomic_or_fetch(&m32_sig_pending, 1u << sig, __ATOMIC_SEQ_CST); }
+
+static void set_handler(uint32_t sig, uint32_t h, uint32_t flags)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_SIGNALS") != NULL;
+    if (g_faults_off < 0)
+        g_faults_off = getenv("OCERZ_NO_M32_FAULT_HANDLERS") != NULL;
+    g_sig_handler[sig] = h;
+    g_sig_flags[sig] = flags;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    if (h == 1) {   /* SIG_IGN is honored: SIGPIPE */
+        sa.sa_handler = SIG_IGN;
+    } else if (h > 1 && async_signal(sig) && !off) {
+        sa.sa_handler = host_signal;
+        sa.sa_flags = (int)(flags & (SA_RESTART | SA_NOCLDSTOP | SA_NOCLDWAIT));
+    } else {
+        if (h > 1 && (!fault_signal(sig) || g_faults_off == 1))
+            m32_log_once("signal handler recorded (not delivered) for signal",
+                         sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "another");
+        if (!async_signal(sig))
+            return;
+        sa.sa_handler = SIG_DFL;
+    }
+    sigaction((int)sig, &sa, NULL);
+}
+
+/* The guest's handlers for the signals caught since, each once, on the calling thread (m32_trap). */
+void m32_signals_deliver(struct OcerzVM *vm)
+{
+    uint32_t pending = __atomic_load_n(&m32_sig_pending, __ATOMIC_SEQ_CST) & ~t_sig_running;
+    while (pending) {
+        uint32_t sig = (uint32_t)__builtin_ctz(pending), bit = 1u << sig;
+        pending &= pending - 1;
+        if (!(__atomic_fetch_and(&m32_sig_pending, ~bit, __ATOMIC_SEQ_CST) & bit))
+            continue;   /* another thread ran it */
+        uint32_t h = g_sig_handler[sig], flags = g_sig_flags[sig];
+        if (h <= 1)
+            continue;
+        if (flags & SA_RESETHAND)
+            set_handler(sig, 0, 0);
+        uint32_t info = 0;
+        if (flags & SA_SIGINFO) {   /* an i386 siginfo_t (64 bytes), then room for a ucontext nobody fills */
+            info = m32_calloc(1, 64 + 512);
+            if (info)
+                m32_wr(info, sig);
+        }
+        uint32_t running = flags & SA_NODEFER ? 0 : bit;
+        t_sig_running |= running;
+        const uint32_t args[3] = { sig, info, info ? info + 64 : 0 };
+        m32_call(vm, h, args, 3, NULL, NULL);
+        t_sig_running &= ~running;
+        if (info)
+            m32_free(info);
+    }
+}
+
 static int sp_signal(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t sig = m32_arg(cpu, 0), h = m32_arg(cpu, 1);
     if (sig == 0 || sig >= NSIG)
         RETV(0xffffffffu);   /* SIG_ERR */
     uint32_t old = g_sig_handler[sig];
-    g_sig_handler[sig] = h;
-    if (h > 1)
-        m32_log_once("signal handler recorded (not delivered) for signal", sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "another");
-    if (h == 1)   /* SIG_IGN is honored: SIGPIPE */
-        signal((int)sig, SIG_IGN);
+    set_handler(sig, h, SA_RESTART);   /* signal() is BSD's: interrupted calls restart */
     RETV(old);
 }
 static int sp_sigaction(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -825,16 +1001,169 @@ static int sp_sigaction(struct OcerzVM *vm, OcerzCPU *cpu)
     if (old) {   /* struct sigaction: handler, mask, flags */
         m32_wr(old, g_sig_handler[sig]);
         m32_wr(old + 4, 0);
-        m32_wr(old + 8, 0);
+        m32_wr(old + 8, g_sig_flags[sig]);
     }
-    if (act) {
-        uint32_t h = m32_rd(act);
-        g_sig_handler[sig] = h;
-        if (h == 1)
-            signal((int)sig, SIG_IGN);
-        else if (h > 1)
-            m32_log_once("sigaction handler recorded (not delivered) for signal", sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "another");
+    if (act)
+        set_handler(sig, m32_rd(act), m32_rd(act + 8));
+    RETV(0);
+}
+
+/* ---- faults ----
+ * A fault in i386 code reaches the program's own handler for it: Mono's SIGSEGV handler turns a null access into a
+ * NullReferenceException and its SIGFPE one a division by zero into a DivideByZeroException, 32-bit Wine turns either
+ * into a Windows exception.  The host's fault handler (vm.c), and the interpreter for a division or an int3, hand it to
+ * ocerz_signal_deliver, which sends a 32-bit cpu here.  The frame is the one XNU's sendsig builds for i386: a 64-byte
+ * siginfo, a 32-byte ucontext and its 600-byte mcontext (exception state, thread state, and the float state, which is
+ * eight reserved bytes then an FXSAVE image), on the thread's stack or on the alternate stack sigaltstack recorded when
+ * the handler asked for SA_ONSTACK.  The handler is called as handler(sig, info, uc) and returns to a trap that loads
+ * the mcontext back, whatever the handler changed in it, as sigreturn does.  A handler that faults again for its own
+ * signal more than a few levels deep is not run again: the kernel would have killed the process. */
+#define MC_SS 12            /* mcontext32: __es at 0, __ss at 12, __fs at 76 */
+#define MC_FS 76
+#define MC_SIZE 600
+#define FS_SNAPSHOT 296     /* the float state's reserved bytes after xmm7 */
+static __thread struct { uint32_t sp, size, flags; } t_altstack = { 0, 0, SS_DISABLE };
+static __thread int t_fault_depth;
+
+/* sigaltstack(const stack_t *ss, stack_t *old): {ss_sp, ss_size, ss_flags}, kept for the guest's fault handlers; the
+ * host thread keeps its own */
+static int sp_sigaltstack(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t ss = m32_arg(cpu, 0), old = m32_arg(cpu, 1), esp = (uint32_t)cpu->gpr[OCERZ_RSP];
+    int on = !(t_altstack.flags & SS_DISABLE) && esp - t_altstack.sp < t_altstack.size;
+    if (old) {
+        m32_wr(old, t_altstack.sp);
+        m32_wr(old + 4, t_altstack.size);
+        m32_wr(old + 8, (t_altstack.flags & SS_DISABLE) | (on ? SS_ONSTACK : 0));
     }
+    if (ss) {
+        uint32_t flags = m32_rd(ss + 8);
+        if (on) {
+            errno = EPERM;
+            RETV(0xffffffffu);
+        }
+        if (flags & SS_DISABLE) {
+            t_altstack.flags = SS_DISABLE;
+        } else {
+            t_altstack.sp = m32_rd(ss);
+            t_altstack.size = m32_rd(ss + 4);
+            t_altstack.flags = 0;
+        }
+    }
+    RETV(0);
+}
+
+static const int g_thread_state_regs[8] = { OCERZ_RAX, OCERZ_RBX, OCERZ_RCX, OCERZ_RDX, OCERZ_RDI, OCERZ_RSI,
+                                            OCERZ_RBP, OCERZ_RSP };
+
+int m32_signal_fault(OcerzCPU *cpu, int sig, uint64_t addr, int code, uint32_t err)
+{
+    if (sig <= 0 || sig >= NSIG)
+        return 0;
+    uint32_t h = g_sig_handler[sig];
+    if (h <= 1 && (sig == SIGSEGV || sig == SIGBUS) && g_sig_handler[sig == SIGSEGV ? SIGBUS : SIGSEGV] > 1) {
+        sig = sig == SIGSEGV ? SIGBUS : SIGSEGV;   /* macOS raises either for a bad access */
+        h = g_sig_handler[sig];
+    }
+    uint32_t flags = g_sig_flags[sig];
+    if (h <= 1 || t_fault_depth >= 4 || g_faults_off == 1)
+        return 0;
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP];
+    int alt = (flags & SA_ONSTACK) && !(t_altstack.flags & SS_DISABLE) && t_altstack.size &&
+              !(esp - t_altstack.sp < t_altstack.size);
+    uint32_t top = alt ? t_altstack.sp + t_altstack.size : esp;
+    uint32_t mc = (top - MC_SIZE) & ~15u, uc = (mc - 32) & ~15u, si = (uc - 64) & ~15u;
+    uint32_t sp = ((si - 16) & ~15u) - 4;   /* at the handler's entry esp + 4 is 16-byte aligned */
+    if (top < MC_SIZE + 256 || !ocerz_addr_readable(sp) || !ocerz_addr_readable(top - 1))
+        return 0;
+    memset(m32_h(sp), 0, top - sp);
+
+    m32_wr(mc + 0, sig == SIGSEGV || sig == SIGBUS ? 14 : sig == SIGFPE ? 0 : sig == SIGTRAP ? 3 : 6);   /* trapno */
+    m32_wr(mc + 4, err);
+    m32_wr(mc + 8, (uint32_t)addr);
+    if (cpu->cc_op != OCERZ_CC_NONE)
+        ocerz_flags_materialize(cpu);
+    for (int i = 0; i < 8; i++)
+        m32_wr(mc + MC_SS + 4 * (uint32_t)i, (uint32_t)cpu->gpr[g_thread_state_regs[i]]);
+    m32_wr(mc + MC_SS + 32, cpu->seg_sel[OCERZ_SREG_SS]);
+    m32_wr(mc + MC_SS + 36, (uint32_t)cpu->rflags);
+    m32_wr(mc + MC_SS + 40, (uint32_t)cpu->rip);
+    m32_wr(mc + MC_SS + 44, cpu->cs_sel);
+    m32_wr(mc + MC_SS + 48, cpu->seg_sel[OCERZ_SREG_DS]);
+    m32_wr(mc + MC_SS + 52, cpu->seg_sel[OCERZ_SREG_ES]);
+    m32_wr(mc + MC_SS + 56, cpu->seg_sel[OCERZ_SREG_FS]);
+    m32_wr(mc + MC_SS + 60, cpu->seg_sel[OCERZ_SREG_GS]);
+    ocerz_x87_fxsave(cpu, mc + MC_FS + 8);
+    m32_wr(mc + MC_FS + 32, cpu->mxcsr);
+    m32_wr(mc + MC_FS + 36, 0xffbf);
+    for (uint32_t i = 0; i < 8; i++) {
+        memcpy(m32_h(mc + MC_FS + 168 + 16 * i), &cpu->xmm[i].lo, 8);
+        memcpy(m32_h(mc + MC_FS + 176 + 16 * i), &cpu->xmm[i].hi, 8);
+    }
+    m32_wr(mc + MC_FS + FS_SNAPSHOT, cpu->fsw);   /* fxsave's FSW folds TOP in; the exact word comes back too */
+
+    m32_wr(uc + 0, (uint32_t)alt);
+    m32_wr(uc + 8, t_altstack.sp);
+    m32_wr(uc + 12, t_altstack.size);
+    m32_wr(uc + 16, t_altstack.flags | (alt ? SS_ONSTACK : 0));
+    m32_wr(uc + 24, MC_SIZE);
+    m32_wr(uc + 28, mc);
+
+    m32_wr(si + 0, (uint32_t)sig);
+    m32_wr(si + 8, (uint32_t)code);
+    m32_wr(si + 24, (uint32_t)addr);
+
+    m32_wr(sp, M32_TRAP(M32_ID_SIGRETURN));
+    m32_wr(sp + 4, (uint32_t)sig);
+    m32_wr(sp + 8, si);
+    m32_wr(sp + 12, uc);
+    cpu->gpr[OCERZ_RSP] = sp;
+    cpu->rip = h;
+    t_fault_depth++;
+    if (flags & SA_RESETHAND)
+        g_sig_handler[sig] = 0;
+    return 1;
+}
+
+/* the handler returned: its ret popped the trap's address, so uc is the third word at esp */
+int m32_sigreturn(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t uc = m32_rd((uint32_t)cpu->gpr[OCERZ_RSP] + 8), mc = uc ? m32_rd(uc + 28) : 0;
+    if (!mc || !ocerz_addr_readable(mc) || !ocerz_addr_readable(mc + MC_SIZE - 1)) {
+        fprintf(stderr, "ocerz: m32: a signal handler returned without its context (esp %#x)\n",
+                (uint32_t)cpu->gpr[OCERZ_RSP]);
+        return OCERZ_STEP_FATAL;
+    }
+    for (int i = 0; i < 8; i++)
+        cpu->gpr[g_thread_state_regs[i]] = m32_rd(mc + MC_SS + 4 * (uint32_t)i);
+    cpu->rflags = (m32_rd(mc + MC_SS + 36) & 0x00ffffffu) | OCERZ_FLAG_FIXED1;
+    cpu->cc_op = OCERZ_CC_NONE;
+    cpu->rip = m32_rd(mc + MC_SS + 40);
+    ocerz_x87_fxrstor(cpu, mc + MC_FS + 8);
+    cpu->fsw = (uint16_t)m32_rd(mc + MC_FS + FS_SNAPSHOT);
+    cpu->mxcsr = m32_rd(mc + MC_FS + 32);
+    ocerz_apply_mxcsr_round(cpu->mxcsr);
+    for (uint32_t i = 0; i < 8; i++) {
+        memcpy(&cpu->xmm[i].lo, m32_h(mc + MC_FS + 168 + 16 * i), 8);
+        memcpy(&cpu->xmm[i].hi, m32_h(mc + MC_FS + 176 + 16 * i), 8);
+    }
+    if (t_fault_depth > 0)
+        t_fault_depth--;
+    return OCERZ_STEP_OK;
+}
+
+static int sp_getpagesize(struct OcerzVM *vm, OcerzCPU *cpu) { RETV(m32_page_size()); }
+static int sp_sysconf(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int name = (int)m32_arg(cpu, 0);
+    RETV(name == _SC_PAGESIZE ? (long)m32_page_size() : sysconf(name));
+}
+/* host_page_size(host, vm_size_t *size): KERN_SUCCESS */
+static int sp_host_page_size(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (m32_arg(cpu, 1))
+        m32_wr(m32_arg(cpu, 1), m32_page_size());
     RETV(0);
 }
 
@@ -861,11 +1190,39 @@ static uint32_t rune_locale(void)
     return g;
 }
 
+/* The page size an i386 program is told: 4 KB, as on the Intel Macs it was built for, where the host's are 16 KB.
+ * m32's mmap already maps at 4 KB (a fixed range clears just the part of a host page it covers), its mprotect leaves
+ * the window as it is and a partial munmap keeps the host page, so a 4 KB answer costs nothing; and a program that
+ * lays out memory by it expects 4 KB.  Wine does: told 16 KB, wineserver flagged every PE DLL with 4 KB sections
+ * as one to map flat and ntdll refused it (STATUS_INVALID_IMAGE_FORMAT, at kernelbase.dll).  getpagesize,
+ * sysconf(_SC_PAGESIZE), host_page_size and vm_page_size, vm_page_mask, vm_page_shift and vm_kernel_page_size agree,
+ * and valloc aligns to it.  OCERZ_M32_HOST_PAGES=1 tells the host's. */
+uint32_t m32_page_size(void)
+{
+    static uint32_t size;
+    if (!size)
+        size = getenv("OCERZ_M32_HOST_PAGES") ? (uint32_t)getpagesize() : 4096;
+    return size;
+}
+
+static uint32_t page_var(uint32_t v)
+{
+    uint32_t g = m32_static_alloc(4, 4);
+    m32_wr(g, v);
+    return g;
+}
+
 uint32_t m32_special_data(const char *symbol, void *host_var)
 {
     (void)host_var;
     if (!strcmp(symbol, "__DefaultRuneLocale"))
         return rune_locale();
+    if (!strcmp(symbol, "_vm_page_size") || !strcmp(symbol, "_vm_kernel_page_size"))
+        return page_var(m32_page_size());
+    if (!strcmp(symbol, "_vm_page_mask"))
+        return page_var(m32_page_size() - 1);
+    if (!strcmp(symbol, "_vm_page_shift"))
+        return page_var((uint32_t)__builtin_ctz(m32_page_size()));
     /* object constants CoreFoundation exports but only Foundation's headers declare (so the database has no
      * record): the guest reads the object */
     if (host_var && (!strcmp(symbol, "_NSDefaultRunLoopMode") || !strcmp(symbol, "_NSRunLoopCommonModes"))) {
@@ -1293,6 +1650,74 @@ static int exec_guest(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t genv)
 static int sp_execv(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, cpu, 0); }
 static int sp_execve(struct OcerzVM *vm, OcerzCPU *cpu) { return exec_guest(vm, cpu, m32_arg(cpu, 2)); }
 
+/* posix_spawn(pid_t *pid, path, file_actions *, attr *, argv, envp) and posix_spawnp: the vectors hold 4-byte
+ * pointers, and the file actions and attributes are the host's own, behind the handle their _init calls left in the
+ * guest's slot (the database crosses those as one pointer written back).  The program starts under ocerz as the
+ * syscall's does (ocerz_guest_posix_spawn), an i386 one by m32 and POSIX_SPAWN_SETEXEC in place of this one.  The
+ * database had no shape for the vectors and answered 0 without starting anything: Wine fell back to execv.
+ * posix_spawnp looks a name without a slash up in PATH, as libc does. */
+static int spawn_guest(struct OcerzVM *vm, OcerzCPU *cpu, int search)
+{
+    extern char **environ;
+    char *v[2][512];
+    uint32_t gv[2] = { m32_arg(cpu, 4), m32_arg(cpu, 5) };
+    for (int k = 0; k < 2; k++) {
+        int n = 0;
+        for (uint32_t p; gv[k] && n < 511 && (p = m32_rd(gv[k] + 4 * (uint32_t)n)); n++)
+            v[k][n] = (char *)m32_h(p);
+        v[k][n] = NULL;
+    }
+    uint32_t gpid = m32_arg(cpu, 0), gpath = m32_arg(cpu, 1), gfa = m32_arg(cpu, 2), gat = m32_arg(cpu, 3);
+    posix_spawn_file_actions_t fa = gfa ? (posix_spawn_file_actions_t)m32_host(m32_rd(gfa)) : NULL;
+    posix_spawnattr_t at = gat ? (posix_spawnattr_t)m32_host(m32_rd(gat)) : NULL;
+    char *const *argv = gv[0] ? v[0] : NULL, *const *envp = gv[1] ? v[1] : environ;
+    const char *path = gpath ? (const char *)m32_h(gpath) : NULL;
+    int pid = 0, e;
+    if (!path || !*path) {
+        e = path ? ENOENT : EINVAL;
+    } else if (search && !strchr(path, '/')) {
+        const char *dirs = getenv("PATH") ? getenv("PATH") : "/usr/bin:/bin";
+        e = ENOENT;
+        for (const char *d = dirs; d; d = strchr(d, ':') ? strchr(d, ':') + 1 : NULL) {
+            char full[PATH_MAX];
+            size_t n = strcspn(d, ":");
+            snprintf(full, sizeof full, "%.*s/%s", (int)n, n ? d : ".", path);
+            e = ocerz_guest_posix_spawn(vm, cpu, &pid, full, gfa ? &fa : NULL, gat ? &at : NULL, argv, envp);
+            if (e != ENOENT && e != ENOTDIR && e != EACCES)
+                break;
+        }
+    } else {
+        e = ocerz_guest_posix_spawn(vm, cpu, &pid, path, gfa ? &fa : NULL, gat ? &at : NULL, argv, envp);
+    }
+    if (!e && gpid)
+        m32_wr(gpid, (uint32_t)pid);
+    m32_ret(cpu, (uint32_t)e, 0, 0);   /* the error number itself, errno untouched */
+    return OCERZ_STEP_OK;
+}
+/* syscall(number, ...): the raw system calls m32 answers (src/m32_selfload.c), in libc's convention: -1 and errno where
+ * the kernel's sets the carry flag, a 64-bit result (lseek, thread_selfid) in edx:eax.  Being variadic it had no
+ * crossing and answered 0, so syscall(SYS_thread_selfid) gave every thread the same id. */
+static int sp_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint32_t esp = (uint32_t)cpu->gpr[OCERZ_RSP], back = m32_rd(esp);
+    cpu->gpr[OCERZ_RAX] = m32_arg(cpu, 0);
+    cpu->gpr[OCERZ_RSP] = esp + 4;   /* the number's slot stands for the return address: arguments at [sp + 4] */
+    cpu->rip = back;
+    int rc = m32_raw_syscall(vm, cpu, 0);
+    if (rc != OCERZ_STEP_OK)
+        return rc;
+    cpu->gpr[OCERZ_RSP] = esp + 4;   /* as ret leaves it */
+    if (cpu->rflags & OCERZ_CF) {
+        errno = (int)(uint32_t)cpu->gpr[OCERZ_RAX];
+        m32_save_errno(cpu);
+        cpu->gpr[OCERZ_RAX] = 0xffffffffu;
+        cpu->gpr[OCERZ_RDX] = 0xffffffffu;
+    }
+    return OCERZ_STEP_OK;
+}
+static int sp_posix_spawn(struct OcerzVM *vm, OcerzCPU *cpu) { return spawn_guest(vm, cpu, 0); }
+static int sp_posix_spawnp(struct OcerzVM *vm, OcerzCPU *cpu) { return spawn_guest(vm, cpu, 1); }
+
 /* keymgr: the process-wide pointers GCC 3 and 4's runtime support keeps under fixed keys, one lock each (crt3.o's
  * atexit list, libgcc's unwinder object list).  libkeymgr has no header in today's SDK, so its calls had no
  * declaration and answered 0 without writing the pointer back: Kega Fusion's crt3.o then read whatever the stack
@@ -1343,13 +1768,323 @@ static int sp_keymgr_unlock(struct OcerzVM *vm, OcerzCPU *cpu)
     return RETV_PLAIN(0);
 }
 
+/* libcrypto 0.9.7's MD5_Init, MD5_Update and MD5_Final: the library is gone from Apple silicon, and CommonCrypto's
+ * CC_MD5 calls do the same with a context of the same layout (92 bytes: four state words, the bit count's two, a
+ * 64-byte block, its fill), so the guest's context is used where it is.  Firefox 3.6 links them. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include <CommonCrypto/CommonDigest.h>
+static int sp_MD5_Init(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    return RETV_PLAIN(m32_arg(cpu, 0) ? CC_MD5_Init(m32_h(m32_arg(cpu, 0))) : 0);
+}
+static int sp_MD5_Update(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t c = m32_arg(cpu, 0), d = m32_arg(cpu, 1), n = m32_arg(cpu, 2);
+    return RETV_PLAIN(c && (d || !n) ? CC_MD5_Update(m32_h(c), d ? m32_h(d) : "", n) : 0);
+}
+static int sp_MD5_Final(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    uint32_t md = m32_arg(cpu, 0), c = m32_arg(cpu, 1);
+    return RETV_PLAIN(md && c ? CC_MD5_Final(m32_h(md), m32_h(c)) : 0);
+}
+#pragma clang diagnostic pop
+
+/* localeconv() and localeconv_l(locale): a struct lconv is ten string pointers and fourteen chars, 56 bytes on i386
+ * (the chars at 40) and 96 on arm64 (at 80, clang -arch i386 and -arch arm64).  Crossed, the guest read the host's
+ * structure as its own, and GLib's g_ascii_strtod found an empty decimal point and asserted (Wesnoth).  The guest
+ * gets an i386 copy, kept per thread, with the strings in guest memory. */
+#include <locale.h>
+#include <xlocale.h>
+static uint32_t lconv_guest(const struct lconv *l)
+{
+    static __thread uint32_t g;
+    if (!g)
+        g = m32_static_alloc(56, 4);
+    if (!g || !l)
+        return 0;
+    const char *const *s = (const char *const *)(const void *)l;
+    for (uint32_t i = 0; i < 10; i++)
+        m32_wr(g + 4 * i, m32_cstring(s[i]));
+    memcpy(m32_h(g + 40), (const char *)l + 80, 14);
+    return g;
+}
+static int sp_localeconv(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    return RETV_PLAIN(lconv_guest(localeconv()));
+}
+static int sp_localeconv_l(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    void *loc = m32_host(m32_arg(cpu, 0));
+    return RETV_PLAIN(lconv_guest(localeconv_l(loc ? (locale_t)loc : LC_GLOBAL_LOCALE)));
+}
+
+/* getopt, getopt_long and getopt_long_only: argv is an array of guest pointers and a long option a 16-byte
+ * {name, has_arg, flag, val}, and the state lives in variables the guest has its own copies of.  The host's
+ * getopt runs on a host argv over the same strings, with the guest's optind, opterr and optreset copied in; optind,
+ * optarg and optopt come back, and so does argv's order, which getopt_long permutes. */
+/* the guest's copy of a libSystem variable, or 0 where the import is not one (no database: a trap address) */
+static uint32_t data_cell(const char *name)
+{
+    uint32_t a = m32_export(NULL, name);
+    return a - (uint32_t)OCERZ_DYLDAPI_LO < (uint32_t)(OCERZ_DYLDAPI_HI - OCERZ_DYLDAPI_LO) ? 0 : a;
+}
+static int getopt_common(OcerzCPU *cpu, int kind)
+{
+    int argc = (int)m32_arg(cpu, 0);
+    uint32_t gargv = m32_arg(cpu, 1), gopts = m32_arg(cpu, 2), glong = kind ? m32_arg(cpu, 3) : 0;
+    uint32_t gindex = kind ? m32_arg(cpu, 4) : 0;
+    uint32_t c_optind = data_cell("_optind"), c_optarg = data_cell("_optarg");
+    uint32_t c_opterr = data_cell("_opterr"), c_optopt = data_cell("_optopt");
+    uint32_t c_optreset = data_cell("_optreset");
+    if (argc < 0 || argc > 4096 || !gargv || !gopts) {
+        m32_ret(cpu, (uint32_t)-1, 0, 0);
+        return OCERZ_STEP_OK;
+    }
+    char **argv = calloc((size_t)argc + 1, sizeof *argv);
+    for (int i = 0; i < argc; i++) {
+        uint32_t s = m32_rd(gargv + 4 * (uint32_t)i);
+        argv[i] = s ? (char *)m32_h(s) : NULL;
+    }
+    int nlong = 0;
+    while (glong && m32_rd(glong + 16 * (uint32_t)nlong) && nlong < 1024)
+        nlong++;
+    struct option *lo = calloc((size_t)nlong + 1, sizeof *lo);
+    for (int i = 0; i < nlong; i++) {
+        uint32_t at = glong + 16 * (uint32_t)i, flag = m32_rd(at + 8);
+        lo[i].name = (const char *)m32_h(m32_rd(at));
+        lo[i].has_arg = (int)m32_rd(at + 4);
+        lo[i].flag = flag ? (int *)m32_h(flag) : NULL;
+        lo[i].val = (int)m32_rd(at + 12);
+    }
+    if (c_optind) optind = (int)m32_rd(c_optind);
+    if (c_opterr) opterr = (int)m32_rd(c_opterr);
+    if (c_optreset) optreset = (int)m32_rd(c_optreset);
+    int longindex = gindex ? (int)m32_rd(gindex) : 0;
+    const char *opts = (const char *)m32_h(gopts);
+    int r = kind == 0 ? getopt(argc, argv, opts)
+          : kind == 1 ? getopt_long(argc, argv, opts, lo, gindex ? &longindex : NULL)
+                      : getopt_long_only(argc, argv, opts, lo, gindex ? &longindex : NULL);
+    for (int i = 0; i < argc; i++)
+        m32_wr(gargv + 4 * (uint32_t)i, argv[i] ? (uint32_t)ocerz_h2g(argv[i]) : 0);
+    if (gindex)
+        m32_wr(gindex, (uint32_t)longindex);
+    if (c_optind) m32_wr(c_optind, (uint32_t)optind);
+    if (c_optarg) m32_wr(c_optarg, optarg ? (uint32_t)ocerz_h2g(optarg) : 0);
+    if (c_optopt) m32_wr(c_optopt, (uint32_t)optopt);
+    if (c_optreset) m32_wr(c_optreset, (uint32_t)optreset);
+    free(argv);
+    free(lo);
+    m32_ret(cpu, (uint32_t)r, 0, 0);
+    return OCERZ_STEP_OK;
+}
+static int sp_getopt(struct OcerzVM *vm, OcerzCPU *cpu) { return getopt_common(cpu, 0); }
+static int sp_getopt_long(struct OcerzVM *vm, OcerzCPU *cpu) { return getopt_common(cpu, 1); }
+static int sp_getopt_long_only(struct OcerzVM *vm, OcerzCPU *cpu) { return getopt_common(cpu, 2); }
+
+/* kevent and kevent64 take arrays, nchanges structures in and up to nevents out, where the database's r{} carries
+ * one.  i386's struct kevent is 20 bytes, {ident, filter, flags, fflags, data, udata} with 4-byte ident, data and
+ * udata, against 32 on the host; kevent64_s is the same 48 bytes on both; a timeout's two longs are 4 bytes each.
+ * udata comes back as the guest stored it.  Wine's server waits on its clients' sockets this way. */
+static int kevent_timeout(uint32_t g, struct timespec *ts)
+{
+    if (!g)
+        return 0;
+    ts->tv_sec = (int32_t)m32_rd(g);
+    ts->tv_nsec = (int32_t)m32_rd(g + 4);
+    return 1;
+}
+static int sp_kevent(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int kq = (int)m32_arg(cpu, 0), nch = (int)m32_arg(cpu, 2), nev = (int)m32_arg(cpu, 4);
+    uint32_t gch = m32_arg(cpu, 1), gev = m32_arg(cpu, 3);
+    struct timespec ts;
+    int timed = kevent_timeout(m32_arg(cpu, 5), &ts);
+    if (nch < 0 || nev < 0 || nch > 65536 || nev > 65536) {
+        errno = EINVAL;
+        RETV(-1);
+    }
+    struct kevent *ch = calloc((size_t)nch + 1, sizeof *ch), *ev = calloc((size_t)nev + 1, sizeof *ev);
+    for (int i = 0; i < nch; i++) {
+        const uint8_t *g = m32_h(gch + 20 * (uint32_t)i);
+        int16_t filter; uint16_t flags; uint32_t ident, fflags, udata; int32_t data;
+        memcpy(&ident, g, 4); memcpy(&filter, g + 4, 2); memcpy(&flags, g + 6, 2);
+        memcpy(&fflags, g + 8, 4); memcpy(&data, g + 12, 4); memcpy(&udata, g + 16, 4);
+        EV_SET(&ch[i], ident, filter, flags, fflags, data, (void *)(uintptr_t)udata);
+    }
+    int r = kevent(kq, ch, nch, ev, nev, timed ? &ts : NULL);
+    int err = errno;
+    for (int i = 0; i < r; i++) {
+        uint8_t *g = m32_h(gev + 20 * (uint32_t)i);
+        uint32_t ident = (uint32_t)ev[i].ident, fflags = ev[i].fflags, udata = (uint32_t)(uintptr_t)ev[i].udata;
+        int32_t data = (int32_t)ev[i].data;
+        memcpy(g, &ident, 4); memcpy(g + 4, &ev[i].filter, 2); memcpy(g + 6, &ev[i].flags, 2);
+        memcpy(g + 8, &fflags, 4); memcpy(g + 12, &data, 4); memcpy(g + 16, &udata, 4);
+    }
+    free(ch);
+    free(ev);
+    errno = err;
+    RETV(r);
+}
+static int sp_kevent64(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int kq = (int)m32_arg(cpu, 0), nch = (int)m32_arg(cpu, 2), nev = (int)m32_arg(cpu, 4);
+    uint32_t gch = m32_arg(cpu, 1), gev = m32_arg(cpu, 3), flags = m32_arg(cpu, 5);
+    struct timespec ts;
+    int timed = kevent_timeout(m32_arg(cpu, 6), &ts);
+    RETV(kevent64(kq, nch > 0 ? m32_h(gch) : NULL, nch, nev > 0 ? m32_h(gev) : NULL, nev, flags,
+                  timed ? &ts : NULL));
+}
+
+/* bootstrap_register takes a name_t, a char[128], which crosses as the pointer C passes (look_up and check_in
+ * are above); the ports are names */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static int sp_bootstrap_register(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    RETV(bootstrap_register(m32_arg(cpu, 0), (char *)m32_h(m32_arg(cpu, 1)), m32_arg(cpu, 2)));
+}
+#pragma clang diagnostic pop
+
+/* fork and vfork: in the child libSystem sets mach_task_self_ and bootstrap_port afresh, since the names can
+ * differ there, and so are the guest's copies of them (Wine's server forks to run as a daemon and then looks for
+ * the bootstrap port).  vfork runs as fork, the child having its own copy of the window. */
+static int sp_fork(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    pid_t pid = fork();
+    int err = errno;
+    if (pid == 0) {
+        m32_refill_data("_mach_task_self_");
+        m32_refill_data("_bootstrap_port");
+    }
+    errno = err;
+    RETV(pid);
+}
+
+/* sendmsg and recvmsg: i386's struct msghdr is {name, namelen, iov, iovlen, control, controllen, flags} in 28 bytes
+ * and an iovec {base, len} 8, where the database converts the header and hands the host an i386 iovec array.  The
+ * control data, the descriptors SCM_RIGHTS passes among it, has one layout on both (4-byte cmsghdr fields and
+ * alignment), and so do the names.  Wine's client and server talk this way. */
+#define M32_MSG_IOV_MAX 1024
+static int msg_in(uint32_t g, struct msghdr *m, struct iovec *iov)
+{
+    uint32_t name = m32_rd(g), giov = m32_rd(g + 8), n = m32_rd(g + 12), control = m32_rd(g + 16);
+    if (n > M32_MSG_IOV_MAX)
+        return -1;
+    memset(m, 0, sizeof *m);
+    m->msg_name = name ? m32_h(name) : NULL;
+    m->msg_namelen = m32_rd(g + 4);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t base = m32_rd(giov + 8 * i);
+        iov[i].iov_base = base ? m32_h(base) : NULL;
+        iov[i].iov_len = m32_rd(giov + 8 * i + 4);
+    }
+    m->msg_iov = n ? iov : NULL;
+    m->msg_iovlen = (int)n;
+    m->msg_control = control ? m32_h(control) : NULL;
+    m->msg_controllen = m32_rd(g + 20);
+    m->msg_flags = (int)m32_rd(g + 24);
+    return 0;
+}
+static int sp_sendmsg(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    struct msghdr m;
+    static __thread struct iovec iov[M32_MSG_IOV_MAX];
+    if (msg_in(m32_arg(cpu, 1), &m, iov) != 0) {
+        errno = EMSGSIZE;
+        RETV(-1);
+    }
+    RETV(sendmsg((int)m32_arg(cpu, 0), &m, (int)m32_arg(cpu, 2)));
+}
+static int sp_recvmsg(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    struct msghdr m;
+    static __thread struct iovec iov[M32_MSG_IOV_MAX];
+    uint32_t g = m32_arg(cpu, 1);
+    if (msg_in(g, &m, iov) != 0) {
+        errno = EMSGSIZE;
+        RETV(-1);
+    }
+    ssize_t r = recvmsg((int)m32_arg(cpu, 0), &m, (int)m32_arg(cpu, 2));
+    int err = errno;
+    if (r >= 0) {
+        m32_wr(g + 4, m.msg_namelen);
+        m32_wr(g + 20, m.msg_controllen);
+        m32_wr(g + 24, (uint32_t)m.msg_flags);
+    }
+    errno = err;
+    RETV(r);
+}
+
+/* i386_set_ldt and i386_get_ldt on ocerz's one table (ocerz_ldt_call), which a segment register load reads: Wine
+ * gives each thread an %fs selector for its TEB this way, LDT_AUTO_ALLOC (-1) choosing the index.  The 8-byte
+ * descriptors are read and written in the window. */
+static int ldt_common(OcerzCPU *cpu, int num)
+{
+    long r = ocerz_ldt_call(num, (int32_t)m32_arg(cpu, 0), m32_arg(cpu, 1), (int32_t)m32_arg(cpu, 2));
+    if (r < 0)
+        errno = (int)-r;
+    RETV(r < 0 ? -1 : r);
+}
+static int sp_i386_set_ldt(struct OcerzVM *vm, OcerzCPU *cpu) { return ldt_common(cpu, 5); }
+static int sp_i386_get_ldt(struct OcerzVM *vm, OcerzCPU *cpu) { return ldt_common(cpu, 6); }
+
+/* readv and writev, and the positioned preadv and pwritev: an array of i386 iovecs, as in a msghdr above (Wine's
+ * client sends each request to its server with writev) */
+static int iov_in(uint32_t giov, int n, struct iovec *iov)
+{
+    if (n < 0 || n > M32_MSG_IOV_MAX)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        uint32_t base = m32_rd(giov + 8 * (uint32_t)i);
+        iov[i].iov_base = base ? m32_h(base) : NULL;
+        iov[i].iov_len = m32_rd(giov + 8 * (uint32_t)i + 4);
+    }
+    return 0;
+}
+static int iov_call(OcerzCPU *cpu, int kind)
+{
+    static __thread struct iovec iov[M32_MSG_IOV_MAX];
+    int fd = (int)m32_arg(cpu, 0), n = (int)m32_arg(cpu, 2);
+    if (iov_in(m32_arg(cpu, 1), n, iov) != 0) {
+        errno = EINVAL;
+        RETV(-1);
+    }
+    off_t off = (off_t)(m32_arg(cpu, 3) | (uint64_t)m32_arg(cpu, 4) << 32);
+    switch (kind) {
+    case 0: RETV(readv(fd, iov, n));
+    case 1: RETV(writev(fd, iov, n));
+    case 2: RETV(preadv(fd, iov, n, off));
+    default: RETV(pwritev(fd, iov, n, off));
+    }
+}
+static int sp_readv(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 0); }
+static int sp_writev(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 1); }
+static int sp_preadv(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 2); }
+static int sp_pwritev(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 3); }
+
 static const M32SpecialEntry g_specials[] = {
+    { "_readv", sp_readv }, { "_writev", sp_writev }, { "_preadv", sp_preadv }, { "_pwritev", sp_pwritev },
+    { "_i386_set_ldt", sp_i386_set_ldt }, { "_i386_get_ldt", sp_i386_get_ldt },
+    { "_sendmsg", sp_sendmsg }, { "_recvmsg", sp_recvmsg },
+    { "_fork", sp_fork }, { "_vfork", sp_fork },
+    { "_kevent", sp_kevent }, { "_kevent64", sp_kevent64 },
+    { "_bootstrap_register", sp_bootstrap_register },
+    { "_getopt", sp_getopt }, { "_getopt_long", sp_getopt_long }, { "_getopt_long_only", sp_getopt_long_only },
+    { "_localeconv", sp_localeconv }, { "_localeconv_l", sp_localeconv_l },
+    { "_MD5_Init", sp_MD5_Init }, { "_MD5_Update", sp_MD5_Update }, { "_MD5_Final", sp_MD5_Final },
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
     { "__keymgr_get_and_lock_processwide_ptr_2", sp_keymgr_get_lock_2 },
     { "__keymgr_get_and_lock_processwide_ptr", sp_keymgr_get_lock },
     { "__keymgr_set_and_unlock_processwide_ptr", sp_keymgr_set_unlock },
     { "__keymgr_unlock_processwide_ptr", sp_keymgr_unlock },
-    { "_execv", sp_execv }, { "_execve", sp_execve },
+    { "_execv", sp_execv }, { "_execve", sp_execve }, { "_posix_spawn", sp_posix_spawn },
+    { "_posix_spawnp", sp_posix_spawnp }, { "_syscall", sp_syscall },
     { "_ioctl", sp_ioctl }, { "_pipe", sp_pipe },
     { "_getaddrinfo", sp_getaddrinfo }, { "_freeaddrinfo", sp_freeaddrinfo }, { "_gethostbyname", sp_gethostbyname },
     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },
@@ -1414,15 +2149,21 @@ static const M32SpecialEntry g_specials[] = {
     { "_strftime", sp_strftime }, { "_asctime", sp_asctime }, { "_ctime", sp_ctime },
     { "_getrusage", sp_getrusage }, { "_gettimeofday", sp_gettimeofday }, { "_nanosleep", sp_nanosleep }, { "_select", sp_select },
     { "_open", sp_open }, { "_openat", sp_openat }, { "_fcntl", sp_fcntl },
-    { "_mmap", sp_mmap }, { "_munmap", sp_munmap }, { "_mprotect", sp_ok0 }, { "_madvise", sp_ok0 },
+    { "_NSAllocateMemoryPages", sp_NSAllocateMemoryPages }, { "_NSDeallocateMemoryPages", sp_NSDeallocateMemoryPages },
+    { "_NSCopyMemoryPages", sp_NSCopyMemoryPages },
+    { "_mmap", sp_mmap }, { "_munmap", sp_munmap }, { "_mprotect", sp_mprotect }, { "_madvise", sp_ok0 },
+    { "_getpagesize", sp_getpagesize }, { "_sysconf", sp_sysconf }, { "_host_page_size", sp_host_page_size },
+    { "__host_page_size", sp_host_page_size },
     { "_msync", sp_ok0 }, { "_vm_allocate", sp_vm_allocate }, { "_vm_deallocate", sp_vm_deallocate },
     { "_sbrk", sp_sbrk },
     { "_setjmp", sp_setjmp }, { "__setjmp", sp_setjmp }, { "_sigsetjmp", sp_setjmp },
     { "_longjmp", sp_longjmp }, { "__longjmp", sp_longjmp }, { "_siglongjmp", sp_longjmp },
-    { "_signal", sp_signal }, { "_sigaction", sp_sigaction }, { "_sigaltstack", sp_ok0 },
+    { "_signal", sp_signal }, { "_sigaction", sp_sigaction }, { "_sigaltstack", sp_sigaltstack },
     { "___bzero", sp_bzero }, { "_bzero", sp_bzero }, { "___stack_chk_fail", sp_stack_chk_fail },
     { "_exit", sp_exit },
-    { "_SetFrontProcess", sp_SetFrontProcess },
+    { "_SetFrontProcess", sp_SetFrontProcess }, { "_CPSSetFrontProcess", sp_SetFrontProcess },
+    { "_CPSGetCurrentProcess", sp_CPSGetCurrentProcess }, { "__CPSGetCurrentProcess", sp_CPSGetCurrentProcess },
+    { "_CPSEnableForegroundOperation", sp_CPSEnableForegroundOperation },
     { "__exit", sp__exit },
     { "__Exit", sp__exit },
     { "___cxa_atexit", sp_ok0 },   /* ponytail: C++ static destructors do not run at exit */
@@ -1437,7 +2178,8 @@ static const M32SpecialEntry *const g_tables[] = { g_specials, m32_stdio_special
                                                    m32_exc_specials, m32_zlib_specials, m32_unwind_specials,
                                                    m32_gl_specials, m32_audio_specials, m32_atsu_specials,
                                                    m32_qd_specials, m32_agl_specials, m32_carbon_specials,
-                                                   m32_controls_specials, m32_tsearch_specials };
+                                                   m32_controls_specials, m32_tsearch_specials,
+                                                   m32_cg_specials, m32_iokit_specials };
 
 /* every table's entries by name, open-addressed and built once; the first entry of a name in table order is kept,
  * the one a scan of the tables would have found */

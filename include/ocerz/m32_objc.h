@@ -29,6 +29,14 @@ extern const M32SpecialEntry m32_objc_specials[];
 
 /* type encodings (src/m32_objc_types.c) */
 int m32_encoding_notation(const char *enc, int guest, char *out, size_t n);
+/* A message's pointers whose 32- and 64-bit layouts differ, in its notations gn and hn (made from genc and henc):
+ * 'p' let the host store an 8-byte id where the guest keeps a 4-byte one (NSError **, intoString:) and a 16-byte
+ * NSRange where the guest keeps an 8-byte one (longestEffectiveRange:).  An id * becomes 'E' in gn, one the callee
+ * only writes, stored back as the guest's id ('O' for validateValue:'s, which is read in too), and a pointer to one
+ * structure R{...} in both, copied in and back out ('r' when const).  Arrays (getObjects:, andKeys:, points, rects)
+ * stay 'p'.  0, or -1 with gn and hn as they were. */
+int m32_notation_pointers(const char *sel, const char *genc, const char *henc, char *gn, size_t gsize, char *hn,
+                          size_t hsize);
 const char *m32_objc_guest_encoding(void *host_cls, const char *sel, int is_class);
 int m32_objc_last_variadic(void);   /* whether the last m32_objc_guest_encoding hit is a variadic method */
 

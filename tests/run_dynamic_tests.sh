@@ -78,6 +78,33 @@ run_case() {
     fi
 }
 
+# The same, under -native, where the program's libSystem calls are the host's, crossed by the bridge.
+run_native_file_case() {
+    local name="$1" src="$2" want_out="$3"
+    shift 3
+    if ! clang -arch x86_64 -pthread -o "$TMP/$name" "$src" "$@" 2>/dev/null; then
+        echo "FAIL $name (compile)"; fail=$((fail+1)); return
+    fi
+    local mode got_out got_code out_file err_file
+    for mode in native native-no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = native-no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -native -no-jit "$TMP/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" -native "$TMP/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"
+            fail=$((fail+1))
+        fi
+    done
+}
+
 run_file_case() {
     local name="$1" src="$2" want_out="$3"
     shift 3
@@ -897,6 +924,8 @@ int main(void) {
 
 run_file_case dfork_signal tests/dynamic/fork_signal.c 'fork signal ok'
 run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
+run_file_case dsignal_restart tests/dynamic/signal_restart.c 'OK'
+run_native_file_case dsignal_restart tests/dynamic/signal_restart.c 'OK'
 run_file_case dx87_top_entry tests/dynamic/x87_top_entry.c 'OK'
 run_file_case dshmem_coherence tests/dynamic/shmem_coherence.c 'OK'
 run_file_case drsp_rmw tests/dynamic/rsp_rmw.c '554ae911bb61770a' -mno-red-zone

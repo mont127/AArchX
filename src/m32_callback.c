@@ -16,6 +16,7 @@
 #include "ocerz/bridge.h"
 #include "ocerz/decode.h"
 #include "ocerz/m32.h"
+#include "ocerz/m32_objc.h"
 #include "ocerz/m32_sig.h"
 #include "ocerz/vm.h"
 
@@ -68,7 +69,9 @@ uint32_t m32_call(struct OcerzVM *vm, uint32_t fn, const uint32_t *args, int nar
     uint32_t top = ((uint32_t)cpu->gpr[OCERZ_RSP] - 256) & ~15u;
     struct OcerzBridgeFrame saved;
     ocerz_bridge_guest_enter(&saved);
+    uint64_t fpcr = ocerz_afp_guest();   /* translated code relies on FPCR.AH (src/cpu.c) */
     ocerz_vm_call32(vm, fn, &call, top, M32_TRAP(M32_ID_SENTINEL));
+    ocerz_afp_restore(fpcr);
     ocerz_bridge_guest_leave(&saved);
     if (edx)
         *edx = (uint32_t)call.rdx;
@@ -118,6 +121,54 @@ static void take_struct(HostArgs *a, const M32Type *t, uint8_t *buf)
     }
 }
 
+/* A host pointer to an id or to one structure (class E, O, R or r in the guest notation: the host calling a guest
+ * readFromURL:ofType:error: or attributesAtIndex:effectiveRange:) reaches the guest as a guest copy: a 4-byte id cell,
+ * or the structure in its i386 layout.  Handed the host address, the guest wrote 4 bytes over a handle cell and the
+ * host never saw them.  After the call the copy goes back, an E cell only if the guest stored into it. */
+#define CB_UNWRITTEN 0x57524945u   /* an E cell until the guest stores an id: odd, so no object */
+
+typedef struct CbOut { char cls; uint32_t guest; void *host; const M32Type *g, *h; } CbOut;
+
+static uint32_t out_in(const M32Type *ga, const M32Type *ha, void *host, CbOut *o)
+{
+    uint32_t size = ga->cls == 'R' || ga->cls == 'r' ? (ga->ssize ? ga->ssize : 4) : 4;
+    uint32_t g = m32_malloc(size);
+    if (!g)
+        return 0;
+    if (ga->cls == 'E')
+        m32_wr(g, CB_UNWRITTEN);
+    else if (ga->cls == 'O')
+        m32_wr(g, m32_objc_to_guest(*(void **)host));
+    else {
+        memset(m32_h(g), 0, size);
+        for (int k = 0; k < ga->n && k < ha->n; k++) {
+            uint64_t raw = 0;
+            memcpy(&raw, (const uint8_t *)host + ha->moff[k], ha->msize[k]);
+            uint64_t gv = m32_scalar_out(ga->mcls[k], ha->mcls[k], raw);
+            memcpy((uint8_t *)m32_h(g) + ga->moff[k], &gv, ga->msize[k]);
+        }
+    }
+    *o = (CbOut){ ga->cls, g, host, ga, ha };
+    return g;
+}
+
+static void out_back(const CbOut *o, const char *gnote)
+{
+    if (o->cls == 'E' || o->cls == 'O') {
+        uint32_t id = m32_rd(o->guest);
+        if (o->cls == 'O' || id != CB_UNWRITTEN)
+            *(void **)o->host = m32_objc_to_host(id);
+    } else if (o->cls == 'R') {
+        for (int k = 0; k < o->g->n && k < o->h->n; k++) {
+            uint64_t raw = 0;
+            memcpy(&raw, (const uint8_t *)m32_h(o->guest) + o->g->moff[k], o->g->msize[k]);
+            uint64_t hv = m32_scalar_in(o->g->mcls[k], o->h->mcls[k], raw, gnote, -1);
+            memcpy((uint8_t *)o->host + o->h->moff[k], &hv, o->h->msize[k]);
+        }
+    }
+    m32_free(o->guest);
+}
+
 static void dispatch(unsigned slot, const uint64_t *x, const uint64_t *v, const uint8_t *stack, void *x8,
                      uint64_t *out_x, uint64_t *out_v)
 {
@@ -131,8 +182,16 @@ static void dispatch(unsigned slot, const uint64_t *x, const uint64_t *v, const 
     HostArgs a = { x, v, stack, 0, 0, 0 };
     uint32_t words[16];
     int nw = 0;
+    CbOut outs[4];
+    int nouts = 0;
     for (int i = 0; i < h->nargs && nw < 16; i++) {
         const M32Type *ha = &h->arg[i], *ga = &g->arg[i];
+        if (ga->cls && strchr("EORr", ga->cls) && nouts < 4) {
+            uint64_t raw = a.nx < 8 ? a.x[a.nx++] : take_stack(&a, 8, 8);
+            words[nw++] = raw ? out_in(ga, ha, (void *)(uintptr_t)raw, &outs[nouts]) : 0;
+            nouts += raw && words[nw - 1];
+            continue;
+        }
         if (ha->cls == '{') {
             uint8_t hbuf[256] = { 0 }, gbuf[256] = { 0 };
             take_struct(&a, ha, hbuf);
@@ -159,12 +218,19 @@ static void dispatch(unsigned slot, const uint64_t *x, const uint64_t *v, const 
         log_cb = getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "callbacks");
     if (log_cb)
         fprintf(stderr, "ocerz: m32: callback slot %u -> guest %#x %s (%d words)\n", slot, cb->fn, cb->gnote, nw);
+    const M32Type *gr = &g->ret, *hr = &h->ret;
+    uint32_t sret = 0;   /* a structure i386 returns through memory: its address goes first */
+    if (gr->cls == '{' && !m32_struct_in_regs(gr) && nw < 16 && (sret = m32_malloc(gr->size ? gr->size : 4))) {
+        memmove(words + 1, words, sizeof *words * (size_t)nw++);
+        words[0] = sret;
+    }
     uint32_t edx = 0;
     double st0 = 0;
     uint64_t fpcr = ocerz_abi_round_swap(OCERZ_ABI_ROUND_NEAREST);
     uint32_t eax = m32_call(vm, cb->fn, words, nw, &edx, &st0);
     ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
-    const M32Type *gr = &g->ret, *hr = &h->ret;
+    for (int i = 0; i < nouts; i++)
+        out_back(&outs[i], cb->gnote);
     switch (gr->cls) {
     case 'v':
         break;
@@ -180,14 +246,43 @@ static void dispatch(unsigned slot, const uint64_t *x, const uint64_t *v, const 
     case 'l': case 'L':
         out_x[0] = eax | (uint64_t)edx << 32;
         break;
-    case '{':
-        m32_log_once("structure results from guest callbacks are not supported:", cb->gnote);
+    case '{': {
+        /* i386 Darwin: up to 8 bytes in EAX:EDX, a lone float or double in ST0, the rest through sret; arm64: an
+         * HFA in v0-v3, up to 16 bytes in x0 and x1, the rest at x8.  AppKit asks a window delegate written in
+         * i386 code windowWillResize:toSize:, an NSSize. */
+        uint8_t gbuf[256] = { 0 }, hbuf[256] = { 0 };
+        if (sret) {
+            memcpy(gbuf, m32_h(sret), gr->size);
+            m32_free(sret);
+        } else if (gr->n == 1 && (gr->mcls[0] == 'f' || gr->mcls[0] == 'd')) {
+            float f = (float)st0;
+            if (gr->mcls[0] == 'f')
+                memcpy(gbuf, &f, 4);
+            else
+                memcpy(gbuf, &st0, 8);
+        } else {
+            memcpy(gbuf, &eax, 4);
+            memcpy(gbuf + 4, &edx, 4);
+        }
+        for (int k = 0; k < gr->n && k < hr->n; k++) {
+            uint64_t raw = 0;
+            memcpy(&raw, gbuf + gr->moff[k], gr->msize[k]);
+            uint64_t hv = m32_scalar_in(gr->mcls[k], hr->mcls[k], raw, cb->gnote, -1);
+            memcpy(hbuf + hr->moff[k], &hv, hr->msize[k]);
+        }
+        if (m32_is_hfa(hr))
+            for (int k = 0; k < hr->n; k++)
+                memcpy(&out_v[k], hbuf + hr->moff[k], hr->msize[k]);
+        else if (hr->size <= 16)
+            memcpy(out_x, hbuf, hr->size);
+        else if (x8)
+            memcpy(x8, hbuf, hr->size);
         break;
+    }
     default:
         out_x[0] = m32_scalar_in(gr->cls, hr->cls, eax, "callback result", -1);
         break;
     }
-    (void)x8;
 }
 
 void *m32_callback(uint32_t guest_fn, const char *guest_sig, const char *host_sig)

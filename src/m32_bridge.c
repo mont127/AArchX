@@ -75,6 +75,9 @@ static void m32_fill_data(M32Export *e)
     if (obj || !strcmp(e->data_kind, "ptr")) {
         void *v = *(void **)e->host_fn;
         m32_wr(e->data, obj ? m32_objc_to_guest(v) : m32_handle(v));
+        /* the variable's address stands for the host's: GLUT's fonts are the addresses of its font variables
+         * (GLUT_BITMAP_HELVETICA_12 is &glutBitmapHelvetica12), which GLUT compares with its own */
+        m32_alias(e->data, e->host_fn);
         if (g_nlive < 512) {
             g_live_seen[g_nlive] = v;
             g_live[g_nlive++] = e;
@@ -208,6 +211,35 @@ M32Export *m32_export_by_id(uint32_t id)
     return id < M32_ID_LIMIT ? g_exports[id] : NULL;
 }
 
+/* A function pointer to an export (dlsym's, a GL extension's) is its trap, and a call through it jumped into the trap
+ * window, which sent the call back to the run loop: out of translated code and in again, every call.  DarkPlaces
+ * calls all of OpenGL that way, a quarter of a million calls a second.  The JIT translates a trap as the import stub
+ * it stands for, `jmp [slot]` with this slot holding the trap, so the call crosses (or runs as a leaf) from inside a
+ * block and chains back like any other (src/jit.c, OCERZ_NO_M32_TRAP_BLOCKS=1 turns it off).  0: not an export's. */
+static uint32_t g_trap_slots[M32_ID_LIMIT];
+
+uint32_t m32_trap_slot(uint64_t trap)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_TRAP_BLOCKS") != NULL;
+    uint64_t id = trap - OCERZ_DYLDAPI_LO;
+    if (off || id < M32_ID_FIRST || id >= M32_ID_LIMIT)
+        return 0;
+    uint32_t slot = __atomic_load_n(&g_trap_slots[id], __ATOMIC_ACQUIRE);
+    if (slot)
+        return slot;
+    pthread_mutex_lock(&g_lock);
+    M32Export *e = g_exports[id];
+    if (!g_trap_slots[id] && e && e->kind != M32_EX_DATA && (slot = m32_static_alloc(4, 4)) != 0) {
+        m32_wr(slot, (uint32_t)trap);
+        __atomic_store_n(&g_trap_slots[id], slot, __ATOMIC_RELEASE);
+    }
+    slot = g_trap_slots[id];
+    pthread_mutex_unlock(&g_lock);
+    return slot;
+}
+
 /* OCERZ_M32_HUD=<overlay dylib>: an FPS overlay (simpleoverlay, whose exported fake_dlsym hands back its
  * CGLFlushDrawable wrapper) is loaded here rather than through DYLD_INSERT_LIBRARIES, which every child process
  * inherits (Batman then ran a shell and quit); each frame the guest presents is drawn on before the real flush.
@@ -257,6 +289,17 @@ uint32_t m32_export_special(const char *name, M32Special fn)
     return M32_TRAP(id);
 }
 
+/* Copies a host variable into the guest's copy of it again, if the guest imported it: a fork child's
+ * mach_task_self_ and bootstrap_port, which libSystem sets afresh there and the guest copied in its parent. */
+void m32_refill_data(const char *name)
+{
+    pthread_mutex_lock(&g_lock);
+    for (uint32_t id = M32_ID_FIRST; id < g_next; id++)
+        if (!strcmp(g_exports[id]->name, name) && g_exports[id]->kind == M32_EX_DATA)
+            m32_fill_data(g_exports[id]);
+    pthread_mutex_unlock(&g_lock);
+}
+
 /* The trap address for an import of name from lib (NULL: flat lookup). One export per symbol name. */
 uint32_t m32_export(const char *lib, const char *name)
 {
@@ -275,10 +318,18 @@ uint32_t m32_export(const char *lib, const char *name)
     M32Export *e = calloc(1, sizeof *e);
     e->lib = strdup(lib ? lib : "(flat)");
     e->name = strdup(name);
+    e->gl_ptr = m32_gl_ptr_kind(name);
     e->special = m32_special(name);
     e->kind = e->special ? M32_EX_SPECIAL : M32_EX_UNRESOLVED;
+    /* GNU libiconv's own names, which Apple's libiconv exported beside iconv's until Apple silicon (Firefox 3.6) */
+    static const char *const iconv_names[][2] = { { "_libiconv", "_iconv" }, { "_libiconv_open", "_iconv_open" },
+                                                  { "_libiconv_close", "_iconv_close" } };
+    const char *as = name;
+    for (size_t i = 0; i < sizeof iconv_names / sizeof iconv_names[0]; i++)
+        if (!strcmp(name, iconv_names[i][0]))
+            as = iconv_names[i][1];
     M32DbRec r;
-    if (!e->special && m32_db_lookup(lib, name, &r)) {
+    if (!e->special && m32_db_lookup(lib, as, &r)) {
         e->variant = r.variant;
         e->host_symbol = r.host_symbol;
         if (r.kind == M32_DB_FN) {
@@ -380,7 +431,21 @@ int m32_fastcall(struct OcerzVM *vm, OcerzCPU *cpu, uint32_t trap)
     return OCERZ_STEP_OK + 1;
 }
 
+static int trap_dispatch(struct OcerzVM *vm, OcerzCPU *cpu);
+
+/* every call the guest makes into the host: host code runs without FPCR.AH (src/cpu.c ocerz_afp_host) */
 int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    if (__builtin_expect(__atomic_load_n(&m32_sig_pending, __ATOMIC_RELAXED) != 0, 0) &&
+        cpu->rip - OCERZ_DYLDAPI_LO < M32_ID_LIMIT)
+        m32_signals_deliver(vm);   /* a signal's guest handler runs before the call */
+    uint64_t fpcr = ocerz_afp_host();
+    int r = trap_dispatch(vm, cpu);
+    ocerz_afp_restore(fpcr);
+    return r;
+}
+
+static int trap_dispatch(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t id = (uint32_t)(cpu->rip - OCERZ_DYLDAPI_LO);
     if (id == M32_ID_EXIT) {
@@ -391,6 +456,8 @@ int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu)
         return m32_tlv_trap(vm, cpu);
     if (id == M32_ID_DYLD)
         return m32_dyld_entry(vm, cpu);
+    if (id == M32_ID_SIGRETURN)
+        return m32_sigreturn(vm, cpu);
     M32Export *e = m32_export_by_id(id);
     if (!e) {
         fprintf(stderr, "ocerz: m32: call to trap id %#x with no export (from %#x)\n", (unsigned)id,
@@ -398,6 +465,7 @@ int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu)
         ocerz_vm_request_exit(vm, 134);
         return OCERZ_STEP_EXIT;
     }
+    m32_load_errno();
     /* OCERZ_M32_CALLLOG=<name part>[|<part>...]: the matching imports' first argument words, caller and eax after */
     static const char *calllog = (const char *)1;
     if (calllog == (const char *)1)

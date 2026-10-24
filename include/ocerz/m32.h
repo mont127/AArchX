@@ -22,11 +22,13 @@ struct OcerzVM;
 #define M32_HANDLE_LO    0xE0000000u      /* handle cells, 8 bytes each */
 #define M32_HANDLE_HI    0xF0000000u
 #define M32_TOP_LO       0xF0000000u      /* reserved, never mapped */
+#define M32_WINE_FLOOR   0x82000000u      /* what m32 maps for itself under Wine starts here (m32_run) */
 #define M32_TRAP(id)     ((uint32_t)(OCERZ_DYLDAPI_LO + (id)))
 #define M32_ID_SENTINEL  0xfff0           /* return address of calls into the guest */
 #define M32_ID_EXIT      0xfff4           /* main()'s return address: exit(eax) */
 #define M32_ID_TLV       0xfff8           /* __tlv_bootstrap thunk */
 #define M32_ID_DYLD      0xfffc           /* the entry of the dyld a self-loading program maps (src/m32_selfload.c) */
+#define M32_ID_SIGRETURN 0xffec           /* a fault handler's return address: its context loaded back (m32_libsystem.c) */
 #define M32_ID_FIRST     0x0010           /* first export id */
 #define M32_ID_LIMIT     0xfff0
 
@@ -50,6 +52,7 @@ int m32_trap(struct OcerzVM *vm, OcerzCPU *cpu);
 int m32_raw_syscall(struct OcerzVM *vm, OcerzCPU *cpu, int sysenter);   /* sysenter, or int 0x80 */
 int m32_dyld_entry(struct OcerzVM *vm, OcerzCPU *cpu);                   /* the M32_ID_DYLD trap */
 uint32_t m32_mmap(uint32_t want, uint32_t len, int prot, int flags, int fd, uint64_t off);   /* src/m32_libsystem.c */
+uint32_t m32_page_size(void);   /* the page size an i386 program is told: 4 KB (src/m32_libsystem.c) */
 void m32_selfload_begin(const char *path);                                 /* m32_run, before the program starts */
 void *m32_carbon_wrap(const char *symbol, void *fn);   /* src/m32_carbon.c: the host function an export calls */
 M32Special m32_carbon_special(const char *symbol);      /* src/m32_carbon.c: the UPP calls, by name pattern */
@@ -61,6 +64,8 @@ void m32_qd_quiet(int on);                              /* drawing asks no view 
 void m32_qd_show_window_rect(void *window, void *cg_context, double x, double y, double w, double h);   /* port pixels */
 extern const M32SpecialEntry m32_controls_specials[]; /* src/m32_controls.c: menus and controls arm64 dropped */
 extern const M32SpecialEntry m32_tsearch_specials[];  /* src/m32_tsearch.c: tsearch's trees, in guest memory */
+extern const M32SpecialEntry m32_cg_specials[];       /* src/m32_cg.c: CoreGraphics callbacks and path elements */
+extern const M32SpecialEntry m32_iokit_specials[];    /* src/m32_iokit.c: registry calls that name a plane or a class */
 void m32_qd_window_gone(void *window);                 /* src/m32_qd.c: DisposeWindow drops the window's port */
 void *m32_qd_port_window(uint32_t port);               /* a QuickDraw port's host window, or NULL */
 int m32_qd_port_pixels(uint32_t port, int *w, int *h, uint32_t *rowbytes, uint32_t *pixels);   /* a GWorld's */
@@ -74,11 +79,19 @@ uint32_t m32_steam_dlsym(uint32_t handle, const char *sym);
  * them (bit k: argument k) passed as host addresses.  simd: the host code it calls may use SIMD registers, so the
  * JIT saves the guest's xmm around it.  tramp: called as m32_leaf_tramp(leaf, raw arguments...), which converts the
  * pointer arguments with m32_host as m32_cross does and masks the byte ones before calling fn */
-typedef struct M32Leaf { const char *name; void *fn; uint8_t nargs, ptrs, ret, simd, tramp, bytes; } M32Leaf;
+typedef struct M32Leaf { const char *name; void *fn; uint8_t nargs, ptrs, ret, simd, tramp, bytes, host_fp, gl; } M32Leaf;
 uint64_t m32_leaf_tramp(const M32Leaf *l, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                         uint64_t a5, uint64_t a6);
 enum { M32_LEAF_I32, M32_LEAF_I64, M32_LEAF_ARG0, M32_LEAF_VOID };
 const M32Leaf *m32_leaf_for(uint32_t trap);
+uint32_t m32_trap_slot(uint64_t trap);   /* src/m32_bridge.c: a guest word holding the trap, for a trap's block, or 0 */
+
+/* vertex and element arrays in buffer objects (src/m32_gl.c): with a buffer bound, a gl*Pointer's or a glDraw*Elements'
+ * pointer is an offset into it and crosses as it is */
+enum { M32_GL_NONE, M32_GL_ARRAY, M32_GL_ELEMENT, M32_GL_BIND, M32_GL_BIND_VAO };
+int m32_gl_ptr_kind(const char *name);
+uint64_t m32_gl_ptr(int kind, uint32_t guest_ptr);
+void m32_gl_bound(int kind, uint32_t target, uint32_t buffer);   /* after glBindBuffer(target, buffer), glBindVertexArray */
 
 static inline void *m32_h(uint32_t g) { return (void *)(uintptr_t)(ocerz_guest_base + g); }
 static inline uint32_t m32_rd(uint32_t g) { uint32_t v; memcpy(&v, m32_h(g), 4); return v; }
@@ -109,6 +122,7 @@ typedef struct M32Export {
     int gsize, hsize;
     char *data_kind;
     int file_ret;             /* returns a FILE *: the guest gets m32_file's twin */
+    int gl_ptr;               /* M32_GL_*: a GL call whose pointer may be a buffer offset, or that binds one */
 } M32Export;
 enum { M32_EX_UNRESOLVED, M32_EX_SPECIAL, M32_EX_FN, M32_EX_BAD, M32_EX_DATA };
 
@@ -132,6 +146,7 @@ uint32_t m32_handle(void *host);          /* NULL->0, in window->offset, twin->g
 void *m32_host(uint32_t g);               /* 0->NULL, handle->host, alias->host, else the window address */
 int m32_is_handle(uint32_t g);
 void m32_alias(uint32_t g, void *host);   /* guest-resident object g stands for host */
+void m32_unalias(uint32_t g, void *host); /* host is gone (or g is): neither stands for the other any more */
 uint32_t m32_handle_count(void);
 uint32_t m32_cstring(const char *host);   /* guest copy of a host C string (in-window strings stay put) */
 uint32_t m32_handle_twin_lookup(void *host);   /* the guest object aliased to host, or 0 */
@@ -150,11 +165,17 @@ uint32_t m32_call(struct OcerzVM *vm, uint32_t fn, const uint32_t *args, int nar
 OcerzCPU *m32_thread_attach(struct OcerzVM *vm);   /* a 32-bit guest cpu for a thread the host started */
 extern int m32_started;                              /* the main cpu is running (before: loader calls use it) */
 int m32_tlv_trap(struct OcerzVM *vm, OcerzCPU *cpu);   /* src/m32_thread.c */
+extern volatile uint32_t m32_sig_pending;   /* src/m32_libsystem.c: signals caught for the guest's handlers */
+void m32_signals_deliver(struct OcerzVM *vm); /* runs them, at a crossing */
+int m32_signal_fault(OcerzCPU *cpu, int sig, uint64_t addr, int code, uint32_t err);   /* a fault's handler, or 0 */
+int m32_sigreturn(struct OcerzVM *vm, OcerzCPU *cpu);   /* the M32_ID_SIGRETURN trap */
 void m32_save_errno(OcerzCPU *cpu);
+void m32_load_errno(void);   /* before a call: the host's errno is the guest's (src/m32_stdio.c) */
 uint32_t m32_special_data(const char *symbol, void *host_var);   /* guest variable for a special data import, or 0 */
 void m32_refresh_data(void);   /* re-read host pointer variables that changed (NSApp) */
 
 uint32_t m32_export(const char *lib, const char *name);     /* trap address for an import */
+void m32_refill_data(const char *name);   /* the guest's copy of a host variable, copied again */
 M32Export *m32_export_by_id(uint32_t id);
 M32Special m32_special(const char *symbol);                 /* NULL when none */
 void m32_log_once(const char *what, const char *name);

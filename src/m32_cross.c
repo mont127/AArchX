@@ -10,8 +10,9 @@
  * EDX:EAX, ST0, or through the hidden structure pointer, which the i386 callee pops.
  *
  * Guest-only classes: s is a C string (a host result outside the window is copied into it), P one pointer written
- * through a pointer, W/V one signed/unsigned long written through a pointer, Q a pointer to data whose layouts
- * differ (only a handle may pass; guest memory there needs a special).
+ * through a pointer, W/V one signed/unsigned long written through a pointer, O one object (an id) read and written
+ * through a pointer and E one the callee only writes there, G an AppKit tag (a number standing for the host's), Q a
+ * pointer to data whose layouts differ (only a handle may pass; guest memory there needs a special).
  */
 #include <dlfcn.h>
 #include <malloc/malloc.h>
@@ -36,7 +37,8 @@ static int scalar_size(char c, int guest)
     case 'h': case 'H': return 2;
     case 'i': case 'u': case 'f': return 4;
     case 'l': case 'L': case 'T': case 'd': return 8;
-    case 'p': case 's': case 'P': case 'Q': case 'W': case 'V': case 'S': case 'c': case 'k': case '@': case '#': case ':':
+    case 'p': case 's': case 'P': case 'Q': case 'W': case 'V': case 'S': case 'O': case 'E': case 'G': case 'c': case 'k':
+    case '@': case '#': case ':':
         return guest ? 4 : 8;
     default: return -1;
     }
@@ -44,9 +46,12 @@ static int scalar_size(char c, int guest)
 
 static const char *parse_type(const char *s, int guest, M32Type *t);
 
-/* flatten one structure's members into t, laying them out for the guest or the host */
+/* flatten one structure's members into t, laying them out for the guest or the host.  A digit first is the most
+ * any member is aligned to: "{2up}" is a structure declared under #pragma pack(2), as Carbon's AEDesc is, whose
+ * arm64 pointer sits at offset 4 (tools/sdkgen) */
 static const char *parse_members(const char *s, int guest, M32Type *t, uint32_t *off, uint32_t *align)
 {
+    uint32_t cap = *s >= '1' && *s <= '8' ? (uint32_t)(*s++ - '0') : 0;
     while (*s && *s != '}') {
         if (*s == '{') {
             uint32_t inner_off = 0, inner_align = 1;
@@ -54,7 +59,8 @@ static const char *parse_members(const char *s, int guest, M32Type *t, uint32_t 
             const char *e = parse_members(s + 1, guest, &sub, &inner_off, &inner_align);
             if (!e || *e != '}')
                 return NULL;
-            *off = (*off + inner_align - 1) & ~(inner_align - 1);
+            uint32_t place = cap && inner_align > cap ? cap : inner_align;
+            *off = (*off + place - 1) & ~(place - 1);
             for (int i = 0; i < sub.n; i++) {
                 if (t->n >= M32_MAX_MEMBERS)
                     return NULL;
@@ -64,8 +70,8 @@ static const char *parse_members(const char *s, int guest, M32Type *t, uint32_t 
                 t->n++;
             }
             *off += (inner_off + inner_align - 1) & ~(inner_align - 1);
-            if (inner_align > *align)
-                *align = inner_align;
+            if (place > *align)
+                *align = place;
             s = e + 1;
             continue;
         }
@@ -83,6 +89,8 @@ static const char *parse_members(const char *s, int guest, M32Type *t, uint32_t 
         if (size <= 0 || t->n >= M32_MAX_MEMBERS)
             return NULL;
         uint32_t a = guest && size == 8 ? 4 : (uint32_t)size;
+        if (cap && a > cap)
+            a = cap;
         *off = (*off + a - 1) & ~(a - 1);
         t->mcls[t->n] = c;
         t->msize[t->n] = (uint8_t)size;
@@ -257,6 +265,60 @@ static double dbits(uint64_t v) { double d; memcpy(&d, &v, 8); return d; }
 static uint64_t bitsd(double d) { uint64_t v; memcpy(&v, &d, 8); return v; }
 static uint32_t bitsf(float f) { uint32_t v; memcpy(&v, &f, 4); return v; }
 
+/* AppKit's tags (NSTrackingRectTag, NSToolTipTag) are 64-bit values, and a 32-bit program keeps them in an
+ * NSInteger: Adium's contact list removed a truncated one and AppKit raised "an invalid NSTrackingRectTag ...
+ * Truncated the NSTrackingRectTag to 32bit".  The guest gets a small number for each (class G), and the host its
+ * own tag back for it. */
+static uint64_t *g_tags;   /* guest number n is g_tags[n - 1]; 0 is a free slot */
+static uint32_t g_ntags, g_tag_cap;
+static pthread_mutex_t g_tag_lock = PTHREAD_MUTEX_INITIALIZER;
+
+uint32_t m32_tag_guest(uint64_t host)
+{
+    if (!host)
+        return 0;
+    pthread_mutex_lock(&g_tag_lock);
+    uint32_t free_at = 0, n = 0;
+    for (uint32_t i = 0; i < g_ntags && !n; i++) {
+        if (g_tags[i] == host)
+            n = i + 1;
+        else if (!g_tags[i] && !free_at)
+            free_at = i + 1;
+    }
+    if (!n && !free_at && g_ntags == g_tag_cap) {
+        uint32_t cap = g_tag_cap ? g_tag_cap * 2 : 256;
+        uint64_t *t = realloc(g_tags, cap * sizeof *t);
+        if (t) {
+            g_tags = t;
+            g_tag_cap = cap;
+        }
+    }
+    if (!n && !free_at && g_ntags < g_tag_cap)
+        free_at = ++g_ntags;
+    if (!n && free_at) {
+        g_tags[free_at - 1] = host;
+        n = free_at;
+    }
+    pthread_mutex_unlock(&g_tag_lock);
+    return n;
+}
+
+uint64_t m32_tag_host(uint32_t guest)
+{
+    pthread_mutex_lock(&g_tag_lock);
+    uint64_t h = guest && guest <= g_ntags ? g_tags[guest - 1] : guest;
+    pthread_mutex_unlock(&g_tag_lock);
+    return h;
+}
+
+void m32_tag_free(uint32_t guest)
+{
+    pthread_mutex_lock(&g_tag_lock);
+    if (guest && guest <= g_ntags)
+        g_tags[guest - 1] = 0;
+    pthread_mutex_unlock(&g_tag_lock);
+}
+
 /* one scalar value from guest class g to host class h */
 uint64_t m32_scalar_in(char g, char h, uint64_t raw, const char *fn, int argno)
 {
@@ -266,13 +328,19 @@ uint64_t m32_scalar_in(char g, char h, uint64_t raw, const char *fn, int argno)
     case 'h': raw = (uint64_t)(int64_t)(int16_t)raw; break;
     case 'H': raw = (uint16_t)raw; break;
     case 'i': raw = (uint64_t)(int64_t)(int32_t)raw; break;
-    case 'u': raw = (uint32_t)raw; break;
+    case 'u':
+        raw = (uint32_t)raw;
+        if (h == 'L' && raw == 0x7fffffffu && fn && fn[0] != '_')   /* NSNotFound in a message: the host's is INT64_MAX */
+            raw = INT64_MAX;
+        break;
     case 'f':
         return h == 'd' ? bitsd(fbits((uint32_t)raw)) : (uint32_t)raw;
     case 'd':
         return h == 'f' ? bitsf((float)dbits(raw)) : raw;
     case 'T':
         return ocerz_abi_dtime_to_host(raw);
+    case 'G':
+        return m32_tag_host((uint32_t)raw);
     case 'p': case 's': case 'c':
         return (uint64_t)(uintptr_t)m32_host((uint32_t)raw);
     case '@': return (uint64_t)(uintptr_t)m32_objc_to_host((uint32_t)raw);
@@ -296,12 +364,20 @@ uint64_t m32_scalar_in(char g, char h, uint64_t raw, const char *fn, int argno)
 uint64_t m32_scalar_out(char g, char h, uint64_t raw)
 {
     switch (g) {
+    case 'i': case 'u':   /* NSNotFound and NSIntegerMax are INT64_MAX here and INT32_MAX there; truncated, they read -1 */
+        if ((h == 'l' || h == 'L') && raw == (uint64_t)INT64_MAX)
+            return 0x7fffffffu;
+        if (h == 'l' && raw == (uint64_t)INT64_MIN)   /* NSIntegerMin */
+            return 0x80000000u;
+        return raw;
     case 'f':
         return h == 'd' ? bitsf((float)dbits(raw)) : (uint32_t)raw;
     case 'd':
         return h == 'f' ? bitsd(fbits((uint32_t)raw)) : raw;
     case 'T':
         return ocerz_abi_dtime_to_guest(raw);
+    case 'G':
+        return m32_tag_guest(raw);
     case 'p': case 'Q': case 'c':
         return m32_handle((void *)(uintptr_t)raw);
     case '@': return m32_objc_to_guest((void *)(uintptr_t)raw);
@@ -342,13 +418,106 @@ int m32_struct_in_regs(const M32Type *t)
     return t->size == 1 || t->size == 2 || t->size == 4 || t->size == 8;
 }
 
+#define UNWRITTEN 0x5752495445ull   /* an out object's cell until the callee stores one: odd, so no object */
+
 typedef struct Writeback {
     char cls;
     uint32_t guest;           /* where the guest's value lives */
     uint64_t *cell;           /* the host cell the callee wrote */
     const M32Type *gt, *ht;   /* R: the structure's two layouts */
     uint32_t n;               /* F: how many CGFloats */
+    const struct Packed *pk;  /* K: the structure's steps */
 } Writeback;
+
+/*
+ * Structures the notation cannot describe.  HIToolbox's theme structures are packed to 2, and some hold a union, so
+ * sdkgen gave the arguments that point at them Q and they crossed as the guest's bytes.  Most are laid out alike on
+ * both (a button's draw info is 30 bytes on each, measured with clang -arch i386 and -arch arm64); these are not, as
+ * their CGFloats, longs and CF references widen.  Each is a run of steps: b copies bytes, F widens floats to doubles,
+ * L words to longs, P handles to host pointers.  Firefox 3.6 draws its scroll bars with HIThemeDrawTrack, whose
+ * HIThemeTrackDrawInfo has its HIRect after six bytes: crossed, HIToolbox read its floats as doubles and everything
+ * after them 16 bytes off.  An output structure (out) is copied back.  OCERZ_NO_M32_PACKED=1 crosses them as before.
+ */
+typedef struct Packed { const char *steps; uint16_t gsize, hsize; } Packed;
+static const Packed k_track = { "b6F4b26", 48, 64 },      /* HIThemeTrackDrawInfo */
+                    k_menu = { "b6L1F1b4F2", 26, 42 },    /* HIThemeMenuDrawInfo */
+                    k_text = { "b32P1", 36, 40 },         /* HIThemeTextInfo: truncationHappened comes back */
+                    k_window = { "b14F2", 22, 30 },       /* HIThemeWindowDrawInfo */
+                    k_sbtrack = { "b6F1", 10, 14 },       /* HIScrollBarTrackInfo */
+                    k_title = { "b10F1", 14, 18 };        /* HIThemeMenuTitleDrawInfo */
+static const struct { const char *name; int8_t arg, out; const Packed *p; } g_packed[] = {
+    { "_HIThemeDrawTrack", 0, 0, &k_track }, { "_HIThemeDrawTrackTickMarks", 0, 0, &k_track },
+    { "_HIThemeGetScrollBarTrackRect", 1, 0, &k_track }, { "_HIThemeGetTrackBounds", 0, 0, &k_track },
+    { "_HIThemeGetTrackDragRect", 0, 0, &k_track }, { "_HIThemeGetTrackLiveValue", 0, 0, &k_track },
+    { "_HIThemeGetTrackPartBounds", 0, 0, &k_track }, { "_HIThemeGetTrackParts", 0, 0, &k_track },
+    { "_HIThemeGetTrackThumbPositionFromBounds", 0, 0, &k_track },
+    { "_HIThemeGetTrackThumbPositionFromOffset", 0, 0, &k_track }, { "_HIThemeGetTrackThumbShape", 0, 0, &k_track },
+    { "_HIThemeHitTestTrack", 0, 0, &k_track },
+    { "_HIThemeDrawMenuBackground", 1, 0, &k_menu }, { "_HIThemeGetMenuBackgroundShape", 1, 0, &k_menu },
+    { "_HIThemeDrawTextBox", 2, 1, &k_text }, { "_HIThemeGetTextDimensions", 2, 1, &k_text },
+    { "_HIThemeDrawWindowFrame", 1, 0, &k_window }, { "_HIThemeDrawTitleBarWidget", 1, 0, &k_window },
+    { "_HIThemeGetWindowRegionHit", 1, 0, &k_window }, { "_HIThemeGetWindowShape", 1, 0, &k_window },
+    { "_HIThemeHitTestScrollBarArrows", 1, 0, &k_sbtrack }, { "_HIThemeDrawMenuTitle", 2, 0, &k_title },
+};
+
+static const Packed *packed_layout(const char *name, int arg, int *out)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_PACKED") != NULL;
+    for (size_t i = 0; !off && i < sizeof g_packed / sizeof g_packed[0]; i++)
+        if (g_packed[i].arg == arg && !strcmp(g_packed[i].name, name)) {
+            *out = g_packed[i].out;
+            return g_packed[i].p;
+        }
+    return NULL;
+}
+
+/* guest bytes to host (in) or back (!in), step by step */
+static void packed_copy(const Packed *p, uint8_t *g, uint8_t *h, int in)
+{
+    for (const char *s = p->steps; *s;) {
+        char op = *s++;
+        unsigned n = 0;
+        while (*s >= '0' && *s <= '9')
+            n = n * 10 + (unsigned)(*s++ - '0');
+        for (unsigned k = 0; k < (op == 'b' ? 1 : n); k++) {
+            uint32_t w = 0;
+            uint64_t x = 0;
+            if (op == 'b') {
+                memcpy(in ? h : g, in ? g : h, n);
+                g += n;
+                h += n;
+                continue;
+            }
+            if (in) {
+                memcpy(&w, g, 4);
+                if (op == 'F') {
+                    float f;
+                    memcpy(&f, &w, 4);
+                    double d = f;
+                    memcpy(&x, &d, 8);
+                } else {
+                    x = op == 'P' ? (uint64_t)(uintptr_t)m32_host(w) : w;
+                }
+                memcpy(h, &x, 8);
+            } else {
+                memcpy(&x, h, 8);
+                if (op == 'F') {
+                    double d;
+                    memcpy(&d, &x, 8);
+                    float f = (float)d;
+                    memcpy(&w, &f, 4);
+                } else {
+                    w = op == 'P' ? m32_handle((void *)(uintptr_t)x) : (uint32_t)x;
+                }
+                memcpy(g, &w, 4);
+            }
+            g += 4;
+            h += 8;
+        }
+    }
+}
 
 /*
  * Arrays of CGFloats, and of the structures made of them (CGPoint, CGSize, CGRect), are floats on i386 and doubles on
@@ -396,6 +565,12 @@ static const FloatArray g_float_arrays[] = {
     { "_CGColorSpaceCreateICCBased", 1, 2, 0, -1, -1, 0, 0 },
     { "_CGFunctionCreate", 2, 2, 1, -1, -1, 0, 0 },
     { "_CGFunctionCreate", 4, 2, 3, -1, -1, 0, 0 },
+    { "_CGFontGetGlyphBBoxes", 3, 4, 2, -1, -1, 0, 1 },
+    { "_HIThemeGetTextDimensions", 3, 1, -1, -1, -1, 1, 1 },   /* width, height and baseline */
+    { "_HIThemeGetTextDimensions", 4, 1, -1, -1, -1, 1, 1 },
+    { "_HIThemeGetTextDimensions", 5, 1, -1, -1, -1, 1, 1 },
+    { "_HIThemeGetTrackThumbPositionFromBounds", 2, 1, -1, -1, -1, 1, 1 },   /* HIThemeTrackPosition, a CGFloat */
+    { "_HIThemeGetTrackThumbPositionFromOffset", 2, 1, -1, -1, -1, 1, 1 },
     { "_CTFontGetAdvancesForGlyphs", 3, 2, 4, -1, -1, 0, 1 },
     { "_CTFontGetBoundingRectsForGlyphs", 3, 4, 4, -1, -1, 0, 1 },
     { "_CTFontGetVerticalTranslationsForGlyphs", 2, 2, 3, -1, -1, 0, 1 },
@@ -831,6 +1006,18 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             put_int(&hc, (uint64_t)(uintptr_t)m32_callback((uint32_t)raw, ga->cb, ha->cb), 8);
             continue;
         }
+        int pk_out = 0;
+        const Packed *pk = ga->cls == 'Q' && raw ? packed_layout(e->name, i, &pk_out) : NULL;
+        if (pk) {
+            uint8_t *hs = scratch(&hc, pk->hsize);
+            if (hs) {
+                packed_copy(pk, m32_h((uint32_t)raw), hs, 1);
+                if (pk_out && nwb < 16)
+                    wb[nwb++] = (Writeback){ 'K', (uint32_t)raw, (uint64_t *)hs, NULL, NULL, 0, pk };
+            }
+            put_int(&hc, (uint64_t)(uintptr_t)hs, 8);
+            continue;
+        }
         if (g->farr[i] && raw && nfloats < 4 && nwb < 16) {
             int out = 0, n = float_array_count(&g_float_arrays[g->farr[i] - 1], (uint32_t)cpu->gpr[OCERZ_RSP], &out);
             if (n) {
@@ -846,20 +1033,34 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
                     else
                         floats[nheap++] = d;
                     if (out)
-                        wb[nwb++] = (Writeback){ 'F', (uint32_t)raw, (uint64_t *)d, NULL, NULL, (uint32_t)n };
+                        wb[nwb++] = (Writeback){ 'F', (uint32_t)raw, (uint64_t *)d, NULL, NULL, (uint32_t)n, NULL };
                 }
                 put_int(&hc, (uint64_t)(uintptr_t)d, 8);
                 continue;
             }
+        }
+        if ((ga->cls == 'R' || ga->cls == 'r') && ha->cls != 'R' && ha->cls != 'r') {   /* no host layout to copy to */
+            m32_log_once("a structure pointer with no host layout crosses as the guest's bytes:", e->name);
+            put_int(&hc, (uint64_t)(uintptr_t)m32_host((uint32_t)raw), 8);
+            continue;
         }
         if (ga->cls == 'R' || ga->cls == 'r') {   /* copy in, and back out when the callee may write it */
             uint8_t *hs = raw ? scratch(&hc, ha->ssize) : NULL;
             if (hs) {
                 struct_in(ga, ha, m32_h((uint32_t)raw), hs, e->name, i);
                 if (ga->cls == 'R' && nwb < 16)
-                    wb[nwb++] = (Writeback){ 'R', (uint32_t)raw, (uint64_t *)hs, ga, ha, 0 };
+                    wb[nwb++] = (Writeback){ 'R', (uint32_t)raw, (uint64_t *)hs, ga, ha, 0, NULL };
             }
             put_int(&hc, (uint64_t)(uintptr_t)hs, 8);
+            continue;
+        }
+        if (ga->cls == 'O' || ga->cls == 'E') {   /* a handle is already a host cell */
+            uint64_t *cell = raw && !m32_is_handle((uint32_t)raw) && nwb < 16 ? scratch(&hc, 8) : NULL;
+            if (cell) {   /* an E is only written (NSError *error; is often uninitialized), and kept if it is not */
+                *cell = ga->cls == 'O' ? (uint64_t)(uintptr_t)m32_objc_to_host(m32_rd((uint32_t)raw)) : UNWRITTEN;
+                wb[nwb++] = (Writeback){ 'O', (uint32_t)raw, cell, NULL, NULL, 0, NULL };
+            }
+            put_int(&hc, (uint64_t)(uintptr_t)(cell ? (void *)cell : m32_host((uint32_t)raw)), 8);
             continue;
         }
         if (ga->cls == 'P' || ga->cls == 'W' || ga->cls == 'V' || ga->cls == 'S') {
@@ -868,12 +1069,13 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
                 uint32_t cur = ga->cls == 'S' ? (uint32_t)(int32_t)*(int16_t *)m32_h((uint32_t)raw) : m32_rd((uint32_t)raw);
                 *cell = ga->cls == 'P' ? (uint64_t)(uintptr_t)m32_host(cur)
                       : ga->cls == 'W' || ga->cls == 'S' ? (uint64_t)(int64_t)(int32_t)cur : cur;
-                wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell, NULL, NULL, 0 };
+                wb[nwb++] = (Writeback){ ga->cls, (uint32_t)raw, cell, NULL, NULL, 0, NULL };
             }
             put_int(&hc, (uint64_t)(uintptr_t)cell, 8);
             continue;
         }
-        uint64_t v = m32_scalar_in(ga->cls, ha->cls, raw, e->name, i);
+        uint64_t v = (e->gl_ptr == M32_GL_ARRAY || e->gl_ptr == M32_GL_ELEMENT) && ga->cls == 'p'
+                         ? m32_gl_ptr(e->gl_ptr, (uint32_t)raw) : m32_scalar_in(ga->cls, ha->cls, raw, e->name, i);
         if (ha->cls == 'f' || ha->cls == 'd')
             put_fp(&hc, v, ha->size);
         else
@@ -927,11 +1129,22 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
     ocerz_bridge_lower(&frame);
     m32_refresh_data();
     if (exc) {   /* the host raised: the guest's innermost @try gets it */
+        static int log_throws = -1;
+        if (log_throws < 0)
+            log_throws = getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "throws");
+        if (log_throws) {
+            void m32_describe_exception(void *exception, char *buf, unsigned long size);   /* src/m32_catch.m */
+            char what[512];
+            m32_describe_exception(exc, what, sizeof what);
+            fprintf(stderr, "ocerz: m32: %s raised %s (caller %#x)\n", e->name, what, m32_rd((uint32_t)cpu->gpr[OCERZ_RSP]));
+        }
         for (int i = 0; i < nheap; i++)
             free(floats[i]);
         return m32_objc_guest_throw(cpu, m32_objc_to_guest(exc));
     }
     m32_save_errno(cpu);
+    if (e->gl_ptr == M32_GL_BIND || e->gl_ptr == M32_GL_BIND_VAO)
+        m32_gl_bound(e->gl_ptr, m32_rd((uint32_t)cpu->gpr[OCERZ_RSP] + 4), m32_rd((uint32_t)cpu->gpr[OCERZ_RSP] + 8));
     static int log_gl = -1, log_nan = -1, log_stat = -1;
     if (log_gl < 0) {
         log_gl = getenv("OCERZ_M32LOG") && strstr(getenv("OCERZ_M32LOG"), "glerr");
@@ -968,11 +1181,18 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
             struct_out(wb[i].gt, wb[i].ht, (const uint8_t *)wb[i].cell, m32_h(wb[i].guest));
             continue;
         }
+        if (wb[i].cls == 'K') {
+            packed_copy(wb[i].pk, m32_h(wb[i].guest), (uint8_t *)wb[i].cell, 0);
+            continue;
+        }
         uint64_t v = *wb[i].cell;
+        if (wb[i].cls == 'O' && v == UNWRITTEN)
+            continue;
         if (wb[i].cls == 'S')
             *(int16_t *)m32_h(wb[i].guest) = (int16_t)v;
         else
-            m32_wr(wb[i].guest, wb[i].cls == 'P' ? m32_handle((void *)(uintptr_t)v) : (uint32_t)v);
+            m32_wr(wb[i].guest, wb[i].cls == 'P' ? m32_handle((void *)(uintptr_t)v)
+                              : wb[i].cls == 'O' ? m32_objc_to_guest((void *)(uintptr_t)v) : (uint32_t)v);
     }
     for (int i = 0; i < nheap; i++)
         free(floats[i]);

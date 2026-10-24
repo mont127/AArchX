@@ -86,6 +86,9 @@ int ocerz_jit_pc_in_arena(const struct OcerzVM *vm, const void *host_pc);
 void ocerz_jit_postfork_child(void);
 uint64_t ocerz_jit_thread_mark(void);
 void ocerz_jit_thread_restore(uint64_t mark);
+/* whether a translated ret can read cpu->ras below ras_top 0 (the ring kept in the cpu rather than on the host stack,
+ * OCERZ_NO_HOST_RAS=1, pops without an empty check) */
+int ocerz_jit_ras_wraps(void);
 
 int ocerz_jit_guest_gprs_at(const struct OcerzVM *vm, const void *host_pc,
                             const uint64_t *host_x, const OcerzCPU *cpu, uint64_t out[16]);

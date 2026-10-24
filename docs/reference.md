@@ -128,12 +128,15 @@ bug is in what that switch controls.
 | `OCERZ_NO_MEMFN_PLAIN=1` | translate the system's string and memory routines with ordered accesses when the rest of the process has them |
 | `OCERZ_NO_FPB_DEFER=1` | check every floating-point result immediately instead of once per batch |
 | `OCERZ_NO_FLIP=1` | no profile-driven retranslation of superblocks |
+| `OCERZ_NO_FLIP_KEEP_RETIRE=1` | a superblock whose branches were all kept as they were keeps its probes (nops on the fall-through path) instead of being translated again without them |
 | `OCERZ_NO_VENEER_UNCHAIN=1` | when a block is retired, leave chains that reach it through a veneer (the way far targets are chained) in place, as before 2026-10-11: after a write to guest code they reach the old translation |
 | `OCERZ_FORCE_VENEER=1` | chain every block through a veneer, as only far targets are (for tests) |
 | `OCERZ_NO_CHAIN_SYNC_BATCH=1` | after chaining a new block, flush each patched branch from the instruction cache with its own call, instead of one barrier pair for all of them |
 | `OCERZ_LIVE_SCAN=1` | search the whole list of live blocks for one being retired whose index does not point back at it |
 | `OCERZ_NO_MOVFUSE=1` | do not fold a `mov` into a following shift |
 | `OCERZ_NO_BRIDGE_FASTCALL=1` | in native mode, reach every bridged call through the trap and the dispatcher instead of calling it from inside the translated block |
+| `OCERZ_NO_CHEAP_CALLBACK=1` | when native code calls guest code, clear the host signal mask on every call and save it with the recovery point, as 0.8 did (three system calls a callback), instead of only on a thread's outermost guest call |
+| `OCERZ_NO_OBJC_SEND_CACHE=1` | in native mode, decide every objc_msgSend in full (implementation, signature, selector checks) instead of reusing what the thread decided for the same class, selector and implementation |
 | `OCERZ_NO_COMPACT=1` | keep every block's decoded instructions after translation |
 | `OCERZ_NO_JIT_FLUSH=1` | when the translation arena fills, run everything translated after that in the interpreter instead of starting the arena again |
 

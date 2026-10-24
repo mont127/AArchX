@@ -570,6 +570,18 @@
 # still in progress, and the signal delivered at the return of the nested raise is
 # a signal delivered inside a handler.
 #
+# signal_callback_fault sorts with a comparator that reads a protected page and
+# then protects it again, so every comparison faults once, and a SIGSEGV handler
+# that unprotects the page and returns, so the read is made again and succeeds.
+# In native mode the comparator is a callback from the host's qsort, and each
+# fault jumps back to the callback's recovery point, which is taken without the
+# signal mask and has to put the mask and the signal stack back itself; three
+# hundred recoveries in a row, under both engines and in cache mode, must leave
+# the array sorted and the handler run once per comparison, on the faulting
+# page. Every fault is at the same address, which ocerz once took for a fault
+# loop after sixteen and ended the thread: a garbage collector's barrier or a
+# safepoint poll faults like that, and only Wine's foreign workers really loop.
+#
 # The signal runs are bounded at SIGNAL_TIMEOUT seconds, and a run that times out
 # names the last progress note its fixture wrote. A fixture whose handler was
 # never found usually does not time out at all: the signal takes its default
@@ -1412,9 +1424,10 @@ SIG_KILL_BIN=""
 SIG_ERRORS_BIN=""
 SIG_DEFAULT_BIN=""
 SIG_HANDLER_BIN=""
+SIG_CBFAULT_BIN=""
 SIGNAL_TIMEOUT=30
 SIGNAL_WAIT_SECS=10
-SIGNAL_BRIDGED='___stack_chk_fail ___error _write _strlen _strcmp _memcpy _malloc _free _getpid _time _pthread_create _pthread_join _pthread_self _signal _sigaction _raise _kill _sigprocmask _pthread_sigmask _sigaltstack _pthread_kill _sigemptyset _sigfillset _sigaddset _sigdelset _sigismember'
+SIGNAL_BRIDGED='___stack_chk_fail ___error _write _strlen _strcmp _memcpy _malloc _free _getpid _time _pthread_create _pthread_join _pthread_self _signal _sigaction _raise _kill _sigprocmask _pthread_sigmask _sigaltstack _pthread_kill _sigemptyset _sigfillset _sigaddset _sigdelset _sigismember _qsort _mprotect'
 SIG_DEFAULT_WINCH='signal_default raising SIGWINCH'
 SIG_DEFAULT_MARK='signal_default raising SIGTERM'
 SIG_DEFAULT_PAST='signal_default survived'
@@ -5622,9 +5635,81 @@ int main(void)
 }
 EOC
 
+    cat > "$TMP/signal_callback_fault.c" <<'EOC'
+#include "sig_common.h"
+
+#define TAG "signal_callback_fault"
+#define N 64
+#define SPAN 16384
+
+int mprotect(void *, cb_size, int);
+#define PROT_NONE_ 0
+#define PROT_READ_ 1
+
+/* a whole 16 KB host page: the linker aligns __bss to 4 KB at most, and a
+ * protection that covers only part of a host page is not applied */
+static char g_area[3 * SPAN];
+static int *g_page;
+static volatile sig_atomic_t g_faults;
+static volatile unsigned g_cmps, g_wrong_page, g_wrong_sig, g_skew;
+
+static void on_fault(int sig, siginfo_t *info, void *uc)
+{
+    (void)uc;
+    g_faults++;
+    if (sig != SIGSEGV && sig != SIGBUS)
+        g_wrong_sig++;
+    if (info == 0 || !sig_inside((cb_uptr)info->si_addr, (cb_uptr)g_page, SPAN))
+        g_wrong_page++;
+    if (CB_SKEWED())
+        g_skew++;
+    mprotect(g_page, SPAN, PROT_READ_);
+}
+
+static int cmp_fault(const void *a, const void *b)
+{
+    int x = *(const int *)a + *(volatile int *)&g_page[0];
+    int y = *(const int *)b;
+    g_cmps++;
+    mprotect(g_page, SPAN, PROT_NONE_);
+    return (x > y) - (x < y);
+}
+
+int main(void)
+{
+    struct sigaction sa;
+    unsigned m = 0, bit = 1, i, sorted = 1;
+    int v[N];
+    char *p = (char *)&sa;
+
+    g_page = (int *)(((cb_uptr)g_area + SPAN - 1) & ~(cb_uptr)(SPAN - 1));
+    for (i = 0; i < sizeof sa; i++)
+        p[i] = 0;
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO;
+    for (i = 0; i < N; i++)
+        v[i] = (int)((i * 37u) % N) - N / 2;
+    CK(sigaction(SIGSEGV, &sa, 0) == 0 && sigaction(SIGBUS, &sa, 0) == 0);
+    at_note(TAG, "sorting");
+    mprotect(g_page, SPAN, PROT_NONE_);
+    qsort(v, N, sizeof v[0], cmp_fault);
+    mprotect(g_page, SPAN, PROT_READ_);
+    for (i = 0; i < N; i++)
+        if (v[i] != (int)i - N / 2)
+            sorted = 0;
+    CK(sorted);
+    CK(g_cmps > 0 && (unsigned)g_faults == g_cmps);
+    CK(g_wrong_sig == 0 && g_wrong_page == 0);
+    CK(g_skew == 0);
+    cb_begin(TAG, m);
+    cb_end();
+    return m != 0;
+}
+EOC
+
     for name in signal_sigaction signal_signal signal_mask signal_altstack \
                 signal_pthread_kill signal_kill signal_errors signal_default \
-                signal_handler_bridge; do
+                signal_handler_bridge signal_callback_fault; do
         clang -arch x86_64 -std=c11 -O1 -fno-builtin \
                 -o "$TMP/$name" "$TMP/$name.c" >"$TMP/$name.cc.log" 2>&1 || continue
         case $name in
@@ -5637,6 +5722,7 @@ EOC
             signal_errors) SIG_ERRORS_BIN="$TMP/$name" ;;
             signal_default) SIG_DEFAULT_BIN="$TMP/$name" ;;
             signal_handler_bridge) SIG_HANDLER_BIN="$TMP/$name" ;;
+            signal_callback_fault) SIG_CBFAULT_BIN="$TMP/$name" ;;
         esac
     done
 }
@@ -15147,6 +15233,8 @@ case_signal signal_errors "$SIG_ERRORS_BIN" signal_errors \
 case_signal_default
 case_signal signal_handler_bridge "$SIG_HANDLER_BIN" signal_handler_bridge \
     "bit 0 is sigaction or a raise from main returning non-zero, 1 the two handlers not each run once per raise by the time it returned, or a raise returning with a handler still in progress, 2 bridged strlen inside the handler giving a wrong length, 3 bridged memcpy inside the handler returning the wrong pointer or copying the wrong bytes, 4 bridged strcmp inside the handler giving a wrong answer, 5 a write from inside a handler writing short, 6 the raise of SIGUSR2 inside the SIGUSR1 handler returning non-zero or not running its handler nested inside the first before it returned, 7 a handler handed another signal or entered on a misaligned stack"
+case_signal signal_callback_fault "$SIG_CBFAULT_BIN" signal_callback_fault \
+    "bit 0 is sigaction failing, 1 the array not sorted, 2 the handler not run exactly once per comparison or the comparator never run, 3 the handler handed another signal or a fault address off the protected page, 4 the handler entered on a misaligned stack"
 case_cf cf_basic "$CF_BASIC_BIN" "$CF_BASIC_ARM64" cf_basic "$CF_CLASS_SYM" \
     "cf_basic is the plainest use of a framework there is, with no guest code for CoreFoundation to call, so a failure here means no guest program that uses CoreFoundation at all can run in native mode" \
     string "bit 0 is CFStringCreateWithCString failing or handing back something whose type is not CFStringGetTypeID, 1 CFStringGetLength other than the 20 UTF-16 units of the text, 2 a CFStringGetCharacterAtIndex result other than the expected UniChar, where several lie above 0xff and two are a surrogate pair, 3 CFStringGetCString into a large buffer not returning exactly true or not reproducing the UTF-8 bytes, 4 CFStringGetCString into an 8-byte buffer not returning exactly false, 5 CFStringGetCString into ASCII not returning exactly false, 6 CFStringCreateWithBytes over UTF-16LE bytes not exactly equal to the matching CFSTR literal, 7 CFStringCreateWithBytes over the first five UTF-8 bytes not exactly equal to the literal Hello, 8 kCFStringEncodingUnicode bytes not read in host order with isExternalRepresentation false and big-endian with it true, which is a Boolean argument that did not arrive" \

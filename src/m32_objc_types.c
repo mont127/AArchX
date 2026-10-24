@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "ocerz/m32_objc.h"
+#include "ocerz/m32_sig.h"
 #include "ocerz/m32_objcrt.h"
 
 static const char *skip_quals(const char *e)
@@ -146,6 +147,89 @@ int m32_encoding_notation(const char *enc, int guest, char *out, size_t n)
     return 0;
 }
 
+/* whether the encoding at e, qualifiers and all, is a plain id * ("^@", "o^@"; not a const one, not a block's) */
+static int plain_id_ptr(const char *e)
+{
+    for (; *e && strchr("rnNoORVA+", *e); e++)
+        if (*e == 'r')
+            return 0;
+    return e[0] == '^' && e[1] == '@' && e[2] != '?';
+}
+
+/* a pointer to one structure with members ("^{_NSRange=II}"): its notation ("{uu}") in out, 'r' when it is const
+ * (only read), 'R' when the callee may write it, 0 for anything else */
+static char struct_ptr(const char *e, char *out, size_t n)
+{
+    char cls = 'R';
+    for (; *e && strchr("rnNoORVA+", *e); e++)
+        if (*e == 'r')
+            cls = 'r';
+    size_t o = 0;
+    if (e[0] != '^' || e[1] != '{' || !one(e + 1, out, &o, n, 0) || o < 3 || o + 1 >= n)
+        return 0;
+    out[o] = 0;
+    int members = 0;   /* a notation's structure holds at most M32_MAX_MEMBERS: a larger one stays a pointer */
+    for (const char *p = out; *p; p++)
+        members += *p != '{' && *p != '}';
+    return members <= M32_MAX_MEMBERS ? cls : 0;
+}
+
+int m32_notation_pointers(const char *sel, const char *genc, const char *henc, char *gn, size_t gsize, char *hn,
+                          size_t hsize)
+{
+    char go[1024], ho[1024];
+    size_t gl = 0, hl = 0;
+    const char *ge = genc, *he = henc;
+    for (int part = -3; *ge && *he; part++) {   /* the return value, self and _cmd come before the selector's parts */
+        char gt[512], ht[512];
+        size_t g1 = 0, h1 = 0;
+        const char *gnext = one(ge, gt, &g1, sizeof gt - 2, 0), *hnext = one(he, ht, &h1, sizeof ht - 2, 0);
+        if (!gnext || !hnext)
+            return -1;
+        gt[g1] = ht[h1] = 0;
+        if (part >= 0 && !strcmp(gt, "p") && !strcmp(ht, "p")) {
+            const char *s = sel;
+            for (int k = 0; k < part && s; k++)
+                s = strchr(s, ':') ? strchr(s, ':') + 1 : NULL;
+            size_t len = s && strchr(s, ':') ? (size_t)(strchr(s, ':') - s) : 0;
+            char name[256], gs[400], hs[400];
+            snprintf(name, sizeof name, "%.*s", (int)len, s ? s : "");
+            char gc = struct_ptr(ge, gs, sizeof gs), hc = struct_ptr(he, hs, sizeof hs);
+            int plural = strstr(name, "bjects") || strstr(name, "eys") || strstr(name, "oints") || strstr(name, "ects");
+            if (!len || plural)
+                ;   /* an array of them: their count is another argument */
+            else if (plain_id_ptr(ge) && plain_id_ptr(he))
+                snprintf(gt, sizeof gt, "%c", strstr(name, "alidateValue") ? 'O' : 'E');   /* validateValue: reads it */
+            else if (gc && hc) {
+                snprintf(gt, sizeof gt, "%c%s", gc, gs);
+                snprintf(ht, sizeof ht, "%c%s", gc, hs);
+            }
+        }
+        size_t a = strlen(gt), b = strlen(ht);
+        if (gl + a + 2 >= sizeof go || hl + b + 2 >= sizeof ho)
+            return -1;
+        memcpy(go + gl, gt, a);
+        memcpy(ho + hl, ht, b);
+        gl += a;
+        hl += b;
+        if (part == -3) {
+            go[gl++] = '(';
+            ho[hl++] = '(';
+        }
+        ge = gnext;
+        he = hnext;
+    }
+    if (*ge || *he || gl + 2 > gsize || hl + 2 > hsize)
+        return -1;
+    go[gl++] = ')';
+    ho[hl++] = ')';
+    memcpy(gn, go, gl);
+    gn[gl] = 0;
+    memcpy(hn, ho, hl);
+    hn[hl] = 0;
+    return 0;
+}
+
 /* ---- the i386 method database ---- */
 
 typedef struct Rec { char *key; char *enc; int variadic; } Rec;   /* key: "Class -sel" */
@@ -254,9 +338,31 @@ static const char *drift(const char *sel, const char *enc)
 
 static const char *guest_encoding(void *host_cls, const char *sel, int is_class);
 
+/* The answer for a class and a selector does not change once the headers are loaded, and sends ask it again and
+ * again: a method the class's own records have took about 200 ns, one only a protocol declares (or none, as for
+ * -self) about 5.6 us, a name formatted and looked up for every protocol of every class up the chain.  Each thread
+ * keeps its last answers, misses too, by class, selector and kind (ponytail: a protocol added to a class after it
+ * was asked about is not seen; m32 adds a paired class's protocols before its first send).
+ * OCERZ_NO_M32_ENCODING_CACHE=1 looks every send up. */
+typedef struct EncHit { void *cls; const char *sel; const char *enc; int is_class, variadic; } EncHit;
+#define ENC_CACHE 256
+static __thread EncHit t_enc[ENC_CACHE];
+
 const char *m32_objc_guest_encoding(void *host_cls, const char *sel, int is_class)
 {
-    return drift(sel, guest_encoding(host_cls, sel, is_class));
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_M32_ENCODING_CACHE") != NULL;
+    if (off || !host_cls || !sel)
+        return drift(sel, guest_encoding(host_cls, sel, is_class));
+    EncHit *h = &t_enc[(((uintptr_t)host_cls >> 4) ^ ((uintptr_t)sel >> 2) ^ (uintptr_t)is_class) & (ENC_CACHE - 1)];
+    if (h->cls == host_cls && h->is_class == is_class && (h->sel == sel || !strcmp(h->sel, sel))) {
+        t_variadic = h->variadic;
+        return drift(sel, h->enc);
+    }
+    const char *e = guest_encoding(host_cls, sel, is_class);
+    *h = (EncHit){ host_cls, sel, e, is_class, t_variadic };
+    return drift(sel, e);
 }
 
 static const char *guest_encoding(void *host_cls, const char *sel, int is_class)
