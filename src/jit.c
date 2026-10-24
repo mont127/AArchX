@@ -995,6 +995,9 @@ typedef struct JitBlock {
     uint8_t ordered_loads;
     uint8_t slab;
     JitLayout *lay;
+    uint32_t epi_off;                   /* where its common epilogue starts, 0 if none (epi_share) */
+    uint16_t epi_w;                     /* that epilogue's words, at the block's end */
+    uint8_t epi_shared;                 /* it is one branch to a copy elsewhere: code_words is epi_off + 1 */
 } JitBlock;
 
 static inline uint64_t blk_rip(const JitBlock *b) { return jit_key_rip(b->key); }
@@ -1093,6 +1096,8 @@ struct OcerzJit {
     uint64_t code_lo, code_hi;
     InvSlot invmap[INVMAP_SLOTS];
     int invmap_full;
+    struct EpiShare *epi_share;         /* common epilogues other blocks branch to (epi_share_find) */
+    int n_epi_share, cap_epi_share;
 };
 
 int ocerz_perfstat = -1;
@@ -22109,13 +22114,14 @@ static void tc_ras_fill(OcerzJit *jit, void **cell, uint64_t retaddr, int mode32
 
 static uint64_t g_tc_val[TC_RELOC_MAX];
 
-static int tc_bind(OcerzJit *jit, JitBlock *blk, uint32_t *code, const TcReloc *rel, int nrel, int fresh)
+static int tc_bind(OcerzJit *jit, JitBlock *blk, uint32_t *code, const TcReloc *rel, int nrel, int fresh,
+                   uint32_t limit)
 {
     int mode32 = blk_mode32(blk);
     if (fresh)
         for (int i = 0; i < nrel; i++) {
             const TcReloc *r = &rel[i];
-            if (r->kind == TCR_RASCELL)
+            if (r->kind == TCR_RASCELL || r->off >= limit)
                 continue;
             if (r->kind == TCR_RASSLOT) {
                 void **sl = ras_slot_alloc();
@@ -22134,6 +22140,8 @@ static int tc_bind(OcerzJit *jit, JitBlock *blk, uint32_t *code, const TcReloc *
     for (int i = 0; i < nrel; i++) {
         const TcReloc *r = &rel[i];
         uint32_t *w = code + r->off;
+        if (r->off >= limit)
+            continue;
         if (r->kind == TCR_RASCELL) {
             ras_cell_register((void **)w);
             tc_ras_fill(jit, (void **)w, tc_rip(r->arg), mode32);
@@ -22270,7 +22278,7 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
     return bad;
 }
 
-static _Atomic unsigned long long g_tc_n_ahead;
+static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words;
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
 enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
 static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
@@ -22360,7 +22368,8 @@ static int tc_img_why(const JitBlock *blk, const uint32_t *code, uint32_t words)
             return TCI_CODE;
         }
     }
-    for (uint32_t w = end; w + 2 <= words; w += 2) {
+    uint32_t pool_end = blk->epi_off && blk->epi_off >= end ? blk->epi_off : words;   /* the epilogue follows the pool */
+    for (uint32_t w = end; w + 2 <= pool_end; w += 2) {
         uint64_t x;
         memcpy(&x, code + w, 8);
         if (!tc_is_reloc_word(w) && tc_img_const(x)) {
@@ -22379,9 +22388,10 @@ static void tc_summary(void)
                 (unsigned long long)g_tc_n_pcrel, (unsigned long long)g_tc_n_const,
                 (unsigned long long)g_tc_n_mism, (unsigned long long)g_tc_n_full);
     else
-        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu, %llu words, %llu sharing an epilogue) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
                          " verify_variant=%llu verify_bad=%llu\n",
-                (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_ahead, (unsigned long long)g_tc_n_put,
+                (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_ahead,
+                (unsigned long long)g_tc_n_words, (unsigned long long)g_tc_n_epis, (unsigned long long)g_tc_n_put,
                 (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
                 (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
     fprintf(g_tc_lf, "ocerz: TCACHE[%d] images asked=%llu in=%llu out=%llu same=%llu variant=%llu unkeepable edge=%llu"
@@ -22443,7 +22453,7 @@ static uint32_t *tc_roundtrip(OcerzJit *jit, JitBlock *blk, uint32_t *entry)
     uint32_t *c = (uint32_t *)copy;
     pthread_jit_write_protect_np(0);
     memcpy(c, entry, (size_t)words * 4);
-    if (!tc_bind(jit, blk, c, g_tc_rel, g_tc_nrel, 1)) {
+    if (!tc_bind(jit, blk, c, g_tc_rel, g_tc_nrel, 1, words)) {
         pthread_jit_write_protect_np(1);
         g_tc_n_bad++;
         return NULL;
@@ -22529,6 +22539,8 @@ typedef struct {
     uint8_t host_holds[16];
     int8_t guest_in_host[16];
     uint64_t img_id, img_lo, img_hi;
+    uint32_t epi_off, epi_w;            /* the common epilogue at the end of the code, 0 if none (epi_share) */
+    uint64_t epi_key;                   /* its epi_norm key, 0 if not worked out */
 } TcRec;
 typedef struct { uint64_t lo, hi; } TcDep;
 typedef struct { uint32_t off, insn; } TcStop;
@@ -22760,6 +22772,139 @@ static int stop_sites_running(const JitBlock *b)
     return 1;
 }
 
+/*
+ * ---- shared epilogues ----
+ * Every block ended in the same 50-odd words that put the guest's registers
+ * back in the cpu, restore the host's and return or go on to the dispatch
+ * stub: a quarter of an average block, copied and cache-synced at each load
+ * and spread between the bodies the guest runs.  A block now emits them last,
+ * and when a copy of the same words (relocated ones compared by what they
+ * relocate to, not their value) is within a branch of it, keeps only a b to
+ * that copy where they would start, which is where its exits branch.  The copy
+ * is the first block's own, and the arena keeps a block's words until a flush,
+ * which forgets them all (epi_share_reset).  A record keeps the whole
+ * epilogue, so a load can do the same (tc_load_rec).  OCERZ_NO_EPI_SHARE=1
+ * keeps every block's own.
+ */
+#define EPI_MAX_WORDS 256
+#define EPI_MAX_REL 4
+typedef struct EpiShare {
+    uint64_t key;
+    uint32_t *addr;
+    uint32_t n, nrel;
+    uint32_t *norm;                     /* the words, what relocations write masked out */
+    TcReloc rel[EPI_MAX_REL];           /* its relocations, offsets from its start */
+} EpiShare;
+
+static int epi_share_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_EPI_SHARE") ? 0 : 1;
+    return on;
+}
+
+/* An epilogue's words at base in a block with what its relocations write masked out, and its key; 0 if it cannot be shared. */
+static uint64_t epi_norm(const uint32_t *w, uint32_t n, const TcReloc *rel, int nrel, uint32_t base,
+                         uint32_t *out, TcReloc *orel, uint32_t *onrel)
+{
+    if (!n || n > EPI_MAX_WORDS)
+        return 0;
+    memcpy(out, w, (size_t)n * 4);
+    uint32_t k = 0;
+    for (int i = 0; i < nrel; i++) {
+        if (rel[i].off < base || rel[i].off >= base + n)
+            continue;
+        uint32_t o = rel[i].off - base;
+        if (k >= EPI_MAX_REL || o + (rel[i].form == 1 ? 2u : 4u) > n)
+            return 0;
+        if (rel[i].form == 1)
+            out[o] = out[o + 1] = 0;
+        else
+            for (int j = 0; j < 4; j++) out[o + j] &= ~(0xffffu << 5);
+        orel[k] = rel[i];
+        orel[k].off = o;
+        k++;
+    }
+    *onrel = k;
+    uint64_t h = TC_HASH_SEED ^ n;
+    for (uint32_t i = 0; i < n; i++)
+        h = tc_mix(h, out[i]);
+    for (uint32_t i = 0; i < k; i++)
+        h = tc_mix(tc_mix(h, orel[i].off | (uint64_t)orel[i].kind << 32 | (uint64_t)orel[i].form << 40), orel[i].arg);
+    return h | 1;
+}
+
+static int epi_rel_same(const TcReloc *a, const TcReloc *b, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++)
+        if (a[i].off != b[i].off || a[i].kind != b[i].kind || a[i].form != b[i].form || a[i].arg != b[i].arg)
+            return 0;
+    return 1;
+}
+
+/* A shared copy of these words a b at site reaches (a margin inside its 128 MB). */
+static const EpiShare *epi_share_find(const OcerzJit *jit, uint64_t key, const uint32_t *norm, uint32_t n,
+                                      const TcReloc *orel, uint32_t nrel, const uint32_t *site)
+{
+    for (int i = jit->n_epi_share - 1; i >= 0; i--) {
+        const EpiShare *e = &jit->epi_share[i];
+        ptrdiff_t d = e->addr - site;
+        if (e->key != key || e->n != n || e->nrel != nrel || d <= -(ptrdiff_t)(1 << 24) || d >= (ptrdiff_t)(1 << 24))
+            continue;
+        if (!memcmp(e->norm, norm, (size_t)n * 4) && epi_rel_same(e->rel, orel, nrel))
+            return e;
+    }
+    return NULL;
+}
+
+static void epi_share_add(OcerzJit *jit, uint64_t key, uint32_t *addr, const uint32_t *norm, uint32_t n,
+                          const TcReloc *orel, uint32_t nrel)
+{
+    if (jit->n_epi_share == jit->cap_epi_share) {
+        int cap = jit->cap_epi_share ? 2 * jit->cap_epi_share : 16;
+        if (cap > 4096)
+            return;
+        EpiShare *v = (EpiShare *)realloc(jit->epi_share, (size_t)cap * sizeof *v);
+        if (!v)
+            return;
+        jit->epi_share = v;
+        jit->cap_epi_share = cap;
+    }
+    uint32_t *nw = (uint32_t *)malloc((size_t)n * 4);
+    if (!nw)
+        return;
+    memcpy(nw, norm, (size_t)n * 4);
+    EpiShare *e = &jit->epi_share[jit->n_epi_share++];
+    e->key = key;
+    e->addr = addr;
+    e->n = n;
+    e->nrel = nrel;
+    e->norm = nw;
+    memcpy(e->rel, orel, (size_t)nrel * sizeof *orel);
+}
+
+static void epi_share_reset(OcerzJit *jit)
+{
+    for (int i = 0; i < jit->n_epi_share; i++)
+        free(jit->epi_share[i].norm);
+    jit->n_epi_share = 0;
+}
+
+static uint32_t g_epi_save[EPI_MAX_WORDS];  /* a fresh block's whole epilogue, for its record, when it branches to a copy */
+static uint64_t g_epi_key;                  /* and its key */
+
+/* A copy of the epilogue with this key and size a b at site reaches: the key is the words' and relocations' hash. */
+static const EpiShare *epi_share_find_key(const OcerzJit *jit, uint64_t key, uint32_t n, const uint32_t *site)
+{
+    for (int i = jit->n_epi_share - 1; i >= 0; i--) {
+        const EpiShare *e = &jit->epi_share[i];
+        ptrdiff_t d = e->addr - site;
+        if (e->key == key && e->n == n && d > -(ptrdiff_t)(1 << 24) && d < (ptrdiff_t)(1 << 24))
+            return e;
+    }
+    return NULL;
+}
+
 static void tc_put(OcerzJit *jit, JitBlock *blk)
 {
     (void)jit;
@@ -22781,7 +22926,10 @@ static void tc_put(OcerzJit *jit, JitBlock *blk)
     r.h.key = g_tc_key;
     r.dep_hash = dh;
     r.hoist_sig = blk->hoist_sig;
-    r.code_words = blk->code_words;
+    r.code_words = blk->epi_shared ? blk->epi_off + blk->epi_w : blk->code_words;
+    r.epi_off = blk->epi_off;
+    r.epi_w = blk->epi_w;
+    r.epi_key = blk->epi_off ? g_epi_key : 0;
     r.entry_mod = (uint32_t)((uintptr_t)(void *)blk->code & 63);
     r.n_insns = (uint32_t)n;
     r.n_kept = compact ? blk->n_kept : 0;
@@ -22838,8 +22986,21 @@ static void tc_put(OcerzJit *jit, JitBlock *blk)
     }
 
     g_tc_opos = 0;
-    int ok = tc_out(&r, sizeof r) &&
-             tc_out((const void *)blk->code, (size_t)blk->code_words * 4) &&
+    int ok = tc_out(&r, sizeof r);
+    if (ok && blk->epi_shared) {
+        /* the body and the epilogue it branches away from, as one stretch (tc_out pads each piece) */
+        size_t head = (size_t)blk->epi_off * 4, nb = head + (size_t)blk->epi_w * 4, a = (nb + 7) & ~(size_t)7;
+        ok = g_tc_opos + a <= TC_OUT_MAX;
+        if (ok) {
+            memcpy(g_tc_out + g_tc_opos, (const void *)blk->code, head);
+            memcpy(g_tc_out + g_tc_opos + head, g_epi_save, nb - head);
+            memset(g_tc_out + g_tc_opos + nb, 0, a - nb);
+            g_tc_opos += a;
+        }
+    } else if (ok) {
+        ok = tc_out((const void *)blk->code, (size_t)blk->code_words * 4);
+    }
+    ok = ok &&
              tc_out(g_tc_rel, (size_t)g_tc_nrel * sizeof(TcReloc)) &&
              tc_out(g_tc_mdep, (size_t)ndep * sizeof(TcDep)) &&
              tc_out(blk->insn_off, (size_t)n * sizeof(uint32_t));
@@ -22887,6 +23048,8 @@ static int tc_parse(const OcerzTcRecHead *h, TcView *v)
         r->n_rel > TC_RELOC_MAX || !r->n_dep || r->n_dep > TC_DLOG_MAX || r->n_edges > JIT_MAX_EDGES ||
         r->n_stop_extra > 6 || r->n_push_fix > 0xffff || r->n_pushelide > 0xffff ||
         r->n_oslow > (1u << 16) || r->n_lanerec > (1u << 16) || r->entry_mod >= 64 || (r->entry_mod & 3))
+        return 0;
+    if (r->epi_off && (!r->epi_w || r->epi_w > EPI_MAX_WORDS || r->epi_off + r->epi_w != words))
         return 0;
     v->r = r;
     TC_TAKE(v->code, uint32_t, words);
@@ -23116,9 +23279,26 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
         tc_free_blk(blk);
         return NULL;
     }
-    memcpy(c, v.code, (size_t)words * 4);
+    /* the epilogue a copy in reach already holds: one b to it instead (epi_share) */
+    uint32_t keep = words, norm[EPI_MAX_WORDS], nrel_e = 0;
+    TcReloc orel[EPI_MAX_REL];
+    uint64_t ekey = 0;
+    const EpiShare *share_e = NULL;
+    if (r->epi_off && epi_share_on() && ocerz_tcache_mode() == OCERZ_TC_ON) {
+        if (r->epi_key)
+            share_e = epi_share_find_key(jit, r->epi_key, r->epi_w, c + r->epi_off);
+        if (!share_e) {
+            ekey = epi_norm(v.code + r->epi_off, r->epi_w, v.rel, (int)r->n_rel, r->epi_off, norm, orel, &nrel_e);
+            share_e = ekey ? epi_share_find(jit, ekey, norm, r->epi_w, orel, nrel_e, c + r->epi_off) : NULL;
+        }
+        if (share_e)
+            keep = r->epi_off + 1;
+    }
+    memcpy(c, v.code, (size_t)(share_e ? r->epi_off : words) * 4);
+    if (share_e)
+        c[r->epi_off] = 0x14000000u | ((uint32_t)(share_e->addr - (c + r->epi_off)) & 0x03ffffffu);
 
-    if (!tc_bind(jit, blk, c, v.rel, (int)r->n_rel, 1)) {
+    if (!tc_bind(jit, blk, c, v.rel, (int)r->n_rel, 1, share_e ? r->epi_off : words)) {
         jit_wx(1);
         tc_free_blk(blk);
         return NULL;
@@ -23128,13 +23308,20 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
         fold = !getenv("OCERZ_NO_TCACHE_FOLD");
     if (!fold) {
         jit_wx(1);
-        sys_icache_invalidate(c, (size_t)words * 4);
+        sys_icache_invalidate(c, (size_t)keep * 4);
     }
-    jit->code_cur = c + words;
+    jit->code_cur = c + keep;
+    blk->epi_off = r->epi_off;
+    blk->epi_w = (uint16_t)r->epi_w;
+    blk->epi_shared = share_e != NULL;
+    g_tc_n_epis += share_e != NULL;
+    g_tc_n_words += keep;
+    if (!share_e && ekey)
+        epi_share_add(jit, ekey, c + r->epi_off, norm, r->epi_w, orel, nrel_e);
 
 #define TC_AT(o) ((o) == TC_NONE ? NULL : c + (o))
     blk->code = (JitBlockFn)(void *)c;
-    blk->code_words = words;
+    blk->code_words = keep;
     blk->body_code = TC_AT(r->body_code);
     blk->body_noreload = TC_AT(r->body_noreload);
     blk->hoist_sig = r->hoist_sig;
@@ -23193,7 +23380,7 @@ static JitBlock *tc_load_rec(OcerzJit *jit, const TcView *vp, uint64_t rip, int 
             g_chain_npatched = 0;
             g_chain_batching = 0;
         }
-        chain_sync_with_defer(c, (size_t)words * 4);   /* by address: write access does not matter */
+        chain_sync_with_defer(c, (size_t)keep * 4);   /* by address: write access does not matter */
         cache_insert(jit, blk);
         if (!g_no_chain) {
             chain_batch_begin();
@@ -25080,40 +25267,9 @@ promo_push_fallthrough:
         }
     }
 
-    uint32_t *exit_label = a64_label(&b);
-    emit_xmm_pin_spill_all(&b);
-    emit_spill_pinned(&b);
-    emit_frame_sp_reset(&b);
-    emit_pin_epilogue_restore(&b);
-    uint32_t *dstub = mode32 ? jit->dispatch_stub32 : jit->dispatch_stub;
-    if (term_may_switch_mode(blk->insns[n - 1].op))
-        dstub = NULL;
-    if (dstub) {
-        a64_mov_reg(&b, 1, 1, 20);
-        a64_mov_reg(&b, 1, JTT, 0);
-        a64_mov_reg(&b, 1, 0, 19);
-        a64_ldp_post(&b, 19, 20, 31, 16);
-        a64_ldp_post(&b, 29, 30, 31, 16);
-        uint32_t *nonzero = a64_label(&b); a64_cbnz(&b, 1, JTT, 0);
-        uint32_t *here = a64_label(&b);
-        ptrdiff_t soff = dstub - here;
-        if (g_tc_on) {
-            tc_imm64(&b, 16, TCR_DSTUB, (uint64_t)mode32, (uint64_t)(uintptr_t)dstub);
-            a64_br(&b, 16);
-        } else if (soff >= -(ptrdiff_t)(1 << 25) && soff <= (ptrdiff_t)((1 << 25) - 1)) {
-            a64_b(&b, (int32_t)soff);
-        } else {
-            a64_mov_imm64(&b, 16, (uint64_t)(uintptr_t)dstub);
-            a64_br(&b, 16);
-        }
-        a64_patch_cbz(nonzero, a64_label(&b));
-        a64_mov_reg(&b, 1, 0, JTT);
-        a64_ret(&b);
-    } else {
-        a64_ldp_post(&b, 19, 20, 31, 16);
-        a64_ldp_post(&b, 29, 30, 31, 16);
-        a64_ret(&b);
-    }
+    /* a body that runs off its end goes to the epilogue, which is now emitted last */
+    epi_sites[n_epi++] = a64_label(&b);
+    a64_b(&b, 0);
     int side_patch_oor = 0;
     for (int k = 0; k < g_n_side; k++)
         if (g_side[k].probe && !blk->prof) blk->prof = (JitProf *)calloc(SIDE_MAX, sizeof(JitProf));
@@ -25276,8 +25432,8 @@ promo_push_fallthrough:
         a64_mov_imm64(&b, JT0, rip);
         a64_str(&b, 8, JT0, 20, RIP_OFF);
         a64_mov_imm64(&b, 0, OCERZ_STEP_OK);
-        uint32_t *here = a64_label(&b);
-        a64_b(&b, (int32_t)(exit_label - here));
+        epi_sites[n_epi++] = a64_label(&b);
+        a64_b(&b, 0);
         a64_patch_cbz(loop_poll_exit, poll_stub);
     }
 
@@ -25338,6 +25494,69 @@ promo_push_fallthrough:
                 pending_add_ras(jit_key(g_raslit[i].retaddr, g_xlat_mode32), cell);
         }
         g_n_raslit = 0;
+    }
+
+    /* The common epilogue, last (epi_share). */
+    uint32_t *exit_label = a64_label(&b);
+    blk->epi_off = 0;
+    blk->epi_w = 0;
+    blk->epi_shared = 0;
+    {
+        int share = epi_share_on() && !g_place_pro && (tcm == OCERZ_TC_ON || tcm == OCERZ_TC_OFF);
+        emit_xmm_pin_spill_all(&b);
+        emit_spill_pinned(&b);
+        emit_frame_sp_reset(&b);
+        emit_pin_epilogue_restore(&b);
+        uint32_t *dstub = mode32 ? jit->dispatch_stub32 : jit->dispatch_stub;
+        if (term_may_switch_mode(blk->insns[n - 1].op))
+            dstub = NULL;
+        if (dstub) {
+            a64_mov_reg(&b, 1, 1, 20);
+            a64_mov_reg(&b, 1, JTT, 0);
+            a64_mov_reg(&b, 1, 0, 19);
+            a64_ldp_post(&b, 19, 20, 31, 16);
+            a64_ldp_post(&b, 29, 30, 31, 16);
+            uint32_t *nonzero = a64_label(&b); a64_cbnz(&b, 1, JTT, 0);
+            uint32_t *here = a64_label(&b);
+            ptrdiff_t soff = dstub - here;
+            if (g_tc_on) {
+                tc_imm64(&b, 16, TCR_DSTUB, (uint64_t)mode32, (uint64_t)(uintptr_t)dstub);
+                a64_br(&b, 16);
+            } else if (!share && soff >= -(ptrdiff_t)(1 << 25) && soff <= (ptrdiff_t)((1 << 25) - 1)) {
+                a64_b(&b, (int32_t)soff);
+            } else {
+                /* position-free, so other blocks can share it */
+                a64_mov_imm64(&b, 16, (uint64_t)(uintptr_t)dstub);
+                a64_br(&b, 16);
+            }
+            a64_patch_cbz(nonzero, a64_label(&b));
+            a64_mov_reg(&b, 1, 0, JTT);
+            a64_ret(&b);
+        } else {
+            a64_ldp_post(&b, 19, 20, 31, 16);
+            a64_ldp_post(&b, 29, 30, 31, 16);
+            a64_ret(&b);
+        }
+        uint32_t epi_n = (uint32_t)(b.p - exit_label);
+        g_epi_key = 0;
+        if (!b.overflow && !g_place_pro && epi_n <= EPI_MAX_WORDS) {
+            blk->epi_off = (uint32_t)(exit_label - entry);
+            blk->epi_w = (uint16_t)epi_n;
+            uint32_t norm[EPI_MAX_WORDS], nrel = 0;
+            TcReloc orel[EPI_MAX_REL];
+            uint64_t key = share ? epi_norm(exit_label, epi_n, g_tc_on ? g_tc_rel : NULL, g_tc_on ? g_tc_nrel : 0,
+                                            blk->epi_off, norm, orel, &nrel) : 0;
+            const EpiShare *e = key ? epi_share_find(jit, key, norm, epi_n, orel, nrel, exit_label) : NULL;
+            g_epi_key = g_tc_on ? key : 0;
+            if (e) {
+                memcpy(g_epi_save, exit_label, (size_t)epi_n * 4);
+                *exit_label = 0x14000000u | ((uint32_t)(e->addr - exit_label) & 0x03ffffffu);
+                b.p = exit_label + 1;
+                blk->epi_shared = 1;
+            } else if (key) {
+                epi_share_add(jit, key, exit_label, norm, epi_n, orel, nrel);
+            }
+        }
     }
 
     if (!b.overflow) {
@@ -25581,7 +25800,7 @@ promo_push_fallthrough:
     if (g_tc_on) {
         if (ocerz_tcache_mode() != OCERZ_TC_ROUNDTRIP || !tc_roundtrip(jit, blk, entry)) {
             pthread_jit_write_protect_np(0);
-            tc_bind(jit, blk, entry, g_tc_rel, g_tc_nrel, 0);
+            tc_bind(jit, blk, entry, g_tc_rel, g_tc_nrel, 0, blk->code_words);
             pthread_jit_write_protect_np(1);
         }
         tc_save = g_tc_rec && !g_tc_bad;
@@ -28017,6 +28236,7 @@ static void jit_arena_reset_locked(OcerzJit *jit)
     memset(jit->veneer_pool, 0, sizeof jit->veneer_pool);
     memset(jit->veneer_used, 0, sizeof jit->veneer_used);
     code_index_reset_locked(jit);
+    epi_share_reset(jit);
     jit->code_cur = jit->code_start;
     jit->code_full = 0;
 }
