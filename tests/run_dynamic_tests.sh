@@ -1143,8 +1143,8 @@ else
         OCERZ_GUEST_SLIDE=0x400000 run_bounded "$aot_dir/run.out" "$aot_dir/run.err" "$OCERZ" "$aot_dir/work"
     aot_run_code=$?
     if [ "$aot_code" = 0 ] && [ "$aot_run_code" = 0 ] && [ "$(cat "$aot_dir/run.out")" = OK ] &&
-       awk '/images asked=/ { split($4, a, "="); split($5, b, "="); asked += a[2]; got += b[2] }
-            END { exit !(asked > 0 && got == asked) }' "$aot_dir/run.log"; then
+       awk '/images asked=/ { for (f = 3; f <= NF; f++) { split($f, a, "="); t[a[1]] += a[2] } }
+            END { exit !(t["asked"] > 0 && t["in"] - t["ahead"] == t["asked"]) }' "$aot_dir/run.log"; then
         echo "PASS dtcache_aot"; pass=$((pass+1))
     else
         echo "FAIL dtcache_aot (aot exit=$aot_code run exit=$aot_run_code out='$(cat "$aot_dir/run.out")'" \
@@ -1196,8 +1196,8 @@ else
     run_code=$?
     if [ "$first_code" = 0 ] && [ "$all_code" = 0 ] && [ "$run_code" = 0 ] && [ "$(cat "$aoti_dir/run.out")" = OK ] &&
        grep -q '1 program done' "$aoti_dir/all.err" && grep -q '(1 from the profile)' "$aoti_dir/all.err" &&
-       awk '/images asked=/ { split($4, a, "="); split($5, b, "="); asked += a[2]; got += b[2] }
-            END { exit !(asked > 0 && got == asked) }' "$aoti_dir/run.log"; then
+       awk '/images asked=/ { for (f = 3; f <= NF; f++) { split($f, a, "="); t[a[1]] += a[2] } }
+            END { exit !(t["asked"] > 0 && t["in"] - t["ahead"] == t["asked"]) }' "$aoti_dir/run.log"; then
         echo "PASS dtcache_aot_images"; pass=$((pass+1))
     else
         echo "FAIL dtcache_aot_images (first exit=$first_code -aot-all exit=$all_code run exit=$run_code" \
