@@ -248,6 +248,17 @@ static void rebase_page_v2(uint64_t page_base, uint64_t page_size, uint32_t pg,
     }
 }
 
+/* The pages this process filled in, in order (ocerz_cache_lazy_pages), for its profile's .lazy. */
+#define LAZY_SEEN_MAX 32768
+static uint64_t g_lazy_seen[LAZY_SEEN_MAX];
+static size_t g_lazy_seen_n;
+
+size_t ocerz_cache_lazy_pages(const uint64_t **out)
+{
+    *out = g_lazy_seen;
+    return __atomic_load_n(&g_lazy_seen_n, __ATOMIC_ACQUIRE);
+}
+
 int ocerz_cache_lazy_fault(uintptr_t addr)
 {
     for (int i = 0; i < g_n_lazy; i++) {
@@ -337,6 +348,8 @@ int ocerz_cache_lazy_fault(uintptr_t addr)
         lazy_lock();
         g_lazy[i].done[hidx] = 1;
         g_lazy_inflight--;
+        if (g_lazy_seen_n < LAZY_SEEN_MAX)
+            g_lazy_seen[g_lazy_seen_n++] = page;
         lazy_unlock();
         return 1;
     }

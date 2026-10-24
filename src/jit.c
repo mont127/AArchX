@@ -27878,13 +27878,21 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
  * the arena past code_cur as the profile's records will fill (about 700 bytes
  * each, at most 64 MB), with an atomic add of 0 to one word of each page, which
  * leaves whatever the guest's thread writes there meanwhile as it is.
- * OCERZ_NO_JIT_PREFAULT=1 leaves the faults where they were.
+ * OCERZ_NO_JIT_PREFAULT=1 leaves the faults where they were.  First it fills in
+ * the shared cache's slid pages the program's earlier launches faulted in
+ * (.lazy beside the profile): each was a SIGSEGV, a pread, a rebase and a
+ * remap on the faulting thread, 308 of them in a tclsh start.
+ * OCERZ_NO_LAZY_PREFAULT=1 leaves those to the faults.
  */
-typedef struct { uint8_t *lo, *hi, *buckets; size_t nbuckets; } JitPrefault;
+typedef struct { uint8_t *lo, *hi, *buckets; size_t nbuckets; uint64_t *lazy; size_t nlazy; } JitPrefault;
 
 static void *jit_prefault_main(void *arg)
 {
     JitPrefault *pf = (JitPrefault *)arg;
+    for (size_t i = 0; i < pf->nlazy; i++)
+        if (ocerz_cache_lazy_region((uintptr_t)pf->lazy[i]))
+            (void)ocerz_cache_lazy_fault((uintptr_t)pf->lazy[i]);
+    free(pf->lazy);
     for (size_t o = 0; o < pf->nbuckets; o += 16384)
         __atomic_fetch_add((uint64_t *)(void *)(pf->buckets + o), 0, __ATOMIC_RELAXED);
     pthread_jit_write_protect_np(0);
@@ -27914,12 +27922,19 @@ void ocerz_jit_prefault(struct OcerzVM *vm, size_t records)
     pf->buckets = (uint8_t *)(void *)jit->buckets;
     pf->nbuckets = sizeof jit->buckets;
     jl_release();
+    static int nolazy = -1;
+    if (nolazy < 0) nolazy = getenv("OCERZ_NO_LAZY_PREFAULT") ? 1 : 0;
+    pf->lazy = nolazy ? NULL : ocerz_tcache_profile_lazy(&pf->nlazy);
+    if (!pf->lazy)
+        pf->nlazy = 0;
     pthread_t t;
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    if (pf->lo >= pf->hi || pthread_create(&t, &at, jit_prefault_main, pf) != 0)
+    if ((pf->lo >= pf->hi && !pf->nlazy) || pthread_create(&t, &at, jit_prefault_main, pf) != 0) {
+        free(pf->lazy);
         free(pf);
+    }
     pthread_attr_destroy(&at);
 }
 

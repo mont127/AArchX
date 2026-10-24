@@ -139,6 +139,7 @@
  * warm thread.
  */
 #include "ocerz/tcache.h"
+#include "ocerz/cache.h"
 #include "ocerz/mem.h"
 #include "ocerz/mode.h"
 #include "ocerz/types.h"
@@ -301,7 +302,7 @@ static int env_ignored(const char *kv)
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
         "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=", "OCERZ_NO_TCACHE_FOLD=", "OCERZ_NO_TCACHE_SLAB=",
         "OCERZ_NO_TCACHE_WARM=", "OCERZ_NO_CONT_PLACE=", "OCERZ_EXIT_STOP_ALL=", "OCERZ_AOT_NO_PROFILE_IMAGES=", "OCERZ_TCACHE_AHEAD=", "OCERZ_NO_WX_HOLD=",
-        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=", "OCERZ_NO_TCACHE_PREP=", "OCERZ_NO_TCACHE_KEYS=", "OCERZ_NO_JIT_PREFAULT=",
+        "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=", "OCERZ_NO_TCACHE_PREP=", "OCERZ_NO_TCACHE_KEYS=", "OCERZ_NO_JIT_PREFAULT=", "OCERZ_NO_LAZY_PREFAULT=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
@@ -918,6 +919,18 @@ static void profile_keys_name(char *out, size_t n, const char *rips)
     memcpy(out + l - 5, ".keys", 6);
 }
 
+/* <profile>.lazy: the shared cache's slid pages a launch filled in (cache.c, ocerz_cache_lazy_pages). */
+static void profile_lazy_name(char *out, size_t n, const char *rips)
+{
+    size_t l = strlen(rips);
+    if (l < 5 || l + 1 > n || strcmp(rips + l - 5, ".rips")) {
+        out[0] = 0;
+        return;
+    }
+    memcpy(out, rips, l - 5);
+    memcpy(out + l - 5, ".lazy", 6);
+}
+
 static size_t warm_build(const char *path)
 {
     char kpath[1200];
@@ -1335,6 +1348,7 @@ static uint64_t *g_pset, *g_pord;
 static size_t g_pcap, g_pn, g_pwritten;
 static uint64_t *g_kset, *g_kord;           /* the same in record keys, images' too, for .keys */
 static size_t g_kcap, g_kn, g_kwritten;
+static size_t g_lwritten;                   /* lazy pages already in .lazy */
 static uint64_t g_pident;
 static char g_prips[1200];
 static char **g_pimg;                       /* the disk images this process loaded, for .images */
@@ -1488,6 +1502,19 @@ static void profile_write(void)
         profile_merge(keys, g_kord, g_kn, g_kset, g_kcap);
         g_kwritten = g_kn;
     }
+    const uint64_t *lazy;
+    size_t nl = ocerz_cache_lazy_pages(&lazy);
+    char lname[1200];
+    profile_lazy_name(lname, sizeof lname, g_prips);
+    if (lname[0] && nl > g_lwritten) {
+        uint64_t *lset = NULL;
+        size_t lcap = 0, ln = 0;
+        for (size_t i = 0; i < nl; i++)
+            pset_add(&lset, &lcap, &ln, lazy[i]);
+        profile_merge(lname, lazy, nl, lset, lcap);
+        free(lset);
+        g_lwritten = nl;
+    }
     os_unfair_lock_unlock(&g_plock);
 }
 
@@ -1534,6 +1561,31 @@ void ocerz_tcache_profile_open(uint64_t ident, const uint8_t *cache_uuid, const 
     if (rips && pthread_create(&t, &at, warm_main, rips) != 0)
         free(rips);
     pthread_attr_destroy(&at);
+}
+
+/* The pages the program's earlier launches filled in (.lazy), for the caller to free. */
+uint64_t *ocerz_tcache_profile_lazy(size_t *n)
+{
+    char name[1200];
+    *n = 0;
+    if (!g_prips[0])
+        return NULL;
+    profile_lazy_name(name, sizeof name, g_prips);
+    int fd = name[0] ? open(name, O_RDONLY | O_CLOEXEC) : -1;
+    struct stat st;
+    uint64_t *v = NULL;
+    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= 8 && st.st_size <= (8 << 20) &&
+        (v = (uint64_t *)malloc((size_t)st.st_size)) != NULL) {
+        if (pread(fd, v, (size_t)st.st_size, 0) == st.st_size)
+            *n = (size_t)st.st_size / 8;
+        else {
+            free(v);
+            v = NULL;
+        }
+    }
+    if (fd >= 0)
+        close(fd);
+    return v;
 }
 
 /* How many records the program's profile names (.keys, else .rips), counted when it opened. */
