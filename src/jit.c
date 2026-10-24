@@ -879,6 +879,8 @@ enum JitFaultFlagRecipeKind {
     JFF_LOGIC_RESULT,
     JFF_ADD_RESULT_SRC,
     JFF_ADD_INC_RESULT_SRC,
+    JFF_SUB_RESULT_SRC,     /* a sub's flags from its result and second operand (nzcv_regen_from_regs) */
+    JFF_CMP_OPS,            /* a cmp's from its two operands */
 };
 
 typedef struct JitFaultFlagRecipe {
@@ -2040,6 +2042,7 @@ static struct {
 static int g_n_call_edges;
 
 static OcerzJit *g_xlat_jit;
+static OcerzJit *g_arena_jit;           /* the arena's owner, for the fork hooks (ocerz_jit_prefork) */
 static int g_xlat_mode32;
 static int g_xlat_mode32_fwd(void) { return g_xlat_mode32; }
 
@@ -3254,14 +3257,61 @@ static void emit_xmm_pin_spill_all(A64Buf *b);
 static void emit_spill_pinned_callersaved(A64Buf *b);
 static void emit_fill_pinned_callersaved(A64Buf *b);
 static uint16_t g_lane_used;
+/*
+ * The record most likely pending at the instruction being translated: when the
+ * last flag writer before it in this block is an and, or, xor or test, a LOGIC
+ * record of its size, which emit_materialize can settle inline.  Only a guess;
+ * the code compares it with cc_op and calls out when it is wrong.  0 when
+ * there is nothing to guess.  OCERZ_NO_MAT_GUESS=1 always calls out.
+ */
+extern const struct X86Insn *g_cur_insns_fwd(void);
+static uint32_t materialize_guess(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_MAT_GUESS") ? 1 : 0;
+    const X86Insn *v = g_cur_insns_fwd();
+    if (off || !v || g_cur_insn_idx < 1 || g_cur_insn_idx > JIT_MAX_BLOCK_INSNS) return 0;
+    for (int k = g_cur_insn_idx - 1; k >= 0; k--) {
+        uint64_t def, use;
+        ocerz_flags_defuse(&v[k], &def, &use);
+        if (!(def & JIT_ARITH_FLAGS)) continue;
+        int size = v[k].nops ? v[k].ops[0].size : 0;
+        if ((v[k].op == OCERZ_OP_AND || v[k].op == OCERZ_OP_OR || v[k].op == OCERZ_OP_XOR ||
+             v[k].op == OCERZ_OP_TEST) && (size == 1 || size == 2 || size == 4 || size == 8))
+            return ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0);
+        return 0;
+    }
+    return 0;
+}
 static void emit_materialize(A64Buf *b)
 {
 
     if (!g_defer)
         return;
+    uint32_t guess = materialize_guess();
     a64_ldr(b, 4, JT0, 20, CC_OP_OFF);
     uint32_t *skip = a64_label(b);
     a64_cbz(b, 0, JT0, 0);
+    uint32_t *miss = NULL, *hit_done = NULL;
+    if (guess) {
+        /* ZF, SF and PF of the result, CF, OF and AF clear: ocerz_flags_logic. */
+        int size = (int)((guess >> 8) & 0xff);
+        a64_subs_imm(b, 0, A64_ZR, JT0, guess);
+        miss = a64_label(b);
+        a64_bcond(b, A64_NE, 0);
+        a64_ldr(b, 8, JT1, 20, CC_DST_OFF);
+        if (size == 8) a64_ands_reg(b, 1, A64_ZR, JT1, JT1, 0);
+        else if (size == 4) a64_ands_reg(b, 0, A64_ZR, JT1, JT1, 0);
+        else { a64_lsl_imm(b, 0, JT2, JT1, size == 1 ? 24 : 16); a64_ands_reg(b, 0, A64_ZR, JT2, JT2, 0); }
+        a64_movz(b, JTF, 0, 0);
+        emit_zf_sf(b, OCERZ_ZF | OCERZ_SF);
+        emit_pf(b, JT1);
+        emit_commit_flags(b, JIT_ARITH_FLAGS);
+        a64_str(b, 4, A64_ZR, 20, CC_OP_OFF);
+        hit_done = a64_label(b);
+        a64_b(b, 0);
+        a64_patch_bcond(miss, a64_label(b));
+    }
     emit_xmm_pin_spill_all(b);
     emit_spill_pinned_callersaved(b);
     for (int v = 4; v < 16; v += 2)
@@ -3278,6 +3328,7 @@ static void emit_materialize(A64Buf *b)
     emit_reload_jgb(b);
     emit_reload_mem_base(b);
     emit_xmm_pin_load_all(b);
+    if (hit_done) a64_patch_b(hit_done, a64_label(b));
     a64_patch_cbz(skip, a64_label(b));
 }
 
@@ -6037,6 +6088,34 @@ static int llh_regoff_access(A64Buf *b, const X86Insn *insn, const X86Operand *m
     return 1;
 }
 
+/*
+ * A displacement the access cannot encode (beyond a signed 9-bit offset, or a
+ * positive one the size does not scale) went to the guarded path, which in
+ * cache mode is eight instructions of commpage test around every access and a
+ * compare that costs the block its host flags: frame-pointer code keeps big
+ * frames' locals at [rbp-0x140] and the like, and SQLite's VM loop paid it on
+ * every one.  Up to 4095 either way it is one add or sub into JTA instead,
+ * up to 16 MB two (the high part shifted by 12: Ruby's VM loop keeps its
+ * locals at [rbp-0x1538]), after which the access is the fast form's,
+ * faulting into the commpage retire as any other does.  OCERZ_NO_FAR_DISP=1
+ * sends them to the guard.
+ */
+static int far_disp_ok(int64_t d)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_FAR_DISP") ? 1 : 0;
+    return !off && d > -(1 << 24) && d < (1 << 24);
+}
+static void fold_far_disp_from(A64Buf *b, int rd, int rn, int64_t d)
+{
+    uint32_t a = (uint32_t)(d < 0 ? -d : d), hi = a >> 12, lo = a & 0xfff;
+    uint32_t op = d < 0 ? 0xd1000000u : 0x91000000u;   /* sub / add (immediate), 64-bit */
+    if (hi) { a64_emit32(b, op | (1u << 22) | (hi << 10) | ((uint32_t)rn << 5) | (uint32_t)rd); rn = rd; }
+    if (lo) a64_emit32(b, op | (lo << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
+    else if (!hi && rd != rn) a64_mov_reg(b, 1, rd, rn);
+}
+static void fold_far_disp(A64Buf *b, int r, int64_t d) { fold_far_disp_from(b, r, r, d); }
+
 static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand *m,
                                int size, int reg, int store, int vec)
 {
@@ -6130,11 +6209,17 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
         }
         int scaled = m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095;
         int unscaled = !scaled && m->disp >= -256 && m->disp <= 255;
-        if (!scaled && !unscaled) return 0;
+        if (!scaled && !unscaled && !far_disp_ok(m->disp)) return 0;
         if (!ea_cache_reusable(b, m)) {
             if (hoisted) a64_add_reg(b, 1, JTA, hreg, hi, sc);
             else if (ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, JTA, hi, sc);
             else { a64_add_reg(b, 1, JTA, JGB, hb, 0); a64_add_reg(b, 1, JTA, JTA, hi, sc); }
+        }
+        if (!scaled && !unscaled) {
+            fold_far_disp(b, JTA, m->disp);
+            ea_cache_reset();
+            ACC_AT(JTA, 0);
+            return 1;
         }
         ea_cache_set(b, m);
         ACC_AT(JTA, m->disp);
@@ -6143,7 +6228,16 @@ static int emit_plain_mem_fast(A64Buf *b, const X86Insn *insn, const X86Operand 
     {
         int scaled = m->disp >= 0 && (m->disp % size) == 0 && m->disp / size <= 4095;
         int unscaled = !scaled && m->disp >= -256 && m->disp <= 255;
-        if (!scaled && !unscaled) return 0;
+        if (!scaled && !unscaled) {
+            /* a displacement no access encodes ([rbp-0x140] in a big frame): folded into JTA, then the access at 0 */
+            if (!far_disp_ok(m->disp)) return 0;
+            int src = hoisted ? hreg : JTA;
+            if (!hoisted && !ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, JGB, hb, 0);
+            fold_far_disp_from(b, JTA, src, m->disp);
+            ea_cache_reset();
+            ACC_AT(JTA, 0);
+            return 1;
+        }
         int ra = JTA;
         if (hoisted) ra = hreg;
         else { if (!ea_cache_has_base(b, m)) a64_add_reg(b, 1, JTA, JGB, hb, 0); ea_cache_set_full(b, m->base, OCERZ_REG_NONE, 0); }
@@ -7800,6 +7894,36 @@ static int nzcv_producer_of(const X86Insn *insns, int ci)
     return g_nzcv_prod[ci];
 }
 static int16_t g_nzcv_regen[JIT_MAX_BLOCK_INSNS];
+/*
+ * Whether each producer's registers still hold its operands at every consumer
+ * it hands NZCV to: a sibling setcc or cmov in the window may write one of
+ * them (nzcv_fuse_producer_core lets it), and then NZCV can come back only
+ * from the record.  Filled for the block being translated by nzcv_regs_fill.
+ */
+static uint8_t g_nzcv_regs_ok[JIT_MAX_BLOCK_INSNS];
+static void nzcv_regs_fill(const X86Insn *insns, int n)
+{
+    int16_t last[JIT_MAX_BLOCK_INSNS];
+    for (int k = 0; k < n; k++) last[k] = -1;
+    for (int ci = 1; ci < n; ci++) {
+        int k = nzcv_producer_of(insns, ci);
+        if (k >= 0 && k < ci) last[k] = (int16_t)ci;
+    }
+    for (int k = 0; k < n; k++) {
+        g_nzcv_regs_ok[k] = 0;
+        if (last[k] < 0 || insns[k].nops != 2 || insns[k].ops[0].kind != OCERZ_OPK_REG)
+            continue;
+        const X86Operand *a = &insns[k].ops[0], *r = &insns[k].ops[1];
+        /* add of a register to itself: the result no longer gives its operand back */
+        if (insns[k].op == OCERZ_OP_ADD && r->kind == OCERZ_OPK_REG && r->reg == a->reg)
+            continue;
+        int ok = 1;
+        for (int m = k + 1; m < last[k] && ok; m++)
+            if (insn_writes_reg(&insns[m], a->reg) || (r->kind == OCERZ_OPK_REG && insn_writes_reg(&insns[m], r->reg)))
+                ok = 0;
+        g_nzcv_regs_ok[k] = (uint8_t)ok;
+    }
+}
 /* Which loads sit in a window a consumer takes NZCV through, and from which producer. */
 static void nzcv_regen_scan(const X86Insn *insns, int n)
 {
@@ -7814,13 +7938,124 @@ static void nzcv_regen_scan(const X86Insn *insns, int n)
             if (nzcv_gap_load(&insns[m])) g_nzcv_regen[m] = (int16_t)k;
     }
 }
-/* NZCV from the producer's record, as its subs or adds left it. */
-static void nzcv_regen_emit(A64Buf *b, const X86Insn *p)
+/*
+ * Whether the words a gap load was translated to leave NZCV as the producer
+ * set it, in which case nzcv_regen_emit is not needed after it.  An allow-list:
+ * loads and stores, moves, bitfield and address arithmetic, register
+ * arithmetic, conditional selects and multiplies that set no flags; anything
+ * else (a flag-setting form, any branch or call, FP or SIMD) counts as a
+ * clobber.  The far-displacement fast path made [rbp-0x160] two flag-free
+ * words, and SQLite's VM loop still rebuilt NZCV after it.
+ * OCERZ_NO_NZCV_KEEP_SCAN=1 always rebuilds.
+ */
+static int a64_word_keeps_nzcv(uint32_t w)
+{
+    if ((w & 0x0a000000u) == 0x08000000u)               /* loads and stores */
+        return 1;
+    if ((w & 0x1c000000u) == 0x10000000u) {             /* data processing, immediate */
+        if ((w & 0x1f000000u) == 0x11000000u)            /* add/sub immediate: S is bit 29 */
+            return !(w & 0x20000000u);
+        if ((w & 0x1f800000u) == 0x12000000u)            /* logical immediate: ANDS is opc 11 */
+            return (w & 0x60000000u) != 0x60000000u;
+        return (w & 0x1f800000u) != 0x11800000u;         /* adr/adrp, move wide, bitfield, extract (not tag ops) */
+    }
+    if ((w & 0x0e000000u) == 0x0a000000u) {             /* data processing, register */
+        uint32_t c = (w >> 21) & 0xff;                   /* bits 28:21 */
+        if ((c & 0xf8) == 0x50)                          /* logical shifted: ANDS/BICS are opc 11 */
+            return (w & 0x60000000u) != 0x60000000u;
+        if ((c & 0xf8) == 0x58)                          /* add/sub shifted or extended: S is bit 29 */
+            return !(w & 0x20000000u);
+        if (c == 0xd0)                                   /* adc/sbc: S is bit 29 */
+            return !(w & 0x20000000u);
+        if (c == 0xd4 || c == 0xd6)                      /* conditional select, data processing 1/2 source */
+            return 1;
+        if ((c & 0xf8) == 0xd8)                          /* data processing 3 source (madd, msub, smulh...) */
+            return 1;
+        return 0;                                        /* ccmp/ccmn, setf, rmif and the rest */
+    }
+    return 0;
+}
+static int a64_words_keep_nzcv(const uint32_t *lo, const uint32_t *hi)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_NZCV_KEEP_SCAN") ? 1 : 0;
+    if (off || !lo || hi < lo)
+        return 0;
+    for (const uint32_t *w = lo; w < hi; w++)
+        if (!a64_word_keeps_nzcv(*w))
+            return 0;
+    return 1;
+}
+
+/*
+ * NZCV built again after a gap load that clobbered it.  When nothing in the
+ * window writes the producer's registers (g_nzcv_regs_ok: the window's rule
+ * keeps all but a sibling setcc or cmov off them), they still hold what the
+ * producer left: a cmp's two operands, or a sub's or add's result and second
+ * operand, from which the first one comes back (result + second for a sub,
+ * result - second for an add) and the subs or adds gives NZCV exactly, in the
+ * operation's own width.  So the producer stores no record for it, and the
+ * liveness pass drops the consumer's use as for a window without a load; a
+ * fault at one of the loads rebuilds the record the same way, from the
+ * registers (JFF_SUB_RESULT_SRC, JFF_CMP_OPS, JFF_ADD_RESULT_SRC), so a guest
+ * handler still reads the producer's flags.  SQLite's VM loop stored the
+ * cmp's operands on every opcode.  OCERZ_NO_NZCV_REGS_REGEN=1 goes back to
+ * the record.
+ */
+static int nzcv_regen_from_regs(const X86Insn *p)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_NZCV_REGS_REGEN") ? 0 : 1;
+    /* rsp's register may be a host pointer, or lag behind (lazy rsp): its record stays */
+    return on && p->ops[0].reg != OCERZ_RSP && (p->ops[1].kind != OCERZ_OPK_REG || p->ops[1].reg != OCERZ_RSP);
+}
+static void nzcv_regen_emit(A64Buf *b, const X86Insn *p, int k)
 {
     int sf = p->ops[0].size == 8;
-    a64_ldp_off(b, JT0, JT1, 20, (int)CC_SRC_OFF);
+    if (!nzcv_regen_from_regs(p) || !g_nzcv_regs_ok[k]) {
+        a64_ldp_off(b, JT0, JT1, 20, (int)CC_SRC_OFF);
+        if (p->op == OCERZ_OP_ADD) a64_adds_reg(b, sf, A64_ZR, JT0, JT1, 0);
+        else a64_subs_reg(b, sf, A64_ZR, JT0, JT1, 0);
+        return;
+    }
+    emit_gpr_rd(b, 1, JT0, p->ops[0].reg);
+    if (p->ops[1].kind == OCERZ_OPK_REG) {
+        emit_gpr_rd(b, 1, JT1, p->ops[1].reg);
+    } else {
+        uint64_t v = (uint64_t)ocerz_sext(p->ops[1].imm, p->ops[1].size);
+        a64_mov_imm64(b, JT1, sf ? v : (uint32_t)v);
+    }
+    if (p->op == OCERZ_OP_SUB) a64_add_reg(b, sf, JT0, JT0, JT1, 0);
+    else if (p->op == OCERZ_OP_ADD) a64_sub_reg(b, sf, JT0, JT0, JT1, 0);
     if (p->op == OCERZ_OP_ADD) a64_adds_reg(b, sf, A64_ZR, JT0, JT1, 0);
     else a64_subs_reg(b, sf, A64_ZR, JT0, JT1, 0);
+}
+/*
+ * Whether a consumer at ci may take its producer k's NZCV across the loads in
+ * between with no record behind it: the registers rebuild it (above), and a
+ * fault at each of those loads gets the recipe that rebuilds the record from
+ * them, which this assigns.  A load that already has another recipe keeps the
+ * record.
+ */
+static int nzcv_regen_recipes(const X86Insn *insns, int k, int ci, JitFaultFlagRecipe *recipes, int *n_recipes)
+{
+    const X86Insn *p = &insns[k];
+    const X86Operand *r = &p->ops[1];
+    if (!nzcv_regen_from_regs(p) || !g_nzcv_regs_ok[k] || g_no_fault_recipes || r->size != p->ops[0].size ||
+        (r->kind == OCERZ_OPK_REG && r->high8))
+        return 0;   /* fault_recipe_rhs takes an operand of the producer's size only */
+    uint8_t kind = p->op == OCERZ_OP_CMP ? JFF_CMP_OPS : p->op == OCERZ_OP_SUB ? JFF_SUB_RESULT_SRC : JFF_ADD_RESULT_SRC;
+    for (int m = k + 1; m < ci; m++)
+        if (nzcv_gap_load(&insns[m]) && recipes[m].kind != JFF_NONE &&
+            (recipes[m].kind != kind || recipes[m].producer != (uint8_t)k))
+            return 0;
+    for (int m = k + 1; m < ci; m++)
+        if (nzcv_gap_load(&insns[m]) && recipes[m].kind == JFF_NONE) {
+            recipes[m].kind = kind;
+            recipes[m].producer = (uint8_t)k;
+            (*n_recipes)++;
+        }
+    return 1;
 }
 static int nzcv_fuse_producer_core(const X86Insn *insns, int ci)
 {
@@ -12676,6 +12911,21 @@ static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
 }
 
 #define RFLAGS_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
+/*
+ * bt and its kin define CF alone (ZF is kept, the rest undefined), so with
+ * another instruction's flags still deferred they materialized everything to
+ * merge CF in: a call out, every register spilled around it.  When no flag
+ * but CF is live after the bt, the others are nobody's, and CF goes into a
+ * deferred record of its own instead, a SUB of 0 and the bit, whose borrow
+ * is the bit: SQLite's VM loop called ocerz_flags_materialize 4.5% of its
+ * time this way.  OCERZ_NO_BT_LAZY_CF=1 materializes as before.
+ */
+static int bt_cf_lazy(uint64_t need)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_BT_LAZY_CF") ? 1 : 0;
+    return !off && need != 0 && !(g_cur_live_after & (JIT_ARITH_FLAGS & ~(uint64_t)OCERZ_CF));
+}
 static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exit_sites, int *n_exits)
 {
     if (!g_defer || insn->nops != 2 || insn->seg != OCERZ_SEG_NONE) return 0;
@@ -12687,7 +12937,8 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
         if (d->kind != OCERZ_OPK_REG || d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
         if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (rsp_is_ptr() && o->reg == OCERZ_RSP)) return 0; }
         else if (o->kind != OCERZ_OPK_IMM) return 0;
-        if (need != 0) emit_materialize(b);
+        int lazy = bt_cf_lazy(need);
+        if (need != 0 && !lazy) emit_materialize(b);
         int rd = pin_hreg(pin_slot(d->reg));
         int sf = size == 8;
         unsigned bits = (unsigned)size * 8;
@@ -12713,7 +12964,9 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
             else if (insn->op == OCERZ_OP_BTR) a64_bic_reg(b, sf, rd, rd, JT1, 0);
             else a64_eor_reg(b, sf, rd, rd, JT1, 0);
         }
-        if (need != 0) {
+        if (lazy) {
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, 8, 0), A64_ZR, JT0);
+        } else if (need != 0) {
             a64_ldr(b, 8, JT1, 20, RFLAGS_OFF);
             a64_bfi(b, 1, JT1, JT0, 0, 1);
             a64_str(b, 8, JT1, 20, RFLAGS_OFF);
@@ -12723,8 +12976,8 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
     }
     if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (rsp_is_ptr() && o->reg == OCERZ_RSP)) return 0; }
     else if (o->kind != OCERZ_OPK_IMM) return 0;
-    int mat = need != 0 && !g_nzcv_want;
-    if (need != 0 && g_nzcv_want) mat = 1;
+    int lazy = bt_cf_lazy(need);
+    int mat = need != 0 && !lazy;
     if (mat) emit_materialize(b);
     unsigned bits = (unsigned)size * 8;
     if (d->kind == OCERZ_OPK_REG) {
@@ -12764,6 +13017,8 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
         a64_ldr(b, 8, JT1, 20, RFLAGS_OFF);
         a64_bfi(b, 1, JT1, JT0, 0, 1);
         a64_str(b, 8, JT1, 20, RFLAGS_OFF);
+    } else if (lazy) {
+        emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, 8, 0), A64_ZR, JT0);
     }
     if (g_nzcv_want) {
         a64_subs_imm(b, 1, A64_ZR, JT0, 0);
@@ -15717,6 +15972,25 @@ static int emit_sidt(A64Buf *b, const X86Insn *insn)
     return 1;
 }
 
+/*
+ * stmxcsr stores the guest's MXCSR, which lives in OcerzCPU (ldmxcsr and the
+ * interpreter keep it there; the host FPCR only follows its rounding bits).
+ * x86-64 setjmp saves it on every call, and Ruby's VM calls setjmp around every
+ * block it yields to: 2M of them a second went to the interpreter one by one,
+ * 20% of a `times` loop.
+ */
+static int emit_stmxcsr(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *o = &insn->ops[0];
+    uint32_t *skip;
+    if (o->kind != OCERZ_OPK_MEM || !emit_sse_mem_addr(b, insn, o, 4, exit_sites, n_exits, &skip))
+        return 0;
+    a64_ldr(b, 4, JT2, 20, (uint32_t)offsetof(OcerzCPU, mxcsr));
+    emit_sse_mem_st_gpr(b, 4, JT2);
+    patch_guard_skip(skip, a64_label(b));
+    return 1;
+}
+
 static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
                       uint32_t **exit_sites, int *n_exits)
 {
@@ -15735,6 +16009,8 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         return emit_fence(b, insn);
     if (insn->op == OCERZ_OP_SIDT || insn->op == OCERZ_OP_SGDT)
         return emit_sidt(b, insn);
+    if (insn->op == OCERZ_OP_STMXCSR && !getenv("OCERZ_NO_INLINE_STMXCSR"))
+        return emit_stmxcsr(b, insn, exit_sites, n_exits);
     if ((insn->op == OCERZ_OP_XOR || insn->op == OCERZ_OP_CWD) && g_cur_insns && insn == &g_cur_insns[g_cur_insn_idx] &&
         rdx_prep_skippable(g_cur_insns, g_cur_insn_idx, g_cur_insns_n, need)) {
         g_div_prev_skipped = 1;
@@ -23784,13 +24060,6 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
     JitFaultFlagRecipe fault_recipes[JIT_MAX_BLOCK_INSNS];
     int n_fault_recipes = build_fault_flag_recipes(blk->insns, n, fault_recipes);
     blk->insn_off = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
-    if (blk->insn_off && n_fault_recipes) {
-        blk->fault_flags = (JitFaultFlagRecipe *)malloc((size_t)n *
-                                                        sizeof *blk->fault_flags);
-        if (blk->fault_flags)
-            memcpy(blk->fault_flags, fault_recipes,
-                   (size_t)n * sizeof *blk->fault_flags);
-    }
 
     uint64_t seam_seed = OCERZ_FL_ALL;
     if (!g_no_xlive && is_terminator(blk->insns[n - 1].op)) {
@@ -23833,6 +24102,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
     }
 
     nzcv_prod_fill(blk->insns, n);
+    nzcv_regs_fill(blk->insns, n);
     uint64_t fl_need[JIT_MAX_BLOCK_INSNS];
     uint64_t fl_live[JIT_MAX_BLOCK_INSNS];
     uint64_t jcc_fall_live[JIT_MAX_BLOCK_INSNS];
@@ -23853,7 +24123,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
             }
             int side_fused = i < n - 1 && i >= 1 && blk->insns[i].op == OCERZ_OP_JCC &&
                              (side_fuse_ok(blk->insns, i - 1, n) || (i >= 2 && side_gap_fuse_ok(blk->insns, i - 2, n)));
-            if (blk->fault_flags && blk->fault_flags[i].kind != JFF_NONE)
+            if (fault_recipes[i].kind != JFF_NONE)
                 ocerz_flags_defuse_nofault(&blk->insns[i], &def, &use);
             else
                 ocerz_flags_defuse(&blk->insns[i], &def, &use);
@@ -23867,7 +24137,8 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
                  blk->insns[i].op == OCERZ_OP_ADC || blk->insns[i].op == OCERZ_OP_SBB ||
                  blk->insns[i].op == OCERZ_OP_JCC)) {
                 int fk = nzcv_producer_of(blk->insns, i);
-                if (fk >= 0 && !nzcv_window_has_load(blk->insns, fk, i))
+                if (fk >= 0 && (!nzcv_window_has_load(blk->insns, fk, i) ||
+                                nzcv_regen_recipes(blk->insns, fk, i, fault_recipes, &n_fault_recipes)))
                     use &= ~(uint64_t)JIT_ARITH_FLAGS;
             }
             if (side_fused)
@@ -24085,18 +24356,28 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
         }
     }
     g_wtab_insns = NULL;
+    if (blk->insn_off && n_fault_recipes) {
+        blk->fault_flags = (JitFaultFlagRecipe *)malloc((size_t)n * sizeof *blk->fault_flags);
+        if (blk->fault_flags)
+            memcpy(blk->fault_flags, fault_recipes, (size_t)n * sizeof *blk->fault_flags);
+    }
     lazy_rsp_scan(blk->insns, n);
     nzcv_regen_scan(blk->insns, n);
     int regen_after = -1, regen_k = -1;
+    uint32_t *regen_from = NULL;
     dep_plain_mark(blk->insns, n);
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
         g_dep_plain_op = g_dep_plain[i] ? &insn->ops[1] : NULL;
         if (regen_after >= 0 && i > regen_after) {
-            nzcv_regen_emit(&b, &blk->insns[regen_k]);
+            if (b.overflow || !a64_words_keep_nzcv(regen_from, b.p))
+                nzcv_regen_emit(&b, &blk->insns[regen_k], regen_k);
             regen_after = -1;
+            regen_from = NULL;
         }
         if (g_nzcv_regen[i] >= 0) {
+            if (regen_after < 0)
+                regen_from = b.p;
             regen_after = i;
             regen_k = g_nzcv_regen[i];
         }
@@ -25540,6 +25821,22 @@ void ocerz_jit_fault_recover_flags(const struct OcerzVM *vm,
         cc_dst = src;
         cc_op = ocerz_cc_pack(OCERZ_CC_ADD, size, 0);
         break;
+    case JFF_SUB_RESULT_SRC:
+        if (p->op != OCERZ_OP_SUB || p->nops != 2 ||
+            !fault_recipe_rhs(cpu, &p->ops[1], size, &src))
+            return;
+        cc_src = ocerz_trunc(res + src, size);
+        cc_dst = src;
+        cc_op = ocerz_cc_pack(OCERZ_CC_SUB, size, 0);
+        break;
+    case JFF_CMP_OPS:
+        if (p->op != OCERZ_OP_CMP || p->nops != 2 ||
+            !fault_recipe_rhs(cpu, &p->ops[1], size, &src))
+            return;
+        cc_src = res;
+        cc_dst = src;
+        cc_op = ocerz_cc_pack(OCERZ_CC_SUB, size, 0);
+        break;
     case JFF_ADD_INC_RESULT_SRC: {
         if (p->op != OCERZ_OP_ADD || p->nops != 2 ||
             recipe.producer + 1 >= b->n_insns ||
@@ -25847,6 +26144,7 @@ void ocerz_jit_forget(struct OcerzVM *vm)
 {
     pthread_mutex_init(&jit_lock, NULL);
     g_xlat_jit = NULL;
+    g_arena_jit = NULL;
     g_n_ras_cells = 0;
     g_ras_slot_n = 0;
     memset(g_pending, 0, sizeof g_pending);
@@ -25873,6 +26171,7 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
     jit->owner_pid = (int)getpid();
     jit->code_base = (uint32_t *)p;
     jit->code_cur = (uint32_t *)p;
+    g_arena_jit = jit;
     size_t leaf_bytes = (size_t)(ocerz_leaf_hi - ocerz_leaf_lo);
     if (leaf_bytes && leaf_bytes + 64 < bytes) {
         pthread_jit_write_protect_np(0);
@@ -26889,14 +27188,57 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
     ocerz_vm_purge_jit_ras(vm);
 }
 
+/*
+ * A fork copies the JIT arena whole: the kernel does not share MAP_JIT memory
+ * copy-on-write, so it copies every page in use and walks the rest, 7 ms for a
+ * gigabyte nobody has touched, and a guest fork of a shell took 15 ms against
+ * Rosetta's 2.  The child needs the code below code_cur, which the forking
+ * thread may be running, and none above it: so for the fork the part above is
+ * not inherited, and the child maps it again, empty, where it was, or ends its
+ * arena there when that space is gone.  OCERZ_NO_FORK_TAIL=1 copies it all.
+ */
+static uint8_t *g_fork_tail_lo, *g_fork_tail_hi;
+
 void ocerz_jit_prefork(void)
 {
     jl_acquire(__LINE__);
+    OcerzJit *jit = g_arena_jit;
+    static int off = -1;
+    if (off < 0) off = getenv("OCERZ_NO_FORK_TAIL") ? 1 : 0;
+    g_fork_tail_lo = g_fork_tail_hi = NULL;
+    if (off || !jit)
+        return;
+    uintptr_t pg = (uintptr_t)getpagesize();
+    uint8_t *base = (uint8_t *)jit->code_base, *hi = (uint8_t *)jit->code_end;
+    uint8_t *lo = (uint8_t *)(((uintptr_t)jit->code_cur + pg - 1) & ~(pg - 1));
+    if (lo > base && minherit(base, (size_t)(lo - base), VM_INHERIT_COPY) != 0)
+        return;
+    if (lo < hi && minherit(lo, (size_t)(hi - lo), VM_INHERIT_NONE) == 0) {
+        g_fork_tail_lo = lo;
+        g_fork_tail_hi = hi;
+    }
 }
 
 void ocerz_jit_postfork(void)
 {
+    if (g_fork_tail_lo)
+        (void)minherit(g_fork_tail_lo, (size_t)(g_fork_tail_hi - g_fork_tail_lo), VM_INHERIT_COPY);
     jl_release();
+}
+
+static void fork_tail_remap(void)
+{
+    OcerzJit *jit = g_arena_jit;
+    uint8_t *lo = g_fork_tail_lo, *hi = g_fork_tail_hi;
+    g_fork_tail_lo = g_fork_tail_hi = NULL;
+    if (!jit || !lo)
+        return;
+    void *p = mmap(lo, (size_t)(hi - lo), PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    if (p != (void *)lo) {
+        if (p != MAP_FAILED)
+            munmap(p, (size_t)(hi - lo));
+        jit->code_end = (uint32_t *)(void *)lo;
+    }
 }
 
 void ocerz_jit_postfork_child(void)
@@ -26912,6 +27254,7 @@ void ocerz_jit_postfork_child(void)
     __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
     g_flush_mark = UINT64_MAX;
     g_flush_retry_ns = 0;
+    fork_tail_remap();
 }
 
 static int jit_interp_block(struct OcerzVM *vm, OcerzCPU *cpu, JitBlock *b)

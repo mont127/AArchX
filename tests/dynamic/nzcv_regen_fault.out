@@ -1,0 +1,10 @@
+cmp_load 5f99d64031df669f sub_load 43a431a9b07240e9 add_load a407722f4b58b282 cmp_imm 519d4e481a26f62e
+round 0 faults 4 flags 5505
+round 1 faults 8 flags 5545
+round 2 faults 12 flags 5515
+round 3 faults 16 flags dd92
+round 4 faults 20 flags 1140
+round 5 faults 24 flags 40
+round 6 faults 28 flags 8808
+round 7 faults 32 flags 4444
+fault ab63e22035e3e73f faults 32
