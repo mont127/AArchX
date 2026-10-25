@@ -1023,25 +1023,29 @@ fi
 # litmus must hold, and OCERZ_SR_VERIFY's sampler must have looked while two
 # threads ran and found none of them in a plain block; the process must have
 # switched and stayed able to go plain, except after a writable shared mapping,
-# which makes it ordered for good.  Without the knob the litmus runs as is.
+# which makes it ordered for good.  Those runs switch back to plain at once
+# (OCERZ_SR_HOLD_US=0); "held" keeps the default hold, under which the reader's
+# short sleeps hardly ever let the process go plain.  Without the knob the
+# litmus runs as is.
 run_sr_case() {
-    local name="$1" dir="$TMP/$1" arg want_sticky line why
+    local name="$1" dir="$TMP/$1" arg want_sticky hold prog_arg line why
     mkdir -p "$dir"
     if ! clang -arch x86_64 -O1 -o "$dir/$name" tests/dynamic/sr_switch.c 2>/dev/null; then
         echo "FAIL $name (build)"; fail=$((fail+1)); return
     fi
-    for arg in plain fork shared; do
-        want_sticky=0
+    for arg in plain fork shared held; do
+        want_sticky=0 hold=0 prog_arg=$arg
         [ $arg = shared ] && want_sticky=1
-        OCERZ_TCACHE=off OCERZ_SINGLE_RUNNER=1 OCERZ_SR_VERIFY=1 OCERZ_SR_LOG=1 \
-            run_bounded "$dir/$arg.out" "$dir/$arg.err" "$OCERZ" "$dir/$name" $arg
+        [ $arg = held ] && hold=500 prog_arg=plain
+        OCERZ_TCACHE=off OCERZ_SINGLE_RUNNER=1 OCERZ_SR_VERIFY=1 OCERZ_SR_LOG=1 OCERZ_SR_HOLD_US=$hold \
+            run_bounded "$dir/$arg.out" "$dir/$arg.err" "$OCERZ" "$dir/$name" $prog_arg
         line=$(grep -h 'SINGLE-RUNNER' "$dir/$arg.err" | tail -1)
         why=""
         if [ "$(cat "$dir/$arg.out")" != OK ]; then
             why="got out='$(cat "$dir/$arg.out")'"
         elif ! echo "$line" | grep -q "sticky=$want_sticky "; then
             why="want sticky=$want_sticky: $line"
-        elif [ $want_sticky = 0 ] && ! echo "$line" | grep -Eq 'switches=[0-9]{2,}'; then
+        elif [ $want_sticky = 0 ] && [ $hold = 0 ] && ! echo "$line" | grep -Eq 'switches=[0-9]{2,}'; then
             why="no switches: $line"
         elif [ $want_sticky = 0 ] && ! echo "$line" | grep -Eq 'samples=[0-9]{2,}'; then
             why="the sampler never looked: $line"

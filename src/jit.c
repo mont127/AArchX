@@ -28219,15 +28219,77 @@ static void sr_verify_start(void)
         pthread_detach(t);
 }
 
+/*
+ * The stop of the last but one thread does not make the process plain until
+ * the one left has run alone OCERZ_SR_HOLD_US (500 us): a thread back from its
+ * system call within it finds the process ordered still and switches nothing,
+ * which most of a start-up's comings and goings do.  A thread of its own waits
+ * out the hold and switches, under g_sr_lock as any switch; =0 switches at once.
+ */
+static uint64_t g_sr_hold_ns = UINT64_MAX, g_sr_flip_at;
+static pthread_cond_t g_sr_cv = PTHREAD_COND_INITIALIZER;
+static int g_sr_flipper;
+
+static void *sr_flipper_main(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&g_sr_lock);
+    for (;;) {
+        if (!g_sr_flip_at) {
+            pthread_cond_wait(&g_sr_cv, &g_sr_lock);
+            continue;
+        }
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (now < g_sr_flip_at) {
+            uint64_t d = g_sr_flip_at - now;
+            struct timespec ts = { (time_t)(d / 1000000000ull), (long)(d % 1000000000ull) };
+            pthread_cond_timedwait_relative_np(&g_sr_cv, &g_sr_lock, &ts);
+            continue;
+        }
+        g_sr_flip_at = 0;
+        if (g_sr_runners == 1 && !g_sr_plain && !g_sr_sticky) {
+            sr_set(1);
+            uint64_t g = __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST);
+            pthread_mutex_unlock(&g_sr_lock);
+            sr_nudge_all(g);
+            pthread_mutex_lock(&g_sr_lock);
+        }
+    }
+    return NULL;
+}
+
+/* g_sr_lock held: the process goes plain now, or after the hold */
+static int sr_plain_soon_locked(void)
+{
+    if (g_sr_hold_ns == UINT64_MAX) {
+        const char *e = getenv("OCERZ_SR_HOLD_US");
+        g_sr_hold_ns = (e ? strtoull(e, NULL, 0) : 500) * 1000ull;
+    }
+    if (!g_sr_hold_ns) {
+        sr_set(1);
+        return 1;
+    }
+    if (!g_sr_flipper) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, sr_flipper_main, NULL) != 0) {
+            sr_set(1);
+            return 1;
+        }
+        pthread_detach(t);
+        g_sr_flipper = 1;
+    }
+    g_sr_flip_at = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + g_sr_hold_ns;
+    pthread_cond_signal(&g_sr_cv);
+    return 0;
+}
+
 int ocerz_jit_sr_leave(void)
 {
     if (!g_sr || !t_sr_counted)
         return 0;
     t_sr_counted = 0;
     pthread_mutex_lock(&g_sr_lock);
-    int flip = --g_sr_runners == 1 && !g_sr_plain && !g_sr_sticky;
-    if (flip)
-        sr_set(1);
+    int flip = --g_sr_runners == 1 && !g_sr_plain && !g_sr_sticky && sr_plain_soon_locked();
     uint64_t g = __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&g_sr_lock);
     if (flip)
@@ -28242,6 +28304,8 @@ void ocerz_jit_sr_enter(void)
     t_sr_counted = 1;
     pthread_mutex_lock(&g_sr_lock);
     int n = ++g_sr_runners;
+    if (n >= 2)
+        g_sr_flip_at = 0;   /* a hold under way ends: still ordered */
     if (n >= 2 && g_sr_plain) {
         sr_set(0);
         g_sr_switches++;
@@ -28511,7 +28575,10 @@ void ocerz_jit_postfork_child(void)
     if (g_sr) {   /* the forking thread is the only one, in its system call */
         pthread_mutex_init(&g_sr_lock, NULL);
         pthread_mutex_init(&g_sr_nudge_lock, NULL);
+        pthread_cond_init(&g_sr_cv, NULL);
         g_sr_runners = 0;
+        g_sr_flipper = 0;
+        g_sr_flip_at = 0;
     }
     g_flush_mark = UINT64_MAX;
     g_flush_retry_ns = 0;
