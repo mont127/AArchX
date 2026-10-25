@@ -1555,7 +1555,7 @@ static void *ocerz_worker_entry(void *p)
 
 static int ocerz_spawn_worker(OcerzVM *vm, const OcerzCPU *tmpl)
 {
-    ocerz_jit_require_ordered(vm);
+    ocerz_jit_thread_appears(vm);
     struct ocerz_worker *w = (struct ocerz_worker *)calloc(1, sizeof *w);
     if (!w)
         return -1;
@@ -1640,7 +1640,7 @@ void ocerz_fork_register(void)
 
 static int guest_fork_apply(OcerzVM *vm, pid_t *out)
 {
-    ocerz_jit_require_ordered(vm);
+    ocerz_jit_fork_appears(vm);
     int once_error = pthread_once(&g_fork_atfork_once, ocerz_fork_register_atfork);
     if (once_error != 0 || g_fork_atfork_error != 0)
         return once_error ? once_error : g_fork_atfork_error;
@@ -2230,7 +2230,7 @@ static int guest_spawn_apply(OcerzVM *vm, pid_t *pid, const char *path,
     spawn_rewrite_launchd(hargv, n, self);
     char *henv[GUEST_ENV_MAX + 8];
     guest_child_env(henv, GUEST_ENV_MAX + 8, envp);
-    ocerz_jit_require_ordered(vm);
+    ocerz_jit_thread_appears(vm);
     guest_child_profile(path);
     short sf = 0;
     if (at && posix_spawnattr_getflags(at, &sf) == 0 && (sf & POSIX_SPAWN_SETEXEC))
@@ -3731,7 +3731,7 @@ static void ocerz_hostwq_register(OcerzVM *vm)
     static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&m);
     if (!done) {
-        ocerz_jit_require_ordered(vm);
+        ocerz_jit_thread_appears(vm);
         done = 1;
         g_hostwq_vm = vm;
         int rc = _pthread_workqueue_init_with_workloop(
@@ -3928,7 +3928,7 @@ static int sys_bsdthread_create(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     }
     (void)func;
     (void)funarg;
-    ocerz_jit_require_ordered(vm);
+    ocerz_jit_thread_appears(vm);
     struct ocerz_worker *w = (struct ocerz_worker *)calloc(1, sizeof *w);
     if (!w) {
         ret_err(cpu, OCERZ_ENOMEM_V);
@@ -8898,6 +8898,9 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
     const uint64_t args[6] = { cpu->gpr[OCERZ_RDI], cpu->gpr[OCERZ_RSI], cpu->gpr[OCERZ_RDX], cpu->gpr[OCERZ_R10],
                                cpu->gpr[OCERZ_R8], cpu->gpr[OCERZ_R9] };
     uint32_t ring_at = sysring_enter(cpu, class, num);
+    int sr_was = ocerz_jit_sr_leave();
+    if (class == 2 && num == 250 && (int)args[2] == VM_INHERIT_SHARE)
+        ocerz_jit_note_inherit_share();
     peekguard(cpu, class, num, "entry");
 
     if (class == 2 && (num == 4 || num == 121 || num == 154 || num == 397 || num == 415))
@@ -9029,6 +9032,8 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
             cpu->gs_base = cpu->wine_teb_base;
         }
         g_ocerz_deliver_src = 2;
+        if (sr_was)
+            ocerz_jit_sr_enter();
         if (ocerz_signal_deliver(cpu, OCERZ_SIGSYS, 0, 0, 0))
             return OCERZ_STEP_OK;
         OCERZ_FATAL("unknown syscall class=%d num=%d (rax=%#llx) rip=%#llx\n",
@@ -9037,6 +9042,8 @@ int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
     }
 
     peekguard(cpu, class, num, "exit");
+    if (sr_was)
+        ocerz_jit_sr_enter();
     sysring_exit(cpu, ring_at, class, num);
     /* A call a signal interrupted (EINTR), whose handlers asked for SA_RESTART, goes back onto its syscall instruction
      * with its number and arguments: the handler deliver_async_signals sets up returns there and the call is made

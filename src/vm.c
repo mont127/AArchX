@@ -833,6 +833,8 @@ static int susp_stop_is_safe(OcerzCPU *t)
 int ocerz_vm_thread_suspend(OcerzCPU *self, uint32_t port)
 {
     int counted = 0;
+    if (self)
+        ocerz_jit_guest_suspends(self->vm);
     for (;;) {
         pthread_mutex_lock(&g_cpus_lock);
         OcerzCPU *t = cpu_by_kport_locked(port);
@@ -4164,7 +4166,7 @@ OcerzCPU *ocerz_thread_attach(OcerzVM *vm)
                 (unsigned long long)tid);
         return NULL;
     }
-    ocerz_jit_require_ordered(vm);
+    ocerz_jit_thread_appears(vm);
     ocerz_cpu_register(cpu);
     pthread_mutex_lock(&g_cpus_lock);
     if (g_attach_stacks_n < OCERZ_ATTACH_MAX) {
@@ -4422,7 +4424,16 @@ static void vm_fatal_where(const OcerzCPU *cpu)
     fprintf(stderr, "\n");
 }
 
+static int vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
+{
+    int counted = cpu != &vm->cpu && ocerz_jit_sr_thread_start();   /* main runs from ocerz_jit_create */
+    int rc = vm_run_cpu(vm, cpu);
+    if (counted)
+        ocerz_jit_sr_thread_end();
+    return rc;
+}
+static int vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
 {
     static int trace_init;
     static uint64_t trace_lo, trace_hi;

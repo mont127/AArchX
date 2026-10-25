@@ -175,6 +175,7 @@ typedef struct OcerzCPU {
     uint8_t sig_stop_edges[OCERZ_SIG_STOP_MAX];     /* which of the block's edges it unchained */
     void *sig_stop_blk[OCERZ_SIG_STOP_MAX];
     uint64_t sig_stop_rip[OCERZ_SIG_STOP_MAX];
+    uint64_t sr_gen;            /* the single runner's mode generation this thread runs code of (src/jit.c) */
 } OcerzCPU;
 
 #define OCERZ_RAS_SIZE 256

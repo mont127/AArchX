@@ -62,6 +62,18 @@ int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc
 void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu);
 
 void ocerz_jit_require_ordered(struct OcerzVM *vm);
+/* A thread that may run guest code next to the others appeared (thread, workqueue, callback, spawn): ordered memory
+   from here on, unless OCERZ_SINGLE_RUNNER keeps plain code while only one thread runs guest code. */
+void ocerz_jit_thread_appears(struct OcerzVM *vm);
+void ocerz_jit_fork_appears(struct OcerzVM *vm);
+void ocerz_jit_note_inherit_share(void);
+void ocerz_jit_guest_suspends(struct OcerzVM *vm);
+/* OCERZ_SINGLE_RUNNER: this thread stops (a system call) and starts again running guest code; leave answers whether
+   it was counted, and only then does the matching enter count it again. */
+int ocerz_jit_sr_leave(void);
+void ocerz_jit_sr_enter(void);
+int ocerz_jit_sr_thread_start(void);
+void ocerz_jit_sr_thread_end(void);
 void ocerz_jit_start_ordered(struct OcerzVM *vm);
 void ocerz_jit_prefault(struct OcerzVM *vm, size_t records);
 void ocerz_jit_invalidate_all(struct OcerzVM *vm);

@@ -866,12 +866,21 @@ static size_t jit_code_bytes(void)
 #define JIT_MAX_BLOCK_INSNS 256
 
 #define JIT_KEY_M32 (1ull << 63)
+/* a block translated for plain memory while OCERZ_SINGLE_RUNNER is on (see "single runner") */
+#define JIT_KEY_PLAIN (1ull << 61)
 
+static int g_sr;
+static __thread uint64_t t_sr_kbit;
+static inline uint64_t sr_kbit(void) { return __builtin_expect(g_sr, 0) ? t_sr_kbit : 0; }
+static inline uint64_t jit_key_m(uint64_t rip, int mode32, uint64_t kbit)
+{
+    return (mode32 ? (rip | JIT_KEY_M32) : rip) | kbit;
+}
 static inline uint64_t jit_key(uint64_t rip, int mode32)
 {
-    return mode32 ? (rip | JIT_KEY_M32) : rip;
+    return jit_key_m(rip, mode32, sr_kbit());
 }
-static inline uint64_t jit_key_rip(uint64_t key) { return key & ~JIT_KEY_M32; }
+static inline uint64_t jit_key_rip(uint64_t key) { return key & ~(JIT_KEY_M32 | JIT_KEY_PLAIN); }
 static inline int jit_key_mode32(uint64_t key) { return (int)(key >> 63); }
 
 typedef int (*JitBlockFn)(struct OcerzVM *, OcerzCPU *);
@@ -1004,6 +1013,8 @@ typedef struct JitBlock {
 
 static inline uint64_t blk_rip(const JitBlock *b) { return jit_key_rip(b->key); }
 static inline int blk_mode32(const JitBlock *b) { return jit_key_mode32(b->key); }
+/* the key a block's own edge to rip has: its mode, not the mode of whichever thread looks */
+static inline uint64_t blk_tkey(const JitBlock *b, uint64_t rip) { return jit_key_m(rip, blk_mode32(b), b->key & JIT_KEY_PLAIN); }
 static inline uint64_t blk_insn_rip(const JitBlock *b, int i) { return b->insns ? b->insns[i].rip : b->iref[i].rip; }
 static inline unsigned blk_insn_len(const JitBlock *b, int i) { return b->insns ? b->insns[i].len : b->iref[i].len; }
 static inline unsigned blk_insn_op(const JitBlock *b, int i) { return b->insns ? b->insns[i].op : b->iref[i].op; }
@@ -1093,6 +1104,7 @@ struct OcerzJit {
     JitCodeIndex *ci;
     uint32_t *dispatch_stub;
     uint32_t *dispatch_stub32;
+    uint32_t *dispatch_stub_p, *dispatch_stub32_p;   /* the single runner's plain blocks' */
     JitBlock **live;
     size_t n_live, cap_live;
     uint64_t code_lo, code_hi;
@@ -1101,6 +1113,14 @@ struct OcerzJit {
     struct EpiShare *epi_share;         /* common epilogues other blocks branch to (epi_share_find) */
     int n_epi_share, cap_epi_share;
 };
+
+/* the memory model a translation made now follows: the thread's under the single runner, else the process's */
+static inline int jit_plain_now(const OcerzJit *jit) { return g_sr ? t_sr_kbit != 0 : jit->plain_mem; }
+static inline uint32_t **jit_dstub_slot(OcerzJit *jit, int mode32, int plain)
+{
+    return plain ? (mode32 ? &jit->dispatch_stub32_p : &jit->dispatch_stub_p)
+                 : (mode32 ? &jit->dispatch_stub32 : &jit->dispatch_stub);
+}
 
 int ocerz_perfstat = -1;
 
@@ -2052,6 +2072,7 @@ static OcerzJit *g_xlat_jit;
 static OcerzJit *g_arena_jit;           /* the arena's owner, for the fork hooks (ocerz_jit_prefork) */
 static int g_xlat_mode32;
 static int g_xlat_mode32_fwd(void) { return g_xlat_mode32; }
+static uint64_t g_xlat_kbit;   /* JIT_KEY_PLAIN when the block being translated is a single runner's plain one */
 
 static int8_t *g_pin;
 static uint8_t *g_pin_hold;
@@ -2174,6 +2195,7 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
 
 typedef struct JitThr {
     int frames, parked, dead;
+    uint64_t sr_gen;            /* the single-runner generation this thread last synced to */
     OcerzCPU *cpu;
     struct JitThr *next;
 } JitThr;
@@ -2182,6 +2204,13 @@ static __thread JitThr *t_jit_thr;
 static pthread_key_t g_jit_thr_key;
 static pthread_once_t g_jit_thr_once = PTHREAD_ONCE_INIT;
 static uint64_t g_flush_gen;
+static int g_sr_plain = 1, g_sr_sticky, g_sr_runners;   /* single runner, see there */
+static uint64_t g_sr_gen = 2;
+static __thread int t_sr_counted;
+static __thread uint64_t t_sr_gen;
+static struct OcerzVM *g_sr_vm;
+static void sr_report(void);
+static void sr_verify_start(void);
 static int g_flush_req;
 static __thread int t_xlat_overflow;
 static uint64_t g_flush_mark = UINT64_MAX;
@@ -2242,7 +2271,8 @@ static int jit_exec_one_parked(struct OcerzVM *vm, OcerzCPU *cpu, const X86Insn 
     int r = jit_exec_one(vm, cpu, insn);
     __atomic_sub_fetch(&t->parked, 1, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(&g_flush_req, __ATOMIC_SEQ_CST) ||
-        __atomic_load_n(&g_flush_gen, __ATOMIC_SEQ_CST) != gen) {
+        __atomic_load_n(&g_flush_gen, __ATOMIC_SEQ_CST) != gen ||
+        (g_sr && __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST) != t_sr_gen)) {
         ocerz_vm_jit_escape(r);
     }
     return r;
@@ -2353,6 +2383,14 @@ static unsigned hash_key(uint64_t key)
     key *= 0xff51afd7ed558ccdull;
     key ^= key >> 29;
     return (unsigned)(key & JIT_HASH_MASK);
+}
+
+static JitBlock *cache_lookup_k(OcerzJit *jit, uint64_t key)
+{
+    for (JitBlock *b = __atomic_load_n(&jit->buckets[hash_key(key)], __ATOMIC_ACQUIRE); b; b = b->hnext)
+        if (b->key == key)
+            return b;
+    return NULL;
 }
 
 static JitBlock *cache_lookup(OcerzJit *jit, uint64_t rip, int mode32)
@@ -18719,6 +18757,16 @@ static void emit_dispatch_stub(OcerzJit *jit, int mode32)
         a64_bic_reg(&b, 1, JT0, JT0, JTU, 0);
         to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 1, JT0, 0);
     }
+    int plain = t_sr_kbit != 0;
+    if (g_sr) {   /* a thread whose mode is out of date takes the run loop to its dispatcher */
+        a64_mov_imm64(&b, JTU, (uint64_t)offsetof(OcerzCPU, sr_gen));
+        a64_add_reg(&b, 1, JTU, 1, JTU, 0);
+        a64_ldr(&b, 8, JT0, JTU, 0);
+        a64_mov_imm64(&b, JTU, (uint64_t)(uintptr_t)&g_sr_gen);
+        a64_ldr(&b, 8, JTU, JTU, 0);
+        a64_sub_reg(&b, 1, JT0, JT0, JTU, 0);
+        to_ret[nr++] = a64_label(&b); a64_cbnz(&b, 1, JT0, 0);
+    }
     a64_ldr(&b, 8, JT1, 1, RIP_OFF);
     if (!(mode32 && m32_active && !getenv("OCERZ_NO_M32_TRAP_BLOCKS"))) {   /* m32: a trap's block is looked up too */
         a64_mov_imm64(&b, JTU, OCERZ_DYLDAPI_LO);
@@ -18730,6 +18778,11 @@ static void emit_dispatch_stub(OcerzJit *jit, int mode32)
     if (mode32) {
         int ok = a64_try_orr_imm(&b, 1, JT1, JT1, JIT_KEY_M32);
         assert(ok && "JIT_KEY_M32 must encode as a logical immediate");
+        (void)ok;
+    }
+    if (plain) {
+        int ok = a64_try_orr_imm(&b, 1, JT1, JT1, JIT_KEY_PLAIN);
+        assert(ok && "JIT_KEY_PLAIN must encode as a logical immediate");
         (void)ok;
     }
     a64_lsr_imm(&b, 1, JTT, JT1, 33);
@@ -18764,8 +18817,7 @@ static void emit_dispatch_stub(OcerzJit *jit, int mode32)
     a64_mov_imm64(&b, 0, OCERZ_STEP_OK);
     a64_ret(&b);
     if (!b.overflow) {
-        if (mode32) jit->dispatch_stub32 = entry;
-        else        jit->dispatch_stub = entry;
+        *jit_dstub_slot(jit, mode32, plain) = entry;
         jit->code_cur = b.p;
         sys_icache_invalidate(entry, (size_t)((uint8_t *)b.p - (uint8_t *)entry));
     }
@@ -18885,6 +18937,8 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
     } else {
         a64_str(b, 8, JT1, 20, RIP_OFF);
     }
+    if (g_xlat_kbit)   /* a single runner's plain block looks for plain blocks */
+        (void)a64_try_orr_imm(b, 1, JT1, JT1, JIT_KEY_PLAIN);
     a64_lsr_imm(b, 1, JTT, JT1, 33);
     a64_eor_reg(b, 1, JTT, JTT, JT1, 0);
     a64_mov_imm64(b, JTU, 0xff51afd7ed558ccdull);
@@ -18913,6 +18967,8 @@ static void emit_indirect_tail(A64Buf *b, uint32_t **epi_sites, int *n_epi)
             a64_ldr(b, 8, JTA, JTF, (uint32_t)offsetof(JitBlock, body_code));
             nobody = a64_label(b); a64_cbz(b, 1, JTA, 0);
             a64_eor_reg(b, 1, JT0, JT1, JT0, 0);
+            if (g_xlat_kbit)   /* the site's tag is of the bare target */
+                (void)a64_try_eor_imm(b, 1, JT0, JT0, JIT_KEY_PLAIN);
             a64_stp_off(b, JT0, JTA, JT2, 0);
             a64_mov_reg(b, 1, JT0, JTA);
         } else {
@@ -22140,7 +22196,8 @@ static uint64_t tc_value(const OcerzJit *jit, const JitBlock *blk, int kind, uin
     case TCR_LEAF:
         return (uint64_t)(uintptr_t)(jit->leaf_near ? jit->leaf_near + arg : ocerz_leaf_lo + arg);
     case TCR_DSTUB: {
-        const uint32_t *d = arg ? jit->dispatch_stub32 : jit->dispatch_stub;
+        const uint32_t *d = (arg & 2) ? ((arg & 1) ? jit->dispatch_stub32_p : jit->dispatch_stub_p)
+                                      : ((arg & 1) ? jit->dispatch_stub32 : jit->dispatch_stub);
         if (d) return (uint64_t)(uintptr_t)d;
         break;
     }
@@ -22598,8 +22655,8 @@ static void blk_chain_edges(OcerzJit *jit, JitBlock *blk)
         if (!blk->edges[i].patch_b)
             continue;
         uint32_t *cs = blk->edges[i].probing ? NULL : blk->edges[i].cond_site;
-        uint64_t tk = jit_key(blk->edges[i].target_rip, blk_mode32(blk));
-        JitBlock *t = tk == blk->key ? blk : cache_lookup(jit, blk->edges[i].target_rip, blk_mode32(blk));
+        uint64_t tk = blk_tkey(blk, blk->edges[i].target_rip);
+        JitBlock *t = tk == blk->key ? blk : cache_lookup_k(jit, tk);
         if (!t && g_tcb_n)
             t = tcb_find(tk);
         if (t && t->code) {
@@ -22771,7 +22828,9 @@ static uint64_t tc_key(uint64_t rip, int mode32)
 {
     uint64_t k = g_tc_img_hi ? OCERZ_TC_KEY_IMAGE | (tc_mix(g_tc_img_id, rip - g_tc_img_lo) & (OCERZ_TC_KEY_IMAGE - 1))
                              : rip;
-    return k | (mode32 ? OCERZ_TC_KEY_M32 : 0) | (g_plain_mem ? OCERZ_TC_KEY_PLAIN : 0);
+    /* under the single runner the bit is the mode, of which a rip's memory model follows (memfn) */
+    int plain = g_sr ? t_sr_kbit != 0 : g_plain_mem;
+    return k | (mode32 ? OCERZ_TC_KEY_M32 : 0) | (plain ? OCERZ_TC_KEY_PLAIN : 0);
 }
 
 static uint64_t tc_hash_range(uint64_t h, uint64_t lo, const uint8_t *p, uint64_t n)
@@ -23533,8 +23592,7 @@ static JitBlock *tc_load_built(OcerzJit *jit, const TcView *vp, uint64_t rip, in
 
     jit_wx(0);
     if (!ENV_ON("OCERZ_NO_DISPATCH_STUB")) {
-        if (mode32) { if (!jit->dispatch_stub32) emit_dispatch_stub(jit, 1); }
-        else        { if (!jit->dispatch_stub)   emit_dispatch_stub(jit, 0); }
+        if (!*jit_dstub_slot(jit, mode32, t_sr_kbit != 0)) emit_dispatch_stub(jit, mode32);
     }
     veneer_pool_check(jit);
     uint8_t *pp = (uint8_t *)jit->code_cur;
@@ -23796,7 +23854,7 @@ static void tc_load_ahead(OcerzJit *jit)
                  tc_keepable(rip, 0) && (g_tc_img_hi != 0) == img && !al_marked(jk) && !al_marked(jk | AL_BLK_TAG) &&
                  !cp_marked(jk) && !tc_noload_has(jk);
         if (ok) {
-            g_plain_mem = jit->plain_mem || ocerz_dyldapi_memfn(rip);
+            g_plain_mem = jit_plain_now(jit) || ocerz_dyldapi_memfn(rip);
             ok = tc_key(rip, 0) == key;
         }
         if (ok) {
@@ -23990,7 +24048,7 @@ static void cont_publish(JitBlock *blk)
     JitLayout *L = g_place;
     JitBlock *c = L->caller;
     __atomic_store_n(&c->edges[L->edge].patch_b, (uint32_t *)NULL, __ATOMIC_RELEASE);
-    pending_drop(jit_key(L->rip, 0), c, L->edge);
+    pending_drop(blk_tkey(c, L->rip), c, L->edge);
     __atomic_store_n(&L->child, blk, __ATOMIC_RELEASE);
     L->placed = 1;
     pthread_jit_write_protect_np(0);
@@ -24034,7 +24092,7 @@ static void cont_place(OcerzJit *jit, JitLayout *L)
     int ftop = g_xlat_ftop, pm = g_plain_mem, m32 = g_xlat_mode32;
     g_xlat_cpu = NULL;
     g_xlat_ftop = -1;
-    g_plain_mem = jit->plain_mem || ocerz_dyldapi_memfn(L->rip);
+    g_plain_mem = jit_plain_now(jit) || ocerz_dyldapi_memfn(L->rip);
     g_place = L;
     unsigned long long over = ps_cont_over;
     translate_one(jit, L->rip, 0);
@@ -24258,6 +24316,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
     memcpy(blk->insns, scratch, (size_t)n * sizeof(X86Insn));
     blk->n_insns = n;
     blk->key = jit_key(rip, mode32);
+    g_xlat_kbit = blk->key & JIT_KEY_PLAIN;
     blk->cont_ctr = cont_promote_n();
     blk->edges = calloc(JIT_MAX_EDGES, sizeof *blk->edges);
     if (!blk->edges) {
@@ -24590,8 +24649,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
     pthread_jit_write_protect_np(0);
     ocerz_jit_wx_open = 1;
     if (!ENV_ON("OCERZ_NO_DISPATCH_STUB")) {
-        if (mode32) { if (!jit->dispatch_stub32) emit_dispatch_stub(jit, 1); }
-        else        { if (!jit->dispatch_stub)   emit_dispatch_stub(jit, 0); }
+        if (!*jit_dstub_slot(jit, mode32, t_sr_kbit != 0)) emit_dispatch_stub(jit, mode32);
     }
     veneer_pool_check(jit);
     if (tc_hit && tcm == OCERZ_TC_VERIFY && tc_hit->size >= sizeof(TcRec)) {
@@ -25885,7 +25943,7 @@ promo_push_fallthrough:
         emit_spill_pinned(&b);
         emit_frame_sp_reset(&b);
         emit_pin_epilogue_restore(&b);
-        uint32_t *dstub = mode32 ? jit->dispatch_stub32 : jit->dispatch_stub;
+        uint32_t *dstub = *jit_dstub_slot(jit, mode32, g_xlat_kbit != 0);
         if (term_may_switch_mode(blk->insns[n - 1].op))
             dstub = NULL;
         if (dstub) {
@@ -25898,7 +25956,7 @@ promo_push_fallthrough:
             uint32_t *here = a64_label(&b);
             ptrdiff_t soff = dstub - here;
             if (g_tc_on) {
-                tc_imm64(&b, 16, TCR_DSTUB, (uint64_t)mode32, (uint64_t)(uintptr_t)dstub);
+                tc_imm64(&b, 16, TCR_DSTUB, (uint64_t)mode32 | (g_xlat_kbit ? 2u : 0u), (uint64_t)(uintptr_t)dstub);
                 a64_br(&b, 16);
             } else if (!share && soff >= -(ptrdiff_t)(1 << 25) && soff <= (ptrdiff_t)((1 << 25) - 1)) {
                 a64_b(&b, (int32_t)soff);
@@ -26645,9 +26703,9 @@ int ocerz_jit_note_commpage_fault(struct OcerzVM *vm, const void *host_pc, uint6
     uint64_t block_rip = blk_rip(b);
     int fresh = !cp_marked(b->key);
     cp_mark(b->key);
-    cp_mark(jit_key(fault_rip, blk_mode32(b)));
+    cp_mark(blk_tkey(b, fault_rip));
     if (ENV_ON("OCERZ_CP_NOINVAL")) return 1;
-    if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL")) {
+    if (!fresh && cache_lookup_k(jit, b->key) != b && !ENV_ON("OCERZ_REFAULT_INVAL")) {
         retire_stale_copy(vm, jit, b);
         return 1;
     }
@@ -26668,9 +26726,9 @@ int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t
     OcerzJit *jit = vm ? vm->jit : NULL;
     const uint32_t *pc = (const uint32_t *)host_pc;
     const JitBlock *b = fault_block(jit, pc);
-    if (!b || jit->plain_mem) return 0;
+    if (!b || (g_sr ? (b->key & JIT_KEY_PLAIN) != 0 : jit->plain_mem)) return 0;
     uint64_t block_rip = blk_rip(b);
-    uint64_t ik = jit_key(fault_rip, blk_mode32(b));
+    uint64_t ik = blk_tkey(b, fault_rip);
     int fresh = !al_marked(ik);
     if (fresh) {
         al_mark(ik);
@@ -26678,7 +26736,7 @@ int ocerz_jit_note_align_fault(struct OcerzVM *vm, const void *host_pc, uint64_t
         fresh = !al_marked(b->key | AL_BLK_TAG);
         al_mark(b->key | AL_BLK_TAG);
     }
-    if (!fresh && cache_lookup(jit, block_rip, blk_mode32(b)) != b && !ENV_ON("OCERZ_REFAULT_INVAL")) {
+    if (!fresh && cache_lookup_k(jit, b->key) != b && !ENV_ON("OCERZ_REFAULT_INVAL")) {
         retire_stale_copy(vm, jit, b);
         return 1;
     }
@@ -26902,6 +26960,17 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
     jit->vm = vm;
     jit->plain_mem = !vm->jit_ordered_required &&
         (vm->jit_plain_mem || getenv("OCERZ_PLAIN_MEM") != NULL);
+    if (jit->plain_mem && ocerz_mode == OCERZ_MODE_CACHE && !ocerz_low_base && !m32_active &&
+        ENV_ON("OCERZ_SINGLE_RUNNER")) {
+        g_sr = 1;
+        g_sr_vm = vm;
+        g_sr_runners = 1;
+        t_sr_counted = 1;
+        t_sr_kbit = JIT_KEY_PLAIN;
+        t_sr_gen = 0;   /* syncs, and acknowledges, at its first step */
+        atexit(sr_report);
+        sr_verify_start();
+    }
     if (ocerz_tcache_mode() == OCERZ_TC_ON)
         tc_prep_init();
     size_t bytes = jit_code_bytes();
@@ -27851,7 +27920,7 @@ int ocerz_jit_signal_stop(struct OcerzVM *vm, OcerzCPU *cpu, const void *host_pc
 
 static void sig_rechain(OcerzJit *jit, JitBlock *b, int e)
 {
-    JitBlock *t = cache_lookup(jit, b->edges[e].target_rip, blk_mode32(b));
+    JitBlock *t = cache_lookup_k(jit, blk_tkey(b, b->edges[e].target_rip));
     if (!t || !t->code || !b->edges[e].patch_b)
         return;
     void *dst = (void *)t->code;
@@ -27900,7 +27969,7 @@ void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu)
     jl_acquire(__LINE__);
     for (uint32_t i = 0; i < cpu->sig_stop_n && !jit->stop_requested; i++) {
         JitBlock *b = (JitBlock *)cpu->sig_stop_blk[i];
-        if ((cache_lookup(jit, cpu->sig_stop_rip[i], cpu->sig_stop_m32[i]) != b && !blk_is_cont(b)) ||
+        if ((cache_lookup_k(jit, b->key) != b && !blk_is_cont(b)) ||
             b->live_idx >= jit->n_live || jit->live[b->live_idx] != b)
             continue;
         sig_unstop_site(&sb, jit, b, b->stop_patch, b->stop_insn, b->stop_run);
@@ -27913,6 +27982,325 @@ void ocerz_jit_signal_unstop(struct OcerzVM *vm, OcerzCPU *cpu)
     site_batch_flush(&sb);
     cpu->sig_stop_n = 0;
     jl_release();
+}
+
+
+/*
+ * ---- single runner (OCERZ_SINGLE_RUNNER=1, off by default) ----
+ * x86's order between loads and stores only matters while two threads run
+ * guest code at the same time, and the threads of an interpreter like tclsh or
+ * ruby almost never do: a tclsh loop of 300 ms had two threads in guest code 29
+ * times, 1.4 ms in all, but went ordered for good the moment its workqueue
+ * started, at a cost of 25%.  With the knob on, a process translates plain
+ * while at most one thread runs guest code and ordered while more do, and keeps
+ * both translations: a plain block's key carries JIT_KEY_PLAIN, so the two live
+ * side by side and a switch translates nothing.
+ *
+ * A thread runs guest code from its start to its end except inside a system
+ * call (ocerz_jit_sr_leave / ocerz_jit_sr_enter around ocerz_handle_syscall).
+ * Every thread keeps the mode it runs code of (t_sr_kbit), changed only in its
+ * dispatcher (sr_sync), so whatever it chains, caches in a site or keys in C is
+ * of that mode, and a block links only to blocks of its own mode.  The process's
+ * mode and its generation change under g_sr_lock like a seqlock (sr_set): when
+ * a second thread is about to run, ordered, a new generation, and every other
+ * thread in translated code is nudged out of its loop (suspended, its loop's
+ * stop sites patched as a signal would, resumed); the newcomer waits until
+ * each of them has synced to that generation or sits in a system call, and
+ * after 2 ms it stops every loop as an arena flush does.  A thread syncs at its
+ * dispatcher, behind a dmb, and re-checks the generation after publishing that
+ * it entered a block, as jit_flush's threads do; one back from a system call
+ * across a new generation leaves its block (jit_exec_one_parked), and the
+ * single-runner dispatch stubs leave for it too.  When the last but one thread
+ * stops, plain again, and the one left is nudged so it takes up plain code.
+ * Memory another process can see (a shared mapping, fork) makes the process
+ * ordered for good (g_sr_sticky), as without the knob; so does a thread that
+ * runs translated code without being counted, which nothing should do.
+ */
+typedef struct StopUndo StopUndo;
+static StopUndo *stop_sites_force_undoable(OcerzJit *jit, size_t *n_out);
+static void stop_sites_undo(OcerzJit *jit, StopUndo *u, size_t n);
+static pthread_mutex_t g_sr_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_sr_nudge_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_sr_switches, g_sr_nudges, g_sr_forced, g_sr_wait_ns;
+
+static void sr_set(int plain)
+{
+    __atomic_add_fetch(&g_sr_gen, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_sr_plain, plain, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&g_sr_gen, 1, __ATOMIC_SEQ_CST);
+}
+
+static void sr_sync(OcerzCPU *cpu)
+{
+    uint64_t g;
+    int p;
+    for (;;) {
+        g = __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST);
+        p = __atomic_load_n(&g_sr_plain, __ATOMIC_SEQ_CST);
+        if (!(g & 1) && __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST) == g)
+            break;
+    }
+    t_sr_kbit = p ? JIT_KEY_PLAIN : 0;
+    t_sr_gen = g;
+    if (cpu) {
+        cpu->sr_gen = g;
+        __atomic_store_n(&cpu->ras_top, 0, __ATOMIC_RELEASE);
+    }
+    __asm__ volatile("dmb ish" ::: "memory");
+    __atomic_store_n(&jit_thr()->sr_gen, g, __ATOMIC_SEQ_CST);
+}
+
+static void sr_nudge(JitThr *t)
+{
+    OcerzCPU *c = t->cpu;
+    if (!c || !c->host_kport || !g_sr_vm)
+        return;
+    pthread_mutex_lock(&g_sr_nudge_lock);
+    mach_port_t port = c->host_kport;
+    if (thread_suspend(port) == KERN_SUCCESS) {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS)
+            (void)ocerz_jit_signal_stop(g_sr_vm, c, (const void *)(uintptr_t)__darwin_arm_thread_state64_get_pc(st));
+        thread_resume(port);
+        g_sr_nudges++;
+    }
+    pthread_mutex_unlock(&g_sr_nudge_lock);
+}
+
+static int sr_busy(const JitThr *t, const JitThr *self, uint64_t g)
+{
+    return t != self && !__atomic_load_n(&t->dead, __ATOMIC_SEQ_CST) &&
+           __atomic_load_n(&t->frames, __ATOMIC_SEQ_CST) != __atomic_load_n(&t->parked, __ATOMIC_SEQ_CST) &&
+           __atomic_load_n(&t->sr_gen, __ATOMIC_SEQ_CST) < g;
+}
+
+static void sr_nudge_all(uint64_t g)
+{
+    JitThr *self = jit_thr();
+    for (JitThr *t = __atomic_load_n(&g_jit_thr, __ATOMIC_ACQUIRE); t; t = t->next)
+        if (sr_busy(t, self, g))
+            sr_nudge(t);
+}
+
+/* every other thread has synced to generation g or later, or runs no translated code */
+static void sr_wait(uint64_t g)
+{
+    JitThr *self = jit_thr();
+    OcerzJit *jit = g_sr_vm ? g_sr_vm->jit : NULL;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), next_nudge = 0;
+    StopUndo *undo = NULL;
+    size_t n_undo = 0;
+    int forced = 0;
+    for (unsigned round = 0;; round++) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        int busy = 0, nudge = now >= next_nudge;
+        for (JitThr *t = __atomic_load_n(&g_jit_thr, __ATOMIC_ACQUIRE); t; t = t->next)
+            if (sr_busy(t, self, g)) {
+                busy = 1;
+                if (nudge)
+                    sr_nudge(t);
+            }
+        if (!busy)
+            break;
+        if (nudge)
+            next_nudge = now + 200000;
+        if (now - t0 > 1000000000ull && !(round & 0xfff)) {
+            static int said;
+            if (!__atomic_exchange_n(&said, 1, __ATOMIC_SEQ_CST))
+                for (JitThr *t = __atomic_load_n(&g_jit_thr, __ATOMIC_ACQUIRE); t; t = t->next)
+                    if (sr_busy(t, self, g))
+                        fprintf(stderr, "ocerz: single runner: still waiting after 1 s for cpu#%u (rip %#llx) to leave plain code\n",
+                                t->cpu ? t->cpu->cpu_number : 0u, t->cpu ? (unsigned long long)t->cpu->rip : 0ull);
+        }
+        if (!forced && jit && !jl_held && now - t0 > 2000000) {
+            jl_acquire(__LINE__);
+            undo = stop_sites_force_undoable(jit, &n_undo);
+            jl_release();
+            forced = 1;
+            g_sr_forced++;
+        }
+        if (round < 64) {
+            sched_yield();
+        } else {
+            struct timespec ts = { 0, 20000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    if (forced) {
+        jl_acquire(__LINE__);
+        stop_sites_undo(jit, undo, n_undo);
+        jl_release();
+        free(undo);
+    }
+    g_sr_wait_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+}
+
+static void sr_make_sticky(void)
+{
+    pthread_mutex_lock(&g_sr_lock);
+    int was_plain = g_sr_plain;
+    g_sr_sticky = 1;
+    if (was_plain)
+        sr_set(0);
+    uint64_t g = __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&g_sr_lock);
+    if (was_plain)
+        sr_wait(g);
+}
+
+/*
+ * OCERZ_SR_VERIFY=1: a thread samples every 50 us, while two threads count as
+ * running and no switch is under way, where each thread in translated code is,
+ * and counts each one found in a plain block (violations, in OCERZ_SR_LOG).  A
+ * litmus test of the plain code itself rarely trips on the M5 even when both
+ * threads run plain, so this is what the tests check.
+ */
+static uint64_t g_sr_violations, g_sr_samples;
+
+static void sr_check_locked(void)
+{
+    OcerzJit *jit = g_sr_vm ? g_sr_vm->jit : NULL;
+    uint64_t g = __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST);
+    if (!jit || g_sr_runners < 2)
+        return;
+    for (JitThr *t = __atomic_load_n(&g_jit_thr, __ATOMIC_ACQUIRE); t; t = t->next)
+        if (!__atomic_load_n(&t->dead, __ATOMIC_SEQ_CST) &&
+            __atomic_load_n(&t->frames, __ATOMIC_SEQ_CST) != __atomic_load_n(&t->parked, __ATOMIC_SEQ_CST) &&
+            __atomic_load_n(&t->sr_gen, __ATOMIC_SEQ_CST) < g)
+            return;
+    for (JitThr *t = __atomic_load_n(&g_jit_thr, __ATOMIC_ACQUIRE); t; t = t->next) {
+        OcerzCPU *c = t->cpu;
+        if (__atomic_load_n(&t->dead, __ATOMIC_SEQ_CST) || !c || !c->host_kport ||
+            __atomic_load_n(&t->frames, __ATOMIC_SEQ_CST) == __atomic_load_n(&t->parked, __ATOMIC_SEQ_CST))
+            continue;
+        if (thread_suspend(c->host_kport) != KERN_SUCCESS)
+            continue;
+        arm_thread_state64_t st;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(c->host_kport, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+            const uint32_t *pc = (const uint32_t *)(uintptr_t)__darwin_arm_thread_state64_get_pc(st);
+            const JitBlock *b = ocerz_jit_pc_in_arena(g_sr_vm, pc) ? fault_block(jit, pc) : NULL;
+            if (b && (b->key & JIT_KEY_PLAIN))
+                g_sr_violations++;
+        }
+        thread_resume(c->host_kport);
+    }
+    g_sr_samples++;
+}
+
+static void *sr_verify_main(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        struct timespec ts = { 0, 50000 };
+        nanosleep(&ts, NULL);
+        pthread_mutex_lock(&g_sr_lock);
+        sr_check_locked();
+        pthread_mutex_unlock(&g_sr_lock);
+    }
+    return NULL;
+}
+
+static void sr_report(void)
+{
+    if (getenv("OCERZ_SR_LOG"))
+        fprintf(stderr, "ocerz: SINGLE-RUNNER[%d] switches=%llu nudges=%llu forced=%llu wait_ms=%.3f sticky=%d plain=%d"
+                " samples=%llu violations=%llu\n",
+                (int)getpid(), (unsigned long long)g_sr_switches, (unsigned long long)g_sr_nudges,
+                (unsigned long long)g_sr_forced, g_sr_wait_ns / 1e6, g_sr_sticky, g_sr_plain,
+                (unsigned long long)g_sr_samples, (unsigned long long)g_sr_violations);
+}
+
+static void sr_verify_start(void)
+{
+    pthread_t t;
+    if (getenv("OCERZ_SR_VERIFY") && pthread_create(&t, NULL, sr_verify_main, NULL) == 0)
+        pthread_detach(t);
+}
+
+int ocerz_jit_sr_leave(void)
+{
+    if (!g_sr || !t_sr_counted)
+        return 0;
+    t_sr_counted = 0;
+    pthread_mutex_lock(&g_sr_lock);
+    int flip = --g_sr_runners == 1 && !g_sr_plain && !g_sr_sticky;
+    if (flip)
+        sr_set(1);
+    uint64_t g = __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&g_sr_lock);
+    if (flip)
+        sr_nudge_all(g);
+    return 1;
+}
+
+void ocerz_jit_sr_enter(void)
+{
+    if (!g_sr || t_sr_counted)
+        return;
+    t_sr_counted = 1;
+    pthread_mutex_lock(&g_sr_lock);
+    int n = ++g_sr_runners;
+    if (n >= 2 && g_sr_plain) {
+        sr_set(0);
+        g_sr_switches++;
+    } else if (n == 1 && !g_sr_plain && !g_sr_sticky) {
+        sr_set(1);   /* alone, as a fork's child starts */
+    }
+    int plain = g_sr_plain;
+    uint64_t g = __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&g_sr_lock);
+    if (!plain)
+        sr_wait(g);
+}
+
+int ocerz_jit_sr_thread_start(void)
+{
+    if (!g_sr || t_sr_counted)
+        return 0;
+    ocerz_jit_sr_enter();
+    return 1;
+}
+void ocerz_jit_sr_thread_end(void) { (void)ocerz_jit_sr_leave(); }
+
+static void sr_uncounted(void)
+{
+    static int said;
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_SEQ_CST))
+        fprintf(stderr, "ocerz: single runner: a thread ran translated code without being counted; ordered from here\n");
+    t_sr_counted = 1;
+    pthread_mutex_lock(&g_sr_lock);
+    g_sr_runners++;
+    pthread_mutex_unlock(&g_sr_lock);
+    sr_make_sticky();
+}
+
+void ocerz_jit_thread_appears(struct OcerzVM *vm)
+{
+    if (g_sr && vm && vm->jit)
+        return;
+    ocerz_jit_require_ordered(vm);
+}
+
+/* A fork shares no memory with its child but a writable shared mapping, which made the process ordered when it was
+   made, and memory the guest asked to be inherited shared (minherit), which the single runner notes here. */
+static int g_sr_inherit_share;
+void ocerz_jit_note_inherit_share(void) { __atomic_store_n(&g_sr_inherit_share, 1, __ATOMIC_SEQ_CST); }
+
+/* A thread the guest suspends stops wherever it is, maybe in a plain block, where it could neither answer a switch
+   nor be let go into plain code next to the others: the first suspension makes the process ordered for good, while
+   its target still runs and answers. */
+void ocerz_jit_guest_suspends(struct OcerzVM *vm)
+{
+    if (g_sr && vm && vm->jit && !g_sr_sticky)
+        ocerz_jit_require_ordered(vm);
+}
+void ocerz_jit_fork_appears(struct OcerzVM *vm)
+{
+    if (g_sr && vm && vm->jit && !__atomic_load_n(&g_sr_inherit_share, __ATOMIC_SEQ_CST))
+        return;
+    ocerz_jit_require_ordered(vm);
 }
 
 void ocerz_jit_require_ordered(struct OcerzVM *vm)
@@ -27933,6 +28321,12 @@ void ocerz_jit_require_ordered(struct OcerzVM *vm)
         void *bt[8]; int n = backtrace(bt, 8); backtrace_symbols_fd(bt, n, 2);
     }
 
+    if (g_sr && vm->jit) {
+        vm->jit_ordered_required = 1;
+        vm->jit_plain_mem = 0;
+        sr_make_sticky();
+        return;
+    }
     if (!vm->jit_ordered_required)
         ocerz_tcache_note_ordered();
     vm->jit_ordered_required = 1;
@@ -28033,7 +28427,7 @@ void ocerz_jit_prefault(struct OcerzVM *vm, size_t records)
  */
 void ocerz_jit_start_ordered(struct OcerzVM *vm)
 {
-    if (!vm)
+    if (!vm || g_sr || ENV_ON("OCERZ_SINGLE_RUNNER"))   /* the single runner starts plain and keeps both */
         return;
     vm->jit_plain_mem = 0;
     OcerzJit *jit = vm->jit;
@@ -28114,6 +28508,11 @@ void ocerz_jit_postfork_child(void)
         }
     __atomic_store_n(&g_flush_req, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
+    if (g_sr) {   /* the forking thread is the only one, in its system call */
+        pthread_mutex_init(&g_sr_lock, NULL);
+        pthread_mutex_init(&g_sr_nudge_lock, NULL);
+        g_sr_runners = 0;
+    }
     g_flush_mark = UINT64_MAX;
     g_flush_retry_ns = 0;
     fork_tail_remap();
@@ -28290,7 +28689,7 @@ static void steplog(const OcerzCPU *cpu)
 }
 static void chain_edge_now(OcerzJit *jit, JitBlock *blk, int e)
 {
-    JitBlock *t = cache_lookup(jit, blk->edges[e].target_rip, blk_mode32(blk));
+    JitBlock *t = cache_lookup_k(jit, blk_tkey(blk, blk->edges[e].target_rip));
     if (t && t->code) {
         void *dst = (void *)t->code;
         if (blk->edges[e].kind == EDGE_BODY) {
@@ -28307,7 +28706,7 @@ static void chain_edge_now(OcerzJit *jit, JitBlock *blk, int e)
             return;
         }
     }
-    pending_add(jit_key(blk->edges[e].target_rip, blk_mode32(blk)),
+    pending_add(blk_tkey(blk, blk->edges[e].target_rip),
                 blk->edges[e].patch_b, blk->edges[e].kind,
                 blk->edges[e].pin_class, blk->edges[e].cond_site, blk->hoist_sig, blk, e);
 }
@@ -28362,7 +28761,7 @@ static void flip_retire_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock *blk)
                 cut = 1;
             }
             if (cut)
-                pending_add(jit_key(sblk->edges[i].target_rip, blk_mode32(sblk)), at,
+                pending_add(blk_tkey(sblk, sblk->edges[i].target_rip), at,
                             sblk->edges[i].kind, sblk->edges[i].pin_class,
                             sblk->edges[i].probing ? NULL : cs, sblk->hoist_sig, sblk, i);
         }
@@ -28729,6 +29128,8 @@ static void jit_arena_reset_locked(OcerzJit *jit)
     jit->stop_blocks = NULL;
     jit->dispatch_stub = NULL;
     jit->dispatch_stub32 = NULL;
+    jit->dispatch_stub_p = NULL;
+    jit->dispatch_stub32_p = NULL;
     jit->veneer_n = 0;
     jit->veneer_next_mark = NULL;
     memset(jit->veneer_pool, 0, sizeof jit->veneer_pool);
@@ -28739,7 +29140,7 @@ static void jit_arena_reset_locked(OcerzJit *jit)
     jit->code_full = 0;
 }
 
-typedef struct { uint32_t *site; uint32_t was, now; } StopUndo;
+struct StopUndo { uint32_t *site; uint32_t was, now; };
 
 static void stop_sites_sync(const StopUndo *u, size_t n)
 {
@@ -28950,7 +29351,7 @@ static int aot_walk(struct OcerzVM *vm, OcerzJit *jit, const uint64_t *seed, siz
         JitBlock *b = cache_lookup(jit, rip, 0);
         X86Insn x;
         int ni = 0, kept = 0;
-        g_plain_mem = jit->plain_mem || ocerz_dyldapi_memfn(rip);
+        g_plain_mem = jit_plain_now(jit) || ocerz_dyldapi_memfn(rip);
         if (!b && tc_keepable(rip, 0) && ocerz_tcache_has(tc_key(rip, 0))) {
             kept = 1;
             st->present++;
@@ -29078,7 +29479,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             g_no_jccfuse = getenv("OCERZ_NO_JCCFUSE") ? 1 : 0;
             g_no_addincfuse = getenv("OCERZ_NO_ADDINCFUSE") ? 1 : 0;
             g_no_fault_recipes = getenv("OCERZ_NO_FAULT_RECIPES") ? 1 : 0;
-            g_plain_mem = jit->plain_mem;
+            g_plain_mem = jit_plain_now(jit);
         }
         jl_release();
     }
@@ -29100,6 +29501,13 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 
     if (__builtin_expect(__atomic_load_n(&g_flush_req, __ATOMIC_SEQ_CST), 0))
         return OCERZ_EUNSUP;
+    if (__builtin_expect(g_sr, 0)) {
+        if (!t_sr_counted)
+            sr_uncounted();
+        uint64_t g = __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST);
+        if (t_sr_gen != g || cpu->sr_gen != g)   /* a cpu made afresh (a workqueue's, a call's) has its own copy */
+            sr_sync(cpu);
+    }
     uint64_t gen = __atomic_load_n(&g_flush_gen, __ATOMIC_SEQ_CST);
     JitBlock *b = cache_lookup(jit, cpu->rip, cpu->mode32);
     if (!b && __builtin_expect(jit_space_low(jit) || __atomic_load_n(&g_flush_want, __ATOMIC_RELAXED), 0) &&
@@ -29128,7 +29536,7 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
         b = cache_lookup(jit, cpu->rip, cpu->mode32);
         if (!b) {
             if (ocerz_jitstat > 0) js_xlat++;
-            g_plain_mem = jit->plain_mem || (!cpu->mode32 && ocerz_dyldapi_memfn(cpu->rip));
+            g_plain_mem = jit_plain_now(jit) || (!cpu->mode32 && ocerz_dyldapi_memfn(cpu->rip));
             if (g_jl_log > 0)
                 __atomic_store_n(&g_jl_phase, 2, __ATOMIC_RELAXED);
             g_xlat_ftop = cpu->ftop & 7;
@@ -29187,7 +29595,8 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
     t->cpu = cpu;
     __atomic_store_n(&t->frames, base + 1, __ATOMIC_SEQ_CST);
     if (__builtin_expect(__atomic_load_n(&g_flush_req, __ATOMIC_SEQ_CST) ||
-                         __atomic_load_n(&g_flush_gen, __ATOMIC_SEQ_CST) != gen, 0)) {
+                         __atomic_load_n(&g_flush_gen, __ATOMIC_SEQ_CST) != gen ||
+                         (g_sr && __atomic_load_n(&g_sr_gen, __ATOMIC_SEQ_CST) != t_sr_gen), 0)) {
         __atomic_store_n(&t->frames, base, __ATOMIC_SEQ_CST);
         return __atomic_load_n(&g_flush_req, __ATOMIC_SEQ_CST) ? OCERZ_EUNSUP : OCERZ_STEP_OK;
     }

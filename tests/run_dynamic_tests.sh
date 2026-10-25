@@ -1019,6 +1019,50 @@ else
     echo "FAIL ddep_order_store (stores ${dep_r1:-?} ${dep_s1:-?})"
     fail=$((fail+1))
 fi
+# sr_switch.c under the single runner (OCERZ_SINGLE_RUNNER=1, src/jit.c): the
+# litmus must hold, and OCERZ_SR_VERIFY's sampler must have looked while two
+# threads ran and found none of them in a plain block; the process must have
+# switched and stayed able to go plain, except after a writable shared mapping,
+# which makes it ordered for good.  Without the knob the litmus runs as is.
+run_sr_case() {
+    local name="$1" dir="$TMP/$1" arg want_sticky line why
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -O1 -o "$dir/$name" tests/dynamic/sr_switch.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    for arg in plain fork shared; do
+        want_sticky=0
+        [ $arg = shared ] && want_sticky=1
+        OCERZ_TCACHE=off OCERZ_SINGLE_RUNNER=1 OCERZ_SR_VERIFY=1 OCERZ_SR_LOG=1 \
+            run_bounded "$dir/$arg.out" "$dir/$arg.err" "$OCERZ" "$dir/$name" $arg
+        line=$(grep -h 'SINGLE-RUNNER' "$dir/$arg.err" | tail -1)
+        why=""
+        if [ "$(cat "$dir/$arg.out")" != OK ]; then
+            why="got out='$(cat "$dir/$arg.out")'"
+        elif ! echo "$line" | grep -q "sticky=$want_sticky "; then
+            why="want sticky=$want_sticky: $line"
+        elif [ $want_sticky = 0 ] && ! echo "$line" | grep -Eq 'switches=[0-9]{2,}'; then
+            why="no switches: $line"
+        elif [ $want_sticky = 0 ] && ! echo "$line" | grep -Eq 'samples=[0-9]{2,}'; then
+            why="the sampler never looked: $line"
+        elif ! echo "$line" | grep -q 'violations=0$'; then
+            why="a thread ran a plain block next to another: $line"
+        fi
+        if [ -z "$why" ]; then
+            echo "PASS $name-$arg"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$arg ($why)"; fail=$((fail+1))
+        fi
+    done
+    OCERZ_TCACHE=off run_bounded "$dir/off.out" "$dir/off.err" "$OCERZ" "$dir/$name"
+    if [ "$(cat "$dir/off.out")" = OK ]; then
+        echo "PASS $name-off"; pass=$((pass+1))
+    else
+        echo "FAIL $name-off (got out='$(cat "$dir/off.out")')"; fail=$((fail+1))
+    fi
+}
+
+run_sr_case dsr_switch
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 export OCERZ_TSO_NARROW=1
