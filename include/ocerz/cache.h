@@ -55,4 +55,8 @@ const uint8_t *ocerz_cache_uuid(void);
 void ocerz_cache_prefork(void);
 void ocerz_cache_postfork(void);
 
+/* the process that keeps the cache's files mapped between launches (src/cache_holder.c) */
+void ocerz_cache_holder_note(const uint8_t *uuid, const char *dir);
+int ocerz_cache_holder_main(int argc, char **argv);
+
 #endif

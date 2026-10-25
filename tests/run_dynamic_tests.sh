@@ -1100,7 +1100,67 @@ run_syslink_case() {
     fi
 }
 
+# The cache holder (src/cache_holder.c), with its lock in a directory of the
+# test's own and a 3-second idle: the first launch starts one, the guest's wait
+# for all its children does not wait for it (it is nobody's child but
+# launchd's), a second launch starts none and only touches the lock, the
+# holder goes by itself once no launch comes, and OCERZ_NO_CACHE_HOLDER=1
+# starts none.  Only a holder whose command line names this test's directory is
+# ever stopped.
+hold_stop() {
+    local p
+    for p in $(pgrep -f -- "-hold-cache $1/" 2>/dev/null); do kill "$p" 2>/dev/null; done
+}
+run_holder_case() {
+    local dir="$TMP/dholder" lock pid pid2 out t0 t1 m1 m2 gone=0 i
+    mkdir -p "$dir/a" "$dir/b"
+    t0=$(date +%s)
+    out=$(env -u OCERZ_NO_CACHE_HOLDER OCERZ_CACHE_HOLDER_DIR="$dir/a" OCERZ_CACHE_HOLDER_IDLE=3 \
+          "$OCERZ" /bin/sh -c 'wait; echo waited' 2>&1)
+    t1=$(date +%s)
+    lock=$(ls "$dir/a"/ocerz-cache-holder-* 2>/dev/null | head -1)
+    sleep 0.5
+    pid=$([ -n "$lock" ] && head -1 "$lock")
+    if [ "$out" = waited ] && [ $((t1 - t0)) -le 2 ] && [ -n "$pid" ] &&
+       ps -o ppid=,command= -p "$pid" 2>/dev/null | grep -q -- "^ *1 .*-hold-cache $dir/a/"; then
+        echo "PASS dholder-start"; pass=$((pass+1))
+    else
+        echo "FAIL dholder-start (out='$out' secs=$((t1 - t0)) pid='$pid' ps='$(ps -o ppid=,command= -p "${pid:-0}" 2>&1)')"
+        fail=$((fail+1))
+    fi
+    m1=$(stat -f %m "$lock" 2>/dev/null)
+    sleep 1.2
+    out=$(env -u OCERZ_NO_CACHE_HOLDER OCERZ_CACHE_HOLDER_DIR="$dir/a" OCERZ_CACHE_HOLDER_IDLE=3 \
+          "$OCERZ" /usr/bin/uname -m 2>&1)
+    m2=$(stat -f %m "$lock" 2>/dev/null)
+    pid2=$(head -1 "$lock" 2>/dev/null)
+    if [ "$out" = x86_64 ] && [ "$pid2" = "$pid" ] && [ -n "$m1" ] && [ "${m2:-0}" -gt "$m1" ] &&
+       [ "$(pgrep -f -- "-hold-cache $dir/a/" | wc -l | tr -d ' ')" = 1 ]; then
+        echo "PASS dholder-again"; pass=$((pass+1))
+    else
+        echo "FAIL dholder-again (out='$out' pid=$pid pid2=$pid2 mtime $m1 -> $m2)"; fail=$((fail+1))
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if ! kill -0 "$pid" 2>/dev/null; then gone=1; break; fi
+        sleep 0.5
+    done
+    if [ $gone = 1 ]; then
+        echo "PASS dholder-idle"; pass=$((pass+1))
+    else
+        echo "FAIL dholder-idle (holder $pid still there 10 s after the last launch)"; fail=$((fail+1))
+    fi
+    out=$(OCERZ_NO_CACHE_HOLDER=1 OCERZ_CACHE_HOLDER_DIR="$dir/b" "$OCERZ" /usr/bin/uname -m 2>&1)
+    if [ "$out" = x86_64 ] && [ -z "$(ls "$dir/b")" ]; then
+        echo "PASS dholder-off"; pass=$((pass+1))
+    else
+        echo "FAIL dholder-off (out='$out' dir: $(ls "$dir/b"))"; fail=$((fail+1))
+    fi
+    hold_stop "$dir/a"
+    hold_stop "$dir/b"
+}
+
 run_syslink_case
+run_holder_case
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 export OCERZ_TSO_NARROW=1

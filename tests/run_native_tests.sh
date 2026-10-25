@@ -15410,6 +15410,12 @@ case_sys sys_strings "$SYS_STRINGS_BIN" "$SYS_STRINGS_ARM64" sys_strings "$SYS_S
 case_sys_strings_inplace
 case_sys_strings_fault
 
+# sys_proc starts a child with an environment of its own, in which nothing says
+# no cache holder, so that child starts one as any launch would
+# (src/cache_holder.c); stop the holders this script's ocerz started.
+self_abs="$(cd "$(dirname "$OCERZ")" && pwd)/$(basename "$OCERZ")"
+for p in $(pgrep -f -- "$self_abs -hold-cache " 2>/dev/null); do kill "$p" 2>/dev/null; done
+
 echo "----------------------------------------"
 echo "native tests: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

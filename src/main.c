@@ -101,6 +101,7 @@
 #include "ocerz/dyld.h"
 #include "ocerz/mode.h"
 #include "ocerz/tcache.h"
+#include "ocerz/cache.h"
 
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -494,6 +495,8 @@ static void restore_guest_insertion(void)
 
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && strcmp(argv[1], "-hold-cache") == 0)   /* before anything else: it is no launch */
+        return ocerz_cache_holder_main(argc, argv);
     {
         const char *ef = getenv("OCERZ_STDERR_FILE");
         int efd = ef && ef[0] ? open(ef, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;

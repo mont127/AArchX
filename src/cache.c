@@ -673,6 +673,7 @@ int ocerz_cache_map(OcerzCache *c)
     g_named_cache = c;
     OCERZ_LOG("shared cache mapped at %#llx, %u images\n",
               (unsigned long long)c->base, c->images_cnt);
+    ocerz_cache_holder_note(c->hdr + 0x58, dir);
     return OCERZ_OK;
 }
 

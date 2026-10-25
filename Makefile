@@ -30,6 +30,7 @@
 # measure, not a pass/fail. Pass --min-coverage N to turn it into a gate.
 CC := clang
 export OCERZ_TCACHE ?= off
+export OCERZ_NO_CACHE_HOLDER ?= 1
 ARCHFLAGS := -arch arm64
 CFLAGS := $(ARCHFLAGS) -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Iinclude -MMD -MP
 LDFLAGS := $(ARCHFLAGS)

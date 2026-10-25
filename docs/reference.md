@@ -75,6 +75,22 @@ weakly, which a process binding a C++ library would otherwise build for itself.
 | `OCERZ_TCACHE=verify` | a check, not for use: translate everything anyway and compare each block with the stored one |
 | `OCERZ_TCACHE=roundtrip` | a check, not for use: store nothing, but move every translation to a new address and report anything in it that still pointed at the old one |
 
+### Keeping the shared cache mapped
+
+A program that uses the system libraries maps the x86 shared cache's files
+first. That takes a few milliseconds when no other process has them mapped
+(more on a busy Mac) and a tenth of a millisecond when one has. So the first
+such launch starts `ocerz -hold-cache`, a small process that maps the files
+read-only, reads none of them, and quits once no launch has come for ten
+minutes or macOS has replaced the cache. It shows up in Activity Monitor while
+it runs. Later launches find it through a lock file in the user's temporary
+directory.
+
+| Variable | Effect |
+| --- | --- |
+| `OCERZ_NO_CACHE_HOLDER=1` | start no holder |
+| `OCERZ_CACHE_HOLDER_IDLE=<seconds>` | how long a holder waits for the next launch (600 by default) |
+
 ### Memory ordering
 
 x86 has a stronger memory model than arm64. A program that never creates a
