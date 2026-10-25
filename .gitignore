@@ -9,6 +9,7 @@ notes/
 .notes
 MacNdCheese-WineEngine-PRIVATE/
 /ocerz
+/ocerz-umbrella
 /AArchX.app/
 tests/__pycache__/
 tools/cxx/build/

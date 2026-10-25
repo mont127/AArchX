@@ -1067,6 +1067,40 @@ run_sr_case() {
 }
 
 run_sr_case dsr_switch
+# src/syslink.c: an ocerz an import of which loads NULL (a macOS that moved it to another of libSystem's
+# libraries) executes ocerz-umbrella beside its real file, found through a symbolic link, with its arguments, and
+# with none there says so and exits 127; OCERZ_TEST_SYSLINK_FALLBACK=1 takes that path with every import there.
+# The ocerz-umbrella the build makes must run as ocerz does.
+run_syslink_case() {
+    local dir="$TMP/dsyslink" out rc
+    mkdir -p "$dir/real" "$dir/bin"
+    cp "$OCERZ" "$dir/real/ocerz"
+    ln -sf ../real/ocerz "$dir/bin/ocerz"
+    printf '#!/bin/sh\necho "umbrella $*"\n' > "$dir/real/ocerz-umbrella"
+    chmod +x "$dir/real/ocerz-umbrella"
+    out=$(OCERZ_TEST_SYSLINK_FALLBACK=1 "$dir/bin/ocerz" --version x 2>&1)
+    if [ "$out" = "umbrella --version x" ]; then
+        echo "PASS dsyslink-fallback"; pass=$((pass+1))
+    else
+        echo "FAIL dsyslink-fallback (got '$out')"; fail=$((fail+1))
+    fi
+    rm -f "$dir/real/ocerz-umbrella"
+    out=$(OCERZ_TEST_SYSLINK_FALLBACK=1 "$dir/bin/ocerz" --version 2>&1)
+    rc=$?
+    if [ $rc = 127 ] && echo "$out" | grep -q 'reinstall AArchX'; then
+        echo "PASS dsyslink-missing"; pass=$((pass+1))
+    else
+        echo "FAIL dsyslink-missing (rc=$rc out='$out')"; fail=$((fail+1))
+    fi
+    out=$("$(dirname "$OCERZ")/ocerz-umbrella" --version 2>&1)
+    if [ "$out" = "$("$OCERZ" --version 2>&1)" ] && [ -n "$out" ]; then
+        echo "PASS dsyslink-umbrella"; pass=$((pass+1))
+    else
+        echo "FAIL dsyslink-umbrella (got '$out')"; fail=$((fail+1))
+    fi
+}
+
+run_syslink_case
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 export OCERZ_TSO_NARROW=1

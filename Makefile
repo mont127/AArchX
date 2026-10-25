@@ -34,6 +34,11 @@ ARCHFLAGS := -arch arm64
 CFLAGS := $(ARCHFLAGS) -std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Iinclude -MMD -MP
 LDFLAGS := $(ARCHFLAGS)
 LDLIBS := -lcompression -lobjc
+# libSystem's sub-libraries, linked weak ahead of libSystem itself so that dyld finds each import where it lives
+# (src/syslink.c); ocerz-umbrella is the same program linked through libSystem alone, its fallback
+SYSLIB_DIR := $(shell xcrun --show-sdk-path)/usr/lib/system
+SYSLIBS := $(foreach l,system_c system_kernel system_pthread system_malloc system_platform dyld system_m \
+             system_info dispatch system_blocks compiler_rt launch,-Wl,-weak_library,$(SYSLIB_DIR)/lib$(l).tbd)
 
 SRCS := $(wildcard src/*.c)
 ASRCS := $(wildcard src/*.s)
@@ -46,7 +51,8 @@ UNIT_SRCS := $(wildcard tests/unit/*.c)
 UNIT_BINS := $(UNIT_SRCS:tests/unit/%.c=tests/unit/bin/%)
 
 ocerz: $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(SYSLIBS) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o ocerz-umbrella $(OBJS) $(LDLIBS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
