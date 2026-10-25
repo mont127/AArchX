@@ -2873,41 +2873,19 @@ static uint64_t find_dylib_init(OcerzCache *cache, const char *substr)
     return 0;
 }
 
-#define DEPMAP_BITS 13
-static struct { const char *path; uint64_t mh; } g_depmap[1u << DEPMAP_BITS];
-static int g_depmap_built;
 static uint32_t depmap_hash(const char *s)
 {
     uint32_t h = 2166136261u;
     while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
     return h;
 }
-static void depmap_build(OcerzCache *cache)
-{
-    for (uint32_t i = 0; i < cache->images_cnt; i++) {
-        const char *p = NULL;
-        uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
-        if (!mh || !p) continue;
-        uint32_t h = depmap_hash(p) & ((1u << DEPMAP_BITS) - 1);
-        while (g_depmap[h].path) {
-            if (strcmp(g_depmap[h].path, p) == 0) break;
-            h = (h + 1) & ((1u << DEPMAP_BITS) - 1);
-        }
-        if (!g_depmap[h].path) { g_depmap[h].path = p; g_depmap[h].mh = mh; }
-    }
-    g_depmap_built = 1;
-}
+/* A cache image by its path, through cache.c's index of them (the first image of a path, as dyld takes), else an alias. */
 static uint64_t dep_find(OcerzCache *cache, const char *path)
 {
     if (!cache)
         return 0;
-    if (!g_depmap_built) depmap_build(cache);
-    uint32_t h = depmap_hash(path) & ((1u << DEPMAP_BITS) - 1);
-    for (unsigned n = 0; n < (1u << DEPMAP_BITS) && g_depmap[h].path; n++) {
-        if (strcmp(g_depmap[h].path, path) == 0) return g_depmap[h].mh;
-        h = (h + 1) & ((1u << DEPMAP_BITS) - 1);
-    }
-    return ocerz_cache_find_alias(cache, path);
+    uint64_t mh = ocerz_cache_image_of_path(cache, path, NULL);
+    return mh ? mh : ocerz_cache_find_alias(cache, path);
 }
 
 static uint64_t dep_mh(OcerzCache *cache, const char *path)
@@ -7183,6 +7161,20 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         ocerz_bridge_set_process_args(argc, argv);
     }
 
+    /*
+     * The program's profile opens once the program is mapped, before its
+     * disk dependencies load and its fixups are applied: the warm thread
+     * (tcache.c) then has that time, 0.3 ms for uname and 1.4 ms for perl's
+     * libperl, to decode the records the initializers will ask for, which the
+     * guest's thread decoded itself when they came too late.  The prefault
+     * thread waits for the JIT, which ocerz_vm_install_handlers creates.
+     */
+    if (!g_aot_n && ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled) {
+        ocerz_tcache_profile_open(profile_ident(img.slice, img.path), ocerz_cache_uuid(), img.path);
+        if (ocerz_tcache_profile_ordered())
+            ocerz_jit_start_ordered(vm);
+    }
+
     RpathList main_rpaths;
     collect_rpaths(&img, NULL, &main_rpaths);
     g_flat_defer = ocerz_mode == OCERZ_MODE_NATIVE;
@@ -7280,10 +7272,6 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         OCERZ_LOG("dynamic: dyld API shim not installed\n");
     if (g_aot_n)
         return aot_run(vm, &cache, 1);
-    if (ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled)
-        ocerz_tcache_profile_open(profile_ident(g_main_dimg.slice, g_main_dimg.path), ocerz_cache_uuid(), g_main_dimg.path);
-    if (ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled && ocerz_tcache_profile_ordered())
-        ocerz_jit_start_ordered(vm);
     if (ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled)
         ocerz_jit_prefault(vm, ocerz_tcache_profile_entries());
 
