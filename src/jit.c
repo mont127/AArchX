@@ -22703,16 +22703,40 @@ static uint32_t *tc_roundtrip(OcerzJit *jit, JitBlock *blk, uint32_t *entry)
     return c;
 }
 
-/* The records tc_load_ahead loads in one go, not in the cache yet (tc_batch_end). */
-#define TC_BATCH_MAX 64
+/*
+ * The records tc_load_ahead loads in one go, not in the cache yet
+ * (tc_batch_end), and an index of them by key: every edge of the batch whose
+ * target is not in the cache asks it, so scanning the batch made bigger
+ * batches cost more than the misses they save.
+ */
+#define TC_BATCH_MAX 256
+#define TCB_SLOTS 512
 static JitBlock *g_tcb_blk[TC_BATCH_MAX];
+static uint16_t g_tcb_ix[TCB_SLOTS];      /* an index into g_tcb_blk + 1, 0 for none */
 static int g_tcb_n, g_tcb_on;
+
+static void tcb_add(JitBlock *blk)
+{
+    unsigned h = hash_key(blk->key) & (TCB_SLOTS - 1);
+    while (g_tcb_ix[h])
+        h = (h + 1) & (TCB_SLOTS - 1);
+    g_tcb_blk[g_tcb_n++] = blk;
+    g_tcb_ix[h] = (uint16_t)g_tcb_n;
+}
+
+static void tcb_clear(void)
+{
+    g_tcb_n = 0;
+    memset(g_tcb_ix, 0, sizeof g_tcb_ix);
+}
 
 static JitBlock *tcb_find(uint64_t key)
 {
-    for (int i = 0; i < g_tcb_n; i++)
-        if (g_tcb_blk[i]->key == key)
-            return g_tcb_blk[i];
+    if (!g_tcb_n)
+        return NULL;
+    for (unsigned h = hash_key(key) & (TCB_SLOTS - 1); g_tcb_ix[h]; h = (h + 1) & (TCB_SLOTS - 1))
+        if (g_tcb_blk[g_tcb_ix[h] - 1]->key == key)
+            return g_tcb_blk[g_tcb_ix[h] - 1];
     return NULL;
 }
 
@@ -23764,7 +23788,7 @@ static JitBlock *tc_load_built(OcerzJit *jit, const TcView *vp, uint64_t rip, in
     }
     if (fold && g_tcb_on && g_tcb_n < TC_BATCH_MAX) {
         jit_wx(1);
-        g_tcb_blk[g_tcb_n++] = blk;
+        tcb_add(blk);
         g_tc_n_load++;
         tc_prof_note(rip);
         return blk;
@@ -23844,7 +23868,7 @@ static void tc_batch_end(OcerzJit *jit)
         __asm__ volatile("ic ivau, %0" :: "r"(g_chain_defer[i]) : "memory");
     __asm__ volatile("dsb ish\n\tisb" ::: "memory");
     __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
-    g_tcb_n = 0;
+    tcb_clear();
     for (int i = 0; i < n; i++)
         cache_insert(jit, g_tcb_blk[i]);
     if (!g_no_chain) {
@@ -23884,12 +23908,12 @@ static uint64_t tc_image_rec_rip(const OcerzTcRecHead *h, const TcPrep *p)
  * the process's memory model, not loaded yet, nothing learned against it.
  * A disk image's record is loaded where its image is now (tc_image_rec_rip);
  * a 32-bit one waits for the translator.
- * OCERZ_TCACHE_AHEAD=<n> loads up to n (8), 0 none.
+ * OCERZ_TCACHE_AHEAD=<n> loads up to n (127), 0 none.
  */
 static void tc_load_ahead(OcerzJit *jit)
 {
     static int max = -1;
-    if (max < 0) { const char *e = getenv("OCERZ_TCACHE_AHEAD"); max = e ? atoi(e) : 8; }
+    if (max < 0) { const char *e = getenv("OCERZ_TCACHE_AHEAD"); max = e ? atoi(e) : 127; }
     int pm = g_plain_mem;
     uint64_t pk = g_tc_key, plo = g_tc_img_lo, phi = g_tc_img_hi, pid = g_tc_img_id;
     static int hold = -1;
