@@ -954,6 +954,13 @@ static void test_removed_calls(void)
     int32_t st = (int32_t)call("__LSCopyDefaultSchemeHandlerURL", 2, (uint32_t[]){ m32_handle(cfstr(NULL, "http", 0x08000100)), DATA + 0x21b0 });
     uint32_t app = m32_rd(DATA + 0x21b0);
     check("_LSCopyDefaultSchemeHandlerURL answers a URL or none", (st == 0 && app != 0) || (st == -10814 && app == 0));
+    m32_wr(DATA + 0x21b4, 0);   /* CL_SUCCESS, as a program's local could be */
+    check("clCreateContextFromType answers no context", call("_clCreateContextFromType", 5,
+                                                         (uint32_t[]){ 0, 4 /* CL_DEVICE_TYPE_GPU */, 0, 0, DATA + 0x21b4 }) == 0 &&
+                                                         (int32_t)m32_rd(DATA + 0x21b4) == -1);
+    m32_wr(DATA + 0x21b4, 0);
+    check("... and clCreateContext", call("_clCreateContext", 6, (uint32_t[]){ 0, 1, DATA + 0x21b8, 0, 0, DATA + 0x21b4 }) == 0 &&
+                                     (int32_t)m32_rd(DATA + 0x21b4) == -1);
 }
 
 static void test_menus_controls(uint32_t w)
@@ -984,6 +991,17 @@ static void test_menus_controls(uint32_t w)
     check("GetMenuBar", bar != 0);
     call("_SetMenuBar", 1, (uint32_t[]){ bar });
     call("_DisposeMenuBar", 1, (uint32_t[]){ bar });
+    /* HMGetHelpMenu fills both outputs (GRID 2 retained the MenuRef it was left with), the same menu every time */
+    m32_wr(DATA + 0x1018, 0xc2000008);
+    *(uint16_t *)m32_h(DATA + 0x101c) = 0xffff;
+    check("HMGetHelpMenu answers a menu", call("_HMGetHelpMenu", 2, (uint32_t[]){ DATA + 0x1018, DATA + 0x101c }) == 0 &&
+                                          m32_rd(DATA + 0x1018) && m32_rd(DATA + 0x1018) != 0xc2000008);
+    uint32_t help = m32_rd(DATA + 0x1018);
+    check("... its first free item after the ones it has",
+          *(uint16_t *)m32_h(DATA + 0x101c) == (uint16_t)(cross(CARBON, "_CountMenuItems", 1, (uint32_t[]){ help }) + 1));
+    m32_wr(DATA + 0x1018, 0);
+    call("_HMGetHelpMenu", 2, (uint32_t[]){ DATA + 0x1018, 0 });
+    check("... and the same one again", m32_rd(DATA + 0x1018) == help);
 
     /* a push button: its reference value, 32-bit value, region and hit part */
     uint32_t r = qd_rect(DATA + 0x1020, 20, 30, 40, 130);

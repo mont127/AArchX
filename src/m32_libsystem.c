@@ -1793,6 +1793,20 @@ static int sp_MD5_Final(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 #pragma clang diagnostic pop
 
+/* clCreateContext(props, n, devices, notify, data, errcode_ret) and clCreateContextFromType(props, type, notify, data,
+ * errcode_ret): m32 crosses no OpenCL, and answered both with a NULL context and *errcode_ret as it was, which a
+ * program that tests the error code took for CL_SUCCESS (GRID 2 calls clCreateContextFromType).  They answer NULL
+ * and CL_DEVICE_NOT_FOUND (-1), as on a Mac with no OpenCL device. */
+static int cl_no_context(OcerzCPU *cpu, int err_arg)
+{
+    uint32_t err = m32_arg(cpu, err_arg);
+    if (err)
+        m32_wr(err, (uint32_t)-1);
+    return RETV_PLAIN(0);
+}
+static int sp_clCreateContext(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; return cl_no_context(cpu, 5); }
+static int sp_clCreateContextFromType(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; return cl_no_context(cpu, 4); }
+
 /* localeconv() and localeconv_l(locale): a struct lconv is ten string pointers and fourteen chars, 56 bytes on i386
  * (the chars at 40) and 96 on arm64 (at 80, clang -arch i386 and -arch arm64).  Crossed, the guest read the host's
  * structure as its own, and GLib's g_ascii_strtod found an empty decimal point and asserted (Wesnoth).  The guest
@@ -2078,6 +2092,7 @@ static const M32SpecialEntry g_specials[] = {
     { "_getopt", sp_getopt }, { "_getopt_long", sp_getopt_long }, { "_getopt_long_only", sp_getopt_long_only },
     { "_localeconv", sp_localeconv }, { "_localeconv_l", sp_localeconv_l },
     { "_MD5_Init", sp_MD5_Init }, { "_MD5_Update", sp_MD5_Update }, { "_MD5_Final", sp_MD5_Final },
+    { "_clCreateContext", sp_clCreateContext }, { "_clCreateContextFromType", sp_clCreateContextFromType },
     { "_dispatch_once", sp_dispatch_once }, { "_dispatch_once_f", sp_dispatch_once_f },
     { "__keymgr_get_and_lock_processwide_ptr_2", sp_keymgr_get_lock_2 },
     { "__keymgr_get_and_lock_processwide_ptr", sp_keymgr_get_lock },
