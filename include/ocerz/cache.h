@@ -47,6 +47,8 @@ uint64_t ocerz_cache_resolve_from_image(OcerzCache *c, uint64_t mh, const char *
 uint64_t ocerz_cache_dlsym_image(OcerzCache *c, uint64_t mh, const char *symbol, int *found);
 uint64_t ocerz_cache_image_addr(OcerzCache *c, uint32_t i, const char **path_out);
 uint64_t ocerz_cache_find_alias(OcerzCache *c, const char *path);
+/* the image a path names exactly (no alias), and the cache's own copy of the path */
+uint64_t ocerz_cache_image_of_path(OcerzCache *c, const char *path, const char **cache_path);
 const char *ocerz_cache_name_for_addr(uint64_t addr, uint64_t *base_out);
 const uint8_t *ocerz_cache_uuid(void);
 

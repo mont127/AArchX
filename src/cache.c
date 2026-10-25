@@ -863,12 +863,22 @@ typedef struct CacheIndex {
 enum { DEP_LOAD, DEP_REEXPORT, DEP_UPWARD };
 static CacheIndex *g_cix;
 
+/* eight bytes at a time: every launch hashes the cache's 3500-odd image paths into the index (cix_get), a quarter
+   of a millisecond byte by byte */
 static uint32_t cix_str_hash(const char *s)
 {
-    uint32_t h = 2166136261u;
-    for (; *s; s++)
-        h = (h ^ (unsigned char)*s) * 16777619u;
-    return h;
+    size_t n = strlen(s);
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+    for (; n >= 8; n -= 8, s += 8) {
+        uint64_t w;
+        memcpy(&w, s, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdull;
+        h ^= h >> 32;
+    }
+    uint64_t t = 0;
+    memcpy(&t, s, n);
+    h = (h ^ t) * 0xc4ceb9fe1a85ec53ull;
+    return (uint32_t)(h ^ (h >> 29));
 }
 
 static uint32_t cix_mh_hash(uint64_t mh)
@@ -949,6 +959,24 @@ static uint32_t cix_by_mh(CacheIndex *ix, uint64_t mh)
             return i;
     }
     return CIX_NONE;
+}
+
+uint64_t ocerz_cache_image_of_path(OcerzCache *c, const char *path, const char **cache_path)
+{
+    CacheIndex *ix = cix_get(c);
+    uint32_t i = CIX_NONE;
+    if (ix) {
+        i = cix_by_path(ix, path);
+    } else {
+        for (uint32_t k = 0; k < c->images_cnt && i == CIX_NONE; k++) {
+            const char *p = NULL;
+            if (ocerz_cache_image_addr(c, k, &p) && p && strcmp(p, path) == 0)
+                i = k;
+        }
+    }
+    if (i == CIX_NONE)
+        return 0;
+    return ocerz_cache_image_addr(c, i, cache_path);
 }
 
 static uint64_t cache_image_by_path(OcerzCache *c, const char *path)

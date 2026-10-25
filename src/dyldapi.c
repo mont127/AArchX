@@ -414,86 +414,12 @@ static uint64_t image_slide(uint64_t mh)
 #define OBJC_OPTS_SEL_TABLE 0x18
 #define OBJC_OPTS_SEL_BASE 0x30
 
-typedef struct CachePathSlot {
-    const char *path;
-    uint64_t mh;
-} CachePathSlot;
-
-static CachePathSlot *_Atomic g_cache_paths;
-static uint32_t g_cache_paths_mask;
-static struct OcerzCache *g_cache_paths_of;
-static pthread_mutex_t g_cache_paths_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static uint32_t cache_path_hash(const char *s)
-{
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (; *s; s++) {
-        h ^= (uint8_t)*s;
-        h *= 0x100000001b3ull;
-    }
-    return (uint32_t)(h ^ (h >> 32));
-}
-
-static CachePathSlot *cache_paths_index(struct OcerzCache *cache)
-{
-    CachePathSlot *have = atomic_load(&g_cache_paths);
-    if (have && g_cache_paths_of == cache)
-        return have;
-    pthread_mutex_lock(&g_cache_paths_lock);
-    have = atomic_load(&g_cache_paths);
-    if (!have || g_cache_paths_of != cache) {
-        uint32_t cap = 16;
-        while (cap < cache->images_cnt * 2 + 16)
-            cap <<= 1;
-        CachePathSlot *made = calloc(cap, sizeof *made);
-        if (made) {
-            for (uint32_t i = 0; i < cache->images_cnt; i++) {
-                const char *p = NULL;
-                uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
-                if (!mh || !p)
-                    continue;
-                uint32_t at = cache_path_hash(p) & (cap - 1);
-                while (made[at].path && strcmp(made[at].path, p) != 0)
-                    at = (at + 1) & (cap - 1);
-                if (!made[at].path) {
-                    made[at].path = p;
-                    made[at].mh = mh;
-                }
-            }
-            g_cache_paths_mask = cap - 1;
-            g_cache_paths_of = cache;
-            atomic_store(&g_cache_paths, made);
-            have = made;
-        }
-    }
-    pthread_mutex_unlock(&g_cache_paths_lock);
-    return have;
-}
-
+/* the cache's image of a path, by its own index (ocerz_cache_image_of_path), then an alias */
 static uint64_t cache_find_path_ex(struct OcerzCache *cache, const char *path, const char **cache_path)
 {
-    CachePathSlot *index = cache_paths_index(cache);
-    if (!index) {
-        for (uint32_t i = 0; i < cache->images_cnt; i++) {
-            const char *p = NULL;
-            uint64_t mh = ocerz_cache_image_addr(cache, i, &p);
-            if (mh && p && strcmp(p, path) == 0) {
-                if (cache_path)
-                    *cache_path = p;
-                return mh;
-            }
-        }
-        return 0;
-    }
-    uint32_t at = cache_path_hash(path) & g_cache_paths_mask;
-    while (index[at].path) {
-        if (strcmp(index[at].path, path) == 0) {
-            if (cache_path)
-                *cache_path = index[at].path;
-            return index[at].mh;
-        }
-        at = (at + 1) & g_cache_paths_mask;
-    }
+    uint64_t mh = ocerz_cache_image_of_path(cache, path, cache_path);
+    if (mh)
+        return mh;
     uint64_t alias = ocerz_cache_find_alias(cache, path);
     if (alias && cache_path) {
         *cache_path = NULL;
