@@ -601,6 +601,18 @@ static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v;
 static void wr64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
 static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 
+/*
+ * A file's bytes, mapped copy-on-write rather than read: a loader reads its headers and copies the segments of one
+ * slice, and of a universal file never touches the others.  libperl.dylib is 9 MB, both slices, and was read whole in
+ * 1.4 ms of every perl launch; sqlite3's 6 MB executable was read three times, to peek at it, to name it and to run
+ * it.  free_file gives back what read_file mapped and frees anything else; a file it cannot map, or the 1025th still
+ * mapped, is read as before.
+ */
+#define RF_MAX 1024
+static struct { uint8_t *p; size_t n; } g_rf[RF_MAX];
+static int g_rf_n;
+static pthread_mutex_t g_rf_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static uint8_t *read_file(const char *path, size_t *len_out)
 {
     int fd = open(path, O_RDONLY);
@@ -611,19 +623,42 @@ static uint8_t *read_file(const char *path, size_t *len_out)
         close(fd);
         return NULL;
     }
-    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf) {
-        close(fd);
-        return NULL;
+    pthread_mutex_lock(&g_rf_lock);
+    uint8_t *buf = g_rf_n < RF_MAX && !getenv("OCERZ_NO_MAP_FILES")
+                 ? (uint8_t *)mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) : (uint8_t *)MAP_FAILED;
+    if (buf != (uint8_t *)MAP_FAILED) {
+        g_rf[g_rf_n].p = buf;
+        g_rf[g_rf_n].n = (size_t)sz;
+        g_rf_n++;
     }
-    if (pread(fd, buf, (size_t)sz, 0) != (ssize_t)sz) {
-        free(buf);
-        close(fd);
-        return NULL;
+    pthread_mutex_unlock(&g_rf_lock);
+    if (buf == (uint8_t *)MAP_FAILED) {
+        buf = (uint8_t *)malloc((size_t)sz);
+        if (!buf || pread(fd, buf, (size_t)sz, 0) != (ssize_t)sz) {
+            free(buf);
+            close(fd);
+            return NULL;
+        }
     }
     close(fd);
     *len_out = (size_t)sz;
     return buf;
+}
+
+static void free_file(void *p)
+{
+    if (!p)
+        return;
+    pthread_mutex_lock(&g_rf_lock);
+    for (int i = g_rf_n - 1; i >= 0; i--)
+        if (g_rf[i].p == p) {
+            munmap(p, g_rf[i].n);
+            g_rf[i] = g_rf[--g_rf_n];
+            pthread_mutex_unlock(&g_rf_lock);
+            return;
+        }
+    pthread_mutex_unlock(&g_rf_lock);
+    free(p);
 }
 
 static const uint8_t *select_slice(const uint8_t *buf, size_t len)
@@ -662,7 +697,7 @@ int ocerz_peek_dynamic(const char *path)
         return -1;
     const uint8_t *slice = select_slice(buf, flen);
     if (!slice) {
-        free(buf);
+        free_file(buf);
         return -2;
     }
     uint32_t ncmds = rd32(slice + 16);
@@ -682,7 +717,7 @@ int ocerz_peek_dynamic(const char *path)
     }
     if (dynamic < 0 && has_thread)
         dynamic = has_dylinker;
-    free(buf);
+    free_file(buf);
     return dynamic;
 }
 
@@ -1110,7 +1145,7 @@ uint64_t ocerz_dyld_file_ident(const char *path)
     uint8_t *buf = read_file(path, &flen);
     const uint8_t *slice = buf ? select_slice(buf, flen) : NULL;
     uint64_t id = slice && rd32(slice + 12) == MH_EXECUTE ? profile_ident(slice, path) : 0;
-    free(buf);
+    free_file(buf);
     return id;
 }
 
@@ -4212,7 +4247,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         if (!vbuf || vlen == 0) {
             OCERZ_FATAL("cannot synthesize %s\n", install_name);
             native_dl_reason("its API database would not build an image", NULL);
-            free(vbuf);
+            free_file(vbuf);
             return NULL;
         }
         DynImage *v = &g_dimgs[g_dimgs_n++];
@@ -4229,7 +4264,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
             native_dl_reason("its synthesized image could not be mapped", NULL);
             g_dimgs_n--;
             dimg_changed();
-            free(vbuf);
+            free_file(vbuf);
             return NULL;
         }
         protect_ro_segments(v);
@@ -4305,7 +4340,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
             OCERZ_FATAL("incompatible architecture: %s has no x86_64 slice\n", resolved);
         native_dl_reason("%s has no x86_64 slice, so it is a native library without an API database", resolved);
         g_ndl.host_only = 1;
-        free(buf);
+        free_file(buf);
         return NULL;
     }
 
@@ -4325,7 +4360,7 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
         dimg_changed();
-        free(buf);
+        free_file(buf);
         return NULL;
     }
 
@@ -4447,7 +4482,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path, 
     const uint8_t *slice = select_slice(buf, flen);
     if (!slice) {
         dlerror_set("dlopen(%s): no compatible x86_64 slice", install_path);
-        free(buf);
+        free_file(buf);
         return NULL;
     }
     DynImage *d = &g_dimgs[g_dimgs_n++];
@@ -4463,7 +4498,7 @@ static DynImage *dlopen_load_image(OcerzCache *cache, const char *install_path, 
         dlerror_set("dlopen(%s): cannot map segments", install_path);
         g_dimgs_n--;
         dimg_changed();
-        free(buf);
+        free_file(buf);
         return NULL;
     }
     RpathList *merged = malloc(sizeof *merged);
@@ -6155,7 +6190,7 @@ static int ndl_try(const char *cand, NdlTarget *t)
             snprintf(t->path, sizeof t->path, "%s", abs);
             return 1;
         }
-        free(buf);
+        free_file(buf);
         if (magic == MH_MAGIC_64 || magic == MH_MAGIC || magic == FAT_MAGIC || magic == FAT_CIGAM ||
             magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64) {
             t->kind = NDL_NATIVE_ONLY;
@@ -6283,7 +6318,7 @@ static DynImage *ndl_load_file(NdlTarget *t, const RpathList *chain)
         native_dl_reason("its segments could not be mapped", NULL);
         g_dimgs_n--;
         dimg_changed();
-        free(d->owned_buf);
+        free_file(d->owned_buf);
         memset(d, 0, sizeof *d);
         return NULL;
     }
@@ -6317,7 +6352,7 @@ static void ndl_rollback(int before)
         protect_ro_drop(d);
         if (d->map_size)
             ocerz_unmap(d->map_base, d->map_size);
-        free(d->owned_buf);
+        free_file(d->owned_buf);
         memset(d, 0, sizeof *d);
     }
     g_dimgs_n = before;
@@ -6455,7 +6490,7 @@ static uint64_t ndl_dlopen_locked(struct OcerzVM *vm, const char *path, int mode
         load = 1;
     }
     if (!load) {
-        free(t->buf);
+        free_file(t->buf);
         free(t);
         return handle;
     }
@@ -6473,7 +6508,7 @@ static uint64_t ndl_dlopen_locked(struct OcerzVM *vm, const char *path, int mode
         free(chain);
     }
     g_ndl.active = 0;
-    free(t->buf);
+    free_file(t->buf);
     free(t);
     if (!top || g_ndl.missing[0] || g_native_miss_n > miss_before ||
         g_native_miss_dropped > dropped_before) {
@@ -6561,7 +6596,7 @@ int ocerz_dyld_native_dlopen_preflight(const char *path, uint64_t caller)
         ok = 1;
     }
     if (t)
-        free(t->buf);
+        free_file(t->buf);
     free(t);
     pthread_mutex_unlock(&g_load_lock);
     return ok;
@@ -7051,7 +7086,7 @@ int ocerz_dyld_filetype(const char *path)
     uint8_t *buf = read_file(path, &flen);
     const uint8_t *slice = buf ? select_slice(buf, flen) : NULL;
     int t = slice ? (int)rd32(slice + 12) : -1;
-    free(buf);
+    free_file(buf);
     return t;
 }
 
@@ -7113,7 +7148,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     const uint8_t *slice = select_slice(buf, flen);
     if (!slice) {
         OCERZ_FATAL("%s has no x86_64 slice\n", path);
-        free(buf);
+        free_file(buf);
         return OCERZ_EFORMAT;
     }
 
@@ -7131,12 +7166,12 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     int r = map_segments(&img, 1);
     if (r != OCERZ_OK) {
         OCERZ_FATAL("cannot map segments of %s\n", path);
-        free(buf);
+        free_file(buf);
         return r;
     }
     if (img.main_entry == 0 && img.thread_entry == 0) {
         OCERZ_FATAL("%s has no LC_MAIN or LC_UNIXTHREAD entry\n", path);
-        free(buf);
+        free_file(buf);
         return OCERZ_EFORMAT;
     }
 
@@ -7157,13 +7192,13 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
 
     r = apply_fixups(&img, &cache);
     if (r != OCERZ_OK) {
-        free(buf);
+        free_file(buf);
         return r;
     }
     if (img.cf_off == 0) {
         r = apply_classic_fixups(&img, &cache);
         if (r != OCERZ_OK) {
-            free(buf);
+            free_file(buf);
             return r;
         }
     }
@@ -7186,7 +7221,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
                                 " an x86_64 one into runtime/guest-gnu\n");
                 break;
             }
-        free(buf);
+        free_file(buf);
         return 71;
     }
     if (ocerz_mode == OCERZ_MODE_NATIVE) {
@@ -7203,7 +7238,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     memset(&fr, 0, sizeof fr);
     if (build_frame(path, argc, argv, envp, &fr) != OCERZ_OK) {
         OCERZ_FATAL("cannot build dynamic entry frame\n");
-        free(buf);
+        free_file(buf);
         return OCERZ_ENOMEM;
     }
     if (ocerz_mode == OCERZ_MODE_NATIVE) {
@@ -7213,7 +7248,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
 
     uint64_t tsd = ocerz_map_anywhere(0x8000, PROT_READ | PROT_WRITE);
     if (tsd == 0) {
-        free(buf);
+        free_file(buf);
         return OCERZ_ENOMEM;
     }
     uint64_t self = tsd + 0x4000;
@@ -7227,14 +7262,14 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     }
 
     if (g_main_dimg_valid)
-        free(g_main_dimg.owned_buf);
+        free_file(g_main_dimg.owned_buf);
     g_main_dimg = img;
     g_main_dimg.owned_buf = buf;
     g_main_dimg_valid = 1;
     dimg_changed();
     g_main_loading = NULL;
     buf = NULL;
-    free(buf);
+    free_file(buf);
 
     ocerz_vm_install_handlers(vm);
     if (ocerz_mode == OCERZ_MODE_NATIVE)

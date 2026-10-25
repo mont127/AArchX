@@ -2274,6 +2274,8 @@ int ocerz_mem_arm_exec(uint64_t lo, uint64_t hi)
     }
     if (dis || hi <= lo) return 0;
     uint64_t plo = round_down(lo), phi = round_up(hi);
+    if (!region_for_range(plo, phi))   /* the shared cache's code, which no region holds: every block a launch loads */
+        return 0;
     map_lock_acquire();
     MemRegion *r = region_for_range(plo, phi);
     int n = 0;
