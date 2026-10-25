@@ -1157,6 +1157,31 @@ run_holder_case() {
     fi
     hold_stop "$dir/a"
     hold_stop "$dir/b"
+    # the store: the holder maps its index once it is there, and lets go of it
+    # once the store is gone (the lock's time kept fresh by hand meanwhile)
+    if [ -x /usr/sbin/lsof ]; then
+        mkdir -p "$dir/c"
+        out=$(env -u OCERZ_NO_CACHE_HOLDER OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/tc" OCERZ_CACHE_HOLDER_DIR="$dir/c" \
+              OCERZ_CACHE_HOLDER_IDLE=8 "$OCERZ" /usr/bin/uname -m 2>&1)
+        lock=$(ls "$dir/c"/ocerz-cache-holder-* 2>/dev/null | head -1)
+        sleep 5
+        pid=$([ -n "$lock" ] && head -1 "$lock")
+        local before after real
+        real=$(cd "$dir" && pwd -P)   # lsof names files by their resolved paths (/private/var/folders/...)
+        before=$(/usr/sbin/lsof -p "${pid:-0}" 2>/dev/null | grep -c "$real/tc/tc-[0-9a-f]*/index")
+        rm -rf "$dir/tc"
+        touch "$lock" 2>/dev/null
+        sleep 5
+        after=$(/usr/sbin/lsof -p "${pid:-0}" 2>/dev/null | grep -c "$real/tc/")
+        if [ "$out" = x86_64 ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ "$before" = 1 ] && [ "$after" = 0 ]; then
+            echo "PASS dholder-store"; pass=$((pass+1))
+        else
+            echo "FAIL dholder-store (out='$out' pid='$pid' index mapped before=$before after=$after)"; fail=$((fail+1))
+        fi
+        hold_stop "$dir/c"
+    else
+        echo "SKIP dholder-store: no lsof"
+    fi
 }
 
 run_syslink_case

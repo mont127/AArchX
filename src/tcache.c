@@ -570,6 +570,29 @@ static int claim_store(void)
     return flock(g_ufd, LOCK_SH) == 0;
 }
 
+/* The store's directory for a fingerprint: under OCERZ_TCACHE_DIR, else ~/Library/Caches/ocerz. */
+static int store_dir_name(char *out, size_t n, uint64_t fp)
+{
+    const char *dir = getenv("OCERZ_TCACHE_DIR");
+    const char *home = getenv("HOME");
+    int k;
+    if (dir && dir[0])
+        k = snprintf(out, n, "%s/tc-%016llx", dir, (unsigned long long)fp);
+    else if (home && home[0])
+        k = snprintf(out, n, "%s/Library/Caches/ocerz/tc-%016llx", home, (unsigned long long)fp);
+    else
+        return 0;
+    return k > 0 && (size_t)k < n;
+}
+
+/* Where the store is, or will be once something opens it, for the cache holder (src/cache_holder.c); 0 when it is off. */
+int ocerz_tcache_store_path(char *out, size_t n)
+{
+    if (ocerz_tcache_mode() != OCERZ_TC_ON)
+        return 0;
+    return store_dir_name(out, n, g_opened && g_fp ? g_fp : fingerprint());
+}
+
 static int open_store(void)
 {
     if (g_opened)
@@ -582,13 +605,7 @@ static int open_store(void)
     const char *mf = getenv("OCERZ_TCACHE_MIN_FREE_MB");
     g_floor_bytes = (mf && *mf ? strtoull(mf, NULL, 10) : 10240) << 20;
     g_fp = fingerprint();
-    const char *dir = getenv("OCERZ_TCACHE_DIR");
-    const char *home = getenv("HOME");
-    if (dir && dir[0])
-        snprintf(g_dir, sizeof g_dir, "%s/tc-%016llx", dir, (unsigned long long)g_fp);
-    else if (home && home[0])
-        snprintf(g_dir, sizeof g_dir, "%s/Library/Caches/ocerz/tc-%016llx", home, (unsigned long long)g_fp);
-    else
+    if (!store_dir_name(g_dir, sizeof g_dir, g_fp))
         return 0;
     if (mkdirs(g_dir) != 0 || !claim_store() || !open_index())
         return 0;
