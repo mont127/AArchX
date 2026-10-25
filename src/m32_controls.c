@@ -6,7 +6,7 @@
  *   menus      EnableMenuCommand and IsMenuCommandEnabled find the item by command (GetIndMenuItemWithCommandID);
  *              SetItemCmd and GetItemCmd are its command key; the hierarchical ID calls go through the submenu's
  *              MenuRef; GetMenuBar, SetMenuBar and DisposeMenuBar keep the menus of the menu bar in a handle of
- *              their own
+ *              their own; HMGetHelpMenu is the menu bar's Help menu, made when it has none
  *   controls   EmbedControl and AutoEmbedControl add a subview; a control's reference value is a control property;
  *              GetControlRegion is its frame in the window's coordinates; the 32-bit value, minimum, maximum and
  *              view size are the HIView's; SetControlBounds sets its frame; CountSubControls counts subviews;
@@ -240,6 +240,69 @@ static int sp_DisposeMenuBar(struct OcerzVM *vm, OcerzCPU *cpu)
         free(b);
     }
     RET(0);
+}
+
+/*
+ * HMGetHelpMenu(MenuRef *outHelpMenu, MenuItemIndex *outFirstCustomItemIndex): the Help Manager's menu is gone from
+ * 64-bit HIToolbox, and m32 answered noErr and left both as they were, so GRID 2 handed the garbage MenuRef it got to
+ * CFRetain.  It answers the menu bar's menu titled Help, or one it makes the first time, empty and last in the menu
+ * bar, and the item after the menu's last as the first the program may add.  Without the menu calls it is paramErr
+ * with both cleared.
+ */
+static struct {
+    OSStatus (*create)(int16_t, UInt32, Ref *);
+    OSStatus (*set_title)(Ref, CFStringRef);
+    OSStatus (*copy_title)(Ref, CFStringRef *);
+    CFStringRef (*make_str)(CFAllocatorRef, const char *, CFStringEncoding);
+    CFComparisonResult (*compare)(CFStringRef, CFStringRef, CFStringCompareFlags);
+} hm;
+
+static Ref help_menu(void)
+{
+    static Ref help;
+    if (help || !ready())
+        return help;
+    void *h = dlopen("/System/Library/Frameworks/Carbon.framework/Carbon", RTLD_LAZY | RTLD_LOCAL);
+    *(void **)&hm.create = h ? dlsym(h, "CreateNewMenu") : NULL;
+    *(void **)&hm.set_title = h ? dlsym(h, "SetMenuTitleWithCFString") : NULL;
+    *(void **)&hm.copy_title = h ? dlsym(h, "CopyMenuTitleAsCFString") : NULL;
+    *(void **)&hm.make_str = dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
+    *(void **)&hm.compare = dlsym(RTLD_DEFAULT, "CFStringCompare");
+    CFStringRef title = hm.make_str ? hm.make_str(NULL, "Help", kCFStringEncodingUTF8) : NULL;
+    if (!title || !hm.create || !hm.set_title || !hm.copy_title || !hm.compare)
+        return NULL;
+    Ref root = hi.root_menu();
+    UInt16 n = root ? hi.count_items(root) : 0;
+    for (UInt16 i = 1; i <= n && !help; i++) {
+        Ref sub = NULL;
+        CFStringRef t = NULL;
+        if (hi.get_submenu(root, i, &sub) == noErr && sub && hm.copy_title(sub, &t) == noErr && t) {
+            if (hm.compare(t, title, kCFCompareCaseInsensitive) == kCFCompareEqualTo)
+                help = sub;
+            hi.cf_release(t);
+        }
+    }
+    if (root)
+        hi.cf_release(root);
+    Ref made = NULL;
+    if (!help && hm.create(-16490 /* kHMHelpMenuID */, 0, &made) == noErr && made) {
+        hm.set_title(made, title);
+        hi.insert_menu(made, 0);
+        help = made;
+    }
+    hi.cf_release(title);
+    return help;
+}
+
+static int sp_HMGetHelpMenu(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    Ref help = help_menu();
+    if (A(0))
+        m32_wr(A(0), m32_handle(help));
+    if (A(1))
+        wr16(A(1), help ? (int16_t)(hi.count_items(help) + 1) : 0);
+    RET(help ? noErr : (uint32_t)(int32_t)paramErr);
 }
 
 /* ---- controls ---- */
@@ -644,6 +707,7 @@ const M32SpecialEntry m32_controls_specials[] = {
     { "_SetMenuItemHierarchicalID", sp_SetMenuItemHierarchicalID },
     { "_GetMenuItemHierarchicalID", sp_GetMenuItemHierarchicalID },
     { "_GetMenuBar", sp_GetMenuBar }, { "_SetMenuBar", sp_SetMenuBar }, { "_DisposeMenuBar", sp_DisposeMenuBar },
+    { "_HMGetHelpMenu", sp_HMGetHelpMenu },
     { "_EmbedControl", sp_EmbedControl }, { "_AutoEmbedControl", sp_AutoEmbedControl },
     { "_SetControlReference", sp_SetControlReference }, { "_GetControlReference", sp_GetControlReference },
     { "_GetControlRegion", sp_GetControlRegion }, { "_SetControlBounds", sp_SetControlBounds },
