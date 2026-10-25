@@ -20303,6 +20303,68 @@ typedef struct PendingChain {
 #define PEND_MASK (PEND_SIZE - 1)
 static PendingChain *g_pending[PEND_SIZE];
 
+/*
+ * A warm launch adds and drains pending entries by the tens of thousands
+ * (tclsh: 33k), and gives most of its blocks a first array of predecessors, so
+ * both come from free lists the JIT lock guards, refilled 256 at a time, rather
+ * than from malloc and free: an entry goes back to its list when it is
+ * drained or dropped, an array of four when it grows or its block goes.
+ */
+#define POOL_REFILL 256
+typedef union PredQuad { union PredQuad *next; struct { struct JitBlock *pb; uint8_t e; } v[4]; } PredQuad;
+static PendingChain *g_pend_free;
+static PredQuad *g_pq_free;
+
+static PendingChain *pend_new(void)
+{
+    if (!g_pend_free) {
+        PendingChain *v = (PendingChain *)malloc(POOL_REFILL * sizeof *v);
+        if (!v)
+            return NULL;
+        for (int i = 0; i < POOL_REFILL - 1; i++)
+            v[i].next = &v[i + 1];
+        v[POOL_REFILL - 1].next = NULL;
+        g_pend_free = v;
+    }
+    PendingChain *e = g_pend_free;
+    g_pend_free = e->next;
+    return e;
+}
+
+static void pend_del(PendingChain *e)
+{
+    e->next = g_pend_free;
+    g_pend_free = e;
+}
+
+static void *pq_new(void)
+{
+    if (!g_pq_free) {
+        PredQuad *v = (PredQuad *)malloc(POOL_REFILL * sizeof *v);
+        if (!v)
+            return NULL;
+        for (int i = 0; i < POOL_REFILL - 1; i++)
+            v[i].next = &v[i + 1];
+        v[POOL_REFILL - 1].next = NULL;
+        g_pq_free = v;
+    }
+    PredQuad *q = g_pq_free;
+    g_pq_free = q->next;
+    return q;
+}
+
+/* A block's predecessor array back to its list or to free, by its capacity. */
+static void preds_free(JitBlock *b)
+{
+    if (b->cap_preds == 4) {
+        PredQuad *q = (PredQuad *)(void *)b->preds;
+        q->next = g_pq_free;
+        g_pq_free = q;
+    } else {
+        free(b->preds);
+    }
+}
+
 static void pred_add(JitBlock *target, JitBlock *src, int e)
 {
     if (!target || !src || target == src) return;
@@ -20310,8 +20372,13 @@ static void pred_add(JitBlock *target, JitBlock *src, int e)
         target->preds[target->n_preds - 1].e == e) return;
     if (target->n_preds == target->cap_preds) {
         uint32_t cap = target->cap_preds ? target->cap_preds * 2 : 4;
-        void *np = realloc(target->preds, cap * sizeof target->preds[0]);
+        _Static_assert(sizeof(PredQuad) == 4 * sizeof target->preds[0], "a quad holds four predecessors");
+        void *np = cap == 4 ? pq_new() : malloc(cap * sizeof target->preds[0]);
         if (!np) return;
+        if (target->n_preds)
+            memcpy(np, target->preds, target->n_preds * sizeof target->preds[0]);
+        if (target->cap_preds)
+            preds_free(target);
         target->preds = np;
         target->cap_preds = cap;
     }
@@ -20324,7 +20391,7 @@ static void pending_add(uint64_t target_key, uint32_t *patch_b, uint8_t kind,
                         uint8_t pin_class, uint32_t *cond_site, uint64_t src_sig,
                         JitBlock *src, int edge)
 {
-    PendingChain *e = (PendingChain *)malloc(sizeof *e);
+    PendingChain *e = pend_new();
     if (!e)
         return;
     unsigned h = (unsigned)(hash_key(target_key) & PEND_MASK);
@@ -20366,7 +20433,7 @@ static void **ras_slot_alloc(void)
 
 static void pending_add_ras(uint64_t target_key, void **ras_slot)
 {
-    PendingChain *e = (PendingChain *)malloc(sizeof *e);
+    PendingChain *e = pend_new();
     if (!e)
         return;
     unsigned h = (unsigned)(hash_key(target_key) & PEND_MASK);
@@ -20415,7 +20482,7 @@ static void pending_drain(uint64_t key, JitBlock *target)
                 pred_add(target, e->src, e->edge);
             }
             *pp = e->next;
-            free(e);
+            pend_del(e);
         } else {
             pp = &e->next;
         }
@@ -24035,7 +24102,7 @@ static void pending_drop(uint64_t key, const JitBlock *src, int edge)
         PendingChain *e = *pp;
         if (e->target_key == key && e->src == src && e->edge == edge && !e->ras_slot) {
             *pp = e->next;
-            free(e);
+            pend_del(e);
         } else {
             pp = &e->next;
         }
@@ -27017,7 +27084,7 @@ static void block_destroy(JitBlock *b)
     if (b->lay && !b->pro_w)
         free(b->lay);
     if (b->slab) {
-        free(b->preds);
+        preds_free(b);
         free(b);
         return;
     }
@@ -27032,7 +27099,7 @@ static void block_destroy(JitBlock *b)
     free(b->kept);
     free(b->edges);
     free(b->prof);
-    free(b->preds);
+    preds_free(b);
     free(b);
 }
 
@@ -27069,7 +27136,7 @@ static void pending_clear(void)
         PendingChain *e = g_pending[i];
         while (e) {
             PendingChain *next = e->next;
-            free(e);
+            pend_del(e);
             e = next;
         }
         g_pending[i] = NULL;
@@ -28904,7 +28971,7 @@ static void cont_replace(OcerzJit *jit, JitLayout *L)
             PendingChain *e = *pp;
             if (IN_RES(e->patch_b) || IN_RES(e->cond_site) || IN_RES(e->ras_slot)) {
                 *pp = e->next;
-                free(e);
+                pend_del(e);
             } else {
                 pp = &e->next;
             }
