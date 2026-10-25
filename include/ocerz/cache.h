@@ -31,6 +31,7 @@ int ocerz_cache_lazy_fault(uintptr_t addr);
 int ocerz_cache_lazy_region(uintptr_t addr);
 size_t ocerz_cache_lazy_pages(const uint64_t **out);
 int ocerz_cache_region(uintptr_t addr);
+int ocerz_cache_text(uint64_t lo, uint64_t hi, int inside);
 int ocerz_cache_protect(uintptr_t addr, uint64_t len, int prot);
 int ocerz_cache_write_fault(uintptr_t addr);
 void ocerz_cache_arm_exec(uint64_t lo, uint64_t hi);

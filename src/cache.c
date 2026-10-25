@@ -384,6 +384,7 @@ int ocerz_cache_lazy_region(uintptr_t addr)
 static struct {
     uint64_t addr, size;
     uint8_t *watch;
+    int text;   /* mapped executable in the cache's header: a code region */
 } g_cmap[CMAP_MAX];
 static int g_n_cmap;
 static uint64_t g_cmap_lo = ~0ull, g_cmap_hi;
@@ -400,6 +401,21 @@ static int cmap_find(uintptr_t addr)
 int ocerz_cache_region(uintptr_t addr)
 {
     return cmap_find(addr) >= 0;
+}
+
+/* Whether [lo, hi) lies in one of the cache's code regions (inside), or meets any (else). */
+int ocerz_cache_text(uint64_t lo, uint64_t hi, int inside)
+{
+    if (hi <= lo)
+        return 0;
+    for (int i = 0; i < g_n_cmap; i++) {
+        if (!g_cmap[i].text)
+            continue;
+        uint64_t a = g_cmap[i].addr, b = a + g_cmap[i].size;
+        if (inside ? lo >= a && hi <= b : lo < b && hi > a)
+            return 1;
+    }
+    return 0;
 }
 
 static uint8_t *watch_slot(uintptr_t addr, int alloc)
@@ -564,6 +580,7 @@ static int map_subcache(const char *path, int is_main, OcerzCache *c)
         if (g_n_cmap < CMAP_MAX) {
             g_cmap[g_n_cmap].addr = addr;
             g_cmap[g_n_cmap].size = size;
+            g_cmap[g_n_cmap].text = (initp & VM_PROT_EXECUTE) != 0 && slide_size == 0;
             g_n_cmap++;
             if (addr < g_cmap_lo) g_cmap_lo = addr;
             if (addr + size > g_cmap_hi) g_cmap_hi = addr + size;

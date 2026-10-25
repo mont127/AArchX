@@ -22368,7 +22368,7 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
     return bad;
 }
 
-static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words, g_tc_n_prep;
+static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words, g_tc_n_prep, g_tc_n_pristine;
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
 enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
 static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iwarm, g_tc_n_iahead, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
@@ -22478,10 +22478,10 @@ static void tc_summary(void)
                 (unsigned long long)g_tc_n_pcrel, (unsigned long long)g_tc_n_const,
                 (unsigned long long)g_tc_n_mism, (unsigned long long)g_tc_n_full);
     else
-        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu, prepped %llu, %llu words, %llu sharing an epilogue) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu, prepped %llu, pristine %llu, %llu words, %llu sharing an epilogue) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
                          " verify_variant=%llu verify_bad=%llu\n",
                 (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_ahead,
-                (unsigned long long)g_tc_n_prep, (unsigned long long)g_tc_n_words, (unsigned long long)g_tc_n_epis, (unsigned long long)g_tc_n_put,
+                (unsigned long long)g_tc_n_prep, (unsigned long long)g_tc_n_pristine, (unsigned long long)g_tc_n_words, (unsigned long long)g_tc_n_epis, (unsigned long long)g_tc_n_put,
                 (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
                 (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
     fprintf(g_tc_lf, "ocerz: TCACHE[%d] images asked=%llu in=%llu out=%llu same=%llu variant=%llu unkeepable edge=%llu"
@@ -22642,7 +22642,7 @@ typedef struct {
     uint32_t n_push_fix, n_pushelide, body_code, body_noreload, stop_patch, stop_insn;
     int32_t n_inlined, n_slow;
     uint16_t entry_live, xmm_pinned;
-    uint8_t n_edges, n_stop_extra, n_pinned, pin_class, ordered_loads, flags, pad[6];
+    uint8_t n_edges, n_stop_extra, n_pinned, pin_class, ordered_loads, flags, cache_tag[6];
     uint8_t host_holds[16];
     int8_t guest_in_host[16];
     uint64_t img_id, img_lo, img_hi;
@@ -22657,7 +22657,7 @@ typedef struct {
     uint8_t kind, pin_class, side, probing, pad[4];
 } TcEdge;
 typedef struct { uint32_t ft_site, tk_trip; } TcProf;
-enum { TCF_COMPACT = 1, TCF_FAULTF = 2, TCF_PROF = 4, TCF_LEARNED = 8 };
+enum { TCF_COMPACT = 1, TCF_FAULTF = 2, TCF_PROF = 4, TCF_LEARNED = 8, TCF_PRISTINE = 16 };
 #define TC_NONE UINT32_MAX
 #define TC_OUT_MAX (256u << 10)
 #define TC_HASH_SEED 0x243f6a8885a308d3ull
@@ -22837,6 +22837,46 @@ static int tc_deps_build(uint32_t *ndep, uint64_t *hash)
     *ndep = nd;
     *hash = h;
     return 1;
+}
+
+/*
+ * A shared-cache record whose deps all lie in the cache's code, made while
+ * nothing had touched that code in its process (no protection to writable,
+ * mapping over or unmapping of it: every such change goes through
+ * ocerz_jit_invalidate_range), is pristine, and carries 48 bits of the cache's
+ * UUID.  Loading it in a process whose cache code is untouched too, under the
+ * same cache, needs no deps check: those bytes are the cache file's, as they
+ * were.  The check hashed 82 bytes in 3 ranges of each of tclsh's 27k loads.
+ * A disk image's record, and every record in the Wine layout, is checked as
+ * before.  OCERZ_NO_TCACHE_PRISTINE=1 checks every record.
+ */
+static int g_cache_text_touched;
+
+static uint64_t tc_cache_tag(void)
+{
+    static uint64_t tag;
+    if (!tag) {
+        const uint8_t *u = ocerz_cache_uuid();
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (int i = 0; u && i < 16; i++)
+            h = (h ^ u[i]) * 0x100000001b3ull;
+        tag = (h & 0xffffffffffffull) | 1;
+    }
+    return tag;
+}
+
+static int tc_pristine_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_TCACHE_PRISTINE") ? 0 : 1;
+    return on && !ocerz_low_base && !g_tc_img_hi && !__atomic_load_n(&g_cache_text_touched, __ATOMIC_ACQUIRE);
+}
+
+static int tc_rec_pristine(const TcRec *r)
+{
+    uint64_t t = 0;
+    memcpy(&t, r->cache_tag, sizeof r->cache_tag);
+    return (r->flags & TCF_PRISTINE) && t == tc_cache_tag() && tc_pristine_on();
 }
 
 static int tc_deps_check(const TcDep *d, uint32_t n, uint64_t want)
@@ -23074,8 +23114,13 @@ static void tc_put(OcerzJit *jit, JitBlock *blk)
     r.n_pinned = blk->n_pinned;
     r.pin_class = blk->pin_class;
     r.ordered_loads = blk->ordered_loads;
+    int pristine = tc_pristine_on();
+    for (uint32_t i = 0; pristine && i < ndep; i++)
+        pristine = ocerz_cache_text(g_tc_mdep[i].lo, g_tc_mdep[i].hi, 1);
     r.flags = (uint8_t)((compact ? TCF_COMPACT : 0) | (blk->fault_flags ? TCF_FAULTF : 0) |
-                        (blk->prof ? TCF_PROF : 0) | (g_tc_learned ? TCF_LEARNED : 0));
+                        (blk->prof ? TCF_PROF : 0) | (g_tc_learned ? TCF_LEARNED : 0) | (pristine ? TCF_PRISTINE : 0));
+    uint64_t tag = pristine ? tc_cache_tag() : 0;
+    memcpy(r.cache_tag, &tag, sizeof r.cache_tag);
     memcpy(r.host_holds, blk->host_holds, sizeof r.host_holds);
     memcpy(r.guest_in_host, blk->guest_in_host, sizeof r.guest_in_host);
     r.img_id = g_tc_img_id;
@@ -23463,7 +23508,9 @@ static JitBlock *tc_load_built(OcerzJit *jit, const TcView *vp, uint64_t rip, in
 {
     const TcView v = *vp;
     const TcRec *r = v.r;
-    if (!tc_deps_check(v.dep, r->n_dep, r->dep_hash)) {
+    if (tc_rec_pristine(r)) {
+        g_tc_n_pristine++;
+    } else if (!tc_deps_check(v.dep, r->n_dep, r->dep_hash)) {
         g_tc_n_stale++;
         tc_free_blk(blk);
         return NULL;
@@ -27550,6 +27597,8 @@ static void retire_hit_blocks_locked(struct OcerzVM *vm, OcerzJit *jit, JitBlock
 
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
 {
+    if (!g_cache_text_touched && ocerz_cache_text(addr, addr + len, 0))
+        __atomic_store_n(&g_cache_text_touched, 1, __ATOMIC_RELEASE);
     g_inv_caller = (uint64_t)(uintptr_t)__builtin_return_address(0);
     if (!vm || !len || !vm->jit)
         return;

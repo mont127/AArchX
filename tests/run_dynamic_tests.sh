@@ -1137,18 +1137,19 @@ run_tcache_ord_case() {
 }
 
 run_tcache_ord_case dtcache_ordstart
-# tcache_patch.c against one fresh store: plain, patched (atoi's page made
-# writable and rewritten before the first call, which must reach the patch;
-# with nothing loaded ahead, so atoi's record is found at that call, after the
-# patch), then "wait" five times, each from the store the patched run left: the
-# program sleeps until the warm thread has read every record and the next miss
-# loads all of them ahead, the patched atoi's too, whose dep in the program
-# (where the patched run had it) faults in its deps check inside the run of
-# loads, which must leave the JIT's pages writable.  Whether atoi's record is
-# among the ones loaded ahead depends on what loaded before the sleep (about
-# half the time), hence five tries.  A copy on APFS is a clone whose pages
-# are not in memory, which leaves the warm thread behind the program and loads
-# far fewer records ahead, so each copy is read through first.
+# tcache_patch.c against one fresh store: plain (atoi's records kept
+# pristine), patched (atoi's page made writable and rewritten before the first
+# call, which must reach the patch; with nothing loaded ahead, so atoi's record
+# is found at that call, after the patch), then "wait" five times, each from
+# the store the patched run left: the program sleeps until the warm thread has
+# read every record and the next miss loads all of them ahead, the patched
+# atoi's too, whose dep in the program (where the patched run had it) faults in
+# its deps check inside the run of loads, which must leave the JIT's pages
+# writable; most records must load without their deps check.  Whether atoi's
+# record is among the ones loaded ahead depends on what loaded before the sleep,
+# hence five tries.  A copy on APFS is a clone whose pages are not in memory,
+# which leaves the warm thread behind the program and loads far fewer records
+# ahead, so each copy is read through first.
 run_tcache_patch_case() {
     local name="$1" dir="$TMP/$1" i arg why
     mkdir -p "$dir"
@@ -1179,6 +1180,8 @@ run_tcache_patch_case() {
         why=""
         if [ "$(cat "$dir/run$i.out")" != OK ]; then
             why="got out='$(cat "$dir/run$i.out")' $(grep -h 'guest crash' "$dir/run$i.err" | head -1)"
+        elif [ $i -ge 3 ] && ! grep -q 'loaded=.*pristine [1-9]' "$dir/run$i.err"; then
+            why="no record skipped its deps check: $(grep -h 'loaded=' "$dir/run$i.err" | head -1)"
         fi
         if [ -z "$why" ]; then
             echo "PASS $name-$i-$arg"; pass=$((pass+1))

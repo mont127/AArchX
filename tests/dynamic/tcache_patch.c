@@ -1,17 +1,19 @@
 /*
- * Records of the shared cache's code next to code a program patches.  Run
- * plain, the program calls atoi from the cache, whose blocks go into the store.
- * Run with "patch", it makes atoi's page writable before calling it, drops a
- * jmp to its own function there and calls it: atoi's records are found stale
- * and translated again, and the call must reach the patch rather than the
- * stored translation of atoi.  The patched run loads nothing ahead
- * (run_dynamic_tests.sh), so atoi's record is found at that first call; loaded
- * before the patch, its block would be retired by it and never reused, which
- * tests nothing here.  Run with "wait", it sleeps first, so the warm thread has
- * read every record and the next miss loads the rest ahead
- * (OCERZ_TCACHE_AHEAD, run_dynamic_tests.sh), the patched atoi's among them:
- * that record has a dep in this program where the patched run had it, not
- * mapped now, so its deps check faults inside the run of loads.
+ * Records of the shared cache's code that skip the deps check (src/jit.c,
+ * tc_rec_pristine) next to code a program patches.  Run plain, the program
+ * calls atoi from the cache, whose blocks go into the store as pristine.  Run
+ * with "patch", it makes atoi's page writable before calling it, drops a jmp
+ * to its own function there and calls it: the change of protection goes
+ * through ocerz_jit_invalidate_range, which marks the cache's code touched, so
+ * atoi's records are checked, found stale and translated again, and the call
+ * must reach the patch rather than the stored translation of atoi.  The patched
+ * run loads nothing ahead (run_dynamic_tests.sh), so atoi's record is found at
+ * that first call; loaded before the patch, its block would be retired by it
+ * and never reused, which tests nothing here.  Run with "wait", it sleeps before
+ * the calls, so the warm thread has read every record and the next miss loads
+ * the rest ahead (OCERZ_TCACHE_AHEAD, run_dynamic_tests.sh), the patched atoi's
+ * among them: that record has a dep in this program where the patched run had
+ * it, not mapped now, so its deps check faults inside the run of loads.
  */
 #include <dlfcn.h>
 #include <stdint.h>
@@ -29,12 +31,21 @@ static int my_atoi(const char *s)
     return 4242;
 }
 
+/* labs, a block of the cache's code first run just before atoi: after the
+   sleep its miss loads what the profile has next ahead, atoi's record */
+__attribute__((noinline)) static int calls(long (*p_labs)(long), int (*p_atoi)(const char *))
+{
+    long acc = p_labs(-1) - 1;
+    for (int i = 0; i < 20000; i++)
+        acc += p_atoi("41");
+    return acc == 20000L * 41;
+}
+
 int main(int argc, char **argv)
 {
-    if (argc > 1 && !strcmp(argv[1], "wait"))
-        usleep(300000);
     int (*p_atoi)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "atoi");
-    if (!p_atoi) { printf("no atoi\n"); return 1; }
+    long (*p_labs)(long) = (long (*)(long))dlsym(RTLD_DEFAULT, "labs");
+    if (!p_atoi || !p_labs) { printf("no atoi\n"); return 1; }
     if (argc > 1 && !strcmp(argv[1], "patch")) {
         uintptr_t page = (uintptr_t)p_atoi & ~0xfffULL;
         if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) { printf("mprotect\n"); return 1; }
@@ -47,10 +58,9 @@ int main(int argc, char **argv)
         printf("OK\n");
         return 0;
     }
-    long acc = 0;
-    for (int i = 0; i < 20000; i++)
-        acc += p_atoi("41");
-    if (acc != 20000L * 41) { printf("atoi wrong\n"); return 1; }
+    if (argc > 1 && !strcmp(argv[1], "wait"))
+        usleep(300000);
+    if (!calls(p_labs, p_atoi)) { printf("atoi wrong\n"); return 1; }
     printf("OK\n");
     return 0;
 }
