@@ -1529,12 +1529,20 @@ static void emit_add_simm(A64Buf *b, int rd, int rn, int32_t v)
     else a64_sub_imm(b, 1, rd, rn, (uint32_t)-v);
 }
 
+/*
+ * The mark sets (cp_marks here, al_marks below) are asked about every block a
+ * launch loads or translates, and almost never hold anything: each lookup read
+ * a random word of its 2 MB table, and a page read that way is a page the
+ * process owns, so every launch made both tables resident, 256 pages faulted
+ * in and freed at exit.  A set that holds nothing is not read.
+ */
 #define CP_MARK_SIZE (1u << 18)
 static uint64_t g_cp_marks[CP_MARK_SIZE];
+static unsigned g_cp_n;
 static int g_cp_guard;
 static int cp_marked(uint64_t key)
 {
-    if (!key) return 0;
+    if (!key || !g_cp_n) return 0;
     unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 46) & (CP_MARK_SIZE - 1);
     for (unsigned n = 0; n < CP_MARK_SIZE; n++, i = (i + 1) & (CP_MARK_SIZE - 1)) {
         uint64_t v = g_cp_marks[i];
@@ -1550,7 +1558,7 @@ static void cp_mark(uint64_t key)
     for (unsigned n = 0; n < CP_MARK_SIZE; n++, i = (i + 1) & (CP_MARK_SIZE - 1)) {
         uint64_t v = g_cp_marks[i];
         if (v == key) return;
-        if (v == 0) { g_cp_marks[i] = key; return; }
+        if (v == 0) { g_cp_marks[i] = key; g_cp_n++; return; }
     }
 }
 static inline int mem_guard_needed(void) { return ocerz_low_base != 0 || g_cp_guard; }
@@ -1829,7 +1837,7 @@ static int g_al_all, g_al_n, g_align_blk, g_align_any;
 static int al_marked(uint64_t key)
 {
     if (g_al_all) return 1;
-    if (!key) return 0;
+    if (!key || !g_al_n) return 0;
     unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 46) & (AL_MARK_SIZE - 1);
     for (unsigned n = 0; n < AL_MARK_SIZE; n++, i = (i + 1) & (AL_MARK_SIZE - 1)) {
         uint64_t v = g_al_marks[i];
@@ -20298,7 +20306,7 @@ typedef struct PendingChain {
     uint8_t pin_class;
     struct PendingChain *next;
 } PendingChain;
-#define PEND_BITS 18
+#define PEND_BITS 15   /* every block a launch inserts looks in its bucket: 2^18 of them were 2 MB a launch made resident */
 #define PEND_SIZE (1u << PEND_BITS)
 #define PEND_MASK (PEND_SIZE - 1)
 static PendingChain *g_pending[PEND_SIZE];
