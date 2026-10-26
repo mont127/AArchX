@@ -193,8 +193,8 @@ contributors.
 | x86-64 differential, interpreter against JIT | 104 / 104 |
 | i386 differential, in each of two memory layouts | 40,044 / 40,044 |
 | dynamic-linking suite | 448 / 448 |
-| native-mode suite | 88 / 88 |
-| 32-bit (m32) programs | 79 / 79, one more skipped without a Steam database |
+| native-mode suite | 91 / 91 |
+| 32-bit (m32) programs | 81 / 81, one more skipped without a Steam database |
 
 Counted on macOS 27 in October 2026. [Testing](docs/testing.md) says what
 each gate proves and lists the component suites.
