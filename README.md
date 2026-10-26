@@ -189,10 +189,10 @@ contributors.
 
 | Gate | Result |
 | --- | --- |
-| x86-64 guest suite, interpreted and translated | 134 / 134 |
-| x86-64 differential, interpreter against JIT | 100 / 100 |
+| x86-64 guest suite, interpreted and translated | 143 / 143 |
+| x86-64 differential, interpreter against JIT | 104 / 104 |
 | i386 differential, in each of two memory layouts | 40,044 / 40,044 |
-| dynamic-linking suite | 410 / 410 |
+| dynamic-linking suite | 448 / 448 |
 | native-mode suite | 88 / 88 |
 | 32-bit (m32) programs | 79 / 79, one more skipped without a Steam database |
 
