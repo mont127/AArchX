@@ -1160,13 +1160,37 @@ static __thread uint64_t g_riphist[32];
 static __thread unsigned g_riphist_n;
 static int g_crash_stack;
 
+/*
+ * Whether a fork child keeps the parent's translations.  The child used to
+ * drop them (ocerz_jit_forget) and translate or load everything it ran again
+ * in a new arena: Ruby's every start forks to run `uname -m` from rbconfig.rb,
+ * and each child loaded 3-5K records before its exec.  Kept, the child runs
+ * the code below code_cur that it inherited (ocerz_jit_prefork copies exactly
+ * that) and goes on in the arena's tail, mapped afresh; a program that forks
+ * twenty workers into code it ran already took 86 ms instead of 99.  It failed
+ * when it was tried in August, 14 runs in 20 of that Ruby start: the forking
+ * thread comes out of fork() in the child with its MAP_JIT pages writable and
+ * not executable for it (pthread_jit_write_protect_np is per thread), and its
+ * first translated instruction took a permission fault; the child now makes
+ * them executable first.  On by default from macOS 27, where it was tested;
+ * OCERZ_FORK_KEEPJIT=1 turns it on before, =0 off.
+ */
 static int g_fork_keepjit = -1;
+
+static int fork_keepjit_default(void)
+{
+    char v[32] = "";
+    size_t n = sizeof v - 1;
+    return sysctlbyname("kern.osproductversion", v, &n, NULL, 0) == 0 && atoi(v) >= 27;
+}
 
 void ocerz_vm_atfork_prepare(void)
 {
     pthread_t self = pthread_self();
-    if (g_fork_keepjit < 0)
-        g_fork_keepjit = getenv("OCERZ_FORK_KEEPJIT") ? 1 : 0;
+    if (g_fork_keepjit < 0) {
+        const char *e = getenv("OCERZ_FORK_KEEPJIT");
+        g_fork_keepjit = e ? atoi(e) > 0 : fork_keepjit_default();
+    }
 
     pthread_mutex_lock(&g_cpus_lock);
     g_fork_surviving_cpu = NULL;
@@ -1207,6 +1231,8 @@ void ocerz_vm_atfork_child(void)
     if (g_vm && g_vm->jit_enabled && g_fork_keepjit <= 0) {
         ocerz_jit_forget(g_vm);
         if (survivor) survivor->interp_once = 1;
+    } else if (g_vm && g_vm->jit_enabled) {
+        pthread_jit_write_protect_np(1);
     }
     pthread_mutex_unlock(&g_cpus_lock);
 }

@@ -1560,6 +1560,25 @@ run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
 run_flat_case dflat_lookup 'OK'
+run_file_case dfork_keepjit tests/dynamic/fork_keepjit.c 'OK'
+# Ruby forks at every start (rbconfig.rb runs `uname -m`); kept by its fork children, the JIT failed 14 runs in 20
+# of this, the child faulting on its first translated instruction, because the forking thread came out of fork()
+# with its MAP_JIT pages writable (src/vm.c).  Each run must print hi and no child may report a [BUG].
+if [ -x /usr/bin/ruby ]; then
+    rb_bad=""
+    for rb_i in 1 2 3 4 5 6; do
+        run_bounded "$TMP/druby_fork.$rb_i.out" "$TMP/druby_fork.$rb_i.err" env OCERZ_FORK_KEEPJIT=1 "$OCERZ" /usr/bin/ruby -e 'puts `echo hi`'
+        if [ "$(cat "$TMP/druby_fork.$rb_i.out")" != hi ] || grep -q '\[BUG\]' "$TMP/druby_fork.$rb_i.err"; then
+            rb_bad="run $rb_i: out='$(cat "$TMP/druby_fork.$rb_i.out")' $(grep -m1 '\[BUG\]' "$TMP/druby_fork.$rb_i.err" | cut -c1-120)"
+            break
+        fi
+    done
+    if [ -z "$rb_bad" ]; then
+        echo "PASS druby_fork_keepjit (6 runs)"; pass=$((pass+1))
+    else
+        echo "FAIL druby_fork_keepjit ($rb_bad)"; fail=$((fail+1))
+    fi
+fi
 run_dlopen_cf_case ddlopen_cf 'OK'
 run_load_phase_case ddlopen_load_phase 'OK'
 run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'
