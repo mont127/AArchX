@@ -60,6 +60,9 @@
 struct OcerzVM;
 
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sysctl_x86_value(const char *name, const char **s, uint64_t *v, unsigned *width);
+const char *ocerz_sysctl_x86_name(const int *mib, unsigned n);
+int ocerz_sysctl_x86_mib(const char *name, int mib[2]);
 int ocerz_is_wqthread_exit(uint64_t rip);
 
 #define OCERZ_SIGTRAP 5

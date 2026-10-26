@@ -624,6 +624,8 @@ special _sysconf sysconf
 special _host_page_size host_page_size
 special _sysctl sysctl
 special _sysctlbyname sysctlbyname
+special _sysctlnametomib sysctlnametomib
+special _uname uname
 stub _quick_exit override
 
 opaque __sFILE

@@ -273,6 +273,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <ulimit.h>
 #include <unistd.h>
@@ -2005,12 +2006,46 @@ static void sb_sysctl_page_size(int is_page_size, uint64_t oldp, uint64_t oldlen
         ocerz_st(oldp, (int)len, OCERZ_GUEST_PAGE_SIZE);
 }
 
+/* Whether name has an answer of ocerz_sysctl_x86_value's (src/syscall.c), given back in *step the way the
+   kernel lets one be read. */
+static int sb_sysctl_x86(struct OcerzVM *vm, OcerzCPU *cpu, const char *name, uint64_t oldp, uint64_t oldlenp,
+                         int *step)
+{
+    const char *s = NULL;
+    uint64_t v = 0;
+    unsigned width = 0;
+    if (!name || !ocerz_sysctl_x86_value(name, &s, &v, &width))
+        return 0;
+    uint64_t need = s ? (uint64_t)strlen(s) + 1 : width;
+    if (oldp) {
+        uint64_t cap = oldlenp ? ocerz_ld(oldlenp, 8) : need;
+        if (cap < need) {
+            if (oldlenp)
+                ocerz_st(oldlenp, 8, need);
+            errno = ENOMEM;
+            *step = sb_ret(vm, cpu, -1);
+            return 1;
+        }
+        if (s)
+            memcpy(sb_ptr(oldp), s, (size_t)need);
+        else
+            ocerz_st(oldp, (int)need, v);
+    }
+    if (oldlenp)
+        ocerz_st(oldlenp, 8, need);
+    *step = sb_ret(vm, cpu, 0);
+    return 1;
+}
+
 int ocerz_sys_sysctl(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     int *mib = sb_ptr(sb_arg(cpu, 0));
     unsigned n = (unsigned)sb_arg(cpu, 1);
     uint64_t oldp = sb_arg(cpu, 2), oldlenp = sb_arg(cpu, 3);
     int page = mib && n == 2 && mib[0] == CTL_HW && mib[1] == HW_PAGESIZE;
+    int step;
+    if (mib && !page && !sb_arg(cpu, 4) && sb_sysctl_x86(vm, cpu, ocerz_sysctl_x86_name(mib, n), oldp, oldlenp, &step))
+        return step;
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, SB_LIB, "_sysctl", "i(pupppL)", (const void *)sysctl);
     int r = sysctl(mib, n, sb_ptr(oldp), sb_ptr(oldlenp), sb_ptr(sb_arg(cpu, 4)), (size_t)sb_arg(cpu, 5));
@@ -2025,11 +2060,50 @@ int ocerz_sys_sysctlbyname(struct OcerzVM *vm, OcerzCPU *cpu)
     uint64_t oldp = sb_arg(cpu, 1), oldlenp = sb_arg(cpu, 2);
     int page = name && (strcmp(name, "hw.pagesize") == 0 || strcmp(name, "hw.pagesize32") == 0 ||
                         strcmp(name, "vm.pagesize") == 0);
+    int step;
+    if (!page && !sb_arg(cpu, 3) && sb_sysctl_x86(vm, cpu, name, oldp, oldlenp, &step))
+        return step;
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, SB_LIB, "_sysctlbyname", "i(ppppL)", (const void *)sysctlbyname);
     int r = sysctlbyname(name, sb_ptr(oldp), sb_ptr(oldlenp), sb_ptr(sb_arg(cpu, 3)), (size_t)sb_arg(cpu, 4));
     ocerz_bridge_lower(&outer);
     sb_sysctl_page_size(page, oldp, oldlenp, r);
+    return sb_ret(vm, cpu, r);
+}
+
+int ocerz_sys_sysctlnametomib(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    const char *name = sb_ptr(sb_arg(cpu, 0));
+    int *mibp = sb_ptr(sb_arg(cpu, 1));
+    size_t *sizep = sb_ptr(sb_arg(cpu, 2));
+    int mib[2];
+    if (name && mibp && sizep && ocerz_sysctl_x86_mib(name, mib)) {
+        if (*sizep < 2) {
+            errno = ENOMEM;
+            return sb_ret(vm, cpu, -1);
+        }
+        mibp[0] = mib[0];
+        mibp[1] = mib[1];
+        *sizep = 2;
+        return sb_ret(vm, cpu, 0);
+    }
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_sysctlnametomib", "i(ppp)", (const void *)sysctlnametomib);
+    int r = sysctlnametomib(name, mibp, sizep);
+    ocerz_bridge_lower(&outer);
+    return sb_ret(vm, cpu, r);
+}
+
+/* The machine an x86 process is told it runs on; the rest is the host's, struct utsname being the same on both. */
+int ocerz_sys_uname(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    struct utsname *u = sb_ptr(sb_arg(cpu, 0));
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, SB_LIB, "_uname", "i(p)", (const void *)uname);
+    int r = uname(u);
+    ocerz_bridge_lower(&outer);
+    if (r == 0)
+        snprintf(u->machine, sizeof u->machine, "x86_64");
     return sb_ret(vm, cpu, r);
 }
 

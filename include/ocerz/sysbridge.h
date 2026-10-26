@@ -113,6 +113,8 @@ int ocerz_sys_sysconf(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_host_page_size(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_sysctl(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_sysctlbyname(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_sysctlnametomib(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_uname(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_sandbox_check(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_sandbox_init(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_sandbox_init_with_parameters(struct OcerzVM *vm, OcerzCPU *cpu);

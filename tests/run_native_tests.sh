@@ -12591,6 +12591,83 @@ case_native_tcache() {
     record "$name" "$reason" "kept=$saved loaded=$loaded same=$vok"
 }
 
+# What native mode tells a guest about the machine.  Its uname, sysctl,
+# sysctlbyname and sysctlnametomib reach the host's own functions, which
+# answered an x86 program that it ran on an arm64 Mac: uname -m printed arm64.
+# They answer what cache mode's system calls answer (src/syscall.c), so the
+# fixture prints the same lines in both modes, and uname -m prints x86_64.
+case_native_x86_identity() {
+    local name=native_x86_identity reason="" d="$TMP/native_x86_identity"
+    rm -rf "$d"; mkdir -p "$d"
+    run_bounded "$d/uname.out" "$d/uname.err" "$OCERZ" -native /usr/bin/uname -m
+    if [ "$(cat "$d/uname.out")" != x86_64 ]; then
+        record "$name" "uname -m printed '$(cat "$d/uname.out")' under -native, want x86_64: $(head -1 "$d/uname.err")"
+        return
+    fi
+    if [ "$X86_CLANG" -ne 1 ]; then
+        record "$name" "" "uname only; no x86_64 clang for the sysctl fixture"
+        return
+    fi
+    cat > "$d/ident.c" <<'EOC'
+#include <stdio.h>
+#include <sys/sysctl.h>
+#include <sys/utsname.h>
+static void num(const char *n)
+{
+    long long v = 0;
+    size_t l = sizeof v;
+    int r = sysctlbyname(n, &v, &l, NULL, 0);
+    printf("%s %d %zu %#llx\n", n, r, l, r ? 0 : v);
+}
+static void str(const char *n)
+{
+    char b[256] = "";
+    size_t l = sizeof b;
+    int r = sysctlbyname(n, b, &l, NULL, 0);
+    printf("%s %d '%s'\n", n, r, b);
+}
+int main(void)
+{
+    struct utsname u;
+    uname(&u);
+    printf("uname %s %s\n", u.sysname, u.machine);
+    str("hw.machine");
+    num("hw.cputype");
+    num("hw.cpusubtype");
+    num("sysctl.proc_translated");
+    num("hw.optional.sse4_2");
+    num("hw.optional.avx2_0");
+    str("machdep.cpu.features");
+    num("hw.pagesize");
+    int mib[4];
+    size_t n = 4;
+    int v = 0, r = sysctlnametomib("hw.optional.sse4_2", mib, &n);
+    size_t l = sizeof v;
+    int r2 = sysctl(mib, (unsigned)n, &v, &l, NULL, 0);
+    printf("nametomib %d %zu %d %d\n", r, n, r2, v);
+    int hm[2] = { CTL_HW, HW_MACHINE };
+    char b[64] = "";
+    l = sizeof b;
+    r = sysctl(hm, 2, b, &l, NULL, 0);
+    printf("HW_MACHINE %d '%s'\n", r, b);
+    return 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -o "$d/ident" "$d/ident.c" >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/native.out" "$d/native.err" "$OCERZ" -native "$d/ident"
+    run_bounded "$d/cache.out" "$d/cache.err" "$OCERZ" -cache "$d/ident"
+    if [ "$CACHE_OK" = 1 ] && ! cmp -s "$d/native.out" "$d/cache.out"; then
+        reason="native mode answered '$(diff "$d/cache.out" "$d/native.out" | grep '^>' | head -1 | cut -c3-)' where cache mode answered '$(diff "$d/cache.out" "$d/native.out" | grep '^<' | head -1 | cut -c3-)'"
+    elif ! grep -qx "hw.machine 0 'x86_64'" "$d/native.out" || ! grep -qx "HW_MACHINE 0 'x86_64'" "$d/native.out" ||
+         ! grep -qx "sysctl.proc_translated 0 4 0x1" "$d/native.out"; then
+        reason="native mode did not answer as an x86 process under translation: $(tr '\n' ';' < "$d/native.out" | cut -c1-200)"
+    fi
+    record "$name" "$reason" "$(wc -l < "$d/native.out" | tr -d ' ') lines"
+}
+
 case_bridge_probe_heap() {
     local name=bridge_probe_heap reason="" line
     if [ -z "$PROBE_BIN" ]; then
@@ -15509,6 +15586,7 @@ case_sys sys_strings "$SYS_STRINGS_BIN" "$SYS_STRINGS_ARM64" sys_strings "$SYS_S
     x86 "bit 0 is the writable and executable mapping failing, 1 a function memcpy wrote over code already translated not being what runs next, 2 the same for memset, 3 munmap failing"
 case_sys_strings_inplace
 case_sys_strings_fault
+case_native_x86_identity
 case_native_kept
 case_native_tcache
 

@@ -2858,6 +2858,8 @@ static const BrHandler g_br_handlers[] = {
     { "host_page_size", ocerz_sys_host_page_size },
     { "sysctl", ocerz_sys_sysctl },
     { "sysctlbyname", ocerz_sys_sysctlbyname },
+    { "sysctlnametomib", ocerz_sys_sysctlnametomib },
+    { "uname", ocerz_sys_uname },
     { "sandbox_check",            ocerz_sys_sandbox_check },
     { "sandbox_init",             ocerz_sys_sandbox_init },
     { "sandbox_init_with_parameters", ocerz_sys_sandbox_init_with_parameters },

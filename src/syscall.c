@@ -1185,6 +1185,60 @@ static int x86_sysctl_emit(OcerzCPU *cpu, int idx, uint64_t oldp, uint64_t oldle
     return OCERZ_STEP_OK;
 }
 
+/*
+ * The same answers for native mode, whose sysctl, sysctlbyname,
+ * sysctlnametomib and uname reach the host's own functions (src/sysbridge.c)
+ * and would tell the guest it runs on an arm64 Mac: uname -m said arm64.
+ * ocerz_sysctl_x86_value gives what a name is answered with, a string in *s
+ * or a number of *width bytes in *v.  ocerz_sysctl_x86_name gives the name
+ * behind a MIB: an overridden name the host resolves, hw.pagesize's fixed
+ * number, or the {X86_SYSCTL_MIB, index} pair ocerz_sysctl_x86_mib hands out
+ * for an x86-only name, the way cache mode's sysctl answers name2oid.
+ */
+int ocerz_sysctl_x86_value(const char *name, const char **s, uint64_t *v, unsigned *width)
+{
+    ocerz_sysctl_ovr_resolve();
+    for (unsigned i = 0; i < sizeof g_sysctl_ovr / sizeof g_sysctl_ovr[0]; i++) {
+        const struct ocerz_sysctl_ovr *o = &g_sysctl_ovr[i];
+        if (strcmp(o->name, name) != 0)
+            continue;
+        *s = o->is_str ? o->sval : NULL;
+        *v = o->ival;
+        *width = o->width ? o->width : 4;
+        return 1;
+    }
+    int x = x86_sysctl_find(name);
+    if (x < 0)
+        return 0;
+    *s = g_x86_sysctl[x].sval;
+    *v = g_x86_sysctl[x].val;
+    *width = g_x86_sysctl[x].width;
+    return 1;
+}
+
+const char *ocerz_sysctl_x86_name(const int *mib, unsigned n)
+{
+    if (n == 2 && mib[0] == X86_SYSCTL_MIB)
+        return (unsigned)mib[1] < sizeof g_x86_sysctl / sizeof g_x86_sysctl[0] ? g_x86_sysctl[mib[1]].name : NULL;
+    ocerz_sysctl_ovr_resolve();
+    for (unsigned i = 0; i < sizeof g_sysctl_ovr / sizeof g_sysctl_ovr[0]; i++) {
+        const struct ocerz_sysctl_ovr *o = &g_sysctl_ovr[i];
+        if (o->resolved && o->miblen == n && memcmp(mib, o->mib, (size_t)n * sizeof(int)) == 0)
+            return o->name;
+    }
+    return n == 2 && mib[0] == CTL_HW && mib[1] == HW_PAGESIZE ? "hw.pagesize" : NULL;
+}
+
+int ocerz_sysctl_x86_mib(const char *name, int mib[2])
+{
+    int x = x86_sysctl_find(name);
+    if (x < 0)
+        return 0;
+    mib[0] = X86_SYSCTL_MIB;
+    mib[1] = x;
+    return 1;
+}
+
 static int sys_sysctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
