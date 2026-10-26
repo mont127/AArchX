@@ -65,6 +65,12 @@ builds are removed after a day, or sooner while they add up to more than 2 GB.
 Each directory also keeps a 1 MB filter of the names the shared cache defines
 weakly, which a process binding a C++ library would otherwise build for itself.
 
+In native mode the store also keeps the API databases a launch parsed and the
+system libraries it built from them, and the next launch reads those back
+instead of building them again; the libraries are built afresh after each
+restart of the Mac. Native mode keeps the translations of the program itself
+only with `OCERZ_TCACHE_NATIVE=1` for now.
+
 | Variable | Effect |
 | --- | --- |
 | `OCERZ_TCACHE=off` | translate everything afresh and keep nothing |
@@ -72,6 +78,7 @@ weakly, which a process binding a C++ library would otherwise build for itself.
 | `OCERZ_TCACHE_MAX_MB=<n>` | the size at which a store stops growing (4096 by default) |
 | `OCERZ_TCACHE_MIN_FREE_MB=<n>` | free space the cache leaves on its disk: it stops writing below this, takes at most half of what is free above it, and clears its stores when the disk is already under it (10240 by default) |
 | `OCERZ_TCACHE_LOG=1\|<file>` | print, for each process, how many blocks it loaded and stored |
+| `OCERZ_TCACHE_NATIVE=1` | in native mode, keep the program's translations too, as cache mode does |
 | `OCERZ_TCACHE=verify` | a check, not for use: translate everything anyway and compare each block with the stored one |
 | `OCERZ_TCACHE=roundtrip` | a check, not for use: store nothing, but move every translation to a new address and report anything in it that still pointed at the old one |
 

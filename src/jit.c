@@ -22857,7 +22857,7 @@ static void tc_log_init(void)
 
 static int tc_usable(const OcerzJit *jit)
 {
-    return ocerz_mode != OCERZ_MODE_NATIVE && ocerz_jitstat <= 0 && ocerz_perfstat <= 0 &&
+    return (ocerz_mode != OCERZ_MODE_NATIVE || ocerz_tcache_native()) && ocerz_jitstat <= 0 && ocerz_perfstat <= 0 &&
            !jit->stop_requested;
 }
 

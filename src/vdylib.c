@@ -325,15 +325,21 @@
 #include "ocerz/jit.h"
 #include "ocerz/leaf.h"
 #include "ocerz/mem.h"
+#include "ocerz/tcache.h"
 #include "ocerz/vm.h"
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <mach-o/loader.h>
+#include <uuid/uuid.h>
 
 #define VD_PAGE 4096u
 #define VD_STUB_STRIDE 16u
@@ -964,8 +970,207 @@ static int vd_keeps_r11(const OcerzApiEntry *e)
            (strcmp(e->handler, "tlv_bootstrap") == 0 || strcmp(e->handler, "chkstk") == 0);
 }
 
-uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym host_sym,
-                                 size_t *len_out)
+/*
+ * ---- a built image is kept ----
+ * A build looks every data export up in the host library, sorts every name
+ * and lays out a trie: Foundation's 1548 lookups alone took 2 ms, and the
+ * builds were about half of what a native launch spent before the guest ran.
+ * Nothing in an image changes from one launch to the next but its var slots
+ * and its host addresses, and the host addresses are the arm64 shared cache's,
+ * which stays in one place until the Mac restarts.  So an image built with
+ * ocerz_bridge_host_symbol is written, var slots zeroed, beside the
+ * translation cache's store (<store>/vdylib/<leaf>.<hash of the install
+ * name>.bin), under the identity of its database file, its ordinal and the
+ * shared cache's UUID and address, with the var slots' entries and offsets.  A
+ * later launch that finds the same identity reads the image back and runs only
+ * the fillers, so ___stack_chk_guard is still drawn per process.  A host
+ * value outside the shared cache, an absolute symbol like libobjc's isa masks
+ * or anything else, is written down with the entry it came from, looked up
+ * again on load, and the image is built afresh if it differs.  A build
+ * opens the host library at its first lookup, which runs that library's
+ * initializers there and then; a kept image whose build looked anything up
+ * opens it at the same point.  With the translation cache off (the tests)
+ * nothing is kept.
+ */
+typedef struct VdKeptHdr {
+    char magic[8];
+    uint64_t src_size, src_mtime_s, src_mtime_ns, src_ino, src_dev;
+    uint8_t cache_uuid[16];
+    uint64_t cache_base, cache_len;
+    uint32_t ordinal;
+    uint32_t nvar, nout, looked;
+    uint64_t total, image_at;
+} VdKeptHdr;
+
+typedef struct VdKeptVar {
+    uint32_t entry, off;
+} VdKeptVar;
+
+/* A host value outside the shared cache: the data entry, or VD_KEPT_LEGACY and
+   the g_vd_legacy row, it was looked up for. */
+typedef struct VdKeptOut {
+    uint32_t which, pad;
+    uint64_t value;
+} VdKeptOut;
+
+#define VD_KEPT_LEGACY 0x80000000u
+
+static const char vd_kept_magic[8] = { 'o', 'c', 'z', 'v', 'd', 'y', '1', 0 };
+
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
+
+static int vd_kept_name(const char *install_name, int make, char *out, size_t n)
+{
+    char dir[PATH_MAX];
+    if (!ocerz_tcache_side_dir("vdylib", make, dir, sizeof dir))
+        return 0;
+    const char *leaf = strrchr(install_name, '/');
+    leaf = leaf ? leaf + 1 : install_name;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const char *c = install_name; *c; c++)
+        h = (h ^ (uint8_t)*c) * 0x100000001b3ull;
+    int k = snprintf(out, n, "%s/%s.%016llx.bin", dir, leaf, (unsigned long long)h);
+    return k > 0 && (size_t)k < n;
+}
+
+/* Everything up to nvar: what a kept image has to match to be used. */
+static int vd_kept_identity(const VdLib *lib, VdKeptHdr *h)
+{
+    struct stat st;
+    size_t len = 0;
+    memset(h, 0, sizeof *h);
+    const void *base = _dyld_get_shared_cache_range(&len);
+    if (!base || !len || !_dyld_get_shared_cache_uuid(h->cache_uuid) || stat(lib->api->path, &st) != 0)
+        return 0;
+    memcpy(h->magic, vd_kept_magic, sizeof h->magic);
+    h->src_size = (uint64_t)st.st_size;
+    h->src_mtime_s = (uint64_t)st.st_mtimespec.tv_sec;
+    h->src_mtime_ns = (uint64_t)st.st_mtimespec.tv_nsec;
+    h->src_ino = (uint64_t)st.st_ino;
+    h->src_dev = (uint64_t)st.st_dev;
+    h->cache_base = (uint64_t)(uintptr_t)base;
+    h->cache_len = (uint64_t)len;
+    h->ordinal = lib->ordinal;
+    return 1;
+}
+
+static void vd_keep_image(const VdLib *lib, const uint8_t *buf, uint64_t total, const uint64_t *var_addr,
+                          const VdKeptOut *outv, uint32_t nout, int looked)
+{
+    char name[PATH_MAX], tmp[PATH_MAX + 32];
+    VdKeptHdr h;
+    if (!vd_kept_identity(lib, &h) || !vd_kept_name(lib->api->install_name, 1, name, sizeof name))
+        return;
+    const OcerzApiLibrary *api = lib->api;
+    for (int k = 0; k < api->nentries; k++)
+        h.nvar += api->entries[k].kind == OCERZ_API_VAR;
+    h.nout = nout;
+    h.looked = looked != 0;
+    h.total = total;
+    h.image_at = vd_round_up(sizeof h + (uint64_t)h.nvar * sizeof(VdKeptVar) + (uint64_t)nout * sizeof *outv, 16);
+    uint8_t *out = calloc(1, (size_t)(h.image_at + total));
+    if (!out)
+        return;
+    memcpy(out, &h, sizeof h);
+    VdKeptVar *var = (VdKeptVar *)(void *)(out + sizeof h);
+    if (nout)
+        memcpy(var + h.nvar, outv, (size_t)nout * sizeof *outv);
+    memcpy(out + h.image_at, buf, (size_t)total);
+    uint32_t j = 0;
+    for (int k = 0; k < api->nentries; k++) {
+        const OcerzApiEntry *e = &api->entries[k];
+        if (e->kind != OCERZ_API_VAR)
+            continue;
+        var[j].entry = (uint32_t)k;
+        var[j].off = (uint32_t)var_addr[k];
+        memset(out + h.image_at + var_addr[k], 0, e->bytes);   /* no process's canary on disk */
+        j++;
+    }
+    snprintf(tmp, sizeof tmp, "%s.%d", name, (int)getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        int wrote = write(fd, out, (size_t)(h.image_at + total)) == (ssize_t)(h.image_at + total);
+        close(fd);
+        if (!wrote || rename(tmp, name) != 0)
+            unlink(tmp);
+    }
+    free(out);
+}
+
+static uint8_t *vd_kept_image(const char *install_name, size_t *len_out)
+{
+    char name[PATH_MAX];
+    VdLib *lib = vd_lib(install_name);
+    if (!lib || !vd_kept_name(install_name, 0, name, sizeof name))
+        return NULL;
+    int fd = open(name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return NULL;
+    const OcerzApiLibrary *api = lib->api;
+    VdKeptHdr want, h;
+    struct stat st;
+    VdKeptVar *var = NULL;
+    uint8_t *buf = NULL;
+    if (!vd_kept_identity(lib, &want) || fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof h ||
+        pread(fd, &h, sizeof h, 0) != (ssize_t)sizeof h || memcmp(&h, &want, offsetof(VdKeptHdr, nvar)) != 0 ||
+        h.nvar > (uint32_t)api->nentries || h.nout > (uint32_t)api->nentries + VD_LEGACY_MAX ||
+        h.total == 0 || h.total > UINT32_MAX ||
+        h.image_at < sizeof h + (uint64_t)h.nvar * sizeof *var + (uint64_t)h.nout * sizeof(VdKeptOut) ||
+        h.image_at + h.total != (uint64_t)st.st_size)
+        goto fail;
+    size_t tables = (size_t)h.nvar * sizeof *var + (size_t)h.nout * sizeof(VdKeptOut);
+    var = malloc(tables + 1);
+    buf = malloc((size_t)h.total);
+    if (!var || !buf || pread(fd, var, tables, sizeof h) != (ssize_t)tables ||
+        pread(fd, buf, (size_t)h.total, (off_t)h.image_at) != (ssize_t)h.total)
+        goto fail;
+    close(fd);
+    fd = -1;
+    for (uint32_t j = 0; j < h.nvar; j++) {
+        const OcerzApiEntry *e = var[j].entry < (uint32_t)api->nentries ? &api->entries[var[j].entry] : NULL;
+        const VdFiller *f = e && e->kind == OCERZ_API_VAR ? vd_filler(e->filler) : NULL;
+        if (!f || (uint64_t)var[j].off + e->bytes > h.total)
+            goto fail;
+    }
+    const VdKeptOut *outv = (const VdKeptOut *)(const void *)(var + h.nvar);
+    for (uint32_t j = 0; j < h.nout; j++) {
+        uint32_t w = outv[j].which & ~VD_KEPT_LEGACY;
+        const char *host = NULL;
+        if (!(outv[j].which & VD_KEPT_LEGACY)) {
+            if (w < (uint32_t)api->nentries && api->entries[w].kind == OCERZ_API_DATA)
+                host = api->entries[w].host;
+        } else if (w < sizeof g_vd_legacy / sizeof g_vd_legacy[0] && !strcmp(g_vd_legacy[w].lib, api->install_name)) {
+            host = g_vd_legacy[w].host;
+        }
+        if (!host || (uint64_t)(uintptr_t)ocerz_bridge_host_symbol(api->install_name, host) != outv[j].value) {
+            OCERZ_LOG("vdylib: the kept image of %s is stale: %s is not where it was\n", api->install_name,
+                      host ? host : "an entry");
+            goto fail;
+        }
+    }
+    for (uint32_t j = 0; j < h.nvar; j++) {
+        const OcerzApiEntry *e = &api->entries[var[j].entry];
+        const VdFiller *f = vd_filler(e->filler);
+        if (!f->late)
+            f->fill(buf + var[j].off, e->bytes);
+    }
+    free(var);
+    if (h.looked)
+        (void)ocerz_bridge_host_library(api->install_name);
+    OCERZ_LOG("vdylib: %s from its kept image, %llu bytes\n", api->install_name, (unsigned long long)h.total);
+    if (len_out)
+        *len_out = (size_t)h.total;
+    return buf;
+fail:
+    if (fd >= 0)
+        close(fd);
+    free(var);
+    free(buf);
+    return NULL;
+}
+
+static uint8_t *vd_build(const char *install_name, OcerzVdylibHostSym host_sym, size_t *len_out, int keep)
 {
     VdLib *lib = vd_lib(install_name);
     if (!lib)
@@ -1001,6 +1206,11 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
     VdSym *syms = calloc((size_t)ne + 1 + VD_LEGACY_MAX, sizeof *syms);
     VdNode *nodes = calloc(2 * ((size_t)ne + VD_LEGACY_MAX) + 2, sizeof *nodes);
     uint8_t *buf = NULL;
+    size_t cache_len = 0;
+    const uint8_t *cache_lo = keep ? _dyld_get_shared_cache_range(&cache_len) : NULL;
+    VdKeptOut *outv = cache_lo ? calloc((size_t)ne + VD_LEGACY_MAX + 1, sizeof *outv) : NULL;
+    uint32_t nout = 0;
+    keep = keep && outv;
     if (!var_addr || !syms || !nodes) {
         OCERZ_FATAL("out of memory building virtual %s\n", name);
         goto fail;
@@ -1008,6 +1218,7 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
 
     int m = 0;
     int missed = 0;
+    int looked = 0;
     uint64_t vars_end = vars_off;
     uint32_t stub_index = 0;
     for (int k = 0; k < ne; k++) {
@@ -1034,6 +1245,7 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
             syms[m].absolute = 0;
             m++;
         } else if (e->kind == OCERZ_API_DATA) {
+            looked++;
             void *host = host_sym(name, e->host);
             if (!host) {
                 if (!atomic_exchange(&lib->native_missed[k], 1))
@@ -1046,11 +1258,14 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
             syms[m].addr = (uint64_t)(uintptr_t)host;
             syms[m].absolute = 1;
             m++;
+            if (keep && ((const uint8_t *)host < cache_lo || (const uint8_t *)host >= cache_lo + cache_len))
+                outv[nout++] = (VdKeptOut){ (uint32_t)k, 0, (uint64_t)(uintptr_t)host };
         }
     }
     for (size_t li = 0; li < sizeof g_vd_legacy / sizeof g_vd_legacy[0]; li++) {
         if (strcmp(g_vd_legacy[li].lib, name) != 0)
             continue;
+        looked++;
         void *host = host_sym(name, g_vd_legacy[li].host);
         if (!host) {
             OCERZ_LOG("vdylib: host %s has no %s, so virtual %s does not export %s\n",
@@ -1061,6 +1276,8 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
         syms[m].addr = (uint64_t)(uintptr_t)host;
         syms[m].absolute = 1;
         m++;
+        if (keep && ((const uint8_t *)host < cache_lo || (const uint8_t *)host >= cache_lo + cache_len))
+            outv[nout++] = (VdKeptOut){ VD_KEPT_LEGACY | (uint32_t)li, 0, (uint64_t)(uintptr_t)host };
     }
 
     uint64_t data_used = vars_end - slots_off;
@@ -1186,6 +1403,9 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
               (unsigned long long)text_size, (unsigned long long)data_size,
               (unsigned long long)trie_size, (unsigned long long)trie_off);
 
+    if (keep)
+        vd_keep_image(lib, buf, total, var_addr, outv, nout, looked);
+    free(outv);
     free(var_addr);
     free(syms);
     free(nodes);
@@ -1194,6 +1414,7 @@ uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym ho
     return buf;
 
 fail:
+    free(outv);
     free(var_addr);
     free(syms);
     free(nodes);
@@ -1201,9 +1422,16 @@ fail:
     return NULL;
 }
 
+uint8_t *ocerz_vdylib_image_with(const char *install_name, OcerzVdylibHostSym host_sym,
+                                 size_t *len_out)
+{
+    return vd_build(install_name, host_sym, len_out, 0);
+}
+
 uint8_t *ocerz_vdylib_image(const char *install_name, size_t *len_out)
 {
-    return ocerz_vdylib_image_with(install_name, ocerz_bridge_host_symbol, len_out);
+    uint8_t *buf = vd_kept_image(install_name, len_out);
+    return buf ? buf : vd_build(install_name, ocerz_bridge_host_symbol, len_out, 1);
 }
 
 static inline void vd_errno_enter(const OcerzCPU *cpu)

@@ -297,7 +297,7 @@ static uint64_t stored_sum(const TcStored *z)
 static int env_ignored(const char *kv)
 {
     static const char *const skip[] = {
-        "OCERZ_TCACHE=", "OCERZ_TCACHE_LOG=", "OCERZ_TCACHE_DIR=", "OCERZ_TCACHE_TRACE=",
+        "OCERZ_TCACHE=", "OCERZ_TCACHE_LOG=", "OCERZ_TCACHE_DIR=", "OCERZ_TCACHE_TRACE=", "OCERZ_TCACHE_NATIVE=",
         "OCERZ_TCACHE_MAX_MB=", "OCERZ_TCACHE_MIN_FREE_MB=", "OCERZ_GUESTPROF=", "OCERZ_GUESTPROF_PERIOD=", "OCERZ_LOWBASE=",
         "OCERZ_GUEST_DYLD_INSERT_LIBRARIES=", "OCERZ_PRELOAD_OBJC=", "OCERZ_GUEST_SLIDE=",
         "OCERZ_NO_TCACHE_PROFILE=", "OCERZ_AOT_NO_EXECS=", "OCERZ_NO_TCACHE_FOLD=", "OCERZ_NO_TCACHE_SLAB=",
@@ -374,7 +374,8 @@ static uint64_t free_bytes(void)
     return statfs(g_dir, &s) == 0 ? (uint64_t)s.f_bavail * s.f_bsize : UINT64_MAX;
 }
 
-static void remove_dir(const char *dir)
+/* A store and the side directories in it (ocerz_tcache_side_dir), one level deep. */
+static void remove_dir_at(const char *dir, int depth)
 {
     DIR *d = opendir(dir);
     if (!d)
@@ -385,13 +386,19 @@ static void remove_dir(const char *dir)
             continue;
         char path[1400];
         snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
-        unlink(path);
+        if (unlink(path) != 0 && depth == 0)
+            remove_dir_at(path, 1);
     }
     closedir(d);
     rmdir(dir);
 }
 
-static uint64_t dir_bytes(const char *dir)
+static void remove_dir(const char *dir)
+{
+    remove_dir_at(dir, 0);
+}
+
+static uint64_t dir_bytes_at(const char *dir, int depth)
 {
     uint64_t total = 0;
     DIR *d = opendir(dir);
@@ -404,11 +411,19 @@ static uint64_t dir_bytes(const char *dir)
         char path[1400];
         struct stat st;
         snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
-        if (stat(path, &st) == 0)
-            total += (uint64_t)st.st_blocks * 512;
+        if (stat(path, &st) != 0)
+            continue;
+        total += (uint64_t)st.st_blocks * 512;
+        if (S_ISDIR(st.st_mode) && depth == 0)
+            total += dir_bytes_at(path, 1);
     }
     closedir(d);
     return total;
+}
+
+static uint64_t dir_bytes(const char *dir)
+{
+    return dir_bytes_at(dir, 0);
 }
 
 static void *prune_other_dirs(void *arg)
@@ -591,6 +606,41 @@ int ocerz_tcache_store_path(char *out, size_t n)
     if (ocerz_tcache_mode() != OCERZ_TC_ON)
         return 0;
     return store_dir_name(out, n, g_opened && g_fp ? g_fp : fingerprint());
+}
+
+/* Whether native mode keeps its translations too (OCERZ_TCACHE_NATIVE=1). */
+int ocerz_tcache_native(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("OCERZ_TCACHE_NATIVE");
+        on = v && atoi(v) > 0;
+    }
+    return on;
+}
+
+/* A directory of the store's that another part of ocerz keeps its own files in
+   (src/apidb.c, src/vdylib.c): <store>/<sub>, made, with the store itself, when
+   make is set.  0 when the translation cache is off. */
+int ocerz_tcache_side_dir(const char *sub, int make, char *out, size_t n)
+{
+    char store[PATH_MAX];
+    if (!ocerz_tcache_store_path(store, sizeof store))
+        return 0;
+    int k = snprintf(out, n, "%s/%s", store, sub);
+    if (k <= 0 || (size_t)k >= n)
+        return 0;
+    if (make)
+        for (char *c = out + 1;; c++)
+            if (*c == '/' || !*c) {
+                char was = *c;
+                *c = 0;
+                mkdir(out, 0755);
+                *c = was;
+                if (!was)
+                    break;
+            }
+    return 1;
 }
 
 static int open_store(void)

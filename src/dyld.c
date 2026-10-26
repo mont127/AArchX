@@ -588,6 +588,9 @@
 #include <mach-o/dyld.h>
 #include <mach-o/fat.h>
 #include <crt_externs.h>
+#include <uuid/uuid.h>
+
+extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 
 #define DYN_ARENA_SIZE (256ull << 30)
 #define DYN_STACK_SIZE (8ull << 20)
@@ -7176,6 +7179,13 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         if (ocerz_tcache_profile_ordered())
             ocerz_jit_start_ordered(vm);
         ocerz_jit_prefault_lazy();
+    } else if (!g_aot_n && ocerz_mode == OCERZ_MODE_NATIVE && vm->jit_enabled && ocerz_tcache_native()) {
+        uuid_t host_cache;   /* native mode has no x86 cache: a profile belongs to the arm64 one its records bridge to */
+        if (_dyld_get_shared_cache_uuid(host_cache)) {
+            ocerz_tcache_profile_open(profile_ident(img.slice, img.path), host_cache, img.path);
+            if (ocerz_tcache_profile_ordered())
+                ocerz_jit_start_ordered(vm);
+        }
     }
 
     RpathList main_rpaths;

@@ -95,6 +95,8 @@ void *ocerz_tcache_take_prep(void);
 int ocerz_tcache_found_warm(void);
 
 int ocerz_tcache_store_path(char *out, size_t n);
+int ocerz_tcache_native(void);
+int ocerz_tcache_side_dir(const char *sub, int make, char *out, size_t n);
 
 int ocerz_tcache_warm_has(uint64_t key);
 

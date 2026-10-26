@@ -12491,6 +12491,106 @@ case_native_bound() {
     record "$name" "$reason" "unbound=$n"
 }
 
+# What a native launch keeps beside the translation cache's store (src/apidb.c,
+# src/vdylib.c).  A first run parses the API databases its libraries need,
+# builds their images and keeps both; a second loads the parsed copies and the
+# kept images, parses and builds nothing, and still draws its own
+# ___stack_chk_guard; and once libSystem's database changes, the next run
+# parses it and builds its image again while CoreFoundation's stay kept.  The
+# guest reads a data export (kCFBooleanTrue) too, an absolute address a kept
+# image carries over from the run that built it.
+case_native_kept() {
+    local name=native_kept reason="" d="$TMP/native_kept" i
+    local ls_img=/usr/lib/libSystem.B.dylib cf_img=/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/kept.c" <<'EOC'
+#include <stdio.h>
+#include <stdint.h>
+#include <CoreFoundation/CoreFoundation.h>
+extern uintptr_t __stack_chk_guard;
+int main(void)
+{
+    CFStringRef s = CFStringCreateWithCString(NULL, "kept", kCFStringEncodingUTF8);
+    printf("guard %016lx\n", (unsigned long)__stack_chk_guard);
+    printf("length %ld true %d\n", (long)CFStringGetLength(s), (int)CFBooleanGetValue(kCFBooleanTrue));
+    CFRelease(s);
+    return 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -o "$d/kept" "$d/kept.c" -framework CoreFoundation >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    cp -R "$(dirname "$OCERZ")/runtime/apis" "$d/apis"
+    local api; api=$(ls "$d"/apis/macos/*/libSystem.B.dylib.api | head -1)
+    for i in 1 2 3; do
+        [ "$i" = 3 ] && printf '# changed by the test\n' >> "$api"
+        run_bounded "$d/out$i" "$d/err$i" env OCERZ_APIDB="$d/apis" OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$d/tc" \
+            OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -v -native "$d/kept"
+        echo "rc $?" >> "$d/out$i"
+    done
+    local want g1 g2 g3
+    want=$(printf 'length 4 true 1\nrc 0')
+    g1=$(sed -n 's/^guard //p' "$d/out1"); g2=$(sed -n 's/^guard //p' "$d/out2"); g3=$(sed -n 's/^guard //p' "$d/out3")
+    for i in 1 2 3; do
+        if [ -z "$reason" ] && [ "$(grep -v '^guard ' "$d/out$i")" != "$want" ]; then
+            reason="run $i printed '$(grep -v '^guard ' "$d/out$i" | tr '\n' ' ')', want '$(echo $want)'"
+        fi
+    done
+    if [ -n "$reason" ]; then
+        :
+    elif [ -z "$g1" ] || [ "$g1" = 0000000000000000 ] || [ "$g1" = "$g2" ] || [ "$g2" = "$g3" ]; then
+        reason="the runs drew the guards '$g1', '$g2' and '$g3'; each should draw its own"
+    elif grep -Eq "from its (parsed copy|kept image)" "$d/err1"; then
+        reason="the first run found something kept that no run had written"
+    elif ! grep -q "libSystem.B.dylib.api from its parsed copy" "$d/err2"; then
+        reason="the second run parsed libSystem's database again instead of loading its parsed copy"
+    elif ! grep -Fq "vdylib: $ls_img from its kept image" "$d/err2" || ! grep -Fq "vdylib: $cf_img from its kept image" "$d/err2"; then
+        reason="the second run built libSystem's or CoreFoundation's image again instead of loading the kept one"
+    elif grep -q "libSystem.B.dylib.api from its parsed copy" "$d/err3" || grep -Fq "vdylib: $ls_img from its kept image" "$d/err3"; then
+        reason="the run after libSystem's database changed used what was kept from the old one"
+    elif ! grep -Fq "vdylib: $cf_img from its kept image" "$d/err3"; then
+        reason="the run after libSystem's database changed built CoreFoundation's image again, which did not change"
+    fi
+    record "$name" "$reason" "runs=3"
+}
+
+# Native mode keeping its own translations (OCERZ_TCACHE_NATIVE=1): a first
+# run of xbench_dyn keeps its blocks, a second loads them, and a run that
+# translates everything anyway finds every loaded block the same as its fresh
+# translation; all three print the checksum of a run that keeps nothing.
+case_native_tcache() {
+    local name=native_tcache reason="" d="$TMP/native_tcache" k m
+    rm -rf "$d"; mkdir -p "$d"
+    run_bounded "$d/off.out" "$d/off.err" env OCERZ_TCACHE=off "$OCERZ" -native "$DYN" "$KERNEL" "$SCALE"
+    for k in cold warm verify; do
+        m=on; [ "$k" = verify ] && m=verify
+        run_bounded "$d/$k.out" "$d/$k.err" env OCERZ_TCACHE=$m OCERZ_TCACHE_NATIVE=1 OCERZ_TCACHE_LOG=1 \
+            OCERZ_TCACHE_DIR="$d/tc" OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$DYN" "$KERNEL" "$SCALE"
+    done
+    local saved loaded vok vbad
+    saved=$(grep -o 'saved=[0-9]*' "$d/cold.err" | head -1 | cut -d= -f2)
+    loaded=$(grep -o ' in=[0-9]*' "$d/warm.err" | head -1 | cut -d= -f2)
+    vok=$(grep -o 'same=[0-9]*' "$d/verify.err" | head -1 | cut -d= -f2)
+    vbad=$(grep -o 'verify_bad=[0-9]*' "$d/verify.err" | head -1 | cut -d= -f2)
+    if [ ! -s "$d/off.out" ]; then
+        reason="the run that keeps nothing printed nothing: $(head -1 "$d/off.err")"
+    elif ! cmp -s "$d/off.out" "$d/cold.out" || ! cmp -s "$d/off.out" "$d/warm.out" || ! cmp -s "$d/off.out" "$d/verify.out"; then
+        reason="a run that keeps translations printed something else than '$(head -1 "$d/off.out")': '$(head -1 "$d/cold.out")', '$(head -1 "$d/warm.out")', '$(head -1 "$d/verify.out")'"
+    elif [ "${saved:-0}" -eq 0 ]; then
+        reason="the first run kept no block"
+    elif [ "${loaded:-0}" -eq 0 ]; then
+        reason="the second run loaded no block of the program"
+    elif [ "${vok:-0}" -eq 0 ] || [ "${vbad:-1}" -ne 0 ]; then
+        reason="verify found $vbad blocks different from their fresh translation and $vok the same"
+    fi
+    record "$name" "$reason" "kept=$saved loaded=$loaded same=$vok"
+}
+
 case_bridge_probe_heap() {
     local name=bridge_probe_heap reason="" line
     if [ -z "$PROBE_BIN" ]; then
@@ -15409,6 +15509,8 @@ case_sys sys_strings "$SYS_STRINGS_BIN" "$SYS_STRINGS_ARM64" sys_strings "$SYS_S
     x86 "bit 0 is the writable and executable mapping failing, 1 a function memcpy wrote over code already translated not being what runs next, 2 the same for memset, 3 munmap failing"
 case_sys_strings_inplace
 case_sys_strings_fault
+case_native_kept
+case_native_tcache
 
 # sys_proc starts a child with an environment of its own, in which nothing says
 # no cache holder, so that child starts one as any launch would

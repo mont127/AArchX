@@ -64,6 +64,7 @@
  */
 #include "ocerz/apidb.h"
 #include "ocerz/abi.h"
+#include "ocerz/tcache.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -939,6 +940,219 @@ static AdSlot *ad_publish_locked(const char *install_name, const OcerzApiLibrary
     return s;
 }
 
+/*
+ * ---- the parsed form is kept ----
+ * A native launch parsed every database its program's libraries need, and the
+ * checks the walk makes are the whole cost: libSystem's 435 KB, CoreFoundation's
+ * and Foundation's took a Foundation program 6-8 ms of an 18 ms launch, every
+ * launch, for files that change only when ocerz is updated.  So a library parsed
+ * once is written, as parsed, beside the translation cache's store
+ * (<store>/apidb/<leaf>.<hash of the path>.bin): the text with its fields cut
+ * out, the entries and shapes with each string pointer kept as its offset into
+ * that text, and the name index.  A later load of the same file, the same size,
+ * time, inode and device, reads that back and turns the offsets into pointers,
+ * and parses nothing.  The store is per build of ocerz, so the layout is the one
+ * this build wrote; a library any of whose strings lies outside its text is not
+ * kept, and with the translation cache off (the tests) nothing is.
+ */
+typedef struct AdCacheHdr {
+    char magic[8];
+    uint64_t src_size, src_mtime_s, src_mtime_ns, src_ino, src_dev;
+    uint64_t text_len, nentries, nshapes, hcap;
+    uint64_t install_off, sdk_off;
+    uint64_t text_at, entries_at, shapes_at, hash_at, total;
+} AdCacheHdr;
+
+static const char ad_cache_magic[8] = { 'o', 'c', 'z', 'a', 'p', 'i', '1', 0 };
+
+static int ad_cache_name(const char *src, int make, char *out, size_t n)
+{
+    char dir[PATH_MAX];
+    if (!ocerz_tcache_side_dir("apidb", make, dir, sizeof dir))
+        return 0;
+    const char *leaf = strrchr(src, '/');
+    leaf = leaf ? leaf + 1 : src;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const char *c = src; *c; c++)
+        h = (h ^ (uint8_t)*c) * 0x100000001b3ull;
+    int k = snprintf(out, n, "%s/%s.%016llx.bin", dir, leaf, (unsigned long long)h);
+    return k > 0 && (size_t)k < n;
+}
+
+static int ad_cache_off(const char *text, uint64_t len, const char *p, uint64_t *out)
+{
+    if (!p) {
+        *out = 0;
+        return 1;
+    }
+    if (p < text || (uint64_t)(p - text) > len)
+        return 0;
+    *out = (uint64_t)(p - text) + 1;
+    return 1;
+}
+
+static void ad_cache_save(const char *src, const struct stat *st, const AdLibrary *lib)
+{
+    char name[PATH_MAX], tmp[PATH_MAX + 32];
+    if (!ad_cache_name(src, 1, name, sizeof name))
+        return;
+    const OcerzApiLibrary *pub = &lib->pub;
+    uint64_t len = (uint64_t)st->st_size;
+    AdCacheHdr h;
+    memset(&h, 0, sizeof h);
+    memcpy(h.magic, ad_cache_magic, sizeof h.magic);
+    h.src_size = (uint64_t)st->st_size;
+    h.src_mtime_s = (uint64_t)st->st_mtimespec.tv_sec;
+    h.src_mtime_ns = (uint64_t)st->st_mtimespec.tv_nsec;
+    h.src_ino = (uint64_t)st->st_ino;
+    h.src_dev = (uint64_t)st->st_dev;
+    h.text_len = len;
+    h.nentries = (uint64_t)pub->nentries;
+    h.nshapes = (uint64_t)pub->nshapes;
+    h.hcap = lib->hcap;
+    if (!ad_cache_off(lib->text, len, pub->install_name, &h.install_off) ||
+        !ad_cache_off(lib->text, len, pub->sdk_version, &h.sdk_off))
+        return;
+    h.text_at = (sizeof h + 15) & ~(uint64_t)15;
+    h.entries_at = (h.text_at + len + 1 + 15) & ~(uint64_t)15;
+    h.shapes_at = (h.entries_at + h.nentries * sizeof(OcerzApiEntry) + 15) & ~(uint64_t)15;
+    h.hash_at = (h.shapes_at + h.nshapes * sizeof(OcerzApiShape) + 15) & ~(uint64_t)15;
+    h.total = h.hash_at + (uint64_t)lib->hcap * sizeof(uint32_t);
+    uint8_t *buf = calloc(1, (size_t)h.total);
+    if (!buf)
+        return;
+    memcpy(buf, &h, sizeof h);
+    memcpy(buf + h.text_at, lib->text, (size_t)len + 1);
+    OcerzApiEntry *e = (OcerzApiEntry *)(void *)(buf + h.entries_at);
+    memcpy(e, pub->entries, (size_t)h.nentries * sizeof *e);
+    OcerzApiShape *sh = (OcerzApiShape *)(void *)(buf + h.shapes_at);
+    memcpy(sh, pub->shapes, (size_t)h.nshapes * sizeof *sh);
+    if (lib->hcap)
+        memcpy(buf + h.hash_at, lib->hash, (size_t)lib->hcap * sizeof(uint32_t));
+    int ok = 1;
+    uint64_t o;
+#define AD_OFF(field) do { ok = ok && ad_cache_off(lib->text, len, (field), &o); (field) = (const char *)(uintptr_t)o; } while (0)
+    for (uint64_t k = 0; ok && k < h.nentries; k++) {
+        AD_OFF(e[k].export_name);
+        AD_OFF(e[k].host);
+        AD_OFF(e[k].sig);
+        AD_OFF(e[k].handler);
+        AD_OFF(e[k].filler);
+        AD_OFF(e[k].reason);
+        for (int i = 0; ok && i < e[k].nstructs; i++)
+            AD_OFF(e[k].structs[i].shape);
+        for (int i = 0; ok && i < e[k].ninplace; i++)
+            AD_OFF(e[k].inplace[i].sig);
+    }
+    for (uint64_t k = 0; ok && k < h.nshapes; k++) {
+        AD_OFF(sh[k].name);
+        for (int i = 0; ok && i < sh[k].words; i++)
+            AD_OFF(sh[k].word[i]);
+    }
+#undef AD_OFF
+    if (ok) {
+        snprintf(tmp, sizeof tmp, "%s.%d", name, (int)getpid());
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd >= 0) {
+            int wrote = write(fd, buf, (size_t)h.total) == (ssize_t)h.total;
+            close(fd);
+            if (!wrote || rename(tmp, name) != 0)
+                unlink(tmp);
+        }
+    }
+    free(buf);
+}
+
+static const OcerzApiLibrary *ad_cache_load(const char *src, const struct stat *st)
+{
+    char name[PATH_MAX];
+    if (!ad_cache_name(src, 0, name, sizeof name))
+        return NULL;
+    int fd = open(name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return NULL;
+    struct stat cst;
+    AdCacheHdr h;
+    uint8_t *buf = NULL;
+    AdLibrary *lib = NULL;
+    char *path = NULL;
+    if (fstat(fd, &cst) != 0 || cst.st_size < (off_t)sizeof h || pread(fd, &h, sizeof h, 0) != (ssize_t)sizeof h ||
+        memcmp(h.magic, ad_cache_magic, sizeof h.magic) || h.total != (uint64_t)cst.st_size ||
+        h.src_size != (uint64_t)st->st_size || h.src_mtime_s != (uint64_t)st->st_mtimespec.tv_sec ||
+        h.src_mtime_ns != (uint64_t)st->st_mtimespec.tv_nsec || h.src_ino != (uint64_t)st->st_ino ||
+        h.src_dev != (uint64_t)st->st_dev || h.nentries > (1u << 24) || h.nshapes > (1u << 20) ||
+        h.text_at + h.text_len + 1 > h.entries_at ||
+        h.entries_at + h.nentries * sizeof(OcerzApiEntry) > h.shapes_at ||
+        h.shapes_at + h.nshapes * sizeof(OcerzApiShape) > h.hash_at ||
+        h.hash_at + h.hcap * sizeof(uint32_t) > h.total)
+        goto fail;
+    buf = malloc((size_t)h.total);
+    lib = calloc(1, sizeof *lib);
+    path = strdup(src);
+    if (!buf || !lib || !path || pread(fd, buf, (size_t)h.total, 0) != (ssize_t)h.total)
+        goto fail;
+    close(fd);
+    fd = -1;
+    char *text = (char *)buf + h.text_at;
+    if (text[h.text_len] != 0 || h.install_off > h.text_len + 1 || h.sdk_off > h.text_len + 1)
+        goto fail;
+    OcerzApiEntry *e = (OcerzApiEntry *)(void *)(buf + h.entries_at);
+    OcerzApiShape *sh = (OcerzApiShape *)(void *)(buf + h.shapes_at);
+    int ok = 1;
+#define AD_FIX(field) do { uint64_t o_ = (uint64_t)(uintptr_t)(field); ok = ok && o_ <= h.text_len + 1; \
+                           (field) = o_ ? text + o_ - 1 : NULL; } while (0)
+    for (uint64_t k = 0; ok && k < h.nentries; k++) {
+        if (e[k].nstructs < 0 || e[k].nstructs > OCERZ_APIDB_STRUCT_ARGS || e[k].ninplace < 0 ||
+            e[k].ninplace > OCERZ_APIDB_INPLACE) {
+            ok = 0;
+            break;
+        }
+        AD_FIX(e[k].export_name);
+        AD_FIX(e[k].host);
+        AD_FIX(e[k].sig);
+        AD_FIX(e[k].handler);
+        AD_FIX(e[k].filler);
+        AD_FIX(e[k].reason);
+        for (int i = 0; ok && i < e[k].nstructs; i++)
+            AD_FIX(e[k].structs[i].shape);
+        for (int i = 0; ok && i < e[k].ninplace; i++)
+            AD_FIX(e[k].inplace[i].sig);
+    }
+    for (uint64_t k = 0; ok && k < h.nshapes; k++) {
+        if (sh[k].words < 0 || sh[k].words > OCERZ_APIDB_SHAPE_WORDS) {
+            ok = 0;
+            break;
+        }
+        AD_FIX(sh[k].name);
+        for (int i = 0; ok && i < sh[k].words; i++)
+            AD_FIX(sh[k].word[i]);
+    }
+#undef AD_FIX
+    if (!ok)
+        goto fail;
+    lib->text = text;
+    lib->path = path;
+    lib->hash = h.hcap ? (uint32_t *)(void *)(buf + h.hash_at) : NULL;
+    lib->hcap = (uint32_t)h.hcap;
+    lib->pub.path = path;
+    lib->pub.install_name = h.install_off ? text + h.install_off - 1 : NULL;
+    lib->pub.sdk_version = h.sdk_off ? text + h.sdk_off - 1 : NULL;
+    lib->pub.entries = e;
+    lib->pub.nentries = (int)h.nentries;
+    lib->pub.shapes = sh;
+    lib->pub.nshapes = (int)h.nshapes;
+    if (!lib->pub.install_name)
+        goto fail;
+    return &lib->pub;
+fail:
+    if (fd >= 0)
+        close(fd);
+    free(buf);
+    free(lib);
+    free(path);
+    return NULL;
+}
+
 static const OcerzApiLibrary *ad_load_locked(const char *install_name)
 {
     ad_choose_locked();
@@ -953,21 +1167,30 @@ static const OcerzApiLibrary *ad_load_locked(const char *install_name)
     if (n <= 0 || (size_t)n >= sizeof path)
         return NULL;
 
-    size_t len = 0;
-    int missing = 0;
-    char *text = ad_read_file(path, &len, &missing);
-    if (!text) {
-        int why = errno;
-        if (!missing)
-            fprintf(stderr, "ocerz: apidb: cannot read %s: %s\n", path, strerror(why));
-        return NULL;
-    }
-    char err[512];
-    const OcerzApiLibrary *lib = ocerz_apidb_parse(path, text, len, err, sizeof err);
-    free(text);
+    struct stat sst;
+    int have_st = stat(path, &sst) == 0 && S_ISREG(sst.st_mode);
+    const OcerzApiLibrary *lib = have_st ? ad_cache_load(path, &sst) : NULL;
+    if (lib)
+        OCERZ_LOG("apidb: %s from its parsed copy, %d exports\n", path, lib->nentries);
     if (!lib) {
-        fprintf(stderr, "ocerz: apidb: refusing %s\n", err);
-        return NULL;
+        size_t len = 0;
+        int missing = 0;
+        char *text = ad_read_file(path, &len, &missing);
+        if (!text) {
+            int why = errno;
+            if (!missing)
+                fprintf(stderr, "ocerz: apidb: cannot read %s: %s\n", path, strerror(why));
+            return NULL;
+        }
+        char err[512];
+        lib = ocerz_apidb_parse(path, text, len, err, sizeof err);
+        free(text);
+        if (!lib) {
+            fprintf(stderr, "ocerz: apidb: refusing %s\n", err);
+            return NULL;
+        }
+        if (have_st && (uint64_t)len == (uint64_t)sst.st_size)
+            ad_cache_save(path, &sst, (const AdLibrary *)lib);
     }
     if (strcmp(lib->install_name, install_name) != 0) {
         OCERZ_LOG("apidb: %s describes %s, not %s\n", path, lib->install_name, install_name);
