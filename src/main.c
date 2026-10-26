@@ -611,13 +611,7 @@ int main(int argc, char **argv)
             ocerz_mode = OCERZ_MODE_CACHE;
             mode_from_flag = 1;
         } else if (strcmp(argv[i], "-fex") == 0) {
-#ifdef OCERZ_HAVE_FEX
-            ocerz_engine_run = ocerz_fex_run;
-            ocerz_engine_fault = ocerz_fex_fault;
-#else
-            OCERZ_FATAL("this ocerz was built without FEXCore, so it has no -fex (make FEX=<dir> builds it in)\n");
-            return 64;
-#endif
+            setenv("OCERZ_FEX", "1", 1);
         } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
             load_path = argv[++i];
         } else if (strcmp(argv[i], "-aot") == 0 || strcmp(argv[i], "-aot-deps") == 0) {
@@ -628,6 +622,19 @@ int main(int argc, char **argv)
             usage();
             return 64;
         }
+    }
+    /* -fex, or OCERZ_FEX=1, which -fex sets so that the programs a guest starts run on FEXCore as well */
+    const char *fex_env = getenv("OCERZ_FEX");
+    if (fex_env && *fex_env && strcmp(fex_env, "0") != 0) {
+#ifdef OCERZ_HAVE_FEX
+        ocerz_engine_run = ocerz_fex_run;
+        ocerz_engine_fault = ocerz_fex_fault;
+        ocerz_engine_async = ocerz_fex_async;
+        ocerz_engine_invalidate = ocerz_fex_invalidate;
+#else
+        OCERZ_FATAL("this ocerz was built without FEXCore, so it has no -fex (make FEX=<dir> builds it in)\n");
+        return 64;
+#endif
     }
     if (!mode_from_flag) {
         const char *mode_env = getenv("OCERZ_MODE");

@@ -1575,9 +1575,13 @@ static void async_sig_handler(int sig, siginfo_t *si, void *ctx)
             __atomic_fetch_add(&c->sig_host_rcvd[sig], 1u, __ATOMIC_RELAXED);
         /* a thread inside a translated loop would not see it until the loop ended */
         if (c && !g_async_shared_only && !m32_active && ctx && !(c->sig_mask >> (sig - 1) & 1) &&
-            !g_no_signal_stop)
-            ocerz_jit_signal_stop(c->vm, c,
-                                  (const void *)(uintptr_t)((ucontext_t *)ctx)->uc_mcontext->__ss.__pc);
+            !g_no_signal_stop) {
+            if (ocerz_engine_async)
+                ocerz_engine_async(ctx);
+            else
+                ocerz_jit_signal_stop(c->vm, c,
+                                      (const void *)(uintptr_t)((ucontext_t *)ctx)->uc_mcontext->__ss.__pc);
+        }
     }
 }
 
@@ -2050,6 +2054,8 @@ static void abort_report(int sig, siginfo_t *si, void *ctx)
 }
 
 int (*ocerz_engine_fault)(int sig, siginfo_t *si, void *uc);
+int (*ocerz_engine_async)(void *uc);
+void (*ocerz_engine_invalidate)(uint64_t addr, uint64_t len);
 
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
@@ -3717,6 +3723,12 @@ static void call_sentinel_init(void)
     OCERZ_LOG("vm: call sentinel page at %#llx\n", (unsigned long long)g_call_sentinel);
 }
 
+uint64_t ocerz_vm_call_sentinel(void)
+{
+    pthread_once(&g_call_sentinel_once, call_sentinel_init);
+    return g_call_sentinel;
+}
+
 /* A callback's cpu starts as a copy of its caller's, less two rings it has no use for, which are 6 of the struct's 8 KB
  * and made copying it most of what a callback cost.  Its return-address stack starts empty: a translated ret pops
  * only what the callback's own calls pushed, finds ras_top 0 below that and looks its target up, as it would after a
@@ -3925,7 +3937,9 @@ static int vm_call_core(OcerzVM *vm, uint64_t func, OcerzGuestCall *call, int ng
         }
         }
 
-        if (esc_r) {
+        if (ocerz_engine_run) {
+            r = ocerz_engine_run(vm, &local);
+        } else if (esc_r) {
             r = esc_r;
             esc_r = 0;
             if (r == OCERZ_EUNSUP)
@@ -4281,7 +4295,9 @@ void ocerz_thread_detach(void)
 
 static void ocerz_kick_handler(int sig, siginfo_t *si, void *uc)
 {
-    (void)sig; (void)si; (void)uc;
+    (void)sig; (void)si;
+    if (ocerz_engine_async && uc)
+        ocerz_engine_async(uc);
 }
 static void ocerz_install_kick_handler(void)
 {

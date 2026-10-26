@@ -14,6 +14,15 @@
  * ordered instructions that fault when misaligned across 16 bytes, and FEXCore
  * rewrites such an instruction in place once the frontend hands it the fault.
  *
+ * ocerz_engine_async, when set, is called from the handlers of the signals that
+ * interrupt a running guest thread (a host signal for the guest, the kick an exit
+ * request sends) with the interrupted context, so that a thread looping in
+ * translated code, with no system call to notice anything at, leaves it.
+ *
+ * ocerz_engine_invalidate, when set, hears every guest range ocerz drops
+ * translations for (ocerz_jit_invalidate_range): a write to a page of guest
+ * code, an unmap, a protection change.
+ *
  * FEXCore is linked only by `make FEX=<dir>` (OCERZ_HAVE_FEX); a plain build
  * has no -fex.
  */
@@ -21,6 +30,7 @@
 #define OCERZ_FEX_H
 
 #include <signal.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,9 +41,13 @@ struct OcerzCPU;
 
 extern int (*ocerz_engine_run)(struct OcerzVM *vm, struct OcerzCPU *cpu);
 extern int (*ocerz_engine_fault)(int sig, siginfo_t *si, void *uc);
+extern int (*ocerz_engine_async)(void *uc);
+extern void (*ocerz_engine_invalidate)(uint64_t addr, uint64_t len);
 
 int ocerz_fex_run(struct OcerzVM *vm, struct OcerzCPU *cpu);
 int ocerz_fex_fault(int sig, siginfo_t *si, void *uc);
+int ocerz_fex_async(void *uc);
+void ocerz_fex_invalidate(uint64_t addr, uint64_t len);
 
 #ifdef __cplusplus
 }

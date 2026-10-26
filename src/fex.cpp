@@ -1,77 +1,179 @@
 /*
  * The FEXCore engine behind -fex (include/ocerz/fex.h).
  *
- * One FEXCore context serves the process; each host thread that runs guest
- * code gets a FEXCore thread of its own the first time the run loop hands it a
- * cpu.  FEXCore keeps the guest state while guest code runs, and it is copied
- * into the OcerzCPU and back around every system call, so ocerz's system call
- * layer sees the registers exactly as it does under its own JIT.
+ * One FEXCore context serves the process.  FEXCore keeps the guest state while
+ * guest code runs, and it is copied into the OcerzCPU and back around every
+ * system call and every call out to ocerz, so ocerz's own layers see the
+ * registers exactly as they do under ocerz's JIT.
  *
  * FEXCore needs guest addresses to be host addresses, which is what identity
  * memory mode gives (include/ocerz/mem.h), so -fex runs only there.
  *
- * A system call runs inside FEXCore's callback, on the guest thread, and
- * guest code goes on from where it says.  When the call ends the guest's run
- * (an exit, a thread's end, a pending signal), the callback points the guest at
- * fex_exit_hlt instead: FEXCore leaves ExecuteThread on a HLT, since the
- * context runs with EnableExitOnHLT, and the run loop gets the step code.  A
- * HLT anywhere else is the guest's own, which on x86 is a fault.
+ * ---- threads and nesting ----
+ * Guest code runs nested on one host thread: a system call or a dyld API call
+ * made from guest code can run guest code again through ocerz_vm_call (an
+ * initializer, an image callback), which can call out again, and so on.  Each
+ * level is its own FEXCore thread, kept per host thread in t_levels and made the
+ * first time that depth is reached, then handed whichever cpu runs at that
+ * depth.  t_cur is the level whose code is running, which every callback from
+ * FEXCore works on.  FEXCore checks a thread's code segment for long mode, so
+ * each level has a descriptor table holding macOS's 64-bit user code selector,
+ * 0x2b, and FEXCore's calls and returns keep a stack of their own, which the
+ * frontend provides: 4 MB between two guard pages, starting a quarter of the way
+ * in, as FEX's Linux frontend sets it.
  *
- * FEXCore checks a thread's code segment for long mode, so each thread gets a
- * descriptor table holding macOS's 64-bit user code selector, 0x2b.  Its calls
- * and returns also keep a stack of their own, which the frontend provides: 4 MB
- * between two guard pages, starting a quarter of the way in so that returns
- * past the first call have room, as FEX's Linux frontend sets it.
+ * ---- leaving FEXCore ----
+ * A system call runs inside FEXCore's callback and guest code goes on from where
+ * it says.  When the call ends the guest's run (an exit, a thread's end, a
+ * pending signal), the callback points the guest at fex_exit_hlt instead.  The
+ * context runs with fault-free synchronous faults, so a HLT, an int3 or a ud2
+ * reaches fex_sync_fault with the guest state spilled, and that jumps back to
+ * the level's ocerz_fex_run, which hands the run loop its step code.  An int3
+ * becomes the guest's SIGTRAP; any other trap but our own HLT is fatal, as it
+ * is under ocerz's interpreter.  FEXCore raises no divide error: arm64's divide
+ * answers 0 for a zero divisor.
+ *
+ * ocerz answers some addresses itself that hold no code a host could map: the
+ * dyld API's trap slots and the sentinel a call from ocerz returns to, both
+ * below 4 GB, where macOS gives an arm64 process no memory.  Each is a FEXCore
+ * thunk trampoline, which leaves the address in R11 and goes on at code ocerz
+ * holds in its own memory, since FEXCore reads guest code through host
+ * pointers: the sentinel goes to fex_exit_hlt, and a trap slot to fex_trap_insn,
+ * FEXCore's thunk instruction, which calls fex_trap with the guest registers
+ * spilled.  fex_trap runs ocerz_dyldapi_dispatch; that returns to the caller
+ * itself, and the thunk instruction pops a return address of its own, so the
+ * address is pushed back for it.  A HLT anywhere else is the guest's own, which
+ * on x86 is a fault.
+ *
+ * ---- guest code that changes ----
+ * Every page FEXCore translates from is armed like a page ocerz's JIT translated
+ * from (ocerz_mem_arm_exec, ocerz_cache_arm_exec), so the guest's first write
+ * to it faults; the fault disarms the page, drops FEXCore's translations of it
+ * and lets the write go again.  ocerz's other reasons to drop translations reach
+ * FEXCore through ocerz_engine_invalidate.  Dropping a range drops it from the
+ * shared code buffers and from every FEXCore thread's own lookup cache, so every
+ * level of every host thread is listed in g_all.
+ *
+ * ---- fork ----
+ * A forked child cannot execute its parent's MAP_JIT memory, which holds all of
+ * FEXCore's code, its dispatcher included.  So when the system call that comes
+ * back in a new process is a fork, the callback does not return into that code:
+ * the child makes a context of its own, forgets the parent's threads, and jumps
+ * back to the level's ocerz_fex_run with the guest state in the cpu.
+ *
+ * ---- faults ----
+ * FEXCore's ordered loads and stores fault when misaligned across 16 bytes, and
+ * FEXCore rewrites such an instruction in place once handed the fault.  The x86
+ * commpage, at 0x7fffffe00000, lies above the highest address macOS maps for an
+ * arm64 process, so a guest read of it faults too: the load is decoded, done
+ * from ocerz's copy of the commpage, and stepped over.  Any other fault in
+ * translated code is the guest's: the registers FEXCore keeps in host registers
+ * are spilled from the host context by the mapping FEXCore gave its signal
+ * delegator, the guest rip is found from the host pc, and crash_handler goes on
+ * to deliver the signal as it does for ocerz's own code, jumping back to the run
+ * loop past this level's ocerz_fex_run.  So each level notes its frame, and a
+ * level whose frame is gone by the next entry is dropped.
  */
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Core/SignalDelegator.h>
+#include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXCore/Utils/LogManager.h>
 
+#include <csetjmp>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <vector>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <sys/ucontext.h>
 
 extern "C" {
+#include "ocerz/cache.h"
 #include "ocerz/cpu.h"
+#include "ocerz/dyldapi.h"
 #include "ocerz/fex.h"
 #include "ocerz/flags.h"
 #include "ocerz/interp.h"
+#include "ocerz/mem.h"
 #include "ocerz/syscall.h"
 #include "ocerz/vm.h"
 }
 
 namespace {
 
+using FEXCore::X86State::REG_R11;
+
 constexpr uint16_t MACOS_USER_CS = 0x2b;
+constexpr uint16_t MACOS_USER_SS = 0x23;
 constexpr size_t CALLRET_GUARD = 16384;
 constexpr size_t CALLRET_SIZE = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+constexpr int MAX_LEVELS = 128;
 
 const uint8_t fex_exit_hlt = 0xf4;
 
+struct TrapInsn {
+    uint8_t op[2];
+    uint8_t name[32];
+};
+const TrapInsn fex_trap_insn = {{0x0f, 0x3f}, {'o', 'c', 'e', 'r', 'z', ' ', 'd', 'y', 'l', 'd', ' ', 'a', 'p', 'i'}};
+
 struct FexThread {
+    uint64_t generation;
     OcerzVM *vm;
     OcerzCPU *cpu;
     FEXCore::Core::InternalThreadState *thread;
     FEXCore::Core::CPUState::gdt_segment gdt[32];
     uint8_t *callret;
+    jmp_buf out;
+    uintptr_t frame;
+    bool leave;
+    bool cpu_current;
     uint64_t resume_rip;
     int step;
 };
 
-thread_local FexThread *t_fex;
-
 fextl::unique_ptr<FEXCore::Context::Context> g_ctx;
 std::once_flag g_init_once;
+uint64_t g_sentinel;
+pid_t g_pid;
+uint64_t g_generation;
+
+std::mutex g_all_lock;
+std::vector<FexThread *> g_all;
+
+void destroy_level(FexThread *ft)
+{
+    {
+        std::scoped_lock lk(g_all_lock);
+        std::erase(g_all, ft);
+    }
+    g_ctx->DestroyThread(ft->thread);
+    munmap(ft->callret, CALLRET_SIZE + 2 * CALLRET_GUARD);
+    delete ft;
+}
+
+struct Levels {
+    FexThread *at[MAX_LEVELS];
+    int active;
+    ~Levels()
+    {
+        for (int i = 0; i < MAX_LEVELS; i++)
+            if (at[i] && at[i]->generation == g_generation)
+                destroy_level(at[i]);
+    }
+};
+
+thread_local Levels t_levels;
+thread_local FexThread *t_cur;
 
 void to_cpu(FexThread *ft)
 {
@@ -117,28 +219,112 @@ void from_cpu(FexThread *ft)
     g_ctx->SetXMMRegistersFromState(ft->thread, lo, hi);
 }
 
-int signal_waiting(OcerzCPU *cpu)
+bool must_leave(FexThread *ft, int r)
 {
-    return (__atomic_load_n(&cpu->sig_pending, __ATOMIC_RELAXED) & ~cpu->sig_mask) || ocerz_peek_pending_async_sig();
+    OcerzCPU *cpu = ft->cpu;
+    return r != OCERZ_STEP_OK || ft->vm->exited || cpu->terminated || cpu->interrupt ||
+           (__atomic_load_n(&cpu->sig_pending, __ATOMIC_RELAXED) & ~cpu->sig_mask) || ocerz_peek_pending_async_sig();
 }
+
+void fork_child_restart();
 
 void fex_syscall(FEXCore::Core::CpuStateFrame *Frame)
 {
-    FexThread *ft = t_fex;
-    OcerzVM *vm = ft->vm;
+    FexThread *ft = t_cur;
     OcerzCPU *cpu = ft->cpu;
     auto &S = Frame->State;
     uint64_t at = S.rip;
     to_cpu(ft);
     cpu->cur_rip = at;
     cpu->rip = at + 2;
-    int r = ocerz_handle_syscall(vm, cpu);
+    int r = ocerz_handle_syscall(ft->vm, cpu);
+    if (getpid() != g_pid) {
+        fork_child_restart();
+        ft->leave = true;
+        ft->cpu_current = true;
+        ft->step = r;
+        ft->resume_rip = cpu->rip;
+        _longjmp(ft->out, 1);
+    }
     from_cpu(ft);
-    if (r != OCERZ_STEP_OK || vm->exited || cpu->terminated || cpu->interrupt || signal_waiting(cpu)) {
+    if (must_leave(ft, r)) {
+        ft->leave = true;
         ft->step = r;
         ft->resume_rip = cpu->rip;
         S.rip = (uint64_t)&fex_exit_hlt;
     }
+}
+
+void fex_trap(void *)
+{
+    FexThread *ft = t_cur;
+    OcerzCPU *cpu = ft->cpu;
+    auto &S = ft->thread->CurrentFrame->State;
+    uint64_t slot = S.gregs[REG_R11];
+    to_cpu(ft);
+    cpu->cur_rip = slot;
+    cpu->rip = slot;
+    int r = ocerz_dyldapi_dispatch(ft->vm, cpu);
+    uint64_t back = cpu->rip;
+    if (must_leave(ft, r)) {
+        ft->leave = true;
+        ft->step = r;
+        ft->resume_rip = back;
+        back = (uint64_t)&fex_exit_hlt;
+    }
+    cpu->gpr[OCERZ_RSP] -= 8;
+    *(uint64_t *)cpu->gpr[OCERZ_RSP] = back;
+    from_cpu(ft);
+}
+
+const FEXCore::SignalDelegatorConfig &g_signals_config();
+
+[[noreturn]] void fex_sync_fault(FEXCore::Context::Context *, FEXCore::Core::CpuStateFrame *Frame)
+{
+    FexThread *ft = t_cur;
+    OcerzCPU *cpu = ft->cpu;
+    const auto fault = Frame->SynchronousFaultData;
+    auto &S = Frame->State;
+    if (S.rip == (uint64_t)&fex_exit_hlt) {
+        if (!ft->leave) {
+            to_cpu(ft);
+            ft->leave = true;
+            ft->resume_rip = S.gregs[REG_R11];
+            ft->step = S.gregs[REG_R11] == g_sentinel ? OCERZ_STEP_OK : OCERZ_STEP_FATAL;
+            from_cpu(ft);
+        }
+        _longjmp(ft->out, 1);
+    }
+    to_cpu(ft);
+    cpu->cur_rip = cpu->rip;
+    int delivered = 0;
+    if (fault.TrapNo == FEXCore::X86State::X86_TRAPNO_BP || fault.TrapNo == FEXCore::X86State::X86_TRAPNO_DB)
+        delivered = ocerz_signal_deliver(cpu, OCERZ_SIGTRAP, cpu->rip, 0, 0);
+    if (!delivered)
+        fprintf(stderr, "ocerz: guest fault: x86 trap %u, signal %u, at rip %#llx\n", (unsigned)fault.TrapNo,
+                (unsigned)fault.Signal, (unsigned long long)cpu->rip);
+    ft->leave = true;
+    ft->step = delivered ? OCERZ_STEP_OK : OCERZ_STEP_FATAL;
+    ft->resume_rip = cpu->rip;
+    from_cpu(ft);
+    _longjmp(ft->out, 1);
+}
+
+/* The guest registers FEXCore held in host registers when translated code faulted, put in its state. */
+void spill_host_regs(FexThread *ft, ucontext_t *uc)
+{
+    auto *mc = uc->uc_mcontext;
+    auto &S = ft->thread->CurrentFrame->State;
+    const auto &cfg = g_signals_config();
+    S.rip = g_ctx->RestoreRIPFromHostPC(ft->thread, mc->__ss.__pc);
+    for (size_t i = 0; i < cfg.SRAGPRCount; i++) {
+        const unsigned r = cfg.SRAGPRMapping[i];
+        S.gregs[i] = r == 31 ? mc->__ss.__sp : r == 30 ? mc->__ss.__lr : r == 29 ? mc->__ss.__fp : mc->__ss.__x[r];
+    }
+    for (size_t i = 0; i < cfg.SRAFPRCount; i++)
+        memcpy(&S.xmm.sse.data[i][0], &mc->__ns.__v[cfg.SRAFPRMapping[i]], sizeof(__uint128_t));
+    g_ctx->SetFlagsFromCompactedEFLAGS(
+        ft->thread, g_ctx->ReconstructCompactedEFLAGS(ft->thread, true, (const uint64_t *)&mc->__ss.__x[0], mc->__ss.__cpsr));
 }
 
 class FexSyscalls final : public FEXCore::HLE::SyscallHandler {
@@ -156,12 +342,31 @@ public:
     {
         return std::nullopt;
     }
+    void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState *, uint64_t start, uint64_t length) override
+    {
+        ocerz_cache_arm_exec(start, start + length);
+        ocerz_mem_arm_exec(start, start + length);
+    }
+};
+
+class FexThunks final : public FEXCore::ThunkHandler {
+public:
+    FEXCore::ThunkedFunction *LookupThunk(const FEXCore::IR::SHA256Sum &sum) override
+    {
+        return memcmp(&sum, fex_trap_insn.name, sizeof fex_trap_insn.name) == 0 ? fex_trap : nullptr;
+    }
 };
 
 class FexSignals final : public FEXCore::SignalDelegator {};
 
 FexSyscalls g_syscalls;
+FexThunks g_thunks;
 FexSignals g_signals;
+
+const FEXCore::SignalDelegatorConfig &g_signals_config()
+{
+    return g_signals.GetConfig();
+}
 
 bool feat(const char *name)
 {
@@ -201,8 +406,11 @@ FEXCore::HostFeatures host_features()
     hf.SupportsPreserveAllABI = true;
     hf.ProcessFeatures.HostType = FEXCore::HostFeatures::HostTypeEnum::Linux;
     hf.ProcessFeatures.Is64BitMode = 1;
+    hf.ProcessFeatures.SupportsFaultFreeSynchronousFaults = 1;
     return hf;
 }
+
+void new_context();
 
 void fex_init()
 {
@@ -214,34 +422,50 @@ void fex_init()
     FEXCore::Config::Initialize();
     FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
     FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, "0");
+    new_context();
+}
+
+void new_context()
+{
+    g_pid = getpid();
+    g_generation++;
     g_ctx = FEXCore::Context::Context::CreateNewContext(host_features());
     g_ctx->SetSignalDelegator(&g_signals);
     g_ctx->SetSyscallHandler(&g_syscalls);
+    g_ctx->SetThunkHandler(&g_thunks);
     g_ctx->EnableExitOnHLT();
     if (!g_ctx->InitCore()) {
         fprintf(stderr, "ocerz: fatal: FEXCore did not start\n");
         exit(70);
     }
+    g_sentinel = ocerz_vm_call_sentinel();
+    g_ctx->AddThunkTrampolineIRHandler(g_sentinel, (uintptr_t)&fex_exit_hlt);
+    for (uint64_t off = 0; off <= 0x2000; off += 8)
+        g_ctx->AddThunkTrampolineIRHandler(OCERZ_DYLDAPI_LO + off, (uintptr_t)&fex_trap_insn);
 }
 
-FexThread *fex_thread(OcerzVM *vm, OcerzCPU *cpu)
+/* In a forked child: the parent's context and threads stay where they are, unused, since their code cannot run here
+ * and taking them apart would run their destructors against it. */
+void fork_child_restart()
 {
-    FexThread *ft = t_fex;
-    if (ft && ft->cpu == cpu)
-        return ft;
-    if (ft) {
-        g_ctx->DestroyThread(ft->thread);
-        munmap(ft->callret, CALLRET_SIZE + 2 * CALLRET_GUARD);
-        delete ft;
-    }
-    ft = new FexThread {};
-    ft->vm = vm;
-    ft->cpu = cpu;
+    (void)g_ctx.release();
+    g_all.clear();
+    new (&g_all_lock) std::mutex();
+    for (int i = 0; i < MAX_LEVELS; i++)
+        t_levels.at[i] = nullptr;
+    new_context();
+}
+
+FexThread *new_level()
+{
+    auto *ft = new FexThread {};
+    ft->generation = g_generation;
     ft->thread = g_ctx->CreateThread();
     auto &S = ft->thread->CurrentFrame->State;
     S.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = ft->gdt;
     S.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = ft->gdt;
     S.cs_idx = MACOS_USER_CS;
+    S.ss_idx = MACOS_USER_SS;
     auto *cs = FEXCore::Core::CPUState::GetSegmentFromIndex(S, S.cs_idx);
     FEXCore::Core::CPUState::SetGDTLimit(cs, 0xF'FFFFU);
     cs->L = 1;
@@ -252,9 +476,54 @@ FexThread *fex_thread(OcerzVM *vm, OcerzCPU *cpu)
     }
     ft->thread->CallRetStackBase = ft->callret + CALLRET_GUARD;
     mprotect(ft->thread->CallRetStackBase, CALLRET_SIZE, PROT_READ | PROT_WRITE);
-    S.callret_sp = (uint64_t)ft->thread->CallRetStackBase + CALLRET_SIZE / 4;
-    t_fex = ft;
+    ft->thread->CurrentFrame->Pointers.SynchronousExceptionHandler = (uint64_t)&fex_sync_fault;
+    std::scoped_lock lk(g_all_lock);
+    g_all.push_back(ft);
     return ft;
+}
+
+/* The commpage load the instruction faulted on, done from ocerz's copy; false if it is none. */
+bool commpage_load(arm_thread_state64_t *ss, uint32_t insn)
+{
+    uint64_t *x = &ss->__x[0];
+    auto reg = [&](unsigned n) { return n == 31 ? (uint64_t)ss->__sp : x[n]; };
+    const unsigned size = insn >> 30, rt = insn & 31, rn = (insn >> 5) & 31;
+    unsigned opc = 1;
+    uint64_t addr;
+    if ((insn & 0x3f000000) == 0x39000000) {
+        opc = (insn >> 22) & 3;
+        addr = reg(rn) + (((insn >> 10) & 0xfff) << size);
+    } else if ((insn & 0x3f200c00) == 0x38000000 || (insn & 0x3f200c00) == 0x19000000) {
+        opc = (insn >> 22) & 3;
+        addr = reg(rn) + (uint64_t)((int64_t)((uint64_t)((insn >> 12) & 0x1ff) << 55) >> 55);
+    } else if ((insn & 0x3ffffc00) == 0x38bfc000 || (insn & 0x3ffffc00) == 0x08dffc00) {
+        addr = reg(rn);
+    } else if ((insn & 0x3f200c00) == 0x38200800) {
+        opc = (insn >> 22) & 3;
+        const unsigned rm = (insn >> 16) & 31, option = (insn >> 13) & 7, s = (insn >> 12) & 1;
+        uint64_t off = x[rm];
+        if (option == 2)
+            off = (uint32_t)off;
+        else if (option == 6)
+            off = (uint64_t)(int64_t)(int32_t)off;
+        addr = reg(rn) + (s ? off << size : off);
+    } else {
+        return false;
+    }
+    if (opc == 0 || addr < OCERZ_COMMPAGE_LO || addr + (1u << size) > OCERZ_COMMPAGE_HI || !ocerz_commpage)
+        return false;
+    uint64_t v = 0;
+    memcpy(&v, ocerz_commpage + (addr - OCERZ_COMMPAGE_LO), 1u << size);
+    if (opc >= 2 && size < 3) {
+        const unsigned bits = 8u << size;
+        v = (uint64_t)((int64_t)(v << (64 - bits)) >> (64 - bits));
+        if (opc == 3)
+            v = (uint32_t)v;
+    }
+    if (rt != 31)
+        x[rt] = v;
+    ss->__pc += 4;
+    return true;
 }
 
 } // namespace
@@ -262,35 +531,112 @@ FexThread *fex_thread(OcerzVM *vm, OcerzCPU *cpu)
 extern "C" int ocerz_fex_run(OcerzVM *vm, OcerzCPU *cpu)
 {
     std::call_once(g_init_once, fex_init);
-    FexThread *ft = fex_thread(vm, cpu);
-    from_cpu(ft);
-    ft->step = OCERZ_STEP_OK;
-    g_ctx->ExecuteThread(ft->thread);
-    auto &S = ft->thread->CurrentFrame->State;
-    if (S.rip != (uint64_t)&fex_exit_hlt) {
-        to_cpu(ft);
-        fprintf(stderr, "ocerz: guest HLT at %#llx\n", (unsigned long long)cpu->rip);
+    const uintptr_t here = (uintptr_t)__builtin_frame_address(0);
+    while (t_levels.active > 0 && t_levels.at[t_levels.active - 1]->frame <= here)
+        t_levels.active--;
+    t_cur = t_levels.active > 0 ? t_levels.at[t_levels.active - 1] : nullptr;
+    const int depth = t_levels.active;
+    if (depth >= MAX_LEVELS) {
+        fprintf(stderr, "ocerz: fatal: guest calls nested more than %d deep\n", MAX_LEVELS);
         return OCERZ_STEP_FATAL;
     }
+    FexThread *ft = t_levels.at[depth];
+    if (!ft)
+        ft = t_levels.at[depth] = new_level();
+    auto &S = ft->thread->CurrentFrame->State;
+    if (ft->cpu != cpu)
+        S.callret_sp = (uint64_t)ft->thread->CallRetStackBase + CALLRET_SIZE / 4;
+    ft->vm = vm;
+    ft->cpu = cpu;
+    ft->frame = here;
+    ft->leave = false;
+    ft->cpu_current = false;
+    from_cpu(ft);
+
+    FexThread *outer = t_cur;
+    t_cur = ft;
+    t_levels.active = depth + 1;
+    if (_setjmp(ft->out) == 0)
+        g_ctx->ExecuteThread(ft->thread);
+    t_levels.active = depth;
+    t_cur = outer;
+
+    if (!ft->leave) {
+        to_cpu(ft);
+        fprintf(stderr, "ocerz: FEXCore left guest code at %#llx unasked\n", (unsigned long long)cpu->rip);
+        return OCERZ_STEP_FATAL;
+    }
+    if (ft->cpu_current)
+        return ft->step;
     S.rip = ft->resume_rip;
     to_cpu(ft);
     return ft->step;
 }
 
-/* x0..x28, fp, lr and sp lie in that order in the thread state, which is the register array FEXCore patches. */
+/* In order: a commpage read, a misaligned ordered access (x0..x28, fp, lr and sp lie in that order in the thread
+ * state, the register array FEXCore patches), a fault in the shared cache (ocerz's own lazy mapping and write
+ * tracking, in crash_handler), a write to an armed page of guest code, and otherwise the guest's own fault, which
+ * crash_handler delivers from the registers spilled here. */
 extern "C" int ocerz_fex_fault(int sig, siginfo_t *si, void *uc)
 {
-    FexThread *ft = t_fex;
-    if (!ft || sig != SIGBUS || !uc)
+    FexThread *ft = t_cur;
+    if (!ft || !uc || (sig != SIGSEGV && sig != SIGBUS))
         return 0;
     auto *mc = ((ucontext_t *)uc)->uc_mcontext;
     uintptr_t pc = (uintptr_t)mc->__ss.__pc;
     if (!g_ctx->IsAddressInCodeBuffer(ft->thread, pc))
         return 0;
-    auto moved = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
-        ft->thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, pc, (uint64_t *)&mc->__ss.__x[0]);
-    if (!moved)
+    const uint64_t a = (uint64_t)(uintptr_t)si->si_addr;
+    const uint64_t esr = mc->__es.__esr, ec = (esr >> 26) & 0x3f;
+    if (a >= OCERZ_COMMPAGE_LO && a < OCERZ_COMMPAGE_HI && commpage_load(&mc->__ss, *(const uint32_t *)pc))
+        return 1;
+    if (sig == SIGBUS && (esr & 0x3f) == 0x21) {
+        auto moved = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
+            ft->thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, pc, (uint64_t *)&mc->__ss.__x[0]);
+        if (!moved)
+            return 0;
+        mc->__ss.__pc = pc + *moved;
+        return 1;
+    }
+    if (ocerz_cache_region((uintptr_t)a))
         return 0;
-    mc->__ss.__pc = pc + *moved;
+    if ((ec == 0x24 || ec == 0x25) && (esr & (1u << 6)) && ocerz_mem_exec_write_fault(a) == 1) {
+        ocerz_fex_invalidate(a & ~(uint64_t)(OCERZ_HOST_PAGE_SIZE - 1), OCERZ_HOST_PAGE_SIZE);
+        return 1;
+    }
+    spill_host_regs(ft, (ucontext_t *)uc);
+    to_cpu(ft);
+    ft->cpu->cur_rip = ft->cpu->rip;
+    return 0;
+}
+
+/* Called from a signal handler: a thread that must leave (exit, end, a signal to take) and was interrupted in
+ * translated code is sent to the loop top with its registers spilled and the guest aimed at fex_exit_hlt. */
+extern "C" int ocerz_fex_async(void *uc)
+{
+    FexThread *ft = t_cur;
+    if (!ft || !uc || ft->leave || ft->thread->CurrentFrame->InSyscallInfo != 0 || !must_leave(ft, OCERZ_STEP_OK))
+        return 0;
+    auto *mc = ((ucontext_t *)uc)->uc_mcontext;
+    if (!g_ctx->IsAddressInCodeBuffer(ft->thread, (uintptr_t)mc->__ss.__pc))
+        return 0;
+    spill_host_regs(ft, (ucontext_t *)uc);
+    auto &S = ft->thread->CurrentFrame->State;
+    ft->leave = true;
+    ft->step = OCERZ_STEP_OK;
+    ft->resume_rip = S.rip;
+    S.rip = (uint64_t)&fex_exit_hlt;
+    mc->__ss.__pc = g_signals_config().AbsoluteLoopTopAddressFillSRA;
     return 1;
+}
+
+extern "C" void ocerz_fex_invalidate(uint64_t addr, uint64_t len)
+{
+    if (!g_ctx)
+        return;
+    std::scoped_lock lk(g_ctx->GetCodeInvalidationMutex());
+    g_ctx->InvalidateCodeBuffersCodeRange(addr, len);
+    std::scoped_lock all(g_all_lock);
+    for (FexThread *ft : g_all)
+        g_ctx->InvalidateThreadCachedCodeRange(ft->thread, addr, len);
 }

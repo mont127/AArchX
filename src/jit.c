@@ -824,6 +824,7 @@
  */
 #include <execinfo.h>
 #include <dlfcn.h>
+#include "ocerz/fex.h"
 #include "ocerz/jit.h"
 #include "ocerz/dyld.h"
 #include "ocerz/vm.h"
@@ -28694,6 +28695,8 @@ void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len)
     if (!g_cache_text_touched && ocerz_cache_text(addr, addr + len, 0))
         __atomic_store_n(&g_cache_text_touched, 1, __ATOMIC_RELEASE);
     g_inv_caller = (uint64_t)(uintptr_t)__builtin_return_address(0);
+    if (ocerz_engine_invalidate && len)
+        ocerz_engine_invalidate(addr, len);
     if (!vm || !len || !vm->jit)
         return;
 
