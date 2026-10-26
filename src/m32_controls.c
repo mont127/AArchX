@@ -12,7 +12,12 @@
  *              view size are the HIView's; SetControlBounds sets its frame; CountSubControls counts subviews;
  *              GetControlDataSize asks GetControlData; Draw1Control, DrawControls and UpdateControls ask for a redraw;
  *              TestControl and FindControl send the view a hit-test event; HandleControlClick and TrackControl
- *              click the part hit (HIViewSimulateClick); IsControlEnabled is HIViewIsEnabled
+ *              click the part hit (HIViewSimulateClick); IsControlEnabled is HIViewIsEnabled; GetControlPropertySize
+ *              reads the property (GetControlProperty) to learn its size
+ *   windows    HIWindowSetBounds is SetWindowBounds of the rectangle in points; InvalWindowRect and InvalWindowRgn
+ *              ask the content view for a redraw (of the rectangle, of all of it); ValidWindowRect and
+ *              ValidWindowRgn, which only take a redraw back, do nothing.  GRID 2 set its window's bounds with
+ *              HIWindowSetBounds and, answered 0 and left at the size it was made with, sat there
  *   user panes a view of a class of m32's own (CreateUserPaneControl) that keeps the guest's draw, hit-test,
  *              tracking, activate and focus procedures (SetControlData's kControlUserPane...ProcTag) and calls them;
  *              a draw procedure draws with QuickDraw into the window's port (src/m32_qd.c), which the pane then
@@ -57,8 +62,8 @@ static struct {
     void (*clear_menu_bar)(void);
     void (*insert_menu)(Ref, int16_t);
     OSStatus (*add_subview)(Ref, Ref);
-    OSStatus (*set_property)(Ref, OSType, OSType, UInt32, const void *);
-    OSStatus (*get_property)(Ref, OSType, OSType, UInt32, UInt32 *, void *);
+    OSStatus (*set_property)(Ref, OSType, OSType, ByteCount, const void *);
+    OSStatus (*get_property)(Ref, OSType, OSType, ByteCount, ByteCount *, void *);
     OSStatus (*get_frame)(Ref, CGRect *);
     OSStatus (*set_frame)(Ref, const CGRect *);
     Ref (*superview)(Ref);
@@ -93,6 +98,8 @@ static struct {
     OSStatus (*get_bounds)(Ref, CGRect *);
     UInt32 (*event_class)(EventRef);
     UInt32 (*event_kind)(EventRef);
+    OSStatus (*set_window_bounds)(Ref, WindowRegionCode, const QdRect *);
+    OSStatus (*needs_display_rect)(Ref, const CGRect *, Boolean);
     void (*cf_release)(CFTypeRef);
 } hi;
 
@@ -122,6 +129,7 @@ static void load(void)
     L(control_target, "GetControlEventTarget"); L(register_subclass, "HIObjectRegisterSubclass");
     L(hiobject_create, "HIObjectCreate"); L(set_visible, "HIViewSetVisible"); L(get_bounds, "HIViewGetBounds");
     L(event_class, "GetEventClass"); L(event_kind, "GetEventKind");
+    L(set_window_bounds, "SetWindowBounds"); L(needs_display_rect, "HIViewSetNeedsDisplayInRect");
 #undef L
     *(void **)&hi.cf_release = dlsym(RTLD_DEFAULT, "CFRelease");
     g_content_id = h ? (const HIViewID *)dlsym(h, "kHIViewWindowContentID") : NULL;
@@ -424,6 +432,20 @@ static int sp_GetControlDataSize(struct OcerzVM *vm, OcerzCPU *cpu)
     RET((uint32_t)(int32_t)st);
 }
 
+/* GetControlPropertySize(ControlRef, OSType creator, OSType tag, ByteCount *): the size GetControlProperty answers */
+static int sp_GetControlPropertySize(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    enum { MOST = 65536 };
+    void *buf = ready() && A(0) ? malloc(MOST) : NULL;
+    ByteCount n = 0;
+    OSStatus st = buf ? hi.get_property(H(0), A(1), A(2), MOST, &n, buf) : -50;
+    free(buf);
+    if (st == noErr && A(3))
+        m32_wr(A(3), (uint32_t)n);
+    RET((uint32_t)(int32_t)st);
+}
+
 static int sp_Draw1Control(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; if (ready() && A(0)) hi.needs_display(H(0), true); RET(0); }
 static int sp_DrawControls(struct OcerzVM *vm, OcerzCPU *cpu)
 {
@@ -677,6 +699,44 @@ static int sp_CreateUserPaneControl(struct OcerzVM *vm, OcerzCPU *cpu)
     RET(0);
 }
 
+/* ---- windows ---- */
+
+/* HIWindowSetBounds(WindowRef, WindowRegionCode, HICoordinateSpace, const HIRect *): an i386 HIRect is four floats.
+   A Carbon program's scale factor is 1, so a screen pixel is a 72 dpi point; a rectangle in a window's or a view's
+   own coordinates is refused, as no program sets its window that way. */
+static int sp_HIWindowSetBounds(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    if (!ready() || !A(0) || !A(3) || (A(2) != kHICoordSpace72DPIGlobal && A(2) != kHICoordSpaceScreenPixel))
+        RET((uint32_t)(int32_t)paramErr);
+    float f[4];
+    memcpy(f, m32_h(A(3)), sizeof f);
+    QdRect r = { (int16_t)f[1], (int16_t)f[0], (int16_t)(f[1] + f[3]), (int16_t)(f[0] + f[2]) };
+    RET((uint32_t)(int32_t)hi.set_window_bounds(H(0), (WindowRegionCode)A(1), &r));
+}
+
+/* InvalWindowRect(WindowRef, const Rect *): the rectangle, in the window's port coordinates, needs drawing */
+static int sp_InvalWindowRect(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    Ref content = ready() ? content_view(H(0)) : NULL;
+    if (content && A(1)) {
+        QdRect q;
+        memcpy(&q, m32_h(A(1)), sizeof q);
+        CGRect r = CGRectMake(q.left, q.top, q.right - q.left, q.bottom - q.top);
+        hi.needs_display_rect(content, &r, true);
+    }
+    RET(0);
+}
+static int sp_InvalWindowRgn(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    (void)vm;
+    Ref content = ready() ? content_view(H(0)) : NULL;
+    if (content)
+        hi.needs_display(content, true);
+    RET(0);
+}
+
 /* ---- the rest ---- */
 
 static int sp_Nothing(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; RET(0); }
@@ -718,6 +778,9 @@ const M32SpecialEntry m32_controls_specials[] = {
     { "_GetControlMaximum", sp_GetMaximum16 }, { "_SetControlMaximum", sp_SetMaximum16 },
     { "_GetControlViewSize", sp_GetViewSize }, { "_SetControlViewSize", sp_SetViewSize },
     { "_CountSubControls", sp_CountSubControls }, { "_GetControlDataSize", sp_GetControlDataSize },
+    { "_GetControlPropertySize", sp_GetControlPropertySize },
+    { "_HIWindowSetBounds", sp_HIWindowSetBounds }, { "_InvalWindowRect", sp_InvalWindowRect },
+    { "_InvalWindowRgn", sp_InvalWindowRgn }, { "_ValidWindowRect", sp_Nothing }, { "_ValidWindowRgn", sp_Nothing },
     { "_Draw1Control", sp_Draw1Control }, { "_DrawControls", sp_DrawControls }, { "_UpdateControls", sp_DrawControls },
     { "_IsControlEnabled", sp_IsControlEnabled }, { "_TestControl", sp_TestControl }, { "_FindControl", sp_FindControl },
     { "_HandleControlClick", sp_HandleControlClick }, { "_TrackControl", sp_TrackControl },

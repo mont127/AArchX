@@ -1026,6 +1026,26 @@ static void test_menus_controls(uint32_t w)
     check("FindControl finds it", (int16_t)call("_FindControl", 3, (uint32_t[]){ 30u | 80u << 16, w, DATA + 0x1034 }) != 0 &&
                                   m32_rd(DATA + 0x1034) == button);
     check("IsControlEnabled", (call("_IsControlEnabled", 1, (uint32_t[]){ button }) & 0xff) == 1);
+    /* GetControlPropertySize is the size of what SetControlProperty stored; a property never set answers its error */
+    m32_wr(DATA + 0x1038, 0x11223344);
+    cross(CARBON, "_SetControlProperty", 5, (uint32_t[]){ button, FOUR('g','r','i','d'), FOUR('s','i','z','e'), 12, DATA + 0x1100 });
+    m32_wr(DATA + 0x103c, 0xdeadbeef);
+    check("GetControlPropertySize", call("_GetControlPropertySize", 4, (uint32_t[]){ button, FOUR('g','r','i','d'),
+                                                                                    FOUR('s','i','z','e'), DATA + 0x103c }) == 0 &&
+                                    m32_rd(DATA + 0x103c) == 12);
+    int32_t gps = (int32_t)call("_GetControlPropertySize", 4, (uint32_t[]){ button, FOUR('g','r','i','d'), FOUR('n','o','n','e'),
+                                                                             DATA + 0x103c });
+    check("... of a property never set: errControlPropertyNotFound", gps == -5604);
+    /* HIWindowSetBounds moves and sizes the window (GRID 2 sized its own with it); the invalidations answer noErr */
+    float hr[4] = { 140, 160, 320, 200 };
+    memcpy(m32_h(DATA + 0x1110), hr, sizeof hr);
+    check("HIWindowSetBounds", call("_HIWindowSetBounds", 4, (uint32_t[]){ w, 33 /* kWindowContentRgn */,
+                                                                          1 /* kHICoordSpace72DPIGlobal */, DATA + 0x1110 }) == 0);
+    cross(CARBON, "_GetWindowBounds", 3, (uint32_t[]){ w, 33, DATA + 0x1120 });
+    int16_t *gb = (int16_t *)m32_h(DATA + 0x1120);
+    check("... GetWindowBounds answers it", gb[0] == 160 && gb[1] == 140 && gb[2] == 360 && gb[3] == 460);
+    check("InvalWindowRect", call("_InvalWindowRect", 2, (uint32_t[]){ w, qd_rect(DATA + 0x1130, 0, 0, 20, 20) }) == 0);
+    check("InvalWindowRgn", call("_InvalWindowRgn", 2, (uint32_t[]){ w, m32_handle(rgn) }) == 0);
     /* a user pane keeps the procedures the program hands it */
     check("CreateUserPaneControl", call("_CreateUserPaneControl", 4, (uint32_t[]){ w, qd_rect(DATA + 0x1040, 50, 10, 90, 60), 0,
                                                                                   DATA + 0x1050 }) == 0 && m32_rd(DATA + 0x1050));
