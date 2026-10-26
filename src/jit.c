@@ -28547,6 +28547,44 @@ static void *jit_prefault_main(void *arg)
     return NULL;
 }
 
+static int g_lazy_prefaulting;
+
+static void prefault_start(JitPrefault *pf)
+{
+    pthread_t t;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if ((pf->lo >= pf->hi && !pf->nbuckets && !pf->nlazy) || pthread_create(&t, &at, jit_prefault_main, pf) != 0) {
+        free(pf->lazy);
+        free(pf);
+    }
+    pthread_attr_destroy(&at);
+}
+
+/*
+ * The shared cache's slid pages a program's earlier launches faulted in,
+ * filled in by a thread of their own as soon as the profile is open: they
+ * need the cache and the profile and not the JIT, which comes later
+ * (ocerz_jit_prefault), and the guest's thread meanwhile loads the program's
+ * disk dependencies and applies its fixups.
+ */
+void ocerz_jit_prefault_lazy(void)
+{
+    static int nolazy = -1;
+    if (nolazy < 0) nolazy = getenv("OCERZ_NO_LAZY_PREFAULT") || getenv("OCERZ_NO_JIT_PREFAULT") ? 1 : 0;
+    if (nolazy || g_lazy_prefaulting)
+        return;
+    JitPrefault *pf = (JitPrefault *)calloc(1, sizeof *pf);
+    if (!pf)
+        return;
+    pf->lazy = ocerz_tcache_profile_lazy(&pf->nlazy);
+    if (!pf->lazy)
+        pf->nlazy = 0;
+    g_lazy_prefaulting = 1;
+    prefault_start(pf);
+}
+
 void ocerz_jit_prefault(struct OcerzVM *vm, size_t records)
 {
     OcerzJit *jit = vm ? vm->jit : NULL;
@@ -28568,18 +28606,10 @@ void ocerz_jit_prefault(struct OcerzVM *vm, size_t records)
     jl_release();
     static int nolazy = -1;
     if (nolazy < 0) nolazy = getenv("OCERZ_NO_LAZY_PREFAULT") ? 1 : 0;
-    pf->lazy = nolazy ? NULL : ocerz_tcache_profile_lazy(&pf->nlazy);
+    pf->lazy = nolazy || g_lazy_prefaulting ? NULL : ocerz_tcache_profile_lazy(&pf->nlazy);
     if (!pf->lazy)
         pf->nlazy = 0;
-    pthread_t t;
-    pthread_attr_t at;
-    pthread_attr_init(&at);
-    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    if ((pf->lo >= pf->hi && !pf->nlazy) || pthread_create(&t, &at, jit_prefault_main, pf) != 0) {
-        free(pf->lazy);
-        free(pf);
-    }
-    pthread_attr_destroy(&at);
+    prefault_start(pf);
 }
 
 /*

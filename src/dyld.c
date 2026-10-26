@@ -7166,13 +7166,16 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
      * disk dependencies load and its fixups are applied: the warm thread
      * (tcache.c) then has that time, 0.3 ms for uname and 1.4 ms for perl's
      * libperl, to decode the records the initializers will ask for, which the
-     * guest's thread decoded itself when they came too late.  The prefault
-     * thread waits for the JIT, which ocerz_vm_install_handlers creates.
+     * guest's thread decoded itself when they came too late.  The shared
+     * cache's slid pages the profile lists are filled in from here too
+     * (ocerz_jit_prefault_lazy); the rest of the prefault waits for the JIT,
+     * which ocerz_vm_install_handlers creates.
      */
     if (!g_aot_n && ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled) {
         ocerz_tcache_profile_open(profile_ident(img.slice, img.path), ocerz_cache_uuid(), img.path);
         if (ocerz_tcache_profile_ordered())
             ocerz_jit_start_ordered(vm);
+        ocerz_jit_prefault_lazy();
     }
 
     RpathList main_rpaths;

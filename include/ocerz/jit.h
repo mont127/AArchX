@@ -76,6 +76,7 @@ int ocerz_jit_sr_thread_start(void);
 void ocerz_jit_sr_thread_end(void);
 void ocerz_jit_start_ordered(struct OcerzVM *vm);
 void ocerz_jit_prefault(struct OcerzVM *vm, size_t records);
+void ocerz_jit_prefault_lazy(void);
 void ocerz_jit_invalidate_all(struct OcerzVM *vm);
 void ocerz_jit_invalidate_range(struct OcerzVM *vm, uint64_t addr, uint64_t len);
 extern uint64_t ocerz_jit_retire_count;
