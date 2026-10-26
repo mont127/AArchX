@@ -93,6 +93,8 @@ OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key, void **prep);
 void ocerz_tcache_set_prep(void *(*prep)(const OcerzTcRecHead *rec, uint64_t key), void (*drop)(void *));
 void *ocerz_tcache_take_prep(void);
 int ocerz_tcache_found_warm(void);
+int ocerz_tcache_warm_at(size_t *i, int take, OcerzTcRecHead **rec, uint64_t *key, void **prep);
+void ocerz_tcache_warm_untake(size_t i, OcerzTcRecHead *rec);
 
 int ocerz_tcache_store_path(char *out, size_t n);
 int ocerz_tcache_native(void);

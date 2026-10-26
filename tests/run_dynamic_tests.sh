@@ -1340,7 +1340,9 @@ run_tcache_ord_case dtcache_ordstart
 # read every record and the next miss loads all of them ahead, the patched
 # atoi's too, whose dep in the program (where the patched run had it) faults in
 # its deps check inside the run of loads, which must leave the JIT's pages
-# writable; most records must load without their deps check.  Whether atoi's
+# writable; most records must load without their deps check.  The installer
+# (src/jit.c) loads them while the program sleeps, so the fault is its own, and
+# it must have loaded some.  Whether atoi's
 # record is among the ones loaded ahead depends on what loaded before the sleep,
 # hence five tries.  A copy on APFS is a clone whose pages are not in memory,
 # which leaves the warm thread behind the program and loads far fewer records
@@ -1377,6 +1379,8 @@ run_tcache_patch_case() {
             why="got out='$(cat "$dir/run$i.out")' $(grep -h 'guest crash' "$dir/run$i.err" | head -1)"
         elif [ $i -ge 3 ] && ! grep -q 'loaded=.*pristine [1-9]' "$dir/run$i.err"; then
             why="no record skipped its deps check: $(grep -h 'loaded=' "$dir/run$i.err" | head -1)"
+        elif [ $i -ge 3 ] && ! grep -q 'loaded=.*installer [1-9]' "$dir/run$i.err"; then
+            why="the installer loaded nothing while the program slept: $(grep -h 'loaded=' "$dir/run$i.err" | head -1)"
         fi
         if [ -z "$why" ]; then
             echo "PASS $name-$i-$arg"; pass=$((pass+1))

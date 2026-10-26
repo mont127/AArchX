@@ -58,6 +58,9 @@ typedef struct OcerzVM {
     uint64_t stack_hi;
 } OcerzVM;
 
+/* The name of one of ocerz's own threads, set by the thread itself (the tcache installer); a fault on it is
+   ocerz's, and ends the process with a report instead of being handed to a guest or ending the thread. */
+extern __thread const char *ocerz_internal_thread;
 int ocerz_vm_init(OcerzVM *vm);
 int ocerz_vm_run(OcerzVM *vm);
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu);

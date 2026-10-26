@@ -378,6 +378,7 @@
 
 static OcerzVM *g_vm;
 static __thread OcerzCPU *g_cur_cpu;
+__thread const char *ocerz_internal_thread;
 
 #define OCERZ_MAX_CPUS 512
 static uint64_t g_image_slide;
@@ -2037,6 +2038,21 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (ocerz_jit_wx_open)
             pthread_jit_write_protect_np(0);
         siglongjmp(*ocerz_jit_decode_recover, 1);
+    }
+    if (ocerz_internal_thread && (sig == SIGSEGV || sig == SIGBUS)) {
+        /* ocerz's own thread: no guest to hand it to, and ended quietly it would keep the JIT lock it may hold,
+           and every guest thread would wait for it forever */
+        char b[320], *p = b;
+        p = str_into(p, "ocerz: internal error: fault on ocerz's ");
+        p = str_into(p, ocerz_internal_thread);
+        p = str_into(p, " thread at host pc ");
+        p = hex_into(p, ctx ? (uint64_t)((const ucontext_t *)ctx)->uc_mcontext->__ss.__pc : 0);
+        p = str_into(p, " addr ");
+        p = hex_into(p, (uint64_t)(uintptr_t)si->si_addr);
+        p = str_into(p, "\n");
+        write(2, b, (size_t)(p - b));
+        signal(sig, SIG_DFL);   /* the instruction faults again, and the process ends with the system's report */
+        return;
     }
     if ((sig == SIGSEGV || sig == SIGBUS) && ctx && ocerz_mode == OCERZ_MODE_NATIVE) {
         ucontext_t *suc = (ucontext_t *)ctx;

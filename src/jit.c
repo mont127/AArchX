@@ -1685,6 +1685,35 @@ static void jl_dump(const char *tag, uint64_t wait_ns)
     }
 }
 
+/* how many threads wait for the JIT lock: the tcache installer ends its batch for them (tc_installer_main) */
+static int g_jl_waiting;
+
+static void jl_wait(void)
+{
+    __atomic_add_fetch(&g_jl_waiting, 1, __ATOMIC_RELAXED);
+    uint64_t t0 = g_jl_log > 0 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    if (g_jl_log > 0)
+        __atomic_add_fetch(&g_jl_waits, 1, __ATOMIC_RELAXED);
+    for (unsigned long long s = 0;; s++) {
+        if (s < 64) {
+            sched_yield();
+        } else {
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = s < 512 ? 200000 : 2000000;
+            nanosleep(&ts, NULL);
+        }
+        if (pthread_mutex_trylock(&jit_lock) == 0)
+            break;
+        if (g_jl_log > 0) {
+            uint64_t w = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+            if (w > 3000000000ull && (s % 2000) == 0)
+                jl_dump("WAIT", w);
+        }
+    }
+    __atomic_sub_fetch(&g_jl_waiting, 1, __ATOMIC_RELAXED);
+}
+
 static void jl_acquire(int site)
 {
     ocerz_critical_depth++;
@@ -1692,28 +1721,8 @@ static void jl_acquire(int site)
         g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
     if (jl_held)
         jl_recursive_warn("jl_acquire");
-    if (pthread_mutex_trylock(&jit_lock) != 0) {
-        uint64_t t0 = g_jl_log > 0 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
-        if (g_jl_log > 0)
-            __atomic_add_fetch(&g_jl_waits, 1, __ATOMIC_RELAXED);
-        for (unsigned long long s = 0;; s++) {
-            if (s < 64) {
-                sched_yield();
-            } else {
-                struct timespec ts;
-                ts.tv_sec = 0;
-                ts.tv_nsec = s < 512 ? 200000 : 2000000;
-                nanosleep(&ts, NULL);
-            }
-            if (pthread_mutex_trylock(&jit_lock) == 0)
-                break;
-            if (g_jl_log > 0) {
-                uint64_t w = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
-                if (w > 3000000000ull && (s % 2000) == 0)
-                    jl_dump("WAIT", w);
-            }
-        }
-    }
+    if (pthread_mutex_trylock(&jit_lock) != 0)
+        jl_wait();
     if (g_jl_log > 0) {
         __atomic_add_fetch(&g_jl_acq, 1, __ATOMIC_RELAXED);
         __atomic_store_n(&g_jl_owner, jl_tid(), __ATOMIC_RELAXED);
@@ -1722,6 +1731,18 @@ static void jl_acquire(int site)
         __atomic_store_n(&g_jl_phase, site, __ATOMIC_RELAXED);
     }
     jl_held++;
+}
+
+/* the JIT lock if it is free, else 0 with nothing taken (the tcache installer) */
+static int jl_try_acquire(void)
+{
+    ocerz_critical_depth++;
+    if (pthread_mutex_trylock(&jit_lock) != 0) {
+        ocerz_critical_depth--;
+        return 0;
+    }
+    jl_held++;
+    return 1;
 }
 
 static void jl_release(void)
@@ -1769,28 +1790,8 @@ static void jl_lock_step(uint64_t rip)
         g_jl_log = getenv("OCERZ_JITLOCKLOG") ? 1 : 0;
     if (jl_held)
         jl_recursive_warn("jl_lock_step");
-    if (pthread_mutex_trylock(&jit_lock) != 0) {
-        uint64_t t0 = g_jl_log > 0 ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
-        if (g_jl_log > 0)
-            __atomic_add_fetch(&g_jl_waits, 1, __ATOMIC_RELAXED);
-        for (unsigned long long s = 0;; s++) {
-            if (s < 64) {
-                sched_yield();
-            } else {
-                struct timespec ts;
-                ts.tv_sec = 0;
-                ts.tv_nsec = s < 512 ? 200000 : 2000000;
-                nanosleep(&ts, NULL);
-            }
-            if (pthread_mutex_trylock(&jit_lock) == 0)
-                break;
-            if (g_jl_log > 0) {
-                uint64_t w = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
-                if (w > 3000000000ull && (s % 2000) == 0)
-                    jl_dump("WAIT", w);
-            }
-        }
-    }
+    if (pthread_mutex_trylock(&jit_lock) != 0)
+        jl_wait();
     if (g_jl_log > 0) {
         __atomic_add_fetch(&g_jl_acq, 1, __ATOMIC_RELAXED);
         __atomic_store_n(&g_jl_owner, jl_tid(), __ATOMIC_RELAXED);
@@ -22500,7 +22501,7 @@ static int tc_scan(const OcerzJit *jit, const JitBlock *blk, const uint32_t *cod
     return bad;
 }
 
-static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words, g_tc_n_prep, g_tc_n_pristine;
+static _Atomic unsigned long long g_tc_n_ahead, g_tc_n_epis, g_tc_n_words, g_tc_n_prep, g_tc_n_pristine, g_tc_n_inst;
 static _Atomic unsigned long long g_tc_n_load, g_tc_n_put, g_tc_n_stale, g_tc_n_rej, g_tc_n_vok, g_tc_n_vvar, g_tc_n_vbad;
 enum { TCI_EDGE = 1, TCI_INSN, TCI_DEP, TCI_RAS, TCI_ELIDE, TCI_CODE, TCI_N };
 static _Atomic unsigned long long g_tc_n_ifind, g_tc_n_iwarm, g_tc_n_iahead, g_tc_n_iload, g_tc_n_iput, g_tc_n_ivok, g_tc_n_ivvar, g_tc_n_ibad[TCI_N];
@@ -22610,9 +22611,9 @@ static void tc_summary(void)
                 (unsigned long long)g_tc_n_pcrel, (unsigned long long)g_tc_n_const,
                 (unsigned long long)g_tc_n_mism, (unsigned long long)g_tc_n_full);
     else
-        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu, prepped %llu, pristine %llu, %llu words, %llu sharing an epilogue) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
+        fprintf(g_tc_lf, "ocerz: TCACHE[%d] loaded=%llu (ahead %llu, installer %llu, prepped %llu, pristine %llu, %llu words, %llu sharing an epilogue) saved=%llu stale=%llu rejected=%llu verify_ok=%llu"
                          " verify_variant=%llu verify_bad=%llu\n",
-                (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_ahead,
+                (int)getpid(), (unsigned long long)g_tc_n_load, (unsigned long long)g_tc_n_ahead, (unsigned long long)g_tc_n_inst,
                 (unsigned long long)g_tc_n_prep, (unsigned long long)g_tc_n_pristine, (unsigned long long)g_tc_n_words, (unsigned long long)g_tc_n_epis, (unsigned long long)g_tc_n_put,
                 (unsigned long long)g_tc_n_stale, (unsigned long long)g_tc_n_rej,
                 (unsigned long long)g_tc_n_vok, (unsigned long long)g_tc_n_vvar, (unsigned long long)g_tc_n_vbad);
@@ -23909,6 +23910,87 @@ static uint64_t tc_image_rec_rip(const OcerzTcRecHead *h, const TcPrep *p)
     return at - v.r->img_lo + lo;
 }
 
+typedef struct TcAheadSave {
+    int pm, pwo;
+    uint64_t pk, plo, phi, pid;
+} TcAheadSave;
+
+static int tc_wx_hold_on(void)
+{
+    static int hold = -1;
+    if (hold < 0) hold = getenv("OCERZ_NO_WX_HOLD") ? 0 : 1;
+    return hold;
+}
+
+/* what loading records ahead changes, kept to put back in tc_ahead_end; the JIT lock is held */
+static void tc_ahead_begin(TcAheadSave *sv)
+{
+    sv->pm = g_plain_mem;
+    sv->pk = g_tc_key;
+    sv->plo = g_tc_img_lo;
+    sv->phi = g_tc_img_hi;
+    sv->pid = g_tc_img_id;
+    /* a deps check that faults (a dep in an image now mapped elsewhere) leaves
+       through ocerz_jit_decode_recover, so the handler must reopen the pages */
+    sv->pwo = ocerz_jit_wx_open;
+    if (tc_wx_hold_on()) {
+        pthread_jit_write_protect_np(0);
+        g_wx_hold = 1;
+        ocerz_jit_wx_open = 1;
+    }
+    static int batch = -1;
+    if (batch < 0) batch = getenv("OCERZ_NO_TCACHE_BATCH") ? 0 : 1;
+    g_tcb_on = batch;
+    g_tc_from_profile = 1;
+}
+
+/* one record of the warm set loaded ahead, with the checks a miss's load makes; rec and prep are consumed; 1 when it
+   went in */
+static int tc_ahead_one(OcerzJit *jit, OcerzTcRecHead *rec, uint64_t key, void *prep)
+{
+    if (g_tcb_n == TC_BATCH_MAX)
+        tc_batch_end(jit);
+    int img = (key & OCERZ_TC_KEY_IMAGE) != 0;
+    uint64_t rip = img ? tc_image_rec_rip(rec, (const TcPrep *)prep) : key & ~OCERZ_TC_KEY_PLAIN;
+    uint64_t jk = jit_key(rip, 0);
+    int got = 0;
+    int ok = !(key & OCERZ_TC_KEY_M32) && rip && !cache_lookup(jit, rip, 0) && !tcb_find(jk) &&
+             tc_keepable(rip, 0) && (g_tc_img_hi != 0) == img && !al_marked(jk) && !al_marked(jk | AL_BLK_TAG) &&
+             !cp_marked(jk) && !tc_noload_has(jk);
+    if (ok) {
+        g_plain_mem = jit_plain_now(jit) || ocerz_dyldapi_memfn(rip);
+        ok = tc_key(rip, 0) == key;
+    }
+    if (ok) {
+        g_tc_key = key;
+        got = (prep ? tc_load_prepped(jit, rec, (TcPrep *)prep, rip) : tc_load(jit, rec, rip, 0)) != NULL;
+        g_tc_n_ahead += got;
+        g_tc_n_iahead += got && img;
+        g_tc_n_prep += prep != NULL;
+        prep = NULL;
+    }
+    tc_unprep(prep);
+    free(rec);
+    return got;
+}
+
+static void tc_ahead_end(OcerzJit *jit, const TcAheadSave *sv)
+{
+    tc_batch_end(jit);
+    g_tcb_on = 0;
+    g_tc_from_profile = 0;
+    if (tc_wx_hold_on()) {
+        ocerz_jit_wx_open = sv->pwo;
+        g_wx_hold = 0;
+        pthread_jit_write_protect_np(1);
+    }
+    g_plain_mem = sv->pm;
+    g_tc_key = sv->pk;
+    g_tc_img_lo = sv->plo;
+    g_tc_img_hi = sv->phi;
+    g_tc_img_id = sv->pid;
+}
+
 /*
  * After a miss loaded a record the warm thread had decoded, the next ones its
  * profile names are loaded too, while the JIT lock is held anyway: they are
@@ -23924,64 +24006,111 @@ static void tc_load_ahead(OcerzJit *jit)
 {
     static int max = -1;
     if (max < 0) { const char *e = getenv("OCERZ_TCACHE_AHEAD"); max = e ? atoi(e) : 127; }
-    int pm = g_plain_mem;
-    uint64_t pk = g_tc_key, plo = g_tc_img_lo, phi = g_tc_img_hi, pid = g_tc_img_id;
-    static int hold = -1;
-    if (hold < 0) hold = getenv("OCERZ_NO_WX_HOLD") ? 0 : 1;
-    /* a deps check that faults (a dep in an image now mapped elsewhere) leaves
-       through ocerz_jit_decode_recover, so the handler must reopen the pages */
-    int pwo = ocerz_jit_wx_open;
-    if (hold) {
-        pthread_jit_write_protect_np(0);
-        g_wx_hold = 1;
-        ocerz_jit_wx_open = 1;
-    }
-    static int batch = -1;
-    if (batch < 0) batch = getenv("OCERZ_NO_TCACHE_BATCH") ? 0 : 1;
-    g_tcb_on = batch;
-    g_tc_from_profile = 1;
+    TcAheadSave sv;
+    tc_ahead_begin(&sv);
     for (int k = 0; k < max; k++) {
         uint64_t key = 0;
-        if (g_tcb_n == TC_BATCH_MAX)
-            tc_batch_end(jit);
         void *prep = NULL;
         OcerzTcRecHead *rec = ocerz_tcache_warm_next(&key, &prep);
         if (!rec)
             break;
-        int img = (key & OCERZ_TC_KEY_IMAGE) != 0;
-        uint64_t rip = img ? tc_image_rec_rip(rec, (const TcPrep *)prep) : key & ~OCERZ_TC_KEY_PLAIN;
-        uint64_t jk = jit_key(rip, 0);
-        int ok = !(key & OCERZ_TC_KEY_M32) && rip && !cache_lookup(jit, rip, 0) && !tcb_find(jk) &&
-                 tc_keepable(rip, 0) && (g_tc_img_hi != 0) == img && !al_marked(jk) && !al_marked(jk | AL_BLK_TAG) &&
-                 !cp_marked(jk) && !tc_noload_has(jk);
-        if (ok) {
-            g_plain_mem = jit_plain_now(jit) || ocerz_dyldapi_memfn(rip);
-            ok = tc_key(rip, 0) == key;
-        }
-        if (ok) {
-            g_tc_key = key;
-            int got = (prep ? tc_load_prepped(jit, rec, (TcPrep *)prep, rip) : tc_load(jit, rec, rip, 0)) != NULL;
-            g_tc_n_ahead += got;
-            g_tc_n_iahead += got && img;
-            g_tc_n_prep += prep != NULL;
-            prep = NULL;
-        }
-        tc_unprep(prep);
-        free(rec);
+        tc_ahead_one(jit, rec, key, prep);
     }
-    tc_batch_end(jit);
-    g_tcb_on = 0;
-    g_tc_from_profile = 0;
-    if (hold) {
-        ocerz_jit_wx_open = pwo;
-        g_wx_hold = 0;
-        pthread_jit_write_protect_np(1);
+    tc_ahead_end(jit, &sv);
+}
+
+/*
+ * The installer: a thread of ocerz's that loads the warm set's records ahead
+ * of the guest, in the profile's order, while the guest's thread runs the code
+ * already in place.  Loading them on the guest's thread, a batch after each
+ * miss the warm set answered, was a third of a warm launch (8.4 of perl
+ * -MPOSIX's 30 ms, 11 of tclsh's 33).  It takes the JIT lock for a batch of
+ * TCI_BATCH records at a time, with the same checks and the same code as that
+ * load (tc_ahead_one), and lets go between batches, so a miss on the guest's
+ * thread waits at most one batch.  A disk image's record whose image is not
+ * loaded yet is put back, and the installer waits for the next image to load.
+ * It stops when the warm set is done, or after TCI_IDLE_NS with nothing new.
+ * A fork child has none.  OCERZ_NO_TCACHE_INSTALLER=1 leaves all of it to the
+ * guest's thread, as before.
+ */
+#define TCI_BATCH 32
+#define TCI_IDLE_NS 3000000000ull
+
+static int g_tci_started;
+
+static int tc_installer_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = !getenv("OCERZ_NO_TCACHE_INSTALLER");
+    return on && !ocerz_low_base && !g_sr && ocerz_tcache_mode() == OCERZ_TC_ON;
+}
+
+static void *tc_installer_main(void *arg)
+{
+    OcerzJit *jit = (OcerzJit *)arg;
+    pthread_setname_np("ocerz-tcache-install");
+    ocerz_internal_thread = "tcache installer";
+    size_t at = 0;
+    unsigned wait_gen = 0;
+    int waiting = 0;
+    uint64_t idle_since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (;;) {
+        OcerzTcRecHead *rec = NULL;
+        uint64_t key = 0;
+        void *prep = NULL;
+        int rc = ocerz_tcache_warm_at(&at, 0, &rec, &key, &prep);
+        if (rc < 0)
+            break;
+        if (rc == 0 || (waiting && ocerz_dyld_generation() == wait_gen)) {
+            if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - idle_since > TCI_IDLE_NS)
+                break;
+            struct timespec ts = { 0, 100000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        waiting = 0;
+        /* never ahead of a guest thread: only when nobody waits, and without waiting itself */
+        if (__atomic_load_n(&g_jl_waiting, __ATOMIC_RELAXED) || !jl_try_acquire()) {
+            struct timespec ts = { 0, 50000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        TcAheadSave sv;
+        tc_ahead_begin(&sv);
+        for (int k = 0; k < TCI_BATCH; k++) {
+            if (ocerz_tcache_warm_at(&at, 1, &rec, &key, &prep) <= 0)
+                break;
+            if ((key & OCERZ_TC_KEY_IMAGE) && !tc_image_rec_rip(rec, (const TcPrep *)prep)) {
+                at--;   /* its image is not loaded yet: put back, and wait for one to load */
+                ocerz_tcache_warm_untake(at, rec);
+                wait_gen = ocerz_dyld_generation();
+                waiting = 1;
+                break;
+            }
+            g_tc_n_inst += tc_ahead_one(jit, rec, key, prep);
+            if (__atomic_load_n(&g_jl_waiting, __ATOMIC_RELAXED))
+                break;   /* a guest thread wants the lock: it waits for this record, not the batch */
+        }
+        tc_ahead_end(jit, &sv);
+        jl_release();
+        idle_since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     }
-    g_plain_mem = pm;
-    g_tc_key = pk;
-    g_tc_img_lo = plo;
-    g_tc_img_hi = phi;
-    g_tc_img_id = pid;
+    return NULL;
+}
+
+/* the guest's first miss the warm set answered starts it (translate_one) */
+static void tc_installer_start(OcerzJit *jit)
+{
+    if (g_tci_started || !tc_installer_on())
+        return;
+    g_tci_started = 1;
+    pthread_t t;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &at, tc_installer_main, jit) != 0)
+        g_tci_started = 0;
+    pthread_attr_destroy(&at);
 }
 
 static void tc_verify_rec(OcerzJit *jit, JitBlock *blk, const TcView *vp);
@@ -24319,8 +24448,10 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
                 __atomic_add_fetch(&ocerz_jit_xlat_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
             if (lb) {
                 g_tc_rec = 0;
-                if (tc_hit_warm && !mode32)
+                if (tc_hit_warm && !mode32) {
+                    tc_installer_start(jit);
                     tc_load_ahead(jit);
+                }
                 return lb;
             }
         }
@@ -28713,6 +28844,7 @@ void ocerz_jit_postfork_child(void)
     }
     g_flush_mark = UINT64_MAX;
     g_flush_retry_ns = 0;
+    g_tci_started = 1;   /* the child has no warm thread to install from */
     fork_tail_remap();
 }
 

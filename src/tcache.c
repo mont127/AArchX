@@ -920,6 +920,60 @@ OcerzTcRecHead *ocerz_tcache_warm_next(uint64_t *key, void **prep)
     return r;
 }
 
+/*
+ * The installer's walk through the warm set (src/jit.c): the record at *i,
+ * passing over what something else took or the warm thread gave up on, with
+ * its key and prep.  1 with the record, taken (and *i past it) when take is
+ * set, which makes it the caller's; when take is clear only the answer counts,
+ * since the warm thread may drop the record the moment the lock is let go.
+ * 0 while the record at *i is not decoded yet; -1 once the set is done.
+ */
+int ocerz_tcache_warm_at(size_t *i, int take, OcerzTcRecHead **rec, uint64_t *key, void **prep)
+{
+    int rc = -1;
+    pthread_mutex_lock(&g_lock);
+    while (__atomic_load_n(&g_warm_on, __ATOMIC_ACQUIRE) && *i < g_nwarm) {
+        uintptr_t st = __atomic_load_n(&g_warm[*i].st, __ATOMIC_ACQUIRE);
+        if (st == 1 || (g_warm[*i].key & OCERZ_TC_KEY_M32)) {
+            (*i)++;
+            continue;
+        }
+        if (st == 0) {
+            rc = 0;
+            break;
+        }
+        if (take) {   /* as warm_next takes: the warm thread drops what falls behind with the same exchange */
+            st = __atomic_exchange_n(&g_warm[*i].st, 1, __ATOMIC_ACQ_REL);
+            if (st <= 1) {
+                (*i)++;
+                continue;
+            }
+            __atomic_store_n(&g_warm_at, __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+        }
+        *rec = (OcerzTcRecHead *)st;
+        *key = g_warm[*i].key;
+        *prep = g_warm[*i].prep;
+        *i += take != 0;
+        rc = 1;
+        break;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
+/* Puts back what ocerz_tcache_warm_at took at i, untouched, for whoever comes to it next. */
+void ocerz_tcache_warm_untake(size_t i, OcerzTcRecHead *rec)
+{
+    pthread_mutex_lock(&g_lock);
+    uintptr_t one = 1;
+    if (i < g_nwarm && __atomic_compare_exchange_n(&g_warm[i].st, &one, (uintptr_t)rec, 0, __ATOMIC_ACQ_REL,
+                                                    __ATOMIC_RELAXED))
+        __atomic_store_n(&g_warm_at, __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED) - 1, __ATOMIC_RELAXED);
+    else
+        free(rec);
+    pthread_mutex_unlock(&g_lock);
+}
+
 const OcerzTcRecHead *ocerz_tcache_find(uint64_t key)
 {
     const OcerzTcRecHead *found = NULL;
@@ -1090,12 +1144,15 @@ static void *warm_main(void *arg)
             continue;
         uint64_t loc = slot_loc(g_warm[i].key), no = loc >> TC_LOC_OFF_BITS, off = loc & ((1ull << TC_LOC_OFF_BITS) - 1);
         const TcStored *z = loc && no < (1ull << 24) ? warm_at(&m, &nm, no, off) : NULL;
-        if (!stored_head_ok(z, g_warm[i].key))
-            continue;
-        OcerzTcRecHead *r = (OcerzTcRecHead *)malloc(sizeof *r + z->raw);
         uintptr_t zero = 0;
-        if (r && !unpack(z, r, scratch)) {
+        if (!stored_head_ok(z, g_warm[i].key)) {   /* given up on: nothing waits for it (ocerz_tcache_warm_at) */
+            __atomic_compare_exchange_n(&g_warm[i].st, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+            continue;
+        }
+        OcerzTcRecHead *r = (OcerzTcRecHead *)malloc(sizeof *r + z->raw);
+        if (!r || !unpack(z, r, scratch)) {
             free(r);
+            __atomic_compare_exchange_n(&g_warm[i].st, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
             continue;
         }
         void *(*prep)(const OcerzTcRecHead *, uint64_t) = __atomic_load_n(&g_prep_fn, __ATOMIC_ACQUIRE);
