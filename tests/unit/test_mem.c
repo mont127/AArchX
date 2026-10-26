@@ -171,6 +171,73 @@ static void test_padded_shared_activation(uint64_t base)
     close(fd);
 }
 
+/* MAP_FIXED over exactly one earlier mapping takes a one-pass path (Wine maps its 8 GB reserve twice), and a
+   fresh mapping may start inside a host page whose guest pages before it are free. Both must leave what the
+   general path leaves: zeroed contents, the new protection, nothing of the old mapping, the neighbours intact. */
+static void test_whole_owner_replace(uint64_t base)
+{
+    const uint64_t g = OCERZ_GUEST_PAGE_SIZE;
+    const uint64_t lo = base + g, len = 1023 * g;
+    CHECK(ocerz_map_fixed(lo, len, PROT_READ | PROT_WRITE) == OCERZ_OK);
+    CHECK(ocerz_addr_prot(base) == -1);
+    CHECK(ocerz_addr_prot(lo) == (PROT_READ | PROT_WRITE));
+    for (uint64_t off = 0; off < len; off += 16 * g)
+        ocerz_st(lo + off, 8, 0x5000 + off);
+    CHECK(ocerz_ld(lo + 32 * g, 8) == 0x5000 + 32 * g);
+    CHECK(ocerz_protect(lo + 64 * g, 64 * g, PROT_READ) == OCERZ_OK);
+
+    CHECK(ocerz_map_fixed(lo, len, PROT_NONE) == OCERZ_OK);
+    CHECK(ocerz_addr_prot(base) == -1);
+    CHECK(ocerz_addr_prot(lo) == 0);
+    CHECK(ocerz_addr_prot(lo + 64 * g) == 0);
+    CHECK((ocerz_host_region_prot(lo, NULL, NULL) & 0xff) == 0);
+    CHECK(ocerz_map_fixed(lo, len, PROT_READ | PROT_WRITE) == OCERZ_OK);
+    int zero = 1;
+    for (uint64_t off = 0; off < len; off += 16 * g)
+        zero &= ocerz_ld(lo + off, 8) == 0;
+    CHECK(zero);
+    uint64_t query = lo, size = 0;
+    unsigned prot = 0, max_prot = 0;
+    CHECK(ocerz_guest_vm_region(&query, &size, &prot, &max_prot) == 1);
+    CHECK(query == lo && size == len);
+
+    /* part of one mapping: the general path, the rest keeps its contents */
+    ocerz_st(lo + 127 * g, 8, 0x77);
+    ocerz_st(lo + 128 * g, 8, 0x88);
+    ocerz_st(lo + 192 * g, 8, 0x99);
+    CHECK(ocerz_map_fixed(lo + 128 * g, 64 * g, PROT_READ | PROT_WRITE) == OCERZ_OK);
+    CHECK(ocerz_ld(lo + 127 * g, 8) == 0x77);
+    CHECK(ocerz_ld(lo + 128 * g, 8) == 0);
+    CHECK(ocerz_ld(lo + 192 * g, 8) == 0x99);
+
+    /* one mapping with neighbours in its first and last host pages: they keep their contents */
+    CHECK(ocerz_map_fixed(base, g, PROT_READ | PROT_WRITE) == OCERZ_OK);
+    CHECK(ocerz_map_fixed(lo, len - g, PROT_READ | PROT_WRITE) == OCERZ_OK);
+    ocerz_st(base, 8, 0xaa);
+    ocerz_st(lo + len - g, 8, 0xbb);
+    ocerz_st(lo, 8, 0xcc);
+    CHECK(ocerz_map_fixed(lo, len - g, PROT_READ) == OCERZ_OK);
+    CHECK(ocerz_ld(base, 8) == 0xaa);
+    CHECK(ocerz_ld(lo + len - g, 8) == 0xbb);
+    CHECK(ocerz_ld(lo, 8) == 0);
+    CHECK(ocerz_addr_prot(lo) == PROT_READ);
+    CHECK(ocerz_addr_prot(base) == (PROT_READ | PROT_WRITE));
+    CHECK(ocerz_unmap(base, len + g) == OCERZ_OK);
+    CHECK(ocerz_addr_prot(lo) == -1);
+    CHECK(ocerz_addr_committed(lo) == 0);
+    CHECK((ocerz_host_region_prot(lo, NULL, NULL) & 0xff) == 0);
+
+    /* the old mapping's guard pages go with it */
+    uint64_t any = ocerz_map_anywhere(256 * g, PROT_READ | PROT_WRITE);
+    CHECK(any != 0);
+    CHECK(ocerz_map_claim_fixed(any + 256 * g, g, PROT_READ | PROT_WRITE) == OCERZ_ENOMEM);
+    ocerz_st(any, 8, 0xdd);
+    CHECK(ocerz_map_fixed(any, 256 * g, PROT_READ | PROT_WRITE) == OCERZ_OK);
+    CHECK(ocerz_ld(any, 8) == 0);
+    CHECK(ocerz_map_claim_fixed(any + 256 * g, g, PROT_READ | PROT_WRITE) == OCERZ_OK);
+    CHECK(ocerz_unmap(any, 257 * g) == OCERZ_OK);
+}
+
 int main(void)
 {
     const uint64_t lo = 0x100000000ull;
@@ -337,6 +404,8 @@ int main(void)
     CHECK(ocerz_map_claim_fixed(donated, OCERZ_HOST_PAGE_SIZE,
                                 PROT_READ | PROT_WRITE) == OCERZ_OK);
     CHECK(ocerz_unmap(donated, OCERZ_HOST_PAGE_SIZE) == OCERZ_OK);
+
+    test_whole_owner_replace(lo + 24ull * 1024 * 1024);
 
     CHECK(ocerz_map_anywhere(0, PROT_READ | PROT_WRITE) == 0);
     CHECK(ocerz_map_anywhere(UINT64_MAX, PROT_READ | PROT_WRITE) == 0);

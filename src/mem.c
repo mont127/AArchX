@@ -808,9 +808,9 @@ static void bits_clr_range(const MemRegion *r, size_t i0, size_t i1)
 static int install_fresh_locked(MemRegion *r, uint64_t lo, uint64_t hi, uint64_t guard_hi,
                                 int prot, uint32_t *owner_out)
 {
-    uint64_t dhi = round_up(hi);
-    if (lo != round_down(lo) || guard_hi != round_down(guard_hi) || dhi > guard_hi ||
-        !host_pages_plain_locked(r, lo, guard_hi))
+    uint64_t dhi = round_up(hi), hlo = round_down(lo);
+    if ((lo != hlo && (r->glo > hlo || !slots_are_free(r, hlo, lo))) || guard_hi != round_down(guard_hi) ||
+        dhi > guard_hi || !host_pages_plain_locked(r, hlo, guard_hi))
         return -1;
     for (uint64_t p = dhi; p < guard_hi; p += OCERZ_HOST_PAGE)
         if (bit_test(r, pg_index(r, p)))
@@ -819,13 +819,13 @@ static int install_fresh_locked(MemRegion *r, uint64_t lo, uint64_t hi, uint64_t
     uint32_t owner = owner_create_locked(r, (uint32_t)nslots, hi, guard_hi);
     if (!owner)
         return -1;
-    void *hp = ocerz_g2h(lo);
-    if (mmap(hp, (size_t)(dhi - lo), host_prot(prot), MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1,
+    void *hp = ocerz_g2h(hlo);
+    if (mmap(hp, (size_t)(dhi - hlo), host_prot(prot), MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1,
              0) != hp) {
         owner_cancel_locked(owner);
         return -1;
     }
-    bits_set_range(r, pg_index(r, lo), pg_index(r, dhi));
+    bits_set_range(r, pg_index(r, hlo), pg_index(r, dhi));
     if (r->slots) {
         size_t i0 = slot_index(r, lo);
         uint32_t *s = r->slots + i0;
@@ -1242,6 +1242,47 @@ static int detach_replaced_shared_pages_locked(const MemRegion *r,
     return OCERZ_OK;
 }
 
+/* A replacement of exactly one owner's data, in host pages that hold nothing else, is a fresh mapping that takes
+   over the old owner's slots in one pass. Wine maps its 8 GB reserve a second time over the one it was loaded
+   with; the general path makes some ten passes over every page of it, 14 ms in each Wine process. */
+static int replace_whole_owner_locked(MemRegion *r, uint64_t lo, uint64_t hi, int prot,
+                                      uint64_t zero_lo, uint64_t zero_hi, uint32_t *owner_out)
+{
+    uint64_t hlo = round_down(lo), dhi = round_up(hi), n = (hi - lo) / OCERZ_GUEST_PAGE;
+    if (!r->slots || n < 64 || zero_lo > lo || zero_hi < hi || hlo < r->glo || dhi > r->ghi ||
+        ocerz_no_batch_vm())
+        return -1;
+    size_t i0 = slot_index(r, lo);
+    uint32_t *s = r->slots + i0, old = slot_owner(s[0]), diff = 0;
+    if (!slot_is_data(s[0]) || old > owner_n || !owners[old - 1].active || owners[old - 1].live_slots != n)
+        return -1;
+    for (uint64_t k = 0; k < n; k++)
+        diff |= (s[k] & (MEM_SLOT_OWNER_MASK | MEM_SLOT_GUARD)) ^ old;
+    if (diff || !slots_are_free(r, hlo, lo) || !slots_are_free(r, hi, dhi) || !host_pages_plain_locked(r, hlo, dhi))
+        return -1;
+    uint32_t owner = owner_create_locked(r, (uint32_t)n, hi, hi);
+    if (!owner)
+        return -1;
+    void *hp = ocerz_g2h(hlo);
+    if (mmap(hp, (size_t)(dhi - hlo), host_prot(prot), MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) != hp) {
+        owner_cancel_locked(owner);
+        return -1;
+    }
+    bits_set_range(r, pg_index(r, hlo), pg_index(r, dhi));
+    uint32_t v = slot_data_state(owner, prot);
+    for (uint64_t k = 0; k < n; k++)
+        s[k] = v;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    slot_edges_uniform(r, i0, i0 + (size_t)n);
+    owners[old - 1].live_slots = 0;
+    uint64_t alo = UINT64_MAX, ahi = 0;
+    owner_retire_locked(old, &alo, &ahi);
+    (void)sync_host_range_locked(r, alo, ahi);
+    if (owner_out)
+        *owner_out = owner;
+    return 0;
+}
+
 static int install_mapping_locked(MemRegion *r, uint64_t lo, uint64_t hi,
                                   uint64_t guard_hi, int prot, int replace,
                                   uint64_t zero_lo, uint64_t zero_hi,
@@ -1256,6 +1297,8 @@ static int install_mapping_locked(MemRegion *r, uint64_t lo, uint64_t hi,
     if ((!replace && !slots_are_free(r, lo, guard_hi)) ||
         (replace && guard_hi > hi && !slots_are_free(r, hi, guard_hi)))
         return map_refuse(5, lo, hi, OCERZ_ENOMEM);
+    if (replace && guard_hi == hi && replace_whole_owner_locked(r, lo, hi, prot, zero_lo, zero_hi, owner_out) == 0)
+        return OCERZ_OK;
     if (!shared_replacement_allowed_locked(r, lo, hi))
         return map_refuse(6, lo, hi, OCERZ_EUNSUP);
     if ((!replace || slots_are_free(r, lo, guard_hi)) &&
@@ -1303,18 +1346,29 @@ static int install_mapping_locked(MemRegion *r, uint64_t lo, uint64_t hi,
     uint64_t affected_lo = UINT64_MAX;
     uint64_t affected_hi = 0;
     affected_include(lo, guard_hi, &affected_lo, &affected_hi);
-    for (uint64_t slot = 0; slot < nslots64; slot++) {
-        uint64_t p = lo + slot * OCERZ_GUEST_PAGE;
-        if (replace && slot_is_data(old_states[slot])) {
+    for (uint64_t slot = 0; replace && slot < nslots64; slot++) {
+        if (slot_is_data(old_states[slot])) {
             uint32_t old_owner = slot_owner(old_states[slot]);
             if (old_owner <= owner_n && owners[old_owner - 1].active &&
                 owners[old_owner - 1].live_slots)
                 owners[old_owner - 1].live_slots--;
         }
-        slot_store(r, slot_index(r, p), slot_data_state(owner, prot));
     }
-    for (uint64_t p = hi; p < guard_hi; p += OCERZ_GUEST_PAGE)
-        slot_store(r, slot_index(r, p), owner | MEM_SLOT_GUARD);
+    if (r->slots) {
+        /* every slot the same state: one fill, as install_fresh_locked makes it, not a store and two edge
+           syncs per page */
+        size_t i0 = slot_index(r, lo);
+        uint32_t *sl = r->slots + i0, v = slot_data_state(owner, prot);
+        uint64_t ng = (guard_hi - hi) / OCERZ_GUEST_PAGE;
+        for (uint64_t k = 0; k < nslots64; k++)
+            sl[k] = v;
+        for (uint64_t k = 0; k < ng; k++)
+            sl[nslots64 + k] = owner | MEM_SLOT_GUARD;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        word_bits_fill(r->used, i0, i0 + (size_t)(nslots64 + ng), 1);
+        slot_edges_uniform(r, i0, i0 + (size_t)nslots64);
+        slot_edges_uniform(r, i0 + (size_t)nslots64, i0 + (size_t)(nslots64 + ng));
+    }
 
     update_padded_slots_locked(r, lo, hi, 1);
 
