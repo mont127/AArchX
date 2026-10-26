@@ -24030,19 +24030,26 @@ static void tc_load_ahead(OcerzJit *jit)
  * thread waits at most one batch.  A disk image's record whose image is not
  * loaded yet is put back, and the installer waits for the next image to load.
  * It stops when the warm set is done, or after TCI_IDLE_NS with nothing new.
- * A fork child has none.  OCERZ_NO_TCACHE_INSTALLER=1 leaves all of it to the
- * guest's thread, as before.
+ * A launch whose profile names fewer than TCI_MIN records starts none: a
+ * thread started costs about 0.15 ms, which uname (3.3K records) and perl -e 1
+ * (6.2K) paid and got nothing back for, where tclsh (27K) gained 4 ms.
+ * OCERZ_TCACHE_INSTALLER_MIN=<n> moves the line.  A fork child has none.
+ * OCERZ_NO_TCACHE_INSTALLER=1 leaves all of it to the guest's thread, as before.
  */
 #define TCI_BATCH 32
 #define TCI_IDLE_NS 3000000000ull
+#define TCI_MIN 12000
 
 static int g_tci_started;
 
 static int tc_installer_on(void)
 {
     static int on = -1;
+    static long min = -1;
     if (on < 0) on = !getenv("OCERZ_NO_TCACHE_INSTALLER");
-    return on && !ocerz_low_base && !g_sr && ocerz_tcache_mode() == OCERZ_TC_ON;
+    if (min < 0) { const char *e = getenv("OCERZ_TCACHE_INSTALLER_MIN"); min = e ? atol(e) : TCI_MIN; }
+    return on && !ocerz_low_base && !g_sr && ocerz_tcache_mode() == OCERZ_TC_ON &&
+           ocerz_tcache_profile_entries() >= (size_t)min;
 }
 
 static void *tc_installer_main(void *arg)

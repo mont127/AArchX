@@ -1342,7 +1342,8 @@ run_tcache_ord_case dtcache_ordstart
 # its deps check inside the run of loads, which must leave the JIT's pages
 # writable; most records must load without their deps check.  The installer
 # (src/jit.c) loads them while the program sleeps, so the fault is its own, and
-# it must have loaded some.  Whether atoi's
+# it must have loaded some: told to start for a profile this small, which by
+# itself starts none.  Whether atoi's
 # record is among the ones loaded ahead depends on what loaded before the sleep,
 # hence five tries.  A copy on APFS is a clone whose pages are not in memory,
 # which leaves the warm thread behind the program and loads far fewer records
@@ -1371,7 +1372,7 @@ run_tcache_patch_case() {
             cp -R "$dir/patched" "$dir/store"
             cat "$dir/store"/*/* >/dev/null
             OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_MIN_FREE_MB=0 \
-                OCERZ_TCACHE_AHEAD=100000 \
+                OCERZ_TCACHE_AHEAD=100000 OCERZ_TCACHE_INSTALLER_MIN=0 \
                 run_bounded "$dir/run$i.out" "$dir/run$i.err" "$OCERZ" "$dir/$name" $arg
         fi
         why=""
