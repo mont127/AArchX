@@ -825,8 +825,9 @@ static int susp_stop_is_safe(OcerzCPU *t)
     if (thread_get_state(t->host_kport, ARM_THREAD_STATE64, (thread_state_t)&hs, &n) != KERN_SUCCESS)
         return 0;
     memcpy(t->susp_gpr, t->gpr, sizeof t->susp_gpr);
-    if (!ocerz_jit_guest_gprs_at(t->vm, (const void *)(uintptr_t)arm_thread_state64_get_pc(hs),
-                                 hs.__x, t, t->susp_gpr))
+    if (ocerz_engine_gprs_at ? !ocerz_engine_gprs_at(t, &hs, t->susp_gpr)
+                             : !ocerz_jit_guest_gprs_at(t->vm, (const void *)(uintptr_t)arm_thread_state64_get_pc(hs),
+                                                        hs.__x, t, t->susp_gpr))
         return 0;
     t->susp_have_gpr = 1;
     return 1;
@@ -2056,6 +2057,7 @@ static void abort_report(int sig, siginfo_t *si, void *ctx)
 int (*ocerz_engine_fault)(int sig, siginfo_t *si, void *uc);
 int (*ocerz_engine_async)(void *uc);
 void (*ocerz_engine_invalidate)(uint64_t addr, uint64_t len);
+int (*ocerz_engine_gprs_at)(OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
 
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {

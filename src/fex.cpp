@@ -9,6 +9,10 @@
  * FEXCore needs guest addresses to be host addresses, which is what identity
  * memory mode gives (include/ocerz/mem.h), so -fex runs only there.
  *
+ * FEXCore's options are set as FEX's own frontends set them from the
+ * environment: FEX_<OPTION>=value for any option in its table, FEX_TSOENABLED=0
+ * or FEX_MULTIBLOCK=0 for instance.
+ *
  * ---- threads and nesting ----
  * Guest code runs nested on one host thread: a system call or a dyld API call
  * made from guest code can run guest code again through ocerz_vm_call (an
@@ -420,6 +424,13 @@ void fex_init()
             fprintf(stderr, "ocerz: FEXCore: %s\n", m);
     });
     FEXCore::Config::Initialize();
+    static const std::pair<const char *, FEXCore::Config::ConfigOption> env_options[] = {
+#define OPT_BASE(type, group, enum, json, default) {"FEX_" #enum, FEXCore::Config::ConfigOption::CONFIG_##enum},
+#include <FEXCore/Config/ConfigValues.inl>
+    };
+    for (const auto &[name, option] : env_options)
+        if (const char *v = getenv(name))
+            FEXCore::Config::Set(option, v);
     FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
     FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, "0");
     new_context();
@@ -573,7 +584,9 @@ extern "C" int ocerz_fex_run(OcerzVM *vm, OcerzCPU *cpu)
     return ft->step;
 }
 
-/* In order: a commpage read, a misaligned ordered access (x0..x28, fp, lr and sp lie in that order in the thread
+/* In order: the call-return stack running past its guard pages, which happens when calls are left by something
+ * other than their ret (a signal handler's sigreturn, a longjmp) and is answered as FEX's frontends answer it, by
+ * putting the stack pointer, x25 in translated code, back to its starting place; a commpage read, a misaligned ordered access (x0..x28, fp, lr and sp lie in that order in the thread
  * state, the register array FEXCore patches), a fault in the shared cache (ocerz's own lazy mapping and write
  * tracking, in crash_handler), a write to an armed page of guest code, and otherwise the guest's own fault, which
  * crash_handler delivers from the registers spilled here. */
@@ -588,6 +601,10 @@ extern "C" int ocerz_fex_fault(int sig, siginfo_t *si, void *uc)
         return 0;
     const uint64_t a = (uint64_t)(uintptr_t)si->si_addr;
     const uint64_t esr = mc->__es.__esr, ec = (esr >> 26) & 0x3f;
+    if (a - (uint64_t)(uintptr_t)ft->callret < CALLRET_SIZE + 2 * CALLRET_GUARD) {
+        mc->__ss.__x[25] = (uint64_t)(uintptr_t)ft->thread->CallRetStackBase + CALLRET_SIZE / 4;
+        return 1;
+    }
     if (a >= OCERZ_COMMPAGE_LO && a < OCERZ_COMMPAGE_HI && commpage_load(&mc->__ss, *(const uint32_t *)pc))
         return 1;
     if (sig == SIGBUS && (esr & 0x3f) == 0x21) {
@@ -639,4 +656,28 @@ extern "C" void ocerz_fex_invalidate(uint64_t addr, uint64_t len)
     std::scoped_lock all(g_all_lock);
     for (FexThread *ft : g_all)
         g_ctx->InvalidateThreadCachedCodeRange(ft->thread, addr, len);
+}
+
+/* For a suspend from another thread: the target is stopped by the kernel, so its level's state holds still. */
+extern "C" int ocerz_fex_gprs_at(OcerzCPU *cpu, const void *host_state, uint64_t out[16])
+{
+    const auto *hs = (const arm_thread_state64_t *)host_state;
+    FexThread *ft = nullptr;
+    {
+        std::scoped_lock lk(g_all_lock);
+        for (FexThread *t : g_all)
+            if (t->cpu == cpu)
+                ft = t;
+    }
+    if (!ft || ft->thread->CurrentFrame->InSyscallInfo != 0 ||
+        !g_ctx->IsAddressInCodeBuffer(ft->thread, (uintptr_t)arm_thread_state64_get_pc(*hs)))
+        return 0;
+    const auto &cfg = g_signals_config();
+    memcpy(out, ft->thread->CurrentFrame->State.gregs, 16 * sizeof(uint64_t));
+    for (size_t i = 0; i < cfg.SRAGPRCount && i < 16; i++) {
+        const unsigned r = cfg.SRAGPRMapping[i];
+        out[i] = r == 31 ? arm_thread_state64_get_sp(*hs) : r == 30 ? arm_thread_state64_get_lr(*hs)
+               : r == 29 ? arm_thread_state64_get_fp(*hs) : hs->__x[r];
+    }
+    return 1;
 }

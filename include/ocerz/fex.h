@@ -19,6 +19,11 @@
  * request sends) with the interrupted context, so that a thread looping in
  * translated code, with no system call to notice anything at, leaves it.
  *
+ * ocerz_engine_gprs_at, when set, reads a suspended guest thread's general
+ * registers from its host thread state, as ocerz_jit_guest_gprs_at does for
+ * ocerz's own code, and fails where they cannot be read, so the suspend tries
+ * again.
+ *
  * ocerz_engine_invalidate, when set, hears every guest range ocerz drops
  * translations for (ocerz_jit_invalidate_range): a write to a page of guest
  * code, an unmap, a protection change.
@@ -43,11 +48,13 @@ extern int (*ocerz_engine_run)(struct OcerzVM *vm, struct OcerzCPU *cpu);
 extern int (*ocerz_engine_fault)(int sig, siginfo_t *si, void *uc);
 extern int (*ocerz_engine_async)(void *uc);
 extern void (*ocerz_engine_invalidate)(uint64_t addr, uint64_t len);
+extern int (*ocerz_engine_gprs_at)(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
 
 int ocerz_fex_run(struct OcerzVM *vm, struct OcerzCPU *cpu);
 int ocerz_fex_fault(int sig, siginfo_t *si, void *uc);
 int ocerz_fex_async(void *uc);
 void ocerz_fex_invalidate(uint64_t addr, uint64_t len);
+int ocerz_fex_gprs_at(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
 
 #ifdef __cplusplus
 }
