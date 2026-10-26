@@ -117,6 +117,20 @@ static void b_csinc_w(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 0, 0); a64_csin
 static void b_ccmn_vc(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmn_imm(b, 1, 0, 1, 1, A64_VC); a64_cset(b, 0, A64_VS); a64_ret(b); }
 static void b_ccmn_else(A64Buf *b) { a64_adds_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmn_imm(b, 1, 0, 1, 1, A64_VC); a64_cset(b, 0, A64_VS); a64_ret(b); }
 static void b_ccmp_w(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 1, 1, 0); a64_ccmp_imm(b, 0, 0, 7, 0, A64_EQ); a64_cset(b, 0, A64_EQ); a64_ret(b); }
+static void b_ccmp_reg(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 0, 0); a64_ccmp_reg(b, 1, 0, 1, 0, A64_EQ); a64_cset(b, 0, A64_EQ); a64_ret(b); }
+static void b_ccmp_reg_else(A64Buf *b) { a64_subs_imm(b, 1, A64_ZR, 0, 1); a64_ccmp_reg(b, 1, 0, 1, 4, A64_EQ); a64_cset(b, 0, A64_EQ); a64_ret(b); }
+static uint64_t g_pair[2] __attribute__((aligned(16)));
+static void b_caspal(A64Buf *b)
+{
+    a64_mov_imm64(b, 2, (uint64_t)(uintptr_t)g_pair);
+    a64_mov_reg(b, 1, 4, 0);
+    a64_mov_reg(b, 1, 5, 1);
+    a64_mov_imm64(b, 6, 0x11);
+    a64_mov_imm64(b, 7, 0x22);
+    a64_caspal(b, 4, 6, 2);
+    a64_add_reg(b, 1, 0, 4, 5, 0);
+    a64_ret(b);
+}
 static void b_rev64(A64Buf *b) { a64_rev(b, 1, 0, 0); a64_ret(b); }
 static void b_rev32(A64Buf *b) { a64_rev(b, 0, 0, 0); a64_ret(b); }
 static void b_cset(A64Buf *b) { a64_subs_reg(b, 1, A64_ZR, 0, 1, 0); a64_cset(b, 0, A64_EQ); a64_ret(b); }
@@ -497,6 +511,12 @@ int main(void)
     CHECK(run2(b_ccmn_else, 5, 0x7fffffffffffffffull) == 1, "ccmn else leg: nzcv immediate forces V");
     CHECK(run2(b_ccmp_w, 7, 0) == 1, "ccmp w: equal");
     CHECK(run2(b_ccmp_w, 8, 0) == 0, "ccmp w: not equal");
+    CHECK(run2(b_ccmp_reg, 9, 9) == 1, "ccmp reg: equal");
+    CHECK(run2(b_ccmp_reg, 9, 10) == 0, "ccmp reg: not equal");
+    CHECK(run2(b_ccmp_reg_else, 0, 0) == 1, "ccmp reg: the nzcv immediate when the condition fails");
+    g_pair[0] = 3; g_pair[1] = 4;
+    CHECK(run2(b_caspal, 3, 4) == 7 && g_pair[0] == 0x11 && g_pair[1] == 0x22, "caspal: match stores the new pair");
+    CHECK(run2(b_caspal, 3, 4) == 0x33 && g_pair[0] == 0x11 && g_pair[1] == 0x22, "caspal: mismatch returns the old pair");
     CHECK(run2(b_rev64, 0x0102030405060708ull, 0) == 0x0807060504030201ull, "rev64");
     CHECK(run2(b_rev32, 0x01020304ull, 0) == 0x04030201ull, "rev32 zero-extends");
     CHECK(run2(b_cset, 5, 5) == 1, "cset EQ");

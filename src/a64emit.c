@@ -806,6 +806,11 @@ void a64_ccmp_imm(A64Buf *b, int sf, int rn, int imm5, int nzcv, int cond)
     a64_emit32(b, 0x7a400800u | ((uint32_t)sf << 31) | ((uint32_t)(imm5 & 31) << 16) |
                   ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(nzcv & 15));
 }
+void a64_ccmp_reg(A64Buf *b, int sf, int rn, int rm, int nzcv, int cond)
+{
+    a64_emit32(b, 0x7a400000u | ((uint32_t)sf << 31) | ((uint32_t)(rm & 31) << 16) |
+                  ((uint32_t)(cond & 15) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(nzcv & 15));
+}
 void a64_ldr_v_regoff(A64Buf *b, int size, int vt, int rn, int rm, int scaled)
 {
     uint32_t base = size == 16 ? 0x3ce06800u : size == 8 ? 0xfc606800u : 0xbc606800u;
@@ -841,6 +846,9 @@ void a64_swpal(A64Buf *b, int size, int rs, int rt, int rn)
 { a64_emit32(b, 0x38e08000u | (lse_size_bits(size) << 30) | ((uint32_t)(rs & 31) << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31)); }
 void a64_casal(A64Buf *b, int size, int rs, int rt, int rn)
 { a64_emit32(b, 0x08e0fc00u | (lse_size_bits(size) << 30) | ((uint32_t)(rs & 31) << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31)); }
+/* caspal Xs, X(s+1), Xt, X(t+1), [Xn]: rs and rt are even. */
+void a64_caspal(A64Buf *b, int rs, int rt, int rn)
+{ a64_emit32(b, 0x4860fc00u | ((uint32_t)(rs & 31) << 16) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31)); }
 void a64_neg_reg(A64Buf *b, int sf, int rd, int rm)
 { a64_emit32(b, (sf ? 0xcb0003e0u : 0x4b0003e0u) | ((uint32_t)(rm & 31) << 16) | (uint32_t)(rd & 31)); }
 void a64_mvn_reg(A64Buf *b, int sf, int rd, int rm)

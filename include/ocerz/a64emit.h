@@ -218,6 +218,7 @@ void a64_v_rev64_4s(A64Buf *b, int vd, int vn);
 void a64_ldop_al(A64Buf *b, int size, int opc, int rs, int rt, int rn);
 void a64_swpal(A64Buf *b, int size, int rs, int rt, int rn);
 void a64_casal(A64Buf *b, int size, int rs, int rt, int rn);
+void a64_caspal(A64Buf *b, int rs, int rt, int rn);
 void a64_neg_reg(A64Buf *b, int sf, int rd, int rm);
 void a64_mvn_reg(A64Buf *b, int sf, int rd, int rm);
 void a64_rbit(A64Buf *b, int sf, int rd, int rn);
@@ -275,6 +276,7 @@ void a64_v_fmls(A64Buf *b, int dbl, int vd, int vn, int vm);
 void a64_cmn_imm(A64Buf *b, int sf, int rn, int imm12);
 void a64_ccmn_imm(A64Buf *b, int sf, int rn, int imm5, int nzcv, int cond);
 void a64_ccmp_imm(A64Buf *b, int sf, int rn, int imm5, int nzcv, int cond);
+void a64_ccmp_reg(A64Buf *b, int sf, int rn, int rm, int nzcv, int cond);
 void a64_subs_imm_sh12(A64Buf *b, int sf, int rd, int rn, uint32_t imm12);
 void a64_cmp_ext_sxtw(A64Buf *b, int rn, int rm);
 

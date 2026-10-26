@@ -13040,6 +13040,70 @@ static int bt_cf_lazy(uint64_t need)
     if (off < 0) off = getenv("OCERZ_NO_BT_LAZY_CF") ? 1 : 0;
     return !off && need != 0 && !(g_cur_live_after & (JIT_ARITH_FLAGS & ~(uint64_t)OCERZ_CF));
 }
+/*
+ * bts, btr and btc on memory, locked or not: the byte that holds the bit, found as bt finds it, set, cleared or
+ * flipped by a byte LSE atomic in ordered mode and by a load and a store in plain mode, CF the bit as it was.  A
+ * byte atomic is never misaligned, and x86's locked operation on the word around the bit leaves that word's other
+ * bytes as they were too.  They used to be interpreted: a lock bts cost 11 ns against Rosetta's 1.6, and
+ * allocators keep their bitmaps with them.
+ */
+static int emit_bts_mem(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0], *o = &insn->ops[1];
+    unsigned bits = (unsigned)d->size * 8;
+    if (!mem_native_store_ok() || (rsp_is_ptr() && d->index == OCERZ_RSP) || ENV_ON("OCERZ_NO_BTS_MEM")) return 0;
+    if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (rsp_is_ptr() && o->reg == OCERZ_RSP)) return 0; }
+    else if (o->kind != OCERZ_OPK_IMM) return 0;
+    int lazy = bt_cf_lazy(need);
+    int mat = need != 0 && !lazy;
+    if (mat) emit_materialize(b);
+    if (!emit_mem_ea(b, insn, d, JTA)) return 0;
+    (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+    unsigned n = 0;
+    if (o->kind == OCERZ_OPK_IMM) {
+        n = (unsigned)o->imm & (bits - 1);
+        if (n >> 3) a64_add_imm(b, 1, JTA, JTA, n >> 3);
+        a64_mov_imm64(b, JT1, 1u << (n & 7));
+    } else {
+        int ro = pin_hreg(pin_slot(o->reg));
+        if (o->size == 2) a64_sxth(b, 1, JT1, ro); else if (o->size == 4) a64_sxtw(b, JT1, ro); else a64_mov_reg(b, 1, JT1, ro);
+        a64_asr_imm(b, 1, JT2, JT1, 3);
+        a64_add_reg(b, 1, JTA, JTA, JT2, 0);
+        a64_try_and_imm(b, 1, JT2, JT1, 7);
+        a64_mov_imm64(b, JT1, 1);
+        a64_lslv(b, 0, JT1, JT1, JT2);
+    }
+    if (!g_plain_mem) {
+        a64_ldop_al(b, 1, insn->op == OCERZ_OP_BTS ? 3 : insn->op == OCERZ_OP_BTR ? 1 : 2, JT1, JT0, JTA);
+    } else {
+        a64_ldr(b, 1, JT0, JTA, 0);
+        if (insn->op == OCERZ_OP_BTS) a64_orr_reg(b, 0, JTU, JT0, JT1, 0);
+        else if (insn->op == OCERZ_OP_BTR) a64_bic_reg(b, 0, JTU, JT0, JT1, 0);
+        else a64_eor_reg(b, 0, JTU, JT0, JT1, 0);
+        a64_str(b, 1, JTU, JTA, 0);
+    }
+    if (o->kind == OCERZ_OPK_IMM) {
+        a64_ubfx(b, 1, JT0, JT0, (int)(n & 7), 1);
+    } else {
+        a64_lsrv(b, 1, JT0, JT0, JT2);
+        a64_try_and_imm(b, 1, JT0, JT0, 1);
+    }
+    if (mat) {
+        a64_ldr(b, 8, JT1, 20, RFLAGS_OFF);
+        a64_bfi(b, 1, JT1, JT0, 0, 1);
+        a64_str(b, 8, JT1, 20, RFLAGS_OFF);
+    } else if (lazy) {
+        emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, 8, 0), A64_ZR, JT0);
+    }
+    if (g_nzcv_want) {
+        a64_subs_imm(b, 1, A64_ZR, JT0, 0);
+        g_nzcv_kind = NZCV_KIND_BT;
+        g_nzcv_from = g_cur_insn_idx;
+    }
+    return 1;
+}
+
 static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exit_sites, int *n_exits)
 {
     if (!g_defer || insn->nops != 2 || insn->seg != OCERZ_SEG_NONE) return 0;
@@ -13047,6 +13111,8 @@ static int emit_bt(A64Buf *b, const X86Insn *insn, uint64_t need, uint32_t **exi
     const X86Operand *d = &insn->ops[0], *o = &insn->ops[1];
     int size = d->size;
     if (size != 2 && size != 4 && size != 8) return 0;
+    if (insn->op != OCERZ_OP_BT && d->kind == OCERZ_OPK_MEM)
+        return emit_bts_mem(b, insn, need, exit_sites, n_exits);
     if (insn->op != OCERZ_OP_BT) {
         if (d->kind != OCERZ_OPK_REG || d->high8 || pin_slot(d->reg) < 0 || (rsp_is_ptr() && d->reg == OCERZ_RSP)) return 0;
         if (o->kind == OCERZ_OPK_REG) { if (o->high8 || pin_slot(o->reg) < 0 || (rsp_is_ptr() && o->reg == OCERZ_RSP)) return 0; }
@@ -14698,6 +14764,71 @@ static int emit_cmpxchg8b(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 1;
 }
 
+/*
+ * cmpxchg16b: RDX:RAX against the 16 bytes at m, RCX:RBX stored on a match, ZF saying which, RDX:RAX taking the
+ * old value on a mismatch.  Ordered, a caspal of x10:x11 against x14:x15 (CASP wants even-numbered pairs, and
+ * x15 is JTA, so the address moves to JT0 first); plain, a load pair, the compare and a store pair of whichever
+ * value stays, which x86 writes back on a mismatch too.  An operand not 16-byte aligned leaves for the slow path
+ * in both, as the interpreter's own 128-bit compare-exchange is what it gets.  It used to be interpreted always:
+ * 15 ns against Rosetta's 3, and allocators' lock-free lists take one per operation.
+ */
+static int emit_cmpxchg16b(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *m = &insn->ops[0];
+    if (insn->mode32 || insn->opsize != 16 || insn->nops != 1 || m->kind != OCERZ_OPK_MEM || insn->addrsize != 8)
+        return 0;
+    if (insn->seg != OCERZ_SEG_NONE && insn->seg != OCERZ_SEG_GS && insn->seg != OCERZ_SEG_FS)
+        return 0;
+    if (!g_defer || !mem_native_store_ok() || ENV_ON("OCERZ_NO_CMPXCHG16B"))
+        return 0;
+    if (pin_slot(OCERZ_RAX) < 0 || pin_slot(OCERZ_RDX) < 0 || pin_slot(OCERZ_RBX) < 0 || pin_slot(OCERZ_RCX) < 0)
+        return 0;
+    if (rsp_is_ptr() && m->index == OCERZ_RSP)
+        return 0;
+    int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
+    int hbx = pin_hreg(pin_slot(OCERZ_RBX)), hcx = pin_hreg(pin_slot(OCERZ_RCX));
+    emit_materialize(b);
+    if (!emit_mem_ea(b, insn, m, JTA))
+        return 0;
+    (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
+    emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+    a64_try_ands_imm(b, 1, A64_ZR, JTA, 15);
+    uint32_t *align_bne = a64_label(b);
+    a64_bcond(b, A64_NE, 0);
+    if (!g_plain_mem) {
+        a64_mov_reg(b, 1, JT0, JTA);
+        a64_mov_reg(b, 1, JT1, hax);
+        a64_mov_reg(b, 1, JT2, hdx);
+        a64_mov_reg(b, 1, JTU, hbx);
+        a64_mov_reg(b, 1, JTA, hcx);
+        a64_caspal(b, JT1, JTU, JT0);
+        a64_subs_reg(b, 1, A64_ZR, JT1, hax, 0);
+        a64_ccmp_reg(b, 1, JT2, hdx, 0, A64_EQ);
+    } else {
+        a64_ldp_off(b, JT1, JT2, JTA, 0);
+        a64_subs_reg(b, 1, A64_ZR, JT1, hax, 0);
+        a64_ccmp_reg(b, 1, JT2, hdx, 0, A64_EQ);
+        a64_csel(b, 1, JT0, hbx, JT1, A64_EQ);
+        a64_csel(b, 1, JTU, hcx, JT2, A64_EQ);
+        a64_stp_off(b, JT0, JTU, JTA, 0);
+    }
+    a64_csel(b, 1, hax, hax, JT1, A64_EQ);
+    a64_csel(b, 1, hdx, hdx, JT2, A64_EQ);
+    a64_cset(b, JTT, A64_EQ);
+    a64_ldr(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, rflags));
+    a64_bfi(b, 1, JTU, JTT, 6, 1);
+    a64_str(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, rflags));
+    uint32_t *sites[1] = { align_bne };
+    if (!oolslow_add(insn, sites, 1, a64_label(b))) {
+        uint32_t *done = a64_label(b);
+        a64_b(b, 0);
+        patch_any_branch(align_bne, a64_label(b));
+        emit_slowcall(b, insn, exit_sites, n_exits);
+        a64_patch_b(done, a64_label(b));
+    }
+    return 1;
+}
+
 #define X87_CTL_OFF ((uint32_t)offsetof(OcerzCPU, fcw))
 #define X87_FPR_OFF ((uint32_t)offsetof(OcerzCPU, fpr))
 #define X87_XM_OFF ((uint32_t)offsetof(OcerzCPU, fpr_xm))
@@ -16257,6 +16388,8 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_CMPXCHG:
         return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
     case OCERZ_OP_CMPXCHGXB:
+        if (insn->opsize == 16)
+            return emit_cmpxchg16b(b, insn, exit_sites, n_exits);
         return emit_cmpxchg8b(b, insn, exit_sites, n_exits);
     case OCERZ_OP_SHL:
     case OCERZ_OP_SHR:
