@@ -22906,17 +22906,21 @@ static int g_tc_from_profile;
  * a disk image's as well, for the warm thread (.keys, built from when there is
  * one).  perl's 2.7k libperl and program records were found and decoded on the
  * guest's thread at each launch, being in no profile.  A record the warm set
- * held is not noted again in the list the set came from.
+ * held is not noted again in the list the set came from.  The Wine layout
+ * notes keys too, each Windows program in a profile of its own
+ * (launch_profile_ident, src/dyld.c), and no rips, which -aot reads as the
+ * identity layout's: its processes found every one of their 11-42K records on
+ * a miss.
  */
 static void tc_prof_note(uint64_t rip)
 {
-    if (ocerz_low_base || (g_tc_key & OCERZ_TC_KEY_M32))
+    if (g_tc_key & OCERZ_TC_KEY_M32)
         return;
     /* found on this thread before the warm thread reached it, or translated again: still in the profile */
     int known = g_tc_from_profile || (ocerz_tcache_warm_keys() && ocerz_tcache_warm_has(g_tc_key));
     if (!known || !ocerz_tcache_warm_keys())
         ocerz_tcache_profile_note_key(g_tc_key);
-    if (!known && !g_tc_img_hi)
+    if (!known && !g_tc_img_hi && !ocerz_low_base)
         ocerz_tcache_profile_note(rip | (g_tc_key & OCERZ_TC_KEY_PLAIN ? OCERZ_TC_PROF_PLAIN : OCERZ_TC_PROF_ORDERED));
 }
 
@@ -24037,7 +24041,8 @@ static void tc_load_ahead(OcerzJit *jit)
  * A launch whose profile names fewer than TCI_MIN records starts none: a
  * thread started costs about 0.15 ms, which uname (3.3K records) and perl -e 1
  * (6.2K) paid and got nothing back for, where tclsh (27K) gained 4 ms.
- * OCERZ_TCACHE_INSTALLER_MIN=<n> moves the line.  A fork child has none.
+ * OCERZ_TCACHE_INSTALLER_MIN=<n> moves the line.  A fork child has none.  In
+ * the Wine layout too, since its processes have profiles of their own.
  * OCERZ_NO_TCACHE_INSTALLER=1 leaves all of it to the guest's thread, as before.
  */
 #define TCI_BATCH 32
@@ -24053,7 +24058,7 @@ static int tc_installer_on(void)
     static long min = -1;
     if (on < 0) on = !getenv("OCERZ_NO_TCACHE_INSTALLER");
     if (min < 0) { const char *e = getenv("OCERZ_TCACHE_INSTALLER_MIN"); min = e ? atol(e) : TCI_MIN; }
-    return on && !ocerz_low_base && !g_sr && ocerz_tcache_mode() == OCERZ_TC_ON &&
+    return on && !g_sr && ocerz_tcache_mode() == OCERZ_TC_ON &&
            ocerz_tcache_profile_entries() >= (size_t)min;
 }
 

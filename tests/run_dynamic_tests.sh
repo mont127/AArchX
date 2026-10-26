@@ -1279,6 +1279,8 @@ run_tcache_case() {
             why="nothing loaded: $(grep -h 'loaded=' "$log" | head -1)"
         elif [ $i = 2 ] && [ "$name" = dtcache ] && ! grep -q 'images asked=[0-9]* in=[1-9]' "$log"; then
             why="no image record loaded: $(grep -h 'images asked=' "$log" | head -1)"
+        elif [ $i = 2 ] && [ "$name" = dtcache_low ] && ! grep -q 'loaded=[0-9]* (ahead [1-9]' "$log"; then
+            why="the Wine layout loaded nothing ahead from its profile: $(grep -h 'loaded=' "$log" | head -1)"
         elif [ $i = 1 ] && [ "$name" = dtcache ] &&
              [ "$(cat "$dir"/store/profiles/*.keys 2>/dev/null | od -An -v -tx8 | tr -s ' ' '\n' | grep -c '^[2367abef]')" = 0 ]; then
             why="no image record key in the profile's .keys"
@@ -1393,6 +1395,35 @@ run_tcache_patch_case() {
 
 run_tcache_patch_case dtcache_patch
 run_tcache_case dtcache_low 'OK' -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000
+# In the Wine layout a launch's profile is its Windows program's, the first .exe on its command line
+# (src/dyld.c, launch_profile_ident): run as a.exe twice, the second launch loads a.exe's records ahead; the
+# first launch as b.exe has a profile of its own, empty, and loads none ahead.
+wp_dir="$TMP/dtcache_wine_profile"
+mkdir -p "$wp_dir"
+if ! clang -arch x86_64 -O2 -o "$wp_dir/work" tests/dynamic/tcache_work.c -Wl,-no_pie -Wl,-pagezero_size,0x1000 \
+        -Wl,-image_base,0x200000000 2>/dev/null; then
+    echo "FAIL dtcache_wine_profile (build)"; fail=$((fail+1))
+else
+    wp_why=""
+    wp_i=0
+    for wp_exe in a.exe a.exe b.exe; do
+        wp_i=$((wp_i + 1))
+        OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$wp_dir/store" OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_MIN_FREE_MB=0 \
+            run_bounded "$wp_dir/run$wp_i.out" "$wp_dir/run$wp_i.err" "$OCERZ" "$wp_dir/work" "$wp_exe"
+        if [ -z "$wp_why" ] && [ "$(cat "$wp_dir/run$wp_i.out")" != OK ]; then
+            wp_why="run $wp_i ($wp_exe) printed '$(cat "$wp_dir/run$wp_i.out")'"
+        elif [ -z "$wp_why" ] && [ $wp_i = 2 ] && ! grep -q 'loaded=[0-9]* (ahead [1-9]' "$wp_dir/run$wp_i.err"; then
+            wp_why="a.exe's second launch loaded nothing ahead: $(grep -h 'loaded=' "$wp_dir/run$wp_i.err" | head -1)"
+        elif [ -z "$wp_why" ] && [ $wp_i = 3 ] && ! grep -q 'loaded=[0-9]* (ahead 0,' "$wp_dir/run$wp_i.err"; then
+            wp_why="b.exe's first launch loaded a.exe's profile: $(grep -h 'loaded=' "$wp_dir/run$wp_i.err" | head -1)"
+        fi
+    done
+    if [ -z "$wp_why" ]; then
+        echo "PASS dtcache_wine_profile (a.exe warm, b.exe its own)"; pass=$((pass+1))
+    else
+        echo "FAIL dtcache_wine_profile ($wp_why)"; fail=$((fail+1))
+    fi
+fi
 # ocerz -aot fills a fresh store with tcache_work's own code without running
 # it; the launch after it, at another slide, must print OK and find every block
 # of the program it asks for in the store.

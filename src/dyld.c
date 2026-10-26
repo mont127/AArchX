@@ -571,6 +571,7 @@
 #include "ocerz/jit.h"
 #include "ocerz/tcache.h"
 
+#include <ctype.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1137,6 +1138,37 @@ static uint64_t profile_ident(const uint8_t *slice, const char *path)
         h = ident_mix(h, v, sizeof v);
     }
     return h | 1;
+}
+
+/*
+ * The profile a launch keeps (src/tcache.c): its program's, except in the Wine
+ * layout, where every process runs the same loader and the loader's profile
+ * would be every Windows program's at once.  There the first .exe on the
+ * command line (its summary, main.c) is part of it, so services.exe, cmd.exe
+ * and each game have their own.
+ */
+static uint64_t launch_profile_ident(const uint8_t *slice, const char *path)
+{
+    uint64_t id = profile_ident(slice, path);
+    extern char ocerz_cmdline_summary[];
+    if (!ocerz_low_base)
+        return id;
+    for (const char *s = ocerz_cmdline_summary; *s;) {
+        while (*s == ' ')
+            s++;
+        const char *e = s;
+        while (*e && *e != ' ')
+            e++;
+        if (e - s > 4 && !strncasecmp(e - 4, ".exe", 4)) {
+            char low[256];
+            size_t n = (size_t)(e - s) < sizeof low ? (size_t)(e - s) : sizeof low;
+            for (size_t i = 0; i < n; i++)
+                low[i] = (char)tolower((unsigned char)s[i]);
+            return ident_mix(id, low, n) | 1;
+        }
+        s = e;
+    }
+    return id;
 }
 
 uint64_t ocerz_dyld_file_ident(const char *path)
@@ -7227,7 +7259,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
      * which ocerz_vm_install_handlers creates.
      */
     if (!g_aot_n && ocerz_mode == OCERZ_MODE_CACHE && vm->jit_enabled) {
-        ocerz_tcache_profile_open(profile_ident(img.slice, img.path), ocerz_cache_uuid(), img.path);
+        ocerz_tcache_profile_open(launch_profile_ident(img.slice, img.path), ocerz_cache_uuid(), img.path);
         if (ocerz_tcache_profile_ordered())
             ocerz_jit_start_ordered(vm);
         ocerz_jit_prefault_lazy();
