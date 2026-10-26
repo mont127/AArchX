@@ -826,6 +826,16 @@ static const OcerzTcRecHead *warm_take(uint64_t key)
     return v > 1 ? (g_warm_last = (OcerzTcRecHead *)v) : NULL;
 }
 
+/* Whether the warm set, the profile as it was read when it opened, names this key. */
+int ocerz_tcache_warm_has(uint64_t key)
+{
+    if (!__atomic_load_n(&g_warm_on, __ATOMIC_ACQUIRE))
+        return 0;
+    size_t j = (size_t)(slot_hash(key) & g_wmask);
+    while (g_whash[j] && g_warm[g_whash[j] - 1].key != key) j = (j + 1) & g_wmask;
+    return g_whash[j] != 0;
+}
+
 /* Whether the last ocerz_tcache_find answered from the warm set. */
 int ocerz_tcache_found_warm(void)
 {
@@ -1372,6 +1382,13 @@ static char g_prips[1200];
 static char **g_pimg;                       /* the disk images this process loaded, for .images */
 static size_t g_pimg_n, g_pimg_cap, g_pimg_written;
 static char g_ppath[1024];                  /* the main executable, for .path, until it is written */
+static uint64_t *g_plazy;                   /* the .lazy list as it was read (ocerz_tcache_profile_lazy), sorted */
+static size_t g_nplazy;
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
 static int g_pord_done;                     /* .ord was decided */
 static int64_t g_pord_ms = -1;              /* when the program first needed ordered memory, ms into its profile */
 static uint64_t g_popen_ns;
@@ -1403,13 +1420,14 @@ static int pset_add(uint64_t **set, size_t *cap, size_t *n, uint64_t v)
     return 1;
 }
 
-static int pset_has(const uint64_t *set, size_t cap, uint64_t v)
+/* The slot of v in the set, or -1. */
+static ptrdiff_t pset_slot(const uint64_t *set, size_t cap, uint64_t v)
 {
     if (!v || !cap)
-        return 0;
+        return -1;
     size_t j = (size_t)(slot_hash(v) & (cap - 1));
     while (set[j] && set[j] != v) j = (j + 1) & (cap - 1);
-    return set[j] != 0;
+    return set[j] ? (ptrdiff_t)j : -1;
 }
 
 /*
@@ -1455,29 +1473,35 @@ static void profile_merge(const char *path, const uint64_t *ord, size_t n, const
         fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     struct stat st;
     if (fd >= 0 && flock(fd, LOCK_EX) == 0 && fstat(fd, &st) == 0) {
-        size_t have = (size_t)st.st_size / 8, fcap = 0, fn = 0, nout = 0;
+        /* which of this launch's entries the list holds, marked by their slots in this launch's set: the list's
+           own 30k entries were put in a set of their own to find the two a tclsh launch adds */
+        size_t have = (size_t)st.st_size / 8, nout = 0, held = 0;
         uint64_t *old = have && have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(have * 8) : NULL;
-        uint64_t *fset = NULL, *out = have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(n * 8) : NULL;
-        size_t held = 0;
-        if (old && pread(fd, old, have * 8, 0) == (ssize_t)(have * 8))
-            for (size_t i = 0; i < have; i++)
-                held += pset_has(set, cap, old[i]);
-        for (size_t i = 0; held < n && old && i < have; i++)
-            if (old[i])
-                pset_add(&fset, &fcap, &fn, old[i]);
-        if (held >= n) {
+        uint64_t *out = have < OCERZ_TC_PROF_MAX ? (uint64_t *)malloc(n * 8) : NULL;
+        uint8_t *seen = cap ? (uint8_t *)calloc(cap, 1) : NULL;
+        if (old && seen && pread(fd, old, have * 8, 0) == (ssize_t)(have * 8))
+            for (size_t i = 0; i < have && held < n; i++) {
+                ptrdiff_t k = pset_slot(set, cap, old[i]);
+                if (k >= 0 && !seen[k]) {
+                    seen[k] = 1;
+                    held++;
+                }
+            }
+        if (held >= n || (have && !old) || !seen) {
             free(out);
             out = NULL;
         }
-        for (size_t i = 0; out && i < n && have + nout < OCERZ_TC_PROF_MAX; i++)
-            if (!pset_has(fset, fcap, ord[i]))
+        for (size_t i = 0; out && i < n && have + nout < OCERZ_TC_PROF_MAX; i++) {
+            ptrdiff_t k = pset_slot(set, cap, ord[i]);
+            if (k >= 0 && !seen[k])
                 out[nout++] = ord[i];
+        }
         if (nout)
             (void)!pwrite(fd, out, nout * 8, (off_t)(have * 8));
         if (g_log > 0)
             fprintf(stderr, "ocerz: TCACHE[%d] profile %s: %zu held, %zu added\n", (int)getpid(), path, have, nout);
         free(old);
-        free(fset);
+        free(seen);
         free(out);
     }
     if (fd >= 0)
@@ -1491,11 +1515,18 @@ static void profile_write(void)
     if (g_prips[0] && g_pident && g_ppath[0]) {
         char leaf[40], name[1200], dir[1200];
         snprintf(leaf, sizeof leaf, "%016llx.path", (unsigned long long)g_pident);
-        int fd = profile_path(dir, sizeof dir, NULL) && mkdirs(dir) == 0 && profile_path(name, sizeof name, leaf)
+        size_t pl = strlen(g_ppath);
+        char was[1026];
+        int rfd = profile_path(name, sizeof name, leaf) ? open(name, O_RDONLY | O_CLOEXEC) : -1;
+        ssize_t got = rfd >= 0 ? read(rfd, was, sizeof was) : -1;
+        if (rfd >= 0)
+            close(rfd);
+        if (got == (ssize_t)(pl + 1) && !memcmp(was, g_ppath, pl) && was[pl] == '\n')
+            g_ppath[0] = 0;   /* a launch of the same path wrote it already */
+        int fd = g_ppath[0] && profile_path(dir, sizeof dir, NULL) && mkdirs(dir) == 0 && profile_path(name, sizeof name, leaf)
                      ? open(name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)
                      : -1;
         if (fd >= 0) {
-            size_t pl = strlen(g_ppath);
             g_ppath[pl] = '\n';
             if (write(fd, g_ppath, pl + 1) == (ssize_t)(pl + 1))
                 g_ppath[0] = 0;
@@ -1524,6 +1555,11 @@ static void profile_write(void)
     size_t nl = ocerz_cache_lazy_pages(&lazy);
     char lname[1200];
     profile_lazy_name(lname, sizeof lname, g_prips);
+    int lnew = 0;
+    for (size_t i = g_lwritten; i < nl && !lnew; i++)
+        lnew = !g_nplazy || !bsearch(&lazy[i], g_plazy, g_nplazy, 8, cmp_u64);
+    if (lname[0] && nl > g_lwritten && !lnew)
+        g_lwritten = nl;
     if (lname[0] && nl > g_lwritten) {
         uint64_t *lset = NULL;
         size_t lcap = 0, ln = 0;
@@ -1603,6 +1639,17 @@ uint64_t *ocerz_tcache_profile_lazy(size_t *n)
     }
     if (fd >= 0)
         close(fd);
+    /* kept sorted, so that an exit that filled no page the list lacks leaves the list alone (profile_write) */
+    uint64_t *k = v && *n ? (uint64_t *)malloc(*n * 8) : NULL;
+    if (k) {
+        memcpy(k, v, *n * 8);
+        qsort(k, *n, 8, cmp_u64);
+        os_unfair_lock_lock(&g_plock);
+        free(g_plazy);
+        g_plazy = k;
+        g_nplazy = *n;
+        os_unfair_lock_unlock(&g_plock);
+    }
     return v;
 }
 

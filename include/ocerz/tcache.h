@@ -96,4 +96,6 @@ int ocerz_tcache_found_warm(void);
 
 int ocerz_tcache_store_path(char *out, size_t n);
 
+int ocerz_tcache_warm_has(uint64_t key);
+
 #endif

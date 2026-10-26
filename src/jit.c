@@ -22911,9 +22911,11 @@ static void tc_prof_note(uint64_t rip)
 {
     if (ocerz_low_base || (g_tc_key & OCERZ_TC_KEY_M32))
         return;
-    if (!g_tc_from_profile || !ocerz_tcache_warm_keys())
+    /* found on this thread before the warm thread reached it, or translated again: still in the profile */
+    int known = g_tc_from_profile || (ocerz_tcache_warm_keys() && ocerz_tcache_warm_has(g_tc_key));
+    if (!known || !ocerz_tcache_warm_keys())
         ocerz_tcache_profile_note_key(g_tc_key);
-    if (!g_tc_from_profile && !g_tc_img_hi)
+    if (!known && !g_tc_img_hi)
         ocerz_tcache_profile_note(rip | (g_tc_key & OCERZ_TC_KEY_PLAIN ? OCERZ_TC_PROF_PLAIN : OCERZ_TC_PROF_ORDERED));
 }
 
