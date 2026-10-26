@@ -672,12 +672,7 @@ static const char *cache_path_for_mh(struct OcerzCache *cache, uint64_t mh)
     const char *dp = disk_path_for_mh(mh);
     if (dp)
         return dp;
-    for (uint32_t i = 0; i < cache->images_cnt; i++) {
-        const char *p = NULL;
-        if (ocerz_cache_image_addr(cache, i, &p) == mh)
-            return p;
-    }
-    return NULL;
+    return ocerz_cache_path_of_mh(cache, mh);
 }
 
 static int set_add(uint64_t *out, int n, int cap, uint64_t *seen, unsigned mask,

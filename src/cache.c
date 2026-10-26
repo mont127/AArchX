@@ -1275,6 +1275,23 @@ uint64_t ocerz_cache_resolve_in_mh(OcerzCache *c, uint64_t mh, const char *symbo
     return resolve_in_dylib(c, mh, symbol, 0, found);
 }
 
+/* The install path of the cache image at mh, by the index; NULL for an mh no image of the cache has. */
+const char *ocerz_cache_path_of_mh(OcerzCache *c, uint64_t mh)
+{
+    if (!c->mapped || !mh)
+        return NULL;
+    CacheIndex *ix = cix_get(c);
+    const char *p = NULL;
+    if (ix) {
+        uint32_t i = cix_by_mh(ix, mh);
+        return i != CIX_NONE && ocerz_cache_image_addr(c, i, &p) == mh ? p : NULL;
+    }
+    for (uint32_t i = 0; i < c->images_cnt; i++)
+        if (ocerz_cache_image_addr(c, i, &p) == mh)
+            return p;
+    return NULL;
+}
+
 int ocerz_cache_has_image(OcerzCache *c, uint64_t mh)
 {
     if (!c->mapped || !mh)

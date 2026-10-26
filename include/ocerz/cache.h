@@ -44,6 +44,7 @@ uint64_t ocerz_cache_resolve_weak_ex(OcerzCache *c, const char *symbol, int *fou
 uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
                                       const char *symbol, int *found);
 int ocerz_cache_has_image(OcerzCache *c, uint64_t mh);
+const char *ocerz_cache_path_of_mh(OcerzCache *c, uint64_t mh);
 uint64_t ocerz_cache_resolve_from_image(OcerzCache *c, uint64_t mh, const char *symbol, int *found);
 uint64_t ocerz_cache_dlsym_image(OcerzCache *c, uint64_t mh, const char *symbol, int *found);
 uint64_t ocerz_cache_image_addr(OcerzCache *c, uint32_t i, const char **path_out);

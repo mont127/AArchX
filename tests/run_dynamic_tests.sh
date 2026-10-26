@@ -352,6 +352,38 @@ run_chain_rpath_case() {
     done
 }
 
+run_rpath_known_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir/link"
+    if ! clang -arch x86_64 -dynamiclib -install_name @rpath/libknown.dylib \
+            -o "$dir/link/libknown.dylib" tests/dynamic/rpath_known_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name libknown.dylib \
+            -o "$dir/libknown.dylib" tests/dynamic/rpath_known_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -dynamiclib -install_name @rpath/libknown_user.dylib -Wl,-rpath,@loader_path \
+            -o "$dir/libknown_user.dylib" tests/dynamic/rpath_known_user.c "$dir/link/libknown.dylib" 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/rpath_known.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode out_file err_file got_out got_code
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$dir/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$dir/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_wine_segment_case() {
     local name="$1"
     local dir="$TMP/$name"
@@ -1615,6 +1647,7 @@ run_load_phase_case ddlopen_load_phase 'OK'
 run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'
 run_caller_rpath_case ddlopen_caller_rpath 'OK'
 run_chain_rpath_case ddlopen_chain_rpath 'OK'
+run_rpath_known_case drpath_known 'OK'
 run_wine_segment_case dwine_segment
 run_mac_syscall_low_stack_case dmac_syscall_low_stack 'OK'
 run_weak_unloaded_case dweak_unloaded 'OK'

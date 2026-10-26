@@ -4156,6 +4156,18 @@ static int expand_install_name(OcerzCache *cache, DynImage *loader, const char *
 
 static void load_disk_deps(OcerzCache *cache, DynImage *loader, const RpathList *rpaths);
 
+/* An image already loaded and found again through an @rpath name no image is known by (Wine's win32u.so links
+   @rpath/ntdll.so, which ntdll.so dlopened by its path and named "ntdll.so") is known by that name too, so the
+   binder finds it for the ordinal, as dyld does, instead of each of its imports walking every image. */
+static void dimg_note_rpath_name(DynImage *d, const char *name)
+{
+    if (name[0] != '@' || d->rpath_name[0] || strlen(name) >= sizeof d->rpath_name ||
+        dimg_find_by_install_name(name))
+        return;
+    snprintf(d->rpath_name, sizeof d->rpath_name, "%s", name);
+    dimg_index(d);
+}
+
 static void canonicalize_objc_selrefs(DynImage *img)
 {
     int64_t slide = img->slide;
@@ -4355,11 +4367,13 @@ static DynImage *load_disk_dylib(OcerzCache *cache, const char *install_name, Dy
             return NULL;
     }
     DynImage *existing = dimg_find_by_path(resolved);
-    if (existing)
-        return existing;
     uint64_t fdev = 0, fino = 0;
-    if (file_identity(resolved, &fdev, &fino) && (existing = dimg_find_by_identity(fdev, fino)))
+    if (!existing && file_identity(resolved, &fdev, &fino))
+        existing = dimg_find_by_identity(fdev, fino);
+    if (existing) {
+        dimg_note_rpath_name(existing, install_name);
         return existing;
+    }
     if (g_dimgs_n >= DYN_DIMG_MAX) {
         OCERZ_FATAL("too many disk dylibs to load (limit %d)\n", DYN_DIMG_MAX);
         native_dl_reason("the loader holds as many images as it can", NULL);
