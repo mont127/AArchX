@@ -674,6 +674,22 @@ int m32_image_fixup(M32Image *img)
 
 static char g_exe_dir[1024], g_guest32_root[1024];
 
+/* the directory ocerz itself is in, where a release keeps runtime/ and tools/ */
+static int ocerz_dir(char *out, size_t n)
+{
+    char exe[1024], real[1024];
+    uint32_t sz = sizeof exe;
+    if (_NSGetExecutablePath(exe, &sz) != 0 || !realpath(exe, real) || !strrchr(real, '/'))
+        return 0;
+    *strrchr(real, '/') = 0;
+    snprintf(out, n, "%s", real);
+    return 1;
+}
+
+/* The i386 runtime: runtime/guest32 beside ocerz, or else the installer's in ~/.aarchx.  AArchX.zip's app carries an
+ * ocerz of its own and no 32-bit runtime, which no release carries; the runtime one fetch put in ~/.aarchx serves that
+ * copy too.  GRID 2 run through the app found no libstdc++, took 0 from ___cxa_guard_acquire and used a static it
+ * had never constructed. */
 static void guest32_root(void)
 {
     if (g_guest32_root[0])
@@ -683,12 +699,24 @@ static void guest32_root(void)
         snprintf(g_guest32_root, sizeof g_guest32_root, "%s", env);
         return;
     }
-    char exe[1024], real[1024];
-    uint32_t sz = sizeof exe;
-    if (_NSGetExecutablePath(exe, &sz) == 0 && realpath(exe, real) && strrchr(real, '/')) {
-        *strrchr(real, '/') = 0;
-        snprintf(g_guest32_root, sizeof g_guest32_root, "%s/runtime/guest32", real);
+    char dir[1024], alt[1100];
+    struct stat st;
+    if (ocerz_dir(dir, sizeof dir))
+        snprintf(g_guest32_root, sizeof g_guest32_root, "%s/runtime/guest32", dir);
+    const char *home = getenv("HOME");
+    if (home && *home && (!g_guest32_root[0] || stat(g_guest32_root, &st) != 0)) {
+        snprintf(alt, sizeof alt, "%s/.aarchx/runtime/guest32", home);
+        if (stat(alt, &st) == 0 && S_ISDIR(st.st_mode))
+            snprintf(g_guest32_root, sizeof g_guest32_root, "%s", alt);
     }
+}
+
+/* A C++ runtime only the i386 runtime has: macOS no longer ships one, and a bridged stand-in would answer every
+ * call with 0 (an unresolved import), which is no C++ at all. */
+static int cxx_runtime_name(const char *name)
+{
+    return !strcmp(name, "/usr/lib/libstdc++.6.dylib") || !strcmp(name, "/usr/lib/libc++.1.dylib") ||
+           !strcmp(name, "/usr/lib/libc++abi.dylib");
 }
 
 /* the runtime's libstdc++ (tools/fetch_guest32_cxx.sh), which src/m32_fstream.c gives Apple's file streams: the file
@@ -873,6 +901,14 @@ static int load_deps(M32Image *img)
         if (path[0] && bundled_openal(path)) {
             img->deps[i] = strdup(SYSTEM_OPENAL);
             path[0] = 0;
+        }
+        if (!path[0] && cxx_runtime_name(img->deps[i]) && !img->dep_weak[i]) {
+            char dir[1024];
+            fprintf(stderr, "ocerz: m32: %s needs %s, which only AArchX's 32-bit runtime provides, and it is not "
+                            "installed; fetch it (about 15 MB) with\n"
+                            "ocerz: m32:   '%s/tools/fetch_guest32_cxx.sh' ~/.aarchx/runtime/guest32\n",
+                    img->path, img->deps[i], ocerz_dir(dir, sizeof dir) ? dir : ".");
+            return -1;
         }
         if (!path[0]) {   /* system: open it now, so the classes of one used only for them (WebKit) exist */
             ocerz_bridge_host_library(img->deps[i]);

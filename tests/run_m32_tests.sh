@@ -37,4 +37,22 @@ if [ ${#names[@]} -eq 0 ] || [ $# -eq 0 ]; then
     echo "PASS native-by-default"
   else echo "FAIL native-by-default"; fail=1; fi
 fi
+# A C++ program and no 32-bit runtime (src/m32_dyld.c): it stops before running, with the line that names the fetch
+# script, instead of running on imports that all answer 0.  And an ocerz with no runtime/guest32 beside it, as
+# AArchX.zip's app is, finds the one the installer put in ~/.aarchx.
+if { [ ${#names[@]} -eq 0 ] || [ $# -eq 0 ]; } && [ -e runtime/guest32/usr/lib/libstdc++.6.dylib ]; then
+  t=$(mktemp -d "$log/m32-noruntime.XXXXXX")
+  mkdir -p "$t/empty" "$t/app/runtime" "$t/home/.aarchx/runtime"
+  rout=$(cd tests/m32/bin && OCERZ_GUEST32_ROOT="$t/empty" perl -e "alarm 60; exec @ARGV" ../../../ocerz -native ./cxx 2>&1; echo "exit $?")
+  if [[ "$rout" == *"needs /usr/lib/libstdc++.6.dylib, which only AArchX's 32-bit runtime provides"*"fetch_guest32_cxx.sh"*"exit 65" ]]; then
+    echo "PASS cxx-no-runtime"
+  else echo "FAIL cxx-no-runtime: $(echo "$rout" | tail -3)"; fail=1; fi
+  cp ocerz "$t/app/ocerz"
+  for d in apis apis32 guest; do ln -s "$PWD/runtime/$d" "$t/app/runtime/$d"; done
+  ln -s "$PWD/runtime/guest32" "$t/home/.aarchx/runtime/guest32"
+  hout=$(cd tests/m32/bin && HOME="$t/home" perl -e "alarm 60; exec @ARGV" "$t/app/ocerz" -native ./cxx 2>"$log/m32-home.err"; echo "exit $?")
+  if [ "$hout" == "$(cat tests/m32/cxx.expected)" ]; then echo "PASS cxx-home-runtime"
+  else echo "FAIL cxx-home-runtime"; diff <(echo "$hout") tests/m32/cxx.expected | head -5; tail -3 "$log/m32-home.err"; fail=1; fi
+  rm -rf "$t"
+fi
 exit $fail

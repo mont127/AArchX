@@ -167,6 +167,9 @@ How to get it:
   1. Move it to Applications.
   2. Try to open it.
   3. Click **Open Anyway** in System Settings → Privacy & Security.
+
+  It does not carry the C++ and X11 libraries 32-bit games need; see
+  [32-bit Mac programs](m32.md) for the two commands that fetch them.
 - **`make app`** builds it from source.
 
 ## Build
