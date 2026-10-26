@@ -1987,6 +1987,39 @@ static uint64_t native_ivar_offset(const char *name, int *found)
     return ocerz_h2g(cell);
 }
 
+/*
+ * A flat lookup the way dyld makes one: the images the guest has loaded, the
+ * first that exports the name.  ocerz_cache_resolve_ex asks every image of the
+ * shared cache instead, about 2,000 export tries for a name it does not find,
+ * and a flat lookup made that walk before it looked at the loaded disk images:
+ * perl -MPOSIX's POSIX.bundle and Fcntl.bundle import a hundred Perl_* names
+ * flat, every one of them from libperl, a disk image, and the walks were 23 ms
+ * of a 70 ms launch.  So the cache images the guest has loaded are asked
+ * first, in load order (ocerz_dyldapi_loaded_images), then the disk images,
+ * and only a name none of them exports goes to the walk, as before.
+ * OCERZ_NO_FLAT_LOADED=1 walks the cache first again.
+ */
+static int flat_walk_first(void)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("OCERZ_NO_FLAT_LOADED") ? 1 : 0;
+    return off;
+}
+
+static uint64_t cache_flat_loaded_ex(OcerzCache *cache, const char *name, int *found)
+{
+    *found = 0;
+    const uint64_t *mh = NULL;
+    int n = flat_walk_first() || !cache ? 0 : ocerz_dyldapi_loaded_images(&mh);
+    for (int i = 0; i < n; i++) {
+        uint64_t v = mh[i] ? ocerz_cache_resolve_in_mh(cache, mh[i], name, found) : 0;
+        if (*found)
+            return v;
+    }
+    return 0;
+}
+
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
 {
@@ -2044,8 +2077,14 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
     if (!found && libord == -3)
         value = ocerz_cache_resolve_weak_ex(cache, name, &found,
                                             weak_all_cache ? NULL : ocerz_dyldapi_cache_image_loaded);
-    else if (!found)
-        value = ocerz_cache_resolve_ex(cache, name, &found);
+    else if (!found) {
+        if (libord == BIND_ORDINAL_FLAT_LOOKUP)
+            value = cache_flat_loaded_ex(cache, name, &found);
+        if (!found && libord == BIND_ORDINAL_FLAT_LOOKUP && !flat_walk_first())
+            value = disk_flat_resolve_ex(name, &found);
+        if (!found)
+            value = ocerz_cache_resolve_ex(cache, name, &found);
+    }
     if (!found && (libord == -3 || libord == 0 || libord == -2))
         value = ocerz_image_self_resolve_ex(img, name, &found);
     if (!found && virtual_dep) {
@@ -5080,7 +5119,10 @@ uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
             v = disk_flat_resolve(buf);
         if (v)
             return v;
+        int found = 0;
         if (g_run_cache)
+            v = cache_flat_loaded_ex(g_run_cache, buf, &found);
+        if (g_run_cache && !found)
             v = ocerz_cache_resolve(g_run_cache, buf);
         return v;
     }
@@ -5093,9 +5135,19 @@ uint64_t ocerz_dlsym(uint64_t handle, const char *sym)
             v = disk_flat_resolve(buf);
         if (v)
             return v;
+        int found = 0;
         if (g_run_cache)
+            v = cache_flat_loaded_ex(g_run_cache, buf, &found);
+        if (g_run_cache && !found)
             v = ocerz_cache_resolve(g_run_cache, buf);
         return v;
+    }
+    /* NULL is no handle, and dyld says so: XSLoader asks dlsym(NULL, "boot_POSIX")
+       whether a module is linked in already, and ocerz answered from everywhere,
+       a walk of the whole cache for a name nothing exports */
+    if (handle == 0 && !flat_walk_first()) {
+        dlerror_set("dlsym(0x0, %s): invalid handle", sym);
+        return 0;
     }
 
     for (int i = 0; i < g_dimgs_n; i++) {

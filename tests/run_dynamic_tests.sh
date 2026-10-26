@@ -203,6 +203,34 @@ run_alias_case() {
     done
 }
 
+# flat lookups from the loaded images only, and dlsym(NULL) refused (tests/dynamic/flat_lookup.c)
+run_flat_case() {
+    local name="$1" want_out="$2"
+    local dir="$TMP/$name"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -dynamiclib -install_name @executable_path/libflatdep.dylib \
+            -o "$dir/libflatdep.dylib" tests/dynamic/flat_lookup_lib.c 2>/dev/null ||
+       ! clang -arch x86_64 -bundle -undefined dynamic_lookup -o "$dir/flat_lookup.bundle" \
+            tests/dynamic/flat_lookup_bundle.c 2>/dev/null ||
+       ! clang -arch x86_64 -o "$dir/$name" tests/dynamic/flat_lookup.c "$dir/libflatdep.dylib" 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    local mode got_out got_code
+    for mode in jit no-jit; do
+        if [ "$mode" = no-jit ]; then
+            got_out=$( cd "$dir" && "$OCERZ_ABS" -no-jit "./$name" 2>/dev/null )
+        else
+            got_out=$( cd "$dir" && "$OCERZ_ABS" "./$name" 2>/dev/null )
+        fi
+        got_code=$?
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"; fail=$((fail+1))
+        fi
+    done
+}
+
 run_dlopen_cf_case() {
     local name="$1" want_out="$2"
     local dir="$TMP/$name"
@@ -1526,6 +1554,7 @@ run_remap_order_case dremap_order
 run_relpath_case dexec_abspath tests/dynamic/exec_abspath.c 'OK'
 run_file_case ddlopen_self tests/dynamic/dlopen_self.c 'OK'
 run_alias_case ddlopen_alias 'OK'
+run_flat_case dflat_lookup 'OK'
 run_dlopen_cf_case ddlopen_cf 'OK'
 run_load_phase_case ddlopen_load_phase 'OK'
 run_file_case ddlopen_objc_core tests/dynamic/dlopen_objc_core.c 'OK'

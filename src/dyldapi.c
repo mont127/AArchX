@@ -791,6 +791,14 @@ int ocerz_dyldapi_cache_image_loaded(uint64_t mh)
     return set_has(g_closure_hash, g_closure_hash_mask, mh);
 }
 
+/* The images the guest has loaded, in load order: the main image's closure breadth first, the disk images, then
+   what dlopen added.  The array never moves, and grows only at its end. */
+int ocerz_dyldapi_loaded_images(const uint64_t **mh)
+{
+    *mh = g_closure_mh;
+    return g_closure_mh ? g_closure_n : 0;
+}
+
 void ocerz_dyldapi_register_cache_image(uint64_t mh)
 {
     if (!mh || !g_cache || !g_closure_mh ||

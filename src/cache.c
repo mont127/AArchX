@@ -1265,6 +1265,16 @@ uint64_t ocerz_cache_resolve_in_image(OcerzCache *c, const char *path,
     return v;
 }
 
+/* What the cache image at mh exports under symbol, following its re-exports; 0 with *found clear for an mh that is
+   not one of the cache's images. */
+uint64_t ocerz_cache_resolve_in_mh(OcerzCache *c, uint64_t mh, const char *symbol, int *found)
+{
+    *found = 0;
+    if (!c->mapped || !symbol || !ocerz_cache_has_image(c, mh))
+        return 0;
+    return resolve_in_dylib(c, mh, symbol, 0, found);
+}
+
 int ocerz_cache_has_image(OcerzCache *c, uint64_t mh)
 {
     if (!c->mapped || !mh)

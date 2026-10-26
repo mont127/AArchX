@@ -162,6 +162,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_OBJC_SEND_CACHE=1` | in native mode, decide every objc_msgSend in full (implementation, signature, selector checks) instead of reusing what the thread decided for the same class, selector and implementation |
 | `OCERZ_NO_COMPACT=1` | keep every block's decoded instructions after translation |
 | `OCERZ_NO_JIT_FLUSH=1` | when the translation arena fills, run everything translated after that in the interpreter instead of starting the arena again |
+| `OCERZ_NO_FLAT_LOADED=1` | answer a flat-namespace import, and `dlsym` with `RTLD_DEFAULT`, from every image of the shared cache before the program's own libraries, instead of from the loaded images in load order as dyld does; this also lets `dlsym` with a NULL handle search, where dyld refuses it |
 
 ### Native mode
 
