@@ -102,6 +102,7 @@
 #include "ocerz/m32.h"
 #include "ocerz/mem.h"
 #include "ocerz/dyld.h"
+#include "ocerz/fex.h"
 #include "ocerz/mode.h"
 #include "ocerz/tcache.h"
 #include "ocerz/cache.h"
@@ -244,20 +245,19 @@ static int aot_main(OcerzVM *vm, int n, char **images, int deps, const char *sel
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--] program [args...]\n"
+    fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-fex] [-path file] [--] program [args...]\n"
                     "       ocerz -aot|-aot-deps image [image...]\n"
                     "       ocerz -aot-all\n"
                     "       ocerz version\n");
 }
 
-/* Whether the x86_64 image in a Mach-O file has a WINE_RESERVE segment. */
-static int has_wine_reserve(const char *path)
+/* The load commands of the x86_64 image in a Mach-O file, read into buf; NULL if it has none or they do not fit. */
+static const struct mach_header_64 *x86_header(const char *path, uint8_t *buf, size_t cap, size_t *len)
 {
     int fd = open(path, O_RDONLY);
     if (fd < 0)
-        return 0;
-    static uint8_t buf[1 << 16];
-    ssize_t got = pread(fd, buf, sizeof buf, 0);
+        return NULL;
+    ssize_t got = pread(fd, buf, cap, 0);
     uint32_t magic = got >= 8 ? *(const uint32_t *)buf : 0;
     if (magic == FAT_CIGAM) {
         uint32_t n = __builtin_bswap32(*(const uint32_t *)(buf + 4));
@@ -267,19 +267,31 @@ static int has_wine_reserve(const char *path)
             if ((int32_t)__builtin_bswap32((uint32_t)fa->cputype) == CPU_TYPE_X86_64)
                 at = (off_t)__builtin_bswap32(fa->offset);
         }
-        got = at >= 0 ? pread(fd, buf, sizeof buf, at) : 0;
+        got = at >= 0 ? pread(fd, buf, cap, at) : 0;
         magic = got >= 8 ? *(const uint32_t *)buf : 0;
     }
     close(fd);
-    if (magic != MH_MAGIC_64 || (size_t)got < sizeof(struct mach_header_64))
-        return 0;
+    if (magic != MH_MAGIC_64 || got < (ssize_t)sizeof(struct mach_header_64))
+        return NULL;
     const struct mach_header_64 *mh = (const struct mach_header_64 *)buf;
     if (mh->cputype != CPU_TYPE_X86_64)
+        return NULL;
+    *len = (size_t)got;
+    return mh;
+}
+
+/* Whether the x86_64 image in a Mach-O file has a WINE_RESERVE segment. */
+static int has_wine_reserve(const char *path)
+{
+    static uint8_t buf[1 << 16];
+    size_t got = 0;
+    const struct mach_header_64 *mh = x86_header(path, buf, sizeof buf, &got);
+    if (!mh)
         return 0;
     size_t off = sizeof *mh;
-    for (uint32_t i = 0; i < mh->ncmds && off + sizeof(struct load_command) <= (size_t)got; i++) {
+    for (uint32_t i = 0; i < mh->ncmds && off + sizeof(struct load_command) <= got; i++) {
         const struct load_command *lc = (const struct load_command *)(buf + off);
-        if (lc->cmdsize < sizeof *lc || off + lc->cmdsize > (size_t)got)
+        if (lc->cmdsize < sizeof *lc || off + lc->cmdsize > got)
             break;
         if (lc->cmd == LC_SEGMENT_64 &&
             strncmp(((const struct segment_command_64 *)lc)->segname, "WINE_RESERVE", 16) == 0)
@@ -287,6 +299,28 @@ static int has_wine_reserve(const char *path)
         off += lc->cmdsize;
     }
     return 0;
+}
+
+/* The lowest address a static x86_64 image maps, __PAGEZERO aside; 0 if there is none. */
+static uint64_t image_low_vmaddr(const char *path)
+{
+    static uint8_t buf[1 << 16];
+    size_t got = 0;
+    const struct mach_header_64 *mh = x86_header(path, buf, sizeof buf, &got);
+    if (!mh)
+        return 0;
+    uint64_t lo = UINT64_MAX;
+    size_t off = sizeof *mh;
+    for (uint32_t i = 0; i < mh->ncmds && off + sizeof(struct load_command) <= got; i++) {
+        const struct load_command *lc = (const struct load_command *)(buf + off);
+        if (lc->cmdsize < sizeof *lc || off + lc->cmdsize > got)
+            break;
+        const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+        if (lc->cmd == LC_SEGMENT_64 && !(sc->vmaddr == 0 && sc->initprot == 0) && sc->vmaddr < lo)
+            lo = sc->vmaddr;
+        off += lc->cmdsize;
+    }
+    return lo == UINT64_MAX ? 0 : lo;
 }
 
 static int is_wine_loader(const char *path)
@@ -576,6 +610,14 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-cache") == 0) {
             ocerz_mode = OCERZ_MODE_CACHE;
             mode_from_flag = 1;
+        } else if (strcmp(argv[i], "-fex") == 0) {
+#ifdef OCERZ_HAVE_FEX
+            ocerz_engine_run = ocerz_fex_run;
+            ocerz_engine_fault = ocerz_fex_fault;
+#else
+            OCERZ_FATAL("this ocerz was built without FEXCore, so it has no -fex (make FEX=<dir> builds it in)\n");
+            return 64;
+#endif
         } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
             load_path = argv[++i];
         } else if (strcmp(argv[i], "-aot") == 0 || strcmp(argv[i], "-aot-deps") == 0) {
@@ -601,7 +643,8 @@ int main(int argc, char **argv)
         }
     }
     OCERZ_LOG("mode: %s\n", ocerz_mode == OCERZ_MODE_NATIVE ? "native" : "cache");
-    ocerz_afp_enable();
+    if (!ocerz_engine_run)
+        ocerz_afp_enable();
     if (aot == 3 && i >= argc) {
         char selfpath[PATH_MAX];
         uint32_t sl = sizeof selfpath;
@@ -650,7 +693,7 @@ int main(int argc, char **argv)
     ocerz_vm_init(&vm);
     vm.trace = trace;
     vm.strace = strace;
-    vm.jit_enabled = !nojit && getenv("OCERZ_NOJIT") == NULL;
+    vm.jit_enabled = !nojit && getenv("OCERZ_NOJIT") == NULL && !ocerz_engine_run;
     {
         const char *sx = getenv("OCERZ_STRACE_EXE");
         extern char ocerz_cmdline_summary[];
@@ -712,7 +755,10 @@ int main(int argc, char **argv)
         return ocerz_dyld_run(&vm, load_path, gargc, gargv, env_snapshot(environ));
     }
 
-    if (ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
+    /* FEXCore runs guest code at its own addresses, so a static image under -fex gets identity memory reserved where
+     * the image wants to be. */
+    if (ocerz_engine_run ? ocerz_mem_init_identity_at(image_low_vmaddr(load_path), 32ull << 30) != OCERZ_OK
+                         : ocerz_mem_init(0x100000000ull, 0x900000000ull) != OCERZ_OK)
         return 70;
 
     if (ocerz_load_image(load_path, &vm.image) != OCERZ_OK) {

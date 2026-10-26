@@ -338,6 +338,7 @@
  */
 #include "ocerz/vm.h"
 #include "ocerz/dyld.h"
+#include "ocerz/fex.h"
 #include "ocerz/interp.h"
 #include "ocerz/jit.h"
 #include "ocerz/leaf.h"
@@ -2048,9 +2049,14 @@ static void abort_report(int sig, siginfo_t *si, void *ctx)
     raise(sig);
 }
 
+int (*ocerz_engine_fault)(int sig, siginfo_t *si, void *uc);
+
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
     static __thread volatile int depth;
+
+    if (ocerz_engine_fault && ocerz_engine_fault(sig, si, ctx))
+        return;
 
     int align_fault = 0;
     if (sig == SIGSEGV || sig == SIGBUS) {
@@ -4468,6 +4474,8 @@ static void vm_fatal_where(const OcerzCPU *cpu)
 }
 
 static int vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu);
+int (*ocerz_engine_run)(OcerzVM *vm, OcerzCPU *cpu);
+
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
 {
     ocerz_jit_hwtso_thread(vm);   /* before any guest code, interpreted too (src/cpu.c) */
@@ -4580,7 +4588,9 @@ static int vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
                 goto fatal;
             continue;
         }
-        if (esc_r) {
+        if (ocerz_engine_run) {
+            r = ocerz_engine_run(vm, cpu);
+        } else if (esc_r) {
             r = esc_r;
             esc_r = 0;
             if (r == OCERZ_EUNSUP)

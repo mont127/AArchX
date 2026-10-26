@@ -1494,6 +1494,25 @@ int ocerz_mem_init(uint64_t lo, uint64_t hi)
 
 int ocerz_wine_process;
 
+static int identity_arena(void *p, uint64_t size);
+
+/* Identity memory reserved at base exactly, for a static image that cannot move (-fex). */
+int ocerz_mem_init_identity_at(uint64_t base, uint64_t size)
+{
+    base &= ~(uint64_t)(OCERZ_HOST_PAGE - 1);
+    void *p = base ? mmap((void *)base, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0) : MAP_FAILED;
+    if (p != MAP_FAILED && (uint64_t)(uintptr_t)p != base) {
+        munmap(p, (size_t)size);
+        p = MAP_FAILED;
+    }
+    if (p == MAP_FAILED) {
+        OCERZ_FATAL("could not reserve identity memory at %#llx, where the image wants to be\n",
+                    (unsigned long long)base);
+        return OCERZ_ENOMEM;
+    }
+    return identity_arena(p, size);
+}
+
 int ocerz_mem_init_identity(uint64_t size)
 {
     void *p = MAP_FAILED;
@@ -1510,6 +1529,11 @@ int ocerz_mem_init_identity(uint64_t size)
         OCERZ_FATAL("could not reserve a %#llx-byte identity arena\n", (unsigned long long)size);
         return OCERZ_ENOMEM;
     }
+    return identity_arena(p, size);
+}
+
+static int identity_arena(void *p, uint64_t size)
+{
     uint64_t lo = (uint64_t)(uintptr_t)p;
     if (lo < OCERZ_LOW_LIMIT) {
         OCERZ_FATAL("identity arena landed at %#llx, below the low-shadow limit\n",

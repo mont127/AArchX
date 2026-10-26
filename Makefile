@@ -51,9 +51,30 @@ CORE_OBJS := $(filter-out src/main.o,$(OBJS))
 UNIT_SRCS := $(wildcard tests/unit/*.c)
 UNIT_BINS := $(UNIT_SRCS:tests/unit/%.c=tests/unit/bin/%)
 
-ocerz: $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(SYSLIBS) $(LDLIBS)
-	$(CC) $(LDFLAGS) -o ocerz-umbrella $(OBJS) $(LDLIBS)
+# `make FEX=<dir>` links FEXCore in for -fex (src/fex.cpp): <dir> holds FEX-Emu's sources in FEX/ and their CMake
+# build in build/, both made by tools/fex-build.sh.  Without it ocerz is built as before and has no -fex.
+ifdef FEX
+FEX_SRC := $(FEX)/FEX
+FEX_BUILD := $(FEX)/build
+FEX_CXXFLAGS := $(ARCHFLAGS) -std=c++20 -O2 -g -Wall -Wno-unused-parameter -Drestrict=__restrict -Iinclude \
+                -I$(FEX_SRC)/FEXCore/include -I$(FEX_BUILD)/include -I$(FEX_SRC)/External/fmt/include \
+                -I$(FEX_SRC)/External/unordered_dense/include -DARCHITECTURE_arm64=1 -DJIT_ARM64 \
+                -DFEX_DISABLE_TELEMETRY=1 -DFEXCORE_HAS_PRESERVE_ALL_ATTR=1 -DFEX_HAS_PRESERVE_ALL_ATTR=1 \
+                '-DFEXCORE_PRESERVE_ALL_ATTR=__attribute__((preserve_all))' '-DFEX_PRESERVE_ALL_ATTR=__attribute__((preserve_all))'
+FEX_OBJS := src/fex.o
+FEX_LIBS := $(FEX_BUILD)/FEXCore/Source/libFEXCore.a $(FEX_BUILD)/FEXCore/Source/libFEXCore_Base.a \
+            $(FEX_BUILD)/FEXCore/Source/libJemallocDummy.a $(FEX_BUILD)/External/fmt/libfmt.a \
+            $(FEX_BUILD)/External/xxhash/cmake_unofficial/libxxhash.a $(FEX_BUILD)/External/SoftFloat-3e/libsoftfloat_3e.a \
+            $(FEX_BUILD)/External/cephes/libcephes_128bit.a -lc++
+src/main.o: CFLAGS += -DOCERZ_HAVE_FEX=1
+
+src/fex.o: src/fex.cpp include/ocerz/fex.h
+	clang++ $(FEX_CXXFLAGS) -c -o $@ $<
+endif
+
+ocerz: $(OBJS) $(FEX_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(FEX_OBJS) $(SYSLIBS) $(LDLIBS) $(FEX_LIBS)
+	$(CC) $(LDFLAGS) -o ocerz-umbrella $(OBJS) $(FEX_OBJS) $(LDLIBS) $(FEX_LIBS)
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -172,7 +193,7 @@ i386diff:
 	bash tools/i386diff.sh .
 
 clean:
-	rm -f $(OBJS) $(DEPS) ocerz
+	rm -f $(OBJS) $(DEPS) ocerz src/fex.o
 	rm -rf AArchX.app
 	rm -rf tests/unit/bin
 	$(MAKE) -C tests/guest clean

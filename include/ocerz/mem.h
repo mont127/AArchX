@@ -114,6 +114,7 @@ int ocerz_mem_init(uint64_t lo, uint64_t hi);
 void ocerz_mem_set_alloc_floor(uint64_t floor);
 int ocerz_addr_mapped(uint64_t gaddr);
 int ocerz_mem_init_identity(uint64_t size);
+int ocerz_mem_init_identity_at(uint64_t base, uint64_t size);
 extern int ocerz_wine_process;
 #define OCERZ_WINE_ARENA_BASE 0x7a0000000000ull
 int ocerz_mem_init_low_shadow(void);
