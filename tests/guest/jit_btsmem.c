@@ -24,6 +24,10 @@ static void cas16(const char *tag, g_u64 a, g_u64 d, g_u64 b, g_u64 c, int lock)
         __asm__ volatile("cmpxchg16b %1\n\tsetz %b0" : "=r"(z), "+m"(pair[0]), "+a"(a), "+d"(d) : "b"(b), "c"(c) : "cc", "memory");
     g_puts(tag);
     put(" zf ", z & 0xff);
+    g_u64 f, a2 = pair[0], d2 = pair[1];
+    __asm__ volatile("movq $5, %%r8\n\tcmpq $7, %%r8\n\tlock cmpxchg16b %1\n\tpushfq\n\tpopq %0"
+                     : "=r"(f), "+m"(pair[0]), "+a"(a2), "+d"(d2) : "b"(pair[0]), "c"(pair[1]) : "cc", "memory", "r8");
+    put(" flags kept ", f & 0x8d5);
     put(" rax ", a);
     put(" rdx ", d);
     put(" lo ", pair[0]);

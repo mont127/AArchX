@@ -197,6 +197,7 @@ void a64_v_fcvtl(A64Buf *b, int vd, int vn);
 void a64_v_fcvtn(A64Buf *b, int vd, int vn);
 void a64_v_scvtf_4s(A64Buf *b, int vd, int vn);
 void a64_v_fcvtzs_4s(A64Buf *b, int vd, int vn);
+void a64_v_fcvtzs_2d(A64Buf *b, int vd, int vn);
 void a64_v_cmeq(A64Buf *b, int esz, int vd, int vn, int vm);
 void a64_v_cmgt(A64Buf *b, int esz, int vd, int vn, int vm);
 void a64_v_dup_d(A64Buf *b, int vd, int vn, int idx);

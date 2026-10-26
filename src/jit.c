@@ -11379,6 +11379,72 @@ static int l0_aware_op(unsigned op)
     }
 }
 
+/*
+ * rcpps, rcpss, rsqrtps and rsqrtss as the interpreter computes them, 1/x and 1/sqrt(x) in full precision with
+ * no NaN rule of their own.  haddps, haddpd, hsubps and hsubpd as an add or subtract of the operands taken apart
+ * (uzp1 gives each pair's first element, uzp2 its second), addsubps and addsubpd as a subtract and an add merged
+ * lane by lane, all three with addps's NaN rule (emit_nan_fix_packed2 against the operands each lane used).  The
+ * lane cache is flushed and dropped for them as for any packed op.  They were interpreted: 14-16 ns each against
+ * Rosetta's 0.2-2.6.
+ */
+static int emit_sse_fp_extra(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    unsigned op = insn->op;
+    if (insn->nops != 2 || d->kind != OCERZ_OPK_XMM || ENV_ON("OCERZ_NO_SSE_FP_EXTRA")) return 0;
+    int rcp = op == OCERZ_OP_RCPPS || op == OCERZ_OP_RCPSS, rsqrt = op == OCERZ_OP_RSQRTPS || op == OCERZ_OP_RSQRTSS;
+    int scalar = op == OCERZ_OP_RCPSS || op == OCERZ_OP_RSQRTSS;
+    int dbl = op == OCERZ_OP_HADDPD || op == OCERZ_OP_HSUBPD || op == OCERZ_OP_ADDSUBPD;
+    l0_flush_reg(b, d->reg);
+    if (s->kind == OCERZ_OPK_XMM) l0_flush_reg(b, s->reg);
+    l0_inval(d->reg);
+    int vb;
+    if (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) vb = xmm_vreg(s->reg);
+    else { if (!emit_sse_src(b, insn, s, scalar ? 4 : 16, VX1, exit_sites, n_exits)) return 0; vb = VX1; }
+    if (rcp || rsqrt) {
+        a64_mov_imm64(b, JTU, 0x3f800000u);
+        int src = vb;
+        if (scalar) {
+            a64_fmov_v_from_x(b, 0, VX3, JTU);
+            if (rsqrt) { a64_fsqrt_s(b, 0, VX2, vb); src = VX2; }
+            a64_fdiv_s(b, 0, VX2, VX3, src);
+            emit_xmm_st_lo(b, 4, VX2, d->reg);
+        } else {
+            a64_v_dup_gpr(b, 4, VX3, JTU);
+            if (rsqrt) { a64_v_fsqrt(b, 0, VX2, vb); src = VX2; }
+            int vd = xmm_dst_reg(d->reg, VX2);
+            a64_v_fdiv(b, 0, vd, VX3, src);
+            if (vd == VX2) emit_xmm_st(b, VX2, d->reg);
+        }
+        return 1;
+    }
+    int va;
+    if (xmm_is_pinned(d->reg)) va = xmm_vreg(d->reg);
+    else { emit_xmm_ld(b, VX0, d->reg); va = VX0; }
+    int esz = dbl ? 3 : 2;
+    if (op == OCERZ_OP_ADDSUBPS || op == OCERZ_OP_ADDSUBPD) {
+        a64_v_fsub(b, dbl, VX2, va, vb);
+        a64_v_fadd(b, dbl, VX3, va, vb);
+        if (dbl) a64_v_ext(b, VX3, VX3, VX3, 8);
+        else     a64_v_rev64_4s(b, VX3, VX3);
+        a64_v_trn(b, esz, 0, VX2, VX2, VX3);
+    } else {
+        a64_v_uzp(b, esz, 1, VX2, va, vb);
+        a64_v_uzp(b, esz, 0, VX0, va, vb);
+        a64_v_mov(b, VX1, VX2);
+        va = VX0;
+        vb = VX1;
+        if (op == OCERZ_OP_HADDPS || op == OCERZ_OP_HADDPD) a64_v_fadd(b, dbl, VX2, va, vb);
+        else                                                a64_v_fsub(b, dbl, VX2, va, vb);
+    }
+    static int inexact_env = -1;
+    if (inexact_env < 0) inexact_env = getenv("OCERZ_INEXACT_NAN") ? 1 : 0;
+    if (!(inexact_env || g_fpb_fast || ocerz_afp()))
+        emit_nan_fix_packed2(b, dbl, VX2, va, vb, VX3, VX3);
+    emit_xmm_st(b, VX2, d->reg);
+    return 1;
+}
+
 static int emit_sse_fparith(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -11856,6 +11922,42 @@ static int emit_sse_cmpp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, 
     return 1;
 }
 
+/*
+ * cvtpd2dq and cvttpd2dq: two doubles to two int32 in the low half, the high half zeroed.  A lane converts when it
+ * lies strictly between -2^31-1 and 2^31 after rounding by MXCSR.RC (frinti, cvtpd2dq) or as it is (cvttpd2dq),
+ * which NaN never does; the rest get the integer indefinite, 0x80000000.  They used to be interpreted: 16 ns
+ * against Rosetta's 0.8, in every vectorized double-to-int loop.
+ */
+static int emit_sse_cvtpd2dq(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    if (insn->nops != 2 || d->kind != OCERZ_OPK_XMM || ENV_ON("OCERZ_NO_CVTPD2DQ")) return 0;
+    int vs = emit_sse_src_reg(b, insn, s, 16, VX1, exit_sites, n_exits);
+    if (vs < 0) return 0;
+    int vd = xmm_dst_reg(d->reg, VX0);
+    int src = vs;
+    if (insn->op == OCERZ_OP_CVTPD2DQ) {
+        a64_v_frint(b, 1, 4, VX3, vs);
+        src = VX3;
+    }
+    a64_mov_imm64(b, JTU, 0x41e0000000000000ull);
+    a64_v_dup_gpr(b, 8, VX2, JTU);
+    a64_v_fcmgt(b, 1, VX2, VX2, src);
+    a64_mov_imm64(b, JTU, 0xc1e0000000200000ull);
+    a64_v_dup_gpr(b, 8, VX0, JTU);
+    a64_v_fcmgt(b, 1, VX0, src, VX0);
+    a64_v_and(b, VX2, VX2, VX0);
+    a64_v_fcvtzs_2d(b, VX0, src);
+    a64_v_xtn(b, 2, VX0, VX0);
+    a64_v_xtn(b, 2, VX2, VX2);
+    a64_mov_imm64(b, JTU, 0x8000000080000000ull);
+    a64_fmov_v_from_x(b, 1, VX3, JTU);
+    a64_v_bit(b, VX3, VX0, VX2);
+    if (vd != VX3) a64_v_mov(b, vd, VX3);
+    if (vd == VX0) emit_xmm_st(b, VX0, d->reg);
+    return 1;
+}
+
 static int emit_sse_cvtp(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     if (insn->nops != 2) return 0;
@@ -12074,25 +12176,39 @@ static int emit_sse_ptest(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
     return 1;
 }
 
+/*
+ * cvtsd2si and cvtss2si round by MXCSR.RC, which the host FPCR's rounding mode always follows (the SSE arithmetic
+ * depends on it too), so they are a frinti into VX0 and then cvttsd2si's own conversion, its NaN and range arm
+ * included: a rounded value out of range or NaN gives the integer indefinite as a truncated one does.  They read
+ * their source without the l0 lane cache, which does not count them as its own (l0_aware_op).  They used to be
+ * interpreted: 14.6 ns against Rosetta's 0.34, in every lrint and lrintf.
+ */
 static int emit_sse_cvt(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     switch (insn->op) {
-    case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: {
+    case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI:
+    case OCERZ_OP_CVTSD2SI: case OCERZ_OP_CVTSS2SI: {
         if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
         if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
-        int dbl = insn->op == OCERZ_OP_CVTTSD2SI;
-        int vs = (s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) ? l0_src(s->reg, dbl)
+        int round = insn->op == OCERZ_OP_CVTSD2SI || insn->op == OCERZ_OP_CVTSS2SI;
+        if (round && ENV_ON("OCERZ_NO_CVT_ROUND")) return 0;
+        int dbl = insn->op == OCERZ_OP_CVTTSD2SI || insn->op == OCERZ_OP_CVTSD2SI;
+        int vs = (!round && s->kind == OCERZ_OPK_XMM && xmm_is_pinned(s->reg)) ? l0_src(s->reg, dbl)
                : emit_sse_src_reg(b, insn, s, dbl ? 8 : 4, VX0, exit_sites, n_exits);
         if (vs < 0) return 0;
         int ds = pin_slot(d->reg);
         int rd = ds >= 0 ? pin_hreg(ds) : JT0;
-        int reuse = dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs;
+        int reuse = !round && dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs;
         int pend = g_scpend.valid && g_scpend.idx == g_cur_insn_idx - 1;
         if (pend && (!reuse || g_n_nanool + 1 > NANOOL_MAX || unsafe_nocheckbr())) {
             scalar_pend_flush(b);
             pend = 0;
-            reuse = dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs;
+            reuse = !round && dbl && g_fcmp_self_idx == g_cur_insn_idx && g_fcmp_self_vreg == vs;
+        }
+        if (round) {
+            a64_frint_s(b, dbl, 4, VX0, vs);
+            vs = VX0;
         }
         if (g_n_nanool + 1 <= NANOOL_MAX) {
             a64_fcvtzs(b, d->size == 8, dbl, rd, vs);
@@ -12886,6 +13002,10 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_MAXPS: case OCERZ_OP_MAXPD: case OCERZ_OP_MINPS: case OCERZ_OP_MINPD:
     case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_SQRTPS: case OCERZ_OP_SQRTPD:
         return emit_sse_fparith(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_RCPPS: case OCERZ_OP_RCPSS: case OCERZ_OP_RSQRTPS: case OCERZ_OP_RSQRTSS:
+    case OCERZ_OP_HADDPS: case OCERZ_OP_HADDPD: case OCERZ_OP_HSUBPS: case OCERZ_OP_HSUBPD:
+    case OCERZ_OP_ADDSUBPS: case OCERZ_OP_ADDSUBPD:
+        return emit_sse_fp_extra(b, insn, exit_sites, n_exits);
     case OCERZ_OP_PXOR: case OCERZ_OP_XORPS: case OCERZ_OP_PAND: case OCERZ_OP_ANDPS:
     case OCERZ_OP_POR: case OCERZ_OP_ORPS: case OCERZ_OP_PANDN: case OCERZ_OP_ANDNPS:
     case OCERZ_OP_PADDB: case OCERZ_OP_PADDW: case OCERZ_OP_PADDD: case OCERZ_OP_PADDQ:
@@ -12920,6 +13040,8 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_CVTTPS2DQ: case OCERZ_OP_CVTPS2DQ: case OCERZ_OP_CVTDQ2PD:
     case OCERZ_OP_CVTPS2PD: case OCERZ_OP_CVTPD2PS:
         return emit_sse_cvtp(b, insn, exit_sites, n_exits);
+    case OCERZ_OP_CVTPD2DQ: case OCERZ_OP_CVTTPD2DQ:
+        return emit_sse_cvtpd2dq(b, insn, exit_sites, n_exits);
     case OCERZ_OP_AESENC: case OCERZ_OP_AESENCLAST: case OCERZ_OP_AESDEC: case OCERZ_OP_AESDECLAST:
     case OCERZ_OP_AESIMC: case OCERZ_OP_AESKEYGENASSIST:
         return emit_sse_aes(b, insn, exit_sites, n_exits);
@@ -12930,6 +13052,7 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_PTEST:
         return ENV_ON("OCERZ_NO_INLINE_PTEST") ? 0 : emit_sse_ptest(b, insn, exit_sites, n_exits);
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
+    case OCERZ_OP_CVTSD2SI: case OCERZ_OP_CVTSS2SI:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
         return emit_sse_cvt(b, insn, exit_sites, n_exits);
     case OCERZ_OP_MOVQX: {
@@ -12941,6 +13064,7 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     case OCERZ_OP_PSHUFD: return emit_sse_pshufd(b, insn, exit_sites, n_exits);
     case OCERZ_OP_PINSRB: case OCERZ_OP_PINSRW: case OCERZ_OP_PINSRD: case OCERZ_OP_PINSRQ:
     case OCERZ_OP_PEXTRB: case OCERZ_OP_PEXTRW: case OCERZ_OP_PEXTRD: case OCERZ_OP_PEXTRQ:
+    case OCERZ_OP_EXTRACTPS:
         return emit_sse_pinsr_pextr(b, insn, exit_sites, n_exits);
     case OCERZ_OP_PMOVSXBW: case OCERZ_OP_PMOVSXBD: case OCERZ_OP_PMOVSXBQ: case OCERZ_OP_PMOVSXWD: case OCERZ_OP_PMOVSXWQ: case OCERZ_OP_PMOVSXDQ:
     case OCERZ_OP_PMOVZXBW: case OCERZ_OP_PMOVZXBD: case OCERZ_OP_PMOVZXBQ: case OCERZ_OP_PMOVZXWD: case OCERZ_OP_PMOVZXWQ: case OCERZ_OP_PMOVZXDQ:
@@ -13389,7 +13513,7 @@ static int emit_sse_pinsr_pextr(A64Buf *b, const X86Insn *insn, uint32_t **exit_
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     unsigned op = insn->op;
     int esize = (op == OCERZ_OP_PINSRB || op == OCERZ_OP_PEXTRB) ? 1 : (op == OCERZ_OP_PINSRW || op == OCERZ_OP_PEXTRW) ? 2 :
-                (op == OCERZ_OP_PINSRD || op == OCERZ_OP_PEXTRD) ? 4 : 8;
+                (op == OCERZ_OP_PINSRD || op == OCERZ_OP_PEXTRD || op == OCERZ_OP_EXTRACTPS) ? 4 : 8;
     unsigned lanes = 16u / (unsigned)esize;
     unsigned idx = (unsigned)insn->ops[2].imm & (lanes - 1);
     if (op == OCERZ_OP_PINSRB || op == OCERZ_OP_PINSRW || op == OCERZ_OP_PINSRD || op == OCERZ_OP_PINSRQ) {
@@ -14335,7 +14459,8 @@ static int vex_sse128_ok(const X86Insn *insn, int L)
     case OCERZ_OP_SQRTSS: case OCERZ_OP_SQRTSD: case OCERZ_OP_ROUNDSS: case OCERZ_OP_ROUNDSD:
     case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
-    case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD:
+    case OCERZ_OP_CVTSD2SI: case OCERZ_OP_CVTSS2SI:
+    case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_RCPSS: case OCERZ_OP_RSQRTSS:
         return 1;
     case OCERZ_OP_CMPSS: case OCERZ_OP_CMPSDX:
         return insn->nops >= 3 && insn->ops[2].kind == OCERZ_OPK_IMM && (insn->ops[2].imm & 0x1f) < 8;
@@ -14343,7 +14468,9 @@ static int vex_sse128_ok(const X86Insn *insn, int L)
     case OCERZ_OP_ADDPS: case OCERZ_OP_ADDPD: case OCERZ_OP_SUBPS: case OCERZ_OP_SUBPD:
     case OCERZ_OP_MULPS: case OCERZ_OP_MULPD: case OCERZ_OP_DIVPS: case OCERZ_OP_DIVPD:
     case OCERZ_OP_MAXPS: case OCERZ_OP_MAXPD: case OCERZ_OP_MINPS: case OCERZ_OP_MINPD:
-    case OCERZ_OP_SQRTPS: case OCERZ_OP_SQRTPD: case OCERZ_OP_CVTDQ2PS:
+    case OCERZ_OP_SQRTPS: case OCERZ_OP_SQRTPD: case OCERZ_OP_CVTDQ2PS: case OCERZ_OP_CVTPD2DQ: case OCERZ_OP_CVTTPD2DQ:
+    case OCERZ_OP_RCPPS: case OCERZ_OP_RSQRTPS: case OCERZ_OP_HADDPS: case OCERZ_OP_HADDPD: case OCERZ_OP_HSUBPS:
+    case OCERZ_OP_HSUBPD: case OCERZ_OP_ADDSUBPS: case OCERZ_OP_ADDSUBPD: case OCERZ_OP_EXTRACTPS:
     case OCERZ_OP_MOVD: case OCERZ_OP_MOVQX: case OCERZ_OP_PSHUFD: case OCERZ_OP_PSHUFB: case OCERZ_OP_MOVDDUP:
     case OCERZ_OP_PINSRB: case OCERZ_OP_PINSRW: case OCERZ_OP_PINSRD: case OCERZ_OP_PINSRQ:
     case OCERZ_OP_PEXTRB: case OCERZ_OP_PEXTRW: case OCERZ_OP_PEXTRD: case OCERZ_OP_PEXTRQ:
@@ -14770,7 +14897,10 @@ static int emit_cmpxchg8b(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites,
  * x15 is JTA, so the address moves to JT0 first); plain, a load pair, the compare and a store pair of whichever
  * value stays, which x86 writes back on a mismatch too.  An operand not 16-byte aligned leaves for the slow path
  * in both, as the interpreter's own 128-bit compare-exchange is what it gets.  It used to be interpreted always:
- * 15 ns against Rosetta's 3, and allocators' lock-free lists take one per operation.
+ * 15 ns against Rosetta's 3, and allocators' lock-free lists take one per operation.  ZF is all it writes, so
+ * with no flag read after it nothing is written, and with ZF the only one (a retry loop's jne) it is deferred as
+ * a logic result that is zero on a match; otherwise the flags are materialized and ZF stored into them.  What is
+ * read after comes from g_cur_live_after: flags_defuse has no entry for cmpxchg8b/16b, so their need is always 0.
  */
 static int emit_cmpxchg16b(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
 {
@@ -14787,7 +14917,9 @@ static int emit_cmpxchg16b(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
         return 0;
     int hax = pin_hreg(pin_slot(OCERZ_RAX)), hdx = pin_hreg(pin_slot(OCERZ_RDX));
     int hbx = pin_hreg(pin_slot(OCERZ_RBX)), hcx = pin_hreg(pin_slot(OCERZ_RCX));
-    emit_materialize(b);
+    int zf_lazy = !ENV_ON("OCERZ_NO_CAS16_LAZY_ZF") && !(g_cur_live_after & (JIT_ARITH_FLAGS & ~(uint64_t)OCERZ_ZF));
+    if (!zf_lazy)
+        emit_materialize(b);
     if (!emit_mem_ea(b, insn, m, JTA))
         return 0;
     (void)emit_commpage_guard(b, insn, JTA, exit_sites, n_exits);
@@ -14814,10 +14946,15 @@ static int emit_cmpxchg16b(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites
     }
     a64_csel(b, 1, hax, hax, JT1, A64_EQ);
     a64_csel(b, 1, hdx, hdx, JT2, A64_EQ);
-    a64_cset(b, JTT, A64_EQ);
-    a64_ldr(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, rflags));
-    a64_bfi(b, 1, JTU, JTT, 6, 1);
-    a64_str(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, rflags));
+    if (zf_lazy && (g_cur_live_after & OCERZ_ZF)) {
+        a64_cset(b, JTT, A64_NE);
+        emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, 8, 0), JTT, JTT);
+    } else if (!zf_lazy) {
+        a64_cset(b, JTT, A64_EQ);
+        a64_ldr(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, rflags));
+        a64_bfi(b, 1, JTU, JTT, 6, 1);
+        a64_str(b, 8, JTU, 20, (uint32_t)offsetof(OcerzCPU, rflags));
+    }
     uint32_t *sites[1] = { align_bne };
     if (!oolslow_add(insn, sites, 1, a64_label(b))) {
         uint32_t *done = a64_label(b);
@@ -16455,15 +16592,20 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
     case OCERZ_OP_BLENDPS: case OCERZ_OP_BLENDPD: case OCERZ_OP_MOVSHDUP: case OCERZ_OP_MOVSLDUP:
     case OCERZ_OP_MOVMSKPS: case OCERZ_OP_MOVMSKPD: case OCERZ_OP_CMPPS: case OCERZ_OP_CMPPD:
     case OCERZ_OP_CVTTPS2DQ: case OCERZ_OP_CVTPS2DQ: case OCERZ_OP_CVTDQ2PD:
-    case OCERZ_OP_CVTPS2PD: case OCERZ_OP_CVTPD2PS:
+    case OCERZ_OP_CVTPS2PD: case OCERZ_OP_CVTPD2PS: case OCERZ_OP_CVTPD2DQ: case OCERZ_OP_CVTTPD2DQ:
     case OCERZ_OP_AESENC: case OCERZ_OP_AESENCLAST: case OCERZ_OP_AESDEC: case OCERZ_OP_AESDECLAST:
     case OCERZ_OP_AESIMC: case OCERZ_OP_AESKEYGENASSIST: case OCERZ_OP_PCLMULQDQ:
     case OCERZ_OP_UCOMISS: case OCERZ_OP_UCOMISD: case OCERZ_OP_COMISS: case OCERZ_OP_COMISD:
     case OCERZ_OP_PTEST:
     case OCERZ_OP_CVTTSD2SI: case OCERZ_OP_CVTTSS2SI: case OCERZ_OP_CVTSI2SD: case OCERZ_OP_CVTSI2SS:
+    case OCERZ_OP_CVTSD2SI: case OCERZ_OP_CVTSS2SI:
     case OCERZ_OP_CVTSD2SS: case OCERZ_OP_CVTSS2SD: case OCERZ_OP_CVTDQ2PS:
     case OCERZ_OP_MOVD: case OCERZ_OP_MOVQX: case OCERZ_OP_PSHUFD:
     case OCERZ_OP_PINSRB: case OCERZ_OP_PINSRW: case OCERZ_OP_PINSRD: case OCERZ_OP_PINSRQ:
+    case OCERZ_OP_EXTRACTPS:
+    case OCERZ_OP_RCPPS: case OCERZ_OP_RCPSS: case OCERZ_OP_RSQRTPS: case OCERZ_OP_RSQRTSS:
+    case OCERZ_OP_HADDPS: case OCERZ_OP_HADDPD: case OCERZ_OP_HSUBPS: case OCERZ_OP_HSUBPD:
+    case OCERZ_OP_ADDSUBPS: case OCERZ_OP_ADDSUBPD:
     case OCERZ_OP_PEXTRB: case OCERZ_OP_PEXTRW: case OCERZ_OP_PEXTRD: case OCERZ_OP_PEXTRQ:
     case OCERZ_OP_PMOVSXBW: case OCERZ_OP_PMOVSXBD: case OCERZ_OP_PMOVSXBQ: case OCERZ_OP_PMOVSXWD: case OCERZ_OP_PMOVSXWQ: case OCERZ_OP_PMOVSXDQ:
     case OCERZ_OP_PMOVZXBW: case OCERZ_OP_PMOVZXBD: case OCERZ_OP_PMOVZXBQ: case OCERZ_OP_PMOVZXWD: case OCERZ_OP_PMOVZXWQ: case OCERZ_OP_PMOVZXDQ:

@@ -762,6 +762,7 @@ void a64_v_fcvtl(A64Buf *b, int vd, int vn) { v3(b, 0x0e617800u, vd, vn, 0); }
 void a64_v_fcvtn(A64Buf *b, int vd, int vn) { v3(b, 0x0e616800u, vd, vn, 0); }
 void a64_v_scvtf_4s(A64Buf *b, int vd, int vn) { v3(b, 0x4e21d800u, vd, vn, 0); }
 void a64_v_fcvtzs_4s(A64Buf *b, int vd, int vn) { v3(b, 0x4ea1b800u, vd, vn, 0); }
+void a64_v_fcvtzs_2d(A64Buf *b, int vd, int vn) { v3(b, 0x4ee1b800u, vd, vn, 0); }
 void a64_v_cmeq(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e208c00u | ((uint32_t)esz << 22), vd, vn, vm); }
 void a64_v_cmgt(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e203400u | ((uint32_t)esz << 22), vd, vn, vm); }
 void a64_v_dup_d(A64Buf *b, int vd, int vn, int idx) { a64_emit32(b, 0x4e080400u | ((uint32_t)(idx & 1) << 20) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }
