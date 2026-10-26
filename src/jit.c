@@ -24028,7 +24028,11 @@ static void tc_load_ahead(OcerzJit *jit)
  * TCI_BATCH records at a time, with the same checks and the same code as that
  * load (tc_ahead_one), and lets go between batches, so a miss on the guest's
  * thread waits at most one batch.  A disk image's record whose image is not
- * loaded yet is put back, and the installer waits for the next image to load.
+ * loaded yet is put back and set aside (up to TCI_DEFER of them), and the
+ * installer goes on with the ones after it, coming back to those when an image
+ * loads: waiting at the first, as it did, it sat behind perl -MPOSIX's
+ * POSIX.bundle records until the bundle's dlopen, and ruby -e 1 took 91 ms
+ * instead of 87.
  * It stops when the warm set is done, or after TCI_IDLE_NS with nothing new.
  * A launch whose profile names fewer than TCI_MIN records starts none: a
  * thread started costs about 0.15 ms, which uname (3.3K records) and perl -e 1
@@ -24039,6 +24043,7 @@ static void tc_load_ahead(OcerzJit *jit)
 #define TCI_BATCH 32
 #define TCI_IDLE_NS 3000000000ull
 #define TCI_MIN 12000
+#define TCI_DEFER 4096
 
 static int g_tci_started;
 
@@ -24060,11 +24065,35 @@ static void *tc_installer_main(void *arg)
     size_t at = 0;
     unsigned wait_gen = 0;
     int waiting = 0;
+    size_t deferred[TCI_DEFER];
+    int ndef = 0;
+    unsigned def_gen = ocerz_dyld_generation();
     uint64_t idle_since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     for (;;) {
         OcerzTcRecHead *rec = NULL;
         uint64_t key = 0;
         void *prep = NULL;
+        if (ndef && ocerz_dyld_generation() != def_gen && !__atomic_load_n(&g_jl_waiting, __ATOMIC_RELAXED) &&
+            jl_try_acquire()) {
+            /* an image loaded: the records set aside for want of theirs, again */
+            def_gen = ocerz_dyld_generation();
+            TcAheadSave sv;
+            tc_ahead_begin(&sv);
+            int keep = 0;
+            for (int d = 0; d < ndef; d++) {
+                if (!ocerz_tcache_warm_take_at(deferred[d], &rec, &key, &prep))
+                    continue;
+                if (!tc_image_rec_rip(rec, (const TcPrep *)prep)) {
+                    ocerz_tcache_warm_untake(deferred[d], rec);
+                    deferred[keep++] = deferred[d];
+                    continue;
+                }
+                g_tc_n_inst += tc_ahead_one(jit, rec, key, prep);
+            }
+            ndef = keep;
+            tc_ahead_end(jit, &sv);
+            jl_release();
+        }
         int rc = ocerz_tcache_warm_at(&at, 0, &rec, &key, &prep);
         if (rc < 0)
             break;
@@ -24088,8 +24117,12 @@ static void *tc_installer_main(void *arg)
             if (ocerz_tcache_warm_at(&at, 1, &rec, &key, &prep) <= 0)
                 break;
             if ((key & OCERZ_TC_KEY_IMAGE) && !tc_image_rec_rip(rec, (const TcPrep *)prep)) {
-                at--;   /* its image is not loaded yet: put back, and wait for one to load */
-                ocerz_tcache_warm_untake(at, rec);
+                ocerz_tcache_warm_untake(at - 1, rec);   /* its image is not loaded yet: put back */
+                if (ndef < TCI_DEFER) {
+                    deferred[ndef++] = at - 1;   /* and come back to it when an image loads */
+                    continue;
+                }
+                at--;   /* or, with no room to set it aside, wait here for one to load */
                 wait_gen = ocerz_dyld_generation();
                 waiting = 1;
                 break;

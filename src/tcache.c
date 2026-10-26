@@ -962,6 +962,25 @@ int ocerz_tcache_warm_at(size_t *i, int take, OcerzTcRecHead **rec, uint64_t *ke
     return rc;
 }
 
+/* The record at exactly index i of the warm set, taken, if nothing took it or dropped it yet; 1 then, else 0. */
+int ocerz_tcache_warm_take_at(size_t i, OcerzTcRecHead **rec, uint64_t *key, void **prep)
+{
+    int rc = 0;
+    pthread_mutex_lock(&g_lock);
+    if (__atomic_load_n(&g_warm_on, __ATOMIC_ACQUIRE) && i < g_nwarm) {
+        uintptr_t st = __atomic_exchange_n(&g_warm[i].st, 1, __ATOMIC_ACQ_REL);
+        if (st > 1) {
+            *rec = (OcerzTcRecHead *)st;
+            *key = g_warm[i].key;
+            *prep = g_warm[i].prep;
+            __atomic_store_n(&g_warm_at, __atomic_load_n(&g_warm_at, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+            rc = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
 /* Puts back what ocerz_tcache_warm_at took at i, untouched, for whoever comes to it next. */
 void ocerz_tcache_warm_untake(size_t i, OcerzTcRecHead *rec)
 {
