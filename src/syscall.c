@@ -2963,6 +2963,72 @@ static void tc_policy_get_reply(uint64_t reply, uint32_t rcv_size)
     }
 }
 
+/*
+ * The commpage's time-of-day block at 0xd0, as the kernel keeps it: the tick (x86 mach_absolute_time, which is
+ * nanoseconds here) at which the time was taken, its seconds and its fraction of a second in 2^-64 units, the
+ * fraction one tick adds, and the ticks in a second.  x86 gettimeofday, time() and clock_gettime read it and make
+ * the syscall only when it is empty or a second old (XNU's __commpage_gettimeofday), and the syscall is what fills
+ * it.  ocerz's commpage never had it, so every one of them was a syscall: 215 ns against Rosetta's 18.  The tick
+ * is cleared first and set last, which is the reader's retry check; one writer at a time.
+ *
+ * Three things keep it as close as Rosetta's (within a microsecond of the kernel's clock, never stepping back).
+ * The tick and the time are read together, again while more than a microsecond passes between the two tick
+ * readings: a preemption between them once put a block 31 us ahead, and the next one stepped back.  The fraction
+ * a tick adds is measured against the clock between refreshes 0.2 s or more apart, as the kernel's is slewed,
+ * not taken as one nanosecond's.  And a new block never starts behind where the old one had got to (within a
+ * millisecond), and the syscall answers the new block's own time, so no reading comes out behind an earlier one.
+ */
+static uint64_t tod_block_ns(const uint64_t *q, uint64_t tick)
+{
+    uint64_t t0 = q[0];
+    if (!t0 || tick < t0)
+        return 0;
+    __uint128_t f = (__uint128_t)q[2] + (__uint128_t)q[3] * (tick - t0);
+    uint64_t sec = q[1] + (uint64_t)(f >> 64);
+    return sec * 1000000000u + (uint64_t)(((__uint128_t)(uint64_t)f * 1000000000u) >> 64);
+}
+
+static uint64_t commpage_timeofday_refresh(uint64_t *tick_out)
+{
+    static int busy;
+    static uint64_t prev_tick, prev_real, scale;
+    const uint64_t nominal = (uint64_t)(((__uint128_t)1 << 64) / 1000000000u);
+    if (!ocerz_commpage || OCERZ_ENV_ON("OCERZ_NO_COMMPAGE_TOD") || __atomic_test_and_set(&busy, __ATOMIC_ACQUIRE))
+        return 0;
+    uint64_t t1 = 0, t2 = 0, real = 0;
+    for (int i = 0; i < 8; i++) {
+        t1 = mach_absolute_time();
+        real = clock_gettime_nsec_np(CLOCK_REALTIME);
+        t2 = mach_absolute_time();
+        if (ocerz_host_ticks_to_guest_ns(t2 - t1) <= 1000)
+            break;
+    }
+    uint64_t tick = ocerz_host_ticks_to_guest_ns(t1 + (t2 - t1) / 2);
+    if (!scale || !prev_tick || real < prev_real || tick < prev_tick) {
+        scale = nominal;
+        prev_tick = tick;
+        prev_real = real;
+    } else if (tick - prev_tick >= 200000000u) {
+        __uint128_t sc = ((__uint128_t)(real - prev_real) << 64) / ((__uint128_t)(tick - prev_tick) * 1000000000u);
+        scale = sc > nominal - nominal / 2000 && sc < nominal + nominal / 2000 ? (uint64_t)sc : nominal;
+        prev_tick = tick;
+        prev_real = real;
+    }
+    uint64_t *q = (uint64_t *)(void *)(ocerz_commpage + 0xd0);
+    uint64_t now = real, old = tod_block_ns(q, tick);
+    if (old > now && old - now < 1000000u)
+        now = old;
+    __atomic_store_n(&q[0], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&q[1], now / 1000000000u, __ATOMIC_RELAXED);
+    __atomic_store_n(&q[2], (uint64_t)(((__uint128_t)(now % 1000000000u) << 64) / 1000000000u), __ATOMIC_RELAXED);
+    __atomic_store_n(&q[3], scale, __ATOMIC_RELAXED);
+    __atomic_store_n(&q[4], 1000000000u, __ATOMIC_RELAXED);
+    __atomic_store_n(&q[0], tick, __ATOMIC_RELEASE);
+    __atomic_clear(&busy, __ATOMIC_RELEASE);
+    *tick_out = tick;
+    return now;
+}
+
 static int sys_gettimeofday(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     (void)vm;
@@ -2978,8 +3044,17 @@ static int sys_gettimeofday(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ret_err(cpu, r);
         return OCERZ_STEP_OK;
     }
-    if (a[2])
+    uint64_t tick = 0, now = commpage_timeofday_refresh(&tick);
+    if (now) {
+        if (a[0]) {
+            ocerz_st(a[0], 8, now / 1000000000u);
+            ocerz_st(a[0] + 8, 4, (now % 1000000000u) / 1000u);
+        }
+        if (a[2])
+            ocerz_st(a[2], 8, tick);
+    } else if (a[2]) {
         ocerz_st(a[2], 8, ocerz_host_ticks_to_guest_ns(ocerz_ld(a[2], 8)));
+    }
     ret_ok(cpu, r);
     return OCERZ_STEP_OK;
 }

@@ -275,6 +275,23 @@ void ocerz_commpage_init(void)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     };
     memcpy(cp, tmpl, sizeof tmpl);
+    /* The CPU counts and the memory size are this Mac's, as the kernel's commpage (Rosetta's) has them.  The
+       template's are another machine's, 12 CPUs and 32 GB against this one's 10 and 16 GB from sysctl, and a
+       program that sized its threads or caches from the commpage got the other machine's. */
+    int n = 0;
+    size_t nl = sizeof n;
+    if (sysctlbyname("hw.logicalcpu_max", &n, &nl, NULL, 0) == 0 && n > 0 && n < 256)
+        cp[0x12] = cp[0x22] = cp[0x36] = (uint8_t)n;
+    nl = sizeof n;
+    if (sysctlbyname("hw.activecpu", &n, &nl, NULL, 0) == 0 && n > 0 && n < 256)
+        cp[0x34] = (uint8_t)n;
+    nl = sizeof n;
+    if (sysctlbyname("hw.physicalcpu_max", &n, &nl, NULL, 0) == 0 && n > 0 && n < 256)
+        cp[0x35] = (uint8_t)n;
+    uint64_t mem = 0;
+    size_t ml = sizeof mem;
+    if (sysctlbyname("hw.memsize", &mem, &ml, NULL, 0) == 0 && mem)
+        memcpy(cp + 0x38, &mem, sizeof mem);
     struct timeval bt;
     size_t btl = sizeof bt;
     if (sysctlbyname("kern.boottime", &bt, &btl, NULL, 0) == 0 && btl == sizeof bt) {

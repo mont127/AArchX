@@ -928,6 +928,54 @@ run_idname_case() {
 }
 
 run_case dret 'int main(void){return 42;}' '' 42
+# The x86 commpage carries this Mac's CPU counts and memory size, the ones sysctl answers (it carried another
+# machine's: 12 CPUs and 32 GB on a 10-CPU, 16 GB Mac).
+run_case dcommpage_counts '
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/sysctl.h>
+int main(void) {
+  volatile uint8_t *cp = (volatile uint8_t *)0x7fffffe00000ull;
+  int lc = 0, ac = 0, pc = 0; uint64_t mem = 0; size_t l;
+  l = sizeof lc; sysctlbyname("hw.logicalcpu_max", &lc, &l, 0, 0);
+  l = sizeof ac; sysctlbyname("hw.activecpu", &ac, &l, 0, 0);
+  l = sizeof pc; sysctlbyname("hw.physicalcpu_max", &pc, &l, 0, 0);
+  l = sizeof mem; sysctlbyname("hw.memsize", &mem, &l, 0, 0);
+  int ok = cp[0x22] == lc && cp[0x36] == lc && cp[0x34] == ac && cp[0x35] == pc &&
+           *(volatile uint64_t *)(cp + 0x38) == mem && ((*(volatile uint32_t *)(cp + 0x20) >> 16) & 0xff) == (uint32_t)lc;
+  puts(ok ? "commpage counts ok" : "commpage counts differ");
+  return 0;
+}' 'commpage counts ok' 0
+# gettimeofday reads the commpage's time-of-day block, which the syscall fills, instead of making the syscall
+# every time: against the raw syscall it stays within 2 ms, it never goes backwards, and a 1.3 s sleep reads as one.
+run_case dcommpage_tod '
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+static long us(struct timeval t) { return t.tv_sec * 1000000L + t.tv_usec; }
+int main(void) {
+  struct timeval a, b, k; long back = 0, worst = 0;
+  gettimeofday(&a, 0);
+  for (int i = 0; i < 200000; i++) {
+    gettimeofday(&b, 0);
+    if (us(b) < us(a) || b.tv_usec < 0 || b.tv_usec >= 1000000) back++;
+    a = b;
+    if ((i & 1023) == 0) {
+      syscall(SYS_gettimeofday, &k, 0, 0);
+      long e = us(k) - us(b); if (e < 0) e = -e;
+      if (e > worst) worst = e;
+    }
+  }
+  usleep(1300000);
+  gettimeofday(&b, 0);
+  long jump = us(b) - us(a);
+  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+  long e = ts.tv_sec * 1000000L + ts.tv_nsec / 1000 - us(b);
+  printf("%s\n", back == 0 && worst < 2000 && jump > 1250000 && jump < 1800000 && e >= 0 && e < 2000 ? "tod ok" : "tod wrong");
+  return 0;
+}' 'tod ok' 0
 run_case dwrite '
 int main(void){
   const char m[]="dyn raw syscall ok\n"; long r;
