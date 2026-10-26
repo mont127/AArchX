@@ -763,6 +763,10 @@ void a64_v_fcvtn(A64Buf *b, int vd, int vn) { v3(b, 0x0e616800u, vd, vn, 0); }
 void a64_v_scvtf_4s(A64Buf *b, int vd, int vn) { v3(b, 0x4e21d800u, vd, vn, 0); }
 void a64_v_fcvtzs_4s(A64Buf *b, int vd, int vn) { v3(b, 0x4ea1b800u, vd, vn, 0); }
 void a64_v_fcvtzs_2d(A64Buf *b, int vd, int vn) { v3(b, 0x4ee1b800u, vd, vn, 0); }
+void a64_v_faddp(A64Buf *b, int dbl, int vd, int vn, int vm) { v3(b, dbl ? 0x6e60d400u : 0x6e20d400u, vd, vn, vm); }
+/* tbl Vd.16B, {Vn.16B, Vn+1.16B}, Vm.16B */
+void a64_v_tbl2(A64Buf *b, int vd, int vn, int vm) { v3(b, 0x4e002000u, vd, vn, vm); }
+void a64_v_fcvtl2(A64Buf *b, int vd, int vn) { v3(b, 0x4e617800u, vd, vn, 0); }
 void a64_v_cmeq(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x6e208c00u | ((uint32_t)esz << 22), vd, vn, vm); }
 void a64_v_cmgt(A64Buf *b, int esz, int vd, int vn, int vm) { v3(b, 0x4e203400u | ((uint32_t)esz << 22), vd, vn, vm); }
 void a64_v_dup_d(A64Buf *b, int vd, int vn, int idx) { a64_emit32(b, 0x4e080400u | ((uint32_t)(idx & 1) << 20) | ((uint32_t)(vn & 31) << 5) | (uint32_t)(vd & 31)); }

@@ -2,7 +2,9 @@
  * in either operand (x86's rule: the first operand's NaN, else the second's, quieted; an invalid operation gives
  * the negative default NaN), register and memory sources; extractps of every lane to a register and to memory;
  * rcpps, rcpss, rsqrtps and rsqrtss within x86's documented error (1.5 * 2^-12 relative), since x86 gives an
- * estimate and ocerz the exact value.  The JIT has translated them since 2026-10-26. */
+ * estimate and ocerz the exact value; dpps and dppd with assorted masks and signed zeros (no NaNs: dpps and
+ * dppd use the host's NaN rules in the interpreter too, which give x86's only where FPCR.AH is on).  The JIT has
+ * translated them since 2026-10-26. */
 #include "gsys.h"
 static void put(const char *tag, g_u64 v) { g_puts(tag); g_puthex64(v); }
 typedef float v4f __attribute__((vector_size(16)));
@@ -57,6 +59,25 @@ int main(void)
         dmem = b;
         r = a; __asm__ volatile("addsubpd %1, %0" : "+x"(r) : "m"(dmem)); putv2(" addsubpd m ", r);
         __asm__ volatile("vhsubpd %2, %1, %0" : "=x"(r) : "x"(b), "x"(a)); putv2(" vhsubpd ", r);
+    }
+    {
+        static const float dv[] = { 1.5f, -2.25f, 3.0f, 0.125f, -0.0f, 1e30f, -7.5f, 4.0f, 1e-30f, 2.5f, 0.0f, -1.0f };
+        static const double dd[] = { 1.5, -2.25, 1e300, -0.0, 3.75, 0.5 };
+        for (unsigned i = 0; i < 8; i++) {
+            v4f a = { dv[i], dv[i + 1], dv[i + 2], dv[i + 3] }, b = { dv[i + 4], dv[i + 3], dv[i + 2], dv[i + 1] }, r;
+            r = a; __asm__ volatile("dpps $0xff, %1, %0" : "+x"(r) : "x"(b)); putv4("dpps ff ", r);
+            r = a; __asm__ volatile("dpps $0x71, %1, %0" : "+x"(r) : "x"(b)); putv4(" dpps 71 ", r);
+            r = a; __asm__ volatile("dpps $0xa6, %1, %0" : "+x"(r) : "x"(b)); putv4(" dpps a6 ", r);
+            fmem = b;
+            r = a; __asm__ volatile("dpps $0x3c, %1, %0" : "+x"(r) : "m"(fmem)); putv4(" dpps 3c m ", r);
+            __asm__ volatile("vdpps $0xd3, %2, %1, %0" : "=x"(r) : "x"(a), "x"(b)); putv4(" vdpps d3 ", r);
+        }
+        for (unsigned i = 0; i < 4; i++) {
+            v2d a = { dd[i], dd[i + 1] }, b = { dd[i + 2], dd[(i + 5) % 6] }, r;
+            r = a; __asm__ volatile("dppd $0x31, %1, %0" : "+x"(r) : "x"(b)); putv2("dppd 31 ", r);
+            r = a; __asm__ volatile("dppd $0x12, %1, %0" : "+x"(r) : "x"(b)); putv2(" dppd 12 ", r);
+            __asm__ volatile("vdppd $0x33, %2, %1, %0" : "=x"(r) : "x"(a), "x"(b)); putv2(" vdppd 33 ", r);
+        }
     }
     static const float xs[] = { 3.0f, 0.1f, 7.0f, 1e-3f, 1234.5f, 0.5f, 2.0f, 9.75f };
     int ok = 1;

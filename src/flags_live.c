@@ -98,6 +98,20 @@ static void flags_defuse(const X86Insn *insn, uint64_t *def, uint64_t *use,
         d = 0;
         u = OCERZ_SF | OCERZ_ZF | OCERZ_AF | OCERZ_PF | OCERZ_CF;
         break;
+    /* The JIT translates these and keeps CF in the deferred record, so the instruction that last set the flags,
+       whose record kind the next reader specializes on, must be them, not the compare before. */
+    case OCERZ_OP_CLC: case OCERZ_OP_STC:
+        d = OCERZ_CF;
+        u = 0;
+        break;
+    case OCERZ_OP_CMC:
+        d = OCERZ_CF;
+        u = OCERZ_CF;
+        break;
+    case OCERZ_OP_SAHF:
+        d = OCERZ_SF | OCERZ_ZF | OCERZ_AF | OCERZ_PF | OCERZ_CF;
+        u = 0;
+        break;
 
     case OCERZ_OP_ADD:
     case OCERZ_OP_SUB:
