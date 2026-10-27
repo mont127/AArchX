@@ -2058,6 +2058,7 @@ int (*ocerz_engine_fault)(int sig, siginfo_t *si, void *uc);
 int (*ocerz_engine_async)(void *uc);
 void (*ocerz_engine_invalidate)(uint64_t addr, uint64_t len);
 int (*ocerz_engine_gprs_at)(OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
+void (*ocerz_engine_cpuid)(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {

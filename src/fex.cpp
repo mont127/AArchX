@@ -433,6 +433,8 @@ void fex_init()
             fprintf(stderr, "ocerz: FEXCore: %s\n", m);
     });
     FEXCore::Config::Initialize();
+    /* Apple's processors have no FEAT_RNG, and macOS programs use rdrand where CPUID offers it. */
+    FEXCore::Config::Set(FEXCore::Config::CONFIG_SOFTWARERNG, "1");
     static const std::pair<const char *, FEXCore::Config::ConfigOption> env_options[] = {
 #define OPT_BASE(type, group, enum, json, default) {"FEX_" #enum, FEXCore::Config::ConfigOption::CONFIG_##enum},
 #include <FEXCore/Config/ConfigValues.inl>
@@ -705,4 +707,14 @@ extern "C" int ocerz_fex_gprs_at(OcerzCPU *cpu, const void *host_state, uint64_t
                : r == 29 ? arm_thread_state64_get_fp(*hs) : hs->__x[r];
     }
     return 1;
+}
+
+extern "C" void ocerz_fex_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+{
+    std::call_once(g_init_once, fex_init);
+    const auto r = g_ctx->RunCPUIDFunction(leaf, subleaf);
+    out[0] = r.eax;
+    out[1] = r.ebx;
+    out[2] = r.ecx;
+    out[3] = r.edx;
 }

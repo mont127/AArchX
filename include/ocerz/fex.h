@@ -24,6 +24,9 @@
  * ocerz's own code, and fails where they cannot be read, so the suspend tries
  * again.
  *
+ * ocerz_engine_cpuid, when set, is the engine's CPUID, eax ebx ecx edx, which
+ * the x86 hw.optional sysctls follow.
+ *
  * ocerz_engine_invalidate, when set, hears every guest range ocerz drops
  * translations for (ocerz_jit_invalidate_range): a write to a page of guest
  * code, an unmap, a protection change.
@@ -49,12 +52,14 @@ extern int (*ocerz_engine_fault)(int sig, siginfo_t *si, void *uc);
 extern int (*ocerz_engine_async)(void *uc);
 extern void (*ocerz_engine_invalidate)(uint64_t addr, uint64_t len);
 extern int (*ocerz_engine_gprs_at)(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
+extern void (*ocerz_engine_cpuid)(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 
 int ocerz_fex_run(struct OcerzVM *vm, struct OcerzCPU *cpu);
 int ocerz_fex_fault(int sig, siginfo_t *si, void *uc);
 int ocerz_fex_async(void *uc);
 void ocerz_fex_invalidate(uint64_t addr, uint64_t len);
 int ocerz_fex_gprs_at(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
+void ocerz_fex_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 
 #ifdef __cplusplus
 }

@@ -385,6 +385,7 @@
  * that is how a Steam hang was followed from a client's unanswered wait to a
  * SIGUSR1 the server had sent and the client had lost (see vm.c).
  */
+#include "ocerz/fex.h"
 #include "ocerz/syscall.h"
 #include "ocerz/m32.h"
 #include "ocerz/cache.h"
@@ -1162,6 +1163,28 @@ static int x86_sysctl_find(const char *name)
     return -1;
 }
 
+/* Under an engine with a CPUID of its own (-fex), the x86 feature answers follow it, as a Mac's follow its processor. */
+static uint64_t x86_sysctl_value(int idx)
+{
+    static const struct { const char *name; uint32_t leaf; uint8_t reg, bit; } bits[] = {
+        { "hw.optional.aes", 1, 2, 25 }, { "hw.optional.avx1_0", 1, 2, 28 }, { "hw.optional.rdrand", 1, 2, 30 },
+        { "hw.optional.f16c", 1, 2, 29 }, { "hw.optional.fma", 1, 2, 12 }, { "hw.optional.enfstrg", 7, 1, 9 },
+        { "hw.optional.avx2_0", 7, 1, 5 }, { "hw.optional.bmi1", 7, 1, 3 }, { "hw.optional.bmi2", 7, 1, 8 },
+        { "hw.optional.rtm", 7, 1, 11 }, { "hw.optional.hle", 7, 1, 4 }, { "hw.optional.adx", 7, 1, 19 },
+        { "hw.optional.mpx", 7, 1, 14 }, { "hw.optional.sgx", 7, 1, 2 }, { "hw.optional.avx512f", 7, 1, 16 },
+        { "hw.optional.avx512cd", 7, 1, 28 }, { "hw.optional.avx512dq", 7, 1, 17 }, { "hw.optional.avx512bw", 7, 1, 30 },
+        { "hw.optional.avx512vl", 7, 1, 31 }, { "hw.optional.avx512ifma", 7, 1, 21 }, { "hw.optional.avx512vbmi", 7, 2, 1 },
+    };
+    if (ocerz_engine_cpuid)
+        for (unsigned i = 0; i < sizeof bits / sizeof bits[0]; i++)
+            if (strcmp(bits[i].name, g_x86_sysctl[idx].name) == 0) {
+                uint32_t r[4];
+                ocerz_engine_cpuid(bits[i].leaf, 0, r);
+                return (r[bits[i].reg] >> bits[i].bit) & 1;
+            }
+    return g_x86_sysctl[idx].val;
+}
+
 static int x86_sysctl_emit(OcerzCPU *cpu, int idx, uint64_t oldp, uint64_t oldlenp)
 {
     const char *s = g_x86_sysctl[idx].sval;
@@ -1177,7 +1200,7 @@ static int x86_sysctl_emit(OcerzCPU *cpu, int idx, uint64_t oldp, uint64_t oldle
         if (s)
             memcpy(ocerz_g2h(oldp), s, (size_t)need);
         else
-            ocerz_st(oldp, (int)need, g_x86_sysctl[idx].val);
+            ocerz_st(oldp, (int)need, x86_sysctl_value(idx));
     }
     if (oldlenp)
         ocerz_st(oldlenp, 8, need);

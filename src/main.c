@@ -632,6 +632,7 @@ int main(int argc, char **argv)
         ocerz_engine_async = ocerz_fex_async;
         ocerz_engine_invalidate = ocerz_fex_invalidate;
         ocerz_engine_gprs_at = ocerz_fex_gprs_at;
+        ocerz_engine_cpuid = ocerz_fex_cpuid;
 #else
         OCERZ_FATAL("this ocerz was built without FEXCore, so it has no -fex (make FEX=<dir> builds it in)\n");
         return 64;
