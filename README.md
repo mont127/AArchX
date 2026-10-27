@@ -14,7 +14,7 @@
   <img alt="license" src="https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg">
   <img alt="language" src="https://img.shields.io/badge/C-C11-orange.svg">
-  <img alt="version" src="https://img.shields.io/badge/version-0.9-green.svg">
+  <img alt="version" src="https://img.shields.io/badge/version-1.0-green.svg">
 </p>
 
 > [!WARNING]
@@ -43,6 +43,9 @@ Mac's own arm64 frameworks, so they need no x86 system libraries at all.
 - **Two ways to supply the system libraries.** Cache mode translates Apple's
   x86-64 shared cache like any other code. Native mode bridges every call into
   the Mac's own arm64 frameworks instead.
+- **A second translator.** `-fex` runs the program's code on FEXCore, FEX-Emu's
+  translator, instead of AArchX's own (experimental), to compare the two or to
+  get past a program AArchX's translator gets wrong.
 - **Correct before fast.** The interpreter is the reference: every guest test
   runs both interpreted and translated and the two must match byte for byte,
   and 40,044 i386 sequences are compared register by register.
@@ -121,6 +124,7 @@ make apis
 | Safari, Discord | Safari browses, and Discord reaches its signed-in view (September 2026) |
 | Steam, macOS client | full UI with software rendering in cache mode; hardware-accelerated in native mode on macOS 27 |
 | Brawlhalla | reaches its menus, launched from Steam |
+| Hearts of Iron IV, Intel only | reaches its main menu in 23 s (Rosetta 16 s), and under `-fex` too (October 2026) |
 | Ollama | command line and server work, and the menu-bar app runs |
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
 | Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window; WineHQ's 32-bit Wine for macOS runs `cmd` through m32 (October 2026) |
@@ -189,10 +193,10 @@ contributors.
 
 | Gate | Result |
 | --- | --- |
-| x86-64 guest suite, interpreted and translated | 143 / 143 |
-| x86-64 differential, interpreter against JIT | 104 / 104 |
+| x86-64 guest suite, interpreted and translated | 150 / 150 |
+| x86-64 differential, interpreter against JIT | 111 / 111 |
 | i386 differential, in each of two memory layouts | 40,044 / 40,044 |
-| dynamic-linking suite | 448 / 448 |
+| dynamic-linking suite | 466 / 466 |
 | native-mode suite | 91 / 91 |
 | 32-bit (m32) programs | 81 / 81, one more skipped without a Steam database |
 
@@ -247,6 +251,8 @@ security issues as described in [SECURITY.md](SECURITY.md).
 
 AArchX builds on other people's work:
 
+- **FEX-Emu**: `-fex` runs on [FEXCore](https://github.com/FEX-Emu/FEX), FEX-Emu's translator library (MIT), which
+  links fmt, xxHash, SoftFloat 3e and cephes; release packages carry their licenses in `licenses/`.
 - **Jfishin**, through [MacShack](https://github.com/Jfishin/MacShack): native-mode fixes and the 32-bit Steam games work, the
   Steam bridge, Left 4 Dead 2 and Call of Duty: Modern Warfare 3.
 - **LLVM**: the guest C++ runtime in `runtime/guest` is LLVM's libc++, libc++abi and libunwind, built by
