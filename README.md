@@ -124,7 +124,7 @@ make apis
 | Safari, Discord | Safari browses, and Discord reaches its signed-in view (September 2026) |
 | Steam, macOS client | full UI with software rendering in cache mode; hardware-accelerated in native mode on macOS 27 |
 | Brawlhalla | reaches its menus, launched from Steam |
-| Hearts of Iron IV, Intel only | reaches its main menu in 23 s (Rosetta 16 s), and under `-fex` too (October 2026) |
+| Hearts of Iron IV, Intel only | reaches its main menu in 23 s in cache mode and 22 s in native mode (Rosetta 16 s), and under `-fex` in both (October 2026) |
 | Ollama | command line and server work, and the menu-bar app runs |
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
 | Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window; WineHQ's 32-bit Wine for macOS runs `cmd` through m32 (October 2026) |

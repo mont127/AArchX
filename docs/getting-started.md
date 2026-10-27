@@ -89,14 +89,17 @@ To add programs:
 
 To use a tile:
 - double-click it to run the program;
-- right-click it to run it in native mode, stop it, open its last log, show it
-  in Finder or remove it from the library.
+- right-click it to run it in native mode or with FEX, stop it, open its last
+  log, show it in Finder or remove it from the library.
 
 **Activity** lists every run, with how it ended and when it started. Its logs
 are in `~/Library/Logs/AArchX`.
 
 How the app picks the mode:
 - **Native mode**, in the bottom bar, is `-native`.
+- **FEX**, beside it, is [`-fex`](modes.md#fexcore--fex): the program's code
+  runs on FEX-Emu's translator instead of AArchX's. It applies to 64-bit Intel
+  Mac programs only; 32-bit and Windows programs are left as they are.
 - The app switches to native mode by itself for a 32-bit program, which only
   [m32](m32.md) runs, and when Rosetta's x86-64 cache is missing.
 - It refuses an Apple silicon app, which runs without AArchX.
@@ -176,7 +179,7 @@ How to get it:
 
 ```sh
 make -j
-./ocerz version        # AArchX 1.0
+./ocerz version        # AArchX 1.0.1
 ```
 
 The build is C11 with `-arch arm64 -O2`, takes well under a minute, and has no
