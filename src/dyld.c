@@ -566,6 +566,7 @@
 #include "ocerz/apidb.h"
 #include "ocerz/objcbridge.h"
 #include "ocerz/bridge.h"
+#include "ocerz/fex.h"
 #include "ocerz/abi.h"
 #include "ocerz/syscall.h"
 #include "ocerz/jit.h"
@@ -1248,8 +1249,10 @@ static int map_segments(DynImage *img, int is_main)
        shadow: it gives itself a page zero smaller than the default 4 GB to
        reserve the low addresses Windows programs expect, and that layout is
        what the shadow exists for.  OCERZ_NOPIE_LOW=1 keeps any other where it
-       asked to be too. */
-    if (is_main && !img->is_pie && ocerz_mode == OCERZ_MODE_NATIVE && vmlo < OCERZ_LOW_LIMIT &&
+       asked to be too.  FEXCore has no low shadow at all - guest addresses are
+       host addresses, and the host keeps everything below 4 GB plus its own
+       slide - so -fex slides such an image the same way. */
+    if (is_main && !img->is_pie && (ocerz_mode == OCERZ_MODE_NATIVE || ocerz_engine_run) && vmlo < OCERZ_LOW_LIMIT &&
         pagezero >= (1ull << 32) && !ocerz_wine_process && !getenv("OCERZ_NOPIE_LOW")) {
         img->scan_lo = vmlo;
         img->scan_hi = vmhi;
