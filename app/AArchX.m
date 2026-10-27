@@ -3,7 +3,7 @@
  *
  * A program reaches it by being dropped on its window or its Dock icon, by
  * Open With in Finder, or through Choose.  Each one runs as
- * `ocerz [-native] <path>` with its output in ~/Library/Logs/AArchX, and the
+ * `ocerz [-native] [-fex] <path>` with its output in ~/Library/Logs/AArchX, and the
  * window lists every run with how it ended.  ocerz is looked for inside the
  * bundle, then beside it, then in ~/.aarchx and Homebrew's bin.  A Windows
  * program runs as `ocerz <wine> <path>` with a Wine build found on the Mac,
@@ -11,7 +11,9 @@
  * one by one: the bottle's [Wine] BinPath, CrossOver's documented way to use
  * another Wine, puts two small scripts ahead of CrossOver's own bin, and they
  * run CrossOver's wineloader and wineserver under ocerz instead of Rosetta.
- * CrossOver's own files are not modified.
+ * CrossOver's own files are not modified.  -fex, FEX-Emu's translator in place
+ * of AArchX's, applies to 64-bit Intel Mac programs only: 32-bit ones and Wine
+ * need memory FEXCore cannot be given.
  */
 #import <AppKit/AppKit.h>
 #include <mach-o/fat.h>
@@ -525,6 +527,7 @@ static int program_kind(NSString *path, NSString **why)
 @property(strong) NSView *emptyState;
 @property(strong) NSTableView *table;
 @property(strong) NSButton *nativeBox;
+@property(strong) NSButton *fexBox;
 @property(strong) NSPopUpButton *winePopup;
 @property(strong) NSButton *crossoverButton;
 @property(strong) NSArray<WineBuild *> *wines;
@@ -533,6 +536,7 @@ static int program_kind(NSString *path, NSString **why)
 @property(strong) NSMutableArray<Item *> *items;
 - (void)addPaths:(NSArray<NSString *> *)paths run:(BOOL)run;
 - (void)runItem:(Item *)item native:(BOOL)native;
+- (void)runItem:(Item *)item native:(BOOL)native fex:(BOOL)fex;
 - (NSMenu *)menuForItem:(Item *)item;
 @end
 
@@ -918,6 +922,11 @@ static int program_kind(NSString *path, NSString **why)
     self.nativeBox.toolTip = @"Run Intel Mac programs against the Mac's own frameworks instead of Apple's Intel ones.";
     self.nativeBox.state = [[NSUserDefaults standardUserDefaults] boolForKey:@"Native"] ? NSControlStateValueOn
                                                                                        : NSControlStateValueOff;
+    self.fexBox = [NSButton checkboxWithTitle:@"FEX" target:self action:@selector(fexChanged:)];
+    self.fexBox.toolTip = @"Run Intel Mac programs' code on FEX-Emu's FEXCore instead of AArchX's own translator "
+                          @"(experimental, macOS 14.4 or newer). 32-bit and Windows programs are not affected.";
+    self.fexBox.state = [[NSUserDefaults standardUserDefaults] boolForKey:@"FEX"] ? NSControlStateValueOn
+                                                                                 : NSControlStateValueOff;
     NSTextField *wineLabel = [NSTextField labelWithString:@"Windows programs:"];
     wineLabel.textColor = [NSColor secondaryLabelColor];
     self.winePopup = [NSPopUpButton new];
@@ -933,17 +942,18 @@ static int program_kind(NSString *path, NSString **why)
     self.crossoverButton.hidden = find_crossover() == nil;
     NSView *gap = [NSView new];
     [gap setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
-    NSStackView *row = [NSStackView stackViewWithViews:@[ self.nativeBox, self.crossoverButton, gap, wineLabel,
-                                                          self.winePopup ]];
+    NSStackView *row = [NSStackView stackViewWithViews:@[ self.nativeBox, self.fexBox, self.crossoverButton, gap,
+                                                          wineLabel, self.winePopup ]];
     row.spacing = 8;
     self.footer = [NSTextField labelWithString:@""];
     self.footer.textColor = [NSColor tertiaryLabelColor];
     self.footer.font = [NSFont systemFontOfSize:11];
     self.footer.selectable = YES;
     self.footer.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    for (NSView *c in @[ self.nativeBox, wineLabel ])
+    for (NSView *c in @[ self.nativeBox, self.fexBox, wineLabel ])
         ((NSControl *)c).font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
     self.nativeBox.controlSize = NSControlSizeSmall;
+    self.fexBox.controlSize = NSControlSizeSmall;
     NSStackView *bar = [NSStackView stackViewWithViews:@[ row, self.footer ]];
     bar.orientation = NSUserInterfaceLayoutOrientationVertical;
     bar.alignment = NSLayoutAttributeLeading;
@@ -1089,8 +1099,10 @@ static int program_kind(NSString *path, NSString **why)
         return mi;
     };
     add(@"Run", @selector(itemRun:));
-    if (item.kind == KIND_INTEL)
+    if (item.kind == KIND_INTEL) {
         add(@"Run in Native Mode", @selector(itemRunNative:));
+        add(@"Run with FEX", @selector(itemRunFex:));
+    }
     if (item.run.task.running)
         add(@"Stop", @selector(itemStop:));
     [m addItem:[NSMenuItem separatorItem]];
@@ -1111,6 +1123,11 @@ static int program_kind(NSString *path, NSString **why)
 - (void)itemRunNative:(NSMenuItem *)mi
 {
     [self runItem:mi.representedObject native:YES];
+}
+
+- (void)itemRunFex:(NSMenuItem *)mi
+{
+    [self runItem:mi.representedObject native:NO fex:YES];
 }
 
 - (void)itemStop:(NSMenuItem *)mi
@@ -1300,6 +1317,11 @@ static int program_kind(NSString *path, NSString **why)
     [[NSUserDefaults standardUserDefaults] setBool:self.nativeBox.state == NSControlStateValueOn forKey:@"Native"];
 }
 
+- (void)fexChanged:(id)sender
+{
+    [[NSUserDefaults standardUserDefaults] setBool:self.fexBox.state == NSControlStateValueOn forKey:@"FEX"];
+}
+
 - (void)choose:(id)sender
 {
     NSOpenPanel *p = [NSOpenPanel openPanel];
@@ -1333,13 +1355,23 @@ static int program_kind(NSString *path, NSString **why)
 
 - (void)runItem:(Item *)item native:(BOOL)forceNative
 {
-    Run *r = [self runPath:item.path native:forceNative];
+    [self runItem:item native:forceNative fex:NO];
+}
+
+- (void)runItem:(Item *)item native:(BOOL)forceNative fex:(BOOL)forceFex
+{
+    Run *r = [self runPath:item.path native:forceNative fex:forceFex];
     if (r)
         item.run = r;
     [self.grid reloadData];
 }
 
 - (Run *)runPath:(NSString *)path native:(BOOL)forceNative
+{
+    return [self runPath:path native:forceNative fex:NO];
+}
+
+- (Run *)runPath:(NSString *)path native:(BOOL)forceNative fex:(BOOL)forceFex
 {
     NSString *name = [[NSFileManager defaultManager] displayNameAtPath:path];
     NSString *ocerz = find_ocerz();
@@ -1367,11 +1399,16 @@ static int program_kind(NSString *path, NSString **why)
         native = YES;
         reason = @"no Rosetta";
     }
+    BOOL fex = kind == KIND_INTEL && (forceFex || self.fexBox.state == NSControlStateValueOn);
     NSMutableArray *args = [NSMutableArray array];
     if (native)
         [args addObject:@"-native"];
+    if (fex)
+        [args addObject:@"-fex"];
     [args addObjectsFromArray:@[ @"--", path ]];
     NSString *mode = reason ? [NSString stringWithFormat:@"native, %@", reason] : native ? @"native" : nil;
+    if (fex)
+        mode = mode ? [mode stringByAppendingString:@", FEX"] : @"FEX";
     return [self launch:path name:name ocerz:ocerz args:args env:nil cwd:NSHomeDirectory() mode:mode wine:nil];
 }
 
