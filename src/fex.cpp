@@ -683,10 +683,15 @@ extern "C" int ocerz_fex_fault(int sig, siginfo_t *si, void *uc)
         return 0;
     auto *mc = ((ucontext_t *)uc)->uc_mcontext;
     uintptr_t pc = (uintptr_t)mc->__ss.__pc;
+    const uint64_t a = (uint64_t)(uintptr_t)si->si_addr;
+    /* Only translated code reads the x86 commpage, and commpage_load decodes the instruction before it does anything,
+     * so such a fault skips the code-buffer test: a thread may be running blocks of a shared code buffer FEXCore
+     * started after it last looked, which IsAddressInCodeBuffer does not count as its own (Ollama.app's threads). */
+    if (a >= OCERZ_COMMPAGE_LO && a < OCERZ_COMMPAGE_HI && commpage_load(&mc->__ss, *(const uint32_t *)pc))
+        return 1;
     if (!g_ctx->IsAddressInCodeBuffer(ft->thread, pc) &&
         (uint64_t)(uintptr_t)si->si_addr - (uint64_t)(uintptr_t)ft->thread->InterruptFaultPage >= sizeof ft->thread->InterruptFaultPage)
         return 0;
-    const uint64_t a = (uint64_t)(uintptr_t)si->si_addr;
     const uint64_t esr = mc->__es.__esr, ec = (esr >> 26) & 0x3f;
     if (a - (uint64_t)(uintptr_t)ft->thread->InterruptFaultPage < sizeof ft->thread->InterruptFaultPage)
         return interrupt_stop(ft, mc);
@@ -694,8 +699,6 @@ extern "C" int ocerz_fex_fault(int sig, siginfo_t *si, void *uc)
         mc->__ss.__x[25] = (uint64_t)(uintptr_t)ft->thread->CallRetStackBase + CALLRET_SIZE / 4;
         return 1;
     }
-    if (a >= OCERZ_COMMPAGE_LO && a < OCERZ_COMMPAGE_HI && commpage_load(&mc->__ss, *(const uint32_t *)pc))
-        return 1;
     if (sig == SIGBUS && (esr & 0x3f) == 0x21) {
         auto moved = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
             ft->thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, pc, (uint64_t *)&mc->__ss.__x[0]);
