@@ -22830,11 +22830,15 @@ static int ret_flags_live_at(uint64_t rip)
 static int ret_flag_producer(unsigned op);
 static int insn_writes_reg(const X86Insn *in, unsigned reg);
 /*
- * Flags at a jmp through a register that the block's last flag writer
- * computed: they come from working out the target (movsxd rax, [table+idx*4];
- * add rax, table; jmp rax), so nothing at any of its targets can mean them.
- * SQLite's VM switch stored the add's record before every opcode it
- * dispatched.  Flags from a compare or test before such a jmp, or from any
+ * Flags at a jump-table jmp: movsxd rax, [table+idx*4]; add rax, table;
+ * jmp rax.  The add's flags come from working out the target, so nothing at
+ * any of its targets can mean them, and SQLite's VM switch stored the add's
+ * record before every opcode it dispatched.  Only that shape: a target worked
+ * out some other way may come with flags it reads.  objc_msgSend ends in
+ * xor r11, r10; jmp r11 (the cached IMP is kept xored with the class), and
+ * what it jumps to reads them: with them dead, Hearts of Iron IV's first
+ * forwarded message took the struct-return path and treated its selector as
+ * the receiver.  Flags from a compare or test before such a jmp, or from any
  * writer of some other register, stay live, as they may be an answer.
  * OCERZ_NO_JMPREG_FLAGS_DEAD=1 keeps them all live.
  */
@@ -22850,8 +22854,13 @@ static int jmp_reg_flags_dead(const X86Insn *insns, int n)
         ocerz_flags_defuse(&insns[k], &def, &use);
         if (!(def & JIT_ARITH_FLAGS))
             continue;
-        return (def & JIT_ARITH_FLAGS) == JIT_ARITH_FLAGS && !ret_flag_producer(insns[k].op) &&
-               insns[k].ops[0].size == 8 && insn_writes_reg(&insns[k], t->ops[0].reg);
+        if (insns[k].op != OCERZ_OP_ADD || (def & JIT_ARITH_FLAGS) != JIT_ARITH_FLAGS || insns[k].ops[0].size != 8 ||
+            !insn_writes_reg(&insns[k], t->ops[0].reg))
+            return 0;
+        for (int j = k - 1; j >= 0; j--)
+            if (insn_writes_reg(&insns[j], t->ops[0].reg))
+                return insns[j].op == OCERZ_OP_MOVSXD && insns[j].ops[1].kind == OCERZ_OPK_MEM;
+        return 0;
     }
     return 0;
 }
