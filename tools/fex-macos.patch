@@ -11,6 +11,18 @@ index 2d2dfde..a9f2738 100644
    message(FATAL_ERROR "Unsupported system type ${CMAKE_SYSTEM_NAME}."
      " FEX only supports Linux and Windows."
      " If you believe this is in error, file an issue.")
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 9b91055..3258c58 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -238,6 +238,7 @@ public:
+   AddCustomIREntrypoint(uintptr_t Entrypoint, CustomIREntrypointHandler Handler, void* Creator = nullptr, void* Data = nullptr);
+ 
+   void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) override;
++  void AddPlainTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Target) override;
+ 
+   void AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) override;
+ 
 diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
 index 87a110c..ad91f93 100644
 --- a/FEXCore/Source/Interface/Core/CodeCache.cpp
@@ -28,7 +40,7 @@ index 87a110c..ad91f93 100644
    // We ensure this by remapping a temporary buffer onto the PROT_NONE
    // placeholder page in CodeBuffer. Some constraints to keep in mind are:
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 63280a4..b29763b 100644
+index 63280a4..e7ca2fa 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -8,6 +8,7 @@ desc: Glues Frontend, OpDispatcher and IR Opts & Compilation, LookupCache, Dispa
@@ -58,6 +70,26 @@ index 63280a4..b29763b 100644
    FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
  
    static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+@@ -1141,6 +1147,19 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
+   }
+ }
+ 
++void ContextImpl::AddPlainTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Target) {
++  AddCustomIREntrypoint(
++    Entrypoint,
++    [Target](uintptr_t Entrypoint, FEXCore::IR::IREmitter* emit) {
++      auto IRHeader = emit->_IRHeader(emit->Invalid(), Entrypoint, 0, 0, 0, 0);
++      auto Block = emit->CreateCodeNode(true, 0);
++      IRHeader.first->Blocks = emit->WrapNode(Block);
++      emit->SetCurrentCodeBlock(Block);
++      emit->_ExitFunction(IR::OpSize::i64Bit, emit->Constant(Target), IR::BranchHint::None, emit->Invalid(), emit->Invalid());
++    },
++    ThunkHandler, (void*)Target);
++}
++
+ void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
+   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+   ForceTSOValidRanges.Insert(ValidRanges);
 diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
 index 5637b8c..a859ff5 100644
 --- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
@@ -447,6 +479,22 @@ index 67fe0ca..2979d9d 100644
  #include <linux/magic.h>
  #include <sys/stat.h>
  #include <sys/vfs.h>
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 8aa448e..2d44f39 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -182,6 +182,11 @@ public:
+    */
+   FEX_DEFAULT_VISIBILITY virtual void AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t GuestThunkEntrypoint) = 0;
+ 
++  /**
++   * @brief Like AddThunkTrampolineIRHandler, but only redirects: every register keeps what the guest put in it.
++   */
++  FEX_DEFAULT_VISIBILITY virtual void AddPlainTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Target) = 0;
++
+   /**
+    * @brief Adds additional per-instruction granularity TSO enable/disable information for the given range.
+    *
 diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
 index 42feabb..1415dd7 100644
 --- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h

@@ -47,7 +47,8 @@
  *
  * ocerz answers some addresses itself that hold no code a host could map: the
  * dyld API's trap slots and the sentinel a call from ocerz returns to, both
- * below 4 GB, where macOS gives an arm64 process no memory.  Each is a FEXCore
+ * below 4 GB, where macOS gives an arm64 process no memory; native mode's bridge
+ * to arm64 frameworks is one more such slot.  Each is a FEXCore
  * thunk trampoline, which leaves the address in R11 and goes on at code ocerz
  * holds in its own memory, since FEXCore reads guest code through host
  * pointers: the sentinel goes to fex_exit_hlt, and a trap slot to fex_trap_insn,
@@ -137,6 +138,7 @@ struct TrapInsn {
     uint8_t name[32];
 };
 const TrapInsn fex_trap_insn = {{0x0f, 0x3f}, {'o', 'c', 'e', 'r', 'z', ' ', 'd', 'y', 'l', 'd', ' ', 'a', 'p', 'i'}};
+const TrapInsn fex_bridge_insn = {{0x0f, 0x3f}, {'o', 'c', 'e', 'r', 'z', ' ', 'b', 'r', 'i', 'd', 'g', 'e'}};
 
 struct FexThread {
     uint64_t generation;
@@ -267,12 +269,10 @@ void fex_syscall(FEXCore::Core::CpuStateFrame *Frame)
     }
 }
 
-void fex_trap(void *)
+void trap_dispatch(uint64_t slot)
 {
     FexThread *ft = t_cur;
     OcerzCPU *cpu = ft->cpu;
-    auto &S = ft->thread->CurrentFrame->State;
-    uint64_t slot = S.gregs[REG_R11];
     to_cpu(ft);
     cpu->cur_rip = slot;
     cpu->rip = slot;
@@ -287,6 +287,17 @@ void fex_trap(void *)
     cpu->gpr[OCERZ_RSP] -= 8;
     *(uint64_t *)cpu->gpr[OCERZ_RSP] = back;
     from_cpu(ft);
+}
+
+void fex_trap(void *)
+{
+    trap_dispatch(t_cur->thread->CurrentFrame->State.gregs[REG_R11]);
+}
+
+/* A synthesized native-mode stub leaves its export's id in R11, so its trampoline is a plain one. */
+void fex_bridge(void *)
+{
+    trap_dispatch(OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF);
 }
 
 const FEXCore::SignalDelegatorConfig &g_signals_config();
@@ -366,7 +377,11 @@ class FexThunks final : public FEXCore::ThunkHandler {
 public:
     FEXCore::ThunkedFunction *LookupThunk(const FEXCore::IR::SHA256Sum &sum) override
     {
-        return memcmp(&sum, fex_trap_insn.name, sizeof fex_trap_insn.name) == 0 ? fex_trap : nullptr;
+        if (memcmp(&sum, fex_trap_insn.name, sizeof fex_trap_insn.name) == 0)
+            return fex_trap;
+        if (memcmp(&sum, fex_bridge_insn.name, sizeof fex_bridge_insn.name) == 0)
+            return fex_bridge;
+        return nullptr;
     }
 };
 
@@ -464,6 +479,7 @@ void new_context()
     g_ctx->AddThunkTrampolineIRHandler(g_sentinel, (uintptr_t)&fex_exit_hlt);
     for (uint64_t off = 0; off <= 0x2000; off += 8)
         g_ctx->AddThunkTrampolineIRHandler(OCERZ_DYLDAPI_LO + off, (uintptr_t)&fex_trap_insn);
+    g_ctx->AddPlainTrampolineIRHandler(OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF, (uintptr_t)&fex_bridge_insn);
 }
 
 /* In a forked child: the parent's context and threads stay where they are, unused, since their code cannot run here
