@@ -780,3 +780,26 @@ extern "C" int ocerz_fex_pc_in_code(const void *pc)
             return 1;
     return 0;
 }
+
+/* Whether this Mac can run -fex (include/ocerz/fex.h); why names what it lacks. */
+extern "C" int ocerz_fex_supported(const char **why)
+{
+    if (__builtin_available(macOS 14.4, *)) {
+    } else {
+        *why = "macOS 14.4 or newer";
+        return 0;
+    }
+    size_t pg = (size_t)getpagesize();
+    void *p = mmap(nullptr, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    bool zeroes = false;
+    if (p != MAP_FAILED) {
+        *(volatile char *)p = 1;
+        zeroes = madvise(p, pg, MADV_ZERO) == 0 && *(volatile char *)p == 0;
+        munmap(p, pg);
+    }
+    if (!zeroes) {
+        *why = "a kernel with MADV_ZERO";
+        return 0;
+    }
+    return 1;
+}

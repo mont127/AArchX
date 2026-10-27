@@ -36,7 +36,10 @@
  * code, an unmap, a protection change.
  *
  * FEXCore is linked only by `make FEX=<dir>` (OCERZ_HAVE_FEX); a plain build
- * has no -fex.
+ * has no -fex.  ocerz_fex_supported says whether this Mac can run it: FEXCore's
+ * locks wait with os_sync_wait_on_address (macOS 14.4) and the memory it hands
+ * back must read as zeros (MADV_ZERO).  A build for older systems still starts
+ * on them, without -fex.
  */
 #ifndef OCERZ_FEX_H
 #define OCERZ_FEX_H
@@ -66,6 +69,7 @@ void ocerz_fex_invalidate(uint64_t addr, uint64_t len);
 int ocerz_fex_gprs_at(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
 void ocerz_fex_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 int ocerz_fex_pc_in_code(const void *pc);
+int ocerz_fex_supported(const char **why);
 
 #ifdef __cplusplus
 }

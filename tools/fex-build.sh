@@ -16,6 +16,9 @@
 # MADV_ZERO as Linux's does; the 4 KB guard pages after code buffers are left
 # out, 16 KB host pages being larger than the space they guard; and the code
 # cache, which needs mremap, refuses to run.
+#
+# MACOSX_DEPLOYMENT_TARGET and SDKROOT, when set, reach CMake, so a release
+# build's FEXCore targets the same macOS as the ocerz it is linked into.
 set -euo pipefail
 
 FEX_REV=1c4f04b71a4d33091183fd7e1a2c09e6823d27fd
@@ -40,7 +43,9 @@ if [ ! -f "$dir/build/CMakeCache.txt" ]; then
     cmake -S "$dir/FEX" -B "$dir/build" -DCMAKE_BUILD_TYPE=Release -DTUNE_CPU=apple-m1 -DENABLE_LTO=OFF \
         -DBUILD_FEXCONFIG=OFF -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF -DENABLE_FEX_ALLOCATOR=OFF \
         -DENABLE_OFFLINE_TELEMETRY=OFF -DBUILD_TESTING=OFF -DENABLE_CCACHE=OFF -DBUILD_THUNKS=OFF \
-        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+        ${MACOSX_DEPLOYMENT_TARGET:+-DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"} \
+        ${SDKROOT:+-DCMAKE_OSX_SYSROOT="$SDKROOT"}
 fi
 make -C "$dir/build" -j"$(sysctl -n hw.ncpu)" FEXCore JemallocDummy
 echo "FEXCore is built; now: make FEX=$dir"

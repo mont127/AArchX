@@ -768,42 +768,58 @@ index 69e410c..1df7003 100644
        FEXCore::Allocator::VirtualName(Name, Ptr, Size);
      }
 diff --git a/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h b/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
-index bf1bd2b..d188c42 100644
+index bf1bd2b..f6f39cc 100644
 --- a/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
 +++ b/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
-@@ -4,7 +4,9 @@
+@@ -4,7 +4,10 @@
  #include <cstdint>
  #include <limits.h>
  
 -#if !defined(_WIN32)
 +#if defined(__APPLE__)
 +#include <os/os_sync_wait_on_address.h>
++#include <sched.h>
 +#elif !defined(_WIN32)
  #include <linux/futex.h> /* Definition of FUTEX_* constants */
  #include <sys/syscall.h> /* Definition of SYS_* constants */
  #include <unistd.h>
-@@ -271,7 +273,25 @@ public:
+@@ -271,7 +274,40 @@ public:
  
  private:
  
 -#if !defined(_WIN32)
 +#if defined(__APPLE__)
 +  // Darwin's address waits have no bit sets, so a wake for writers could land on a reader and be lost: every wake
-+  // wakes all, and each waiter re-checks the word.
++  // wakes all, and each waiter re-checks the word.  They arrived in macOS 14.4; before it a wait yields and returns,
++  // a spurious wakeup the callers already re-check for, and a wake has no one to wake.
++  void FutexWait(uint32_t Expected) {
++    if (__builtin_available(macOS 14.4, *)) {
++      os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
++    } else {
++      sched_yield();
++    }
++  }
++
++  void FutexWakeAll() {
++    if (__builtin_available(macOS 14.4, *)) {
++      os_sync_wake_by_address_all(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
++    }
++  }
++
 +  void FutexWaitForWriteAvailable(uint32_t Expected) {
-+    os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
++    FutexWait(Expected);
 +  }
 +
 +  void FutexWaitForReadAvailable(uint32_t Expected) {
-+    os_sync_wait_on_address(&Futex, Expected, sizeof(Futex), OS_SYNC_WAIT_ON_ADDRESS_NONE);
++    FutexWait(Expected);
 +  }
 +
 +  void FutexWakeWriter() {
-+    os_sync_wake_by_address_all(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
++    FutexWakeAll();
 +  }
 +
 +  void FutexWakeReaders() {
-+    os_sync_wake_by_address_all(&Futex, sizeof(Futex), OS_SYNC_WAKE_BY_ADDRESS_NONE);
++    FutexWakeAll();
 +  }
 +#elif !defined(_WIN32)
    void FutexWaitForWriteAvailable(uint32_t Expected) {

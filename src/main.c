@@ -627,6 +627,11 @@ int main(int argc, char **argv)
     const char *fex_env = getenv("OCERZ_FEX");
     if (fex_env && *fex_env && strcmp(fex_env, "0") != 0) {
 #ifdef OCERZ_HAVE_FEX
+        const char *fex_needs = NULL;
+        if (!ocerz_fex_supported(&fex_needs)) {
+            OCERZ_FATAL("-fex needs %s; run without it to use ocerz's own translator\n", fex_needs);
+            return 64;
+        }
         ocerz_engine_run = ocerz_fex_run;
         ocerz_engine_fault = ocerz_fex_fault;
         ocerz_engine_async = ocerz_fex_async;
