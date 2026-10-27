@@ -231,6 +231,48 @@ index 7e86e37..d95f7da 100644
    _StoreMemGPRAutoTSO(IDTStoreSize, AddressMode {.Base = DestAddress, .Offset = 2, .AddrSize = OpSize::i64Bit}, Constant(IDTAddress));
  }
  
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index f61b592..8c8030e 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -3044,6 +3044,13 @@ void OpDispatchBuilder::XSaveOpImpl(OpcodeArgs) {
+ 
+     // XSTATE_BV section of the header is 8 bytes in size, but we only really
+     // care about setting at most 3 bits in the first byte. We zero out the rest.
++#ifdef __APPLE__
++    // A component left out of the request keeps its XSTATE_BV bit (as on a Mac's processor and under Rosetta):
++    // only the requested bits are written.
++    Ref OldBV = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
++    Ref Kept = _Andn(OpSize::i64Bit, _And(OpSize::i64Bit, OldBV, Constant(7)), RequestedFeatures);
++    RequestedFeatures = _Or(OpSize::i64Bit, Kept, RequestedFeatures);
++#endif
+     _StoreMemGPR(OpSize::i64Bit, RequestedFeatures, Base, Constant(512), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+   }
+ }
+@@ -3198,6 +3205,15 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+     //
+     // Note: we rematerialize Base/Mask in each block to avoid crossblock
+     // liveness.
++    // A component left out of the requested-feature bitmap in EDX:EAX is not touched at all; only the low bits are
++    // ever set, so EAX is enough, as in XSaveOpImpl.
++    Ref Requested = _Bfe(OpSize, FieldSize, BitIndex, LoadGPRRegister(X86State::REG_RAX));
++    auto RequestedJump = CondJump(Requested, CondClass::NEQ);
++    auto CheckBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetTrueJumpTarget(RequestedJump, CheckBlock);
++    SetCurrentCodeBlock(CheckBlock);
++    StartNewBlock();
++
+     Ref Base = XSaveBase(Op);
+     Ref Mask = _LoadMemGPR(OpSize::i64Bit, Base, Constant(512), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+ 
+@@ -3213,6 +3229,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
+     auto DefaultBlock = CreateNewCodeBlockAfter(RestoreBlock);
+     auto ExitBlock = CreateNewCodeBlockAfter(DefaultBlock);
+     SetJumpTarget(RestoreExitJump, ExitBlock);
++    SetFalseJumpTarget(RequestedJump, ExitBlock);
+     SetFalseJumpTarget(CondJump_, DefaultBlock);
+     SetCurrentCodeBlock(DefaultBlock);
+     StartNewBlock();
 diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
 index eee5023..3709874 100644
 --- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
