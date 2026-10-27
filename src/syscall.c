@@ -1234,7 +1234,7 @@ int ocerz_sysctl_x86_value(const char *name, const char **s, uint64_t *v, unsign
     if (x < 0)
         return 0;
     *s = g_x86_sysctl[x].sval;
-    *v = g_x86_sysctl[x].val;
+    *v = x86_sysctl_value(x);
     *width = g_x86_sysctl[x].width;
     return 1;
 }

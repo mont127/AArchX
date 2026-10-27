@@ -17,7 +17,7 @@
  * Guest code runs nested on one host thread: a system call or a dyld API call
  * made from guest code can run guest code again through ocerz_vm_call (an
  * initializer, an image callback), which can call out again, and so on.  Each
- * level is its own FEXCore thread, kept per host thread in t_levels and made the
+ * level is its own FEXCore thread, kept per host thread in levels() and made the
  * first time that depth is reached, then handed whichever cpu runs at that
  * depth.  t_cur is the level whose code is running, which every callback from
  * FEXCore works on.  FEXCore checks a thread's code segment for long mode, so
@@ -72,7 +72,9 @@
  * FEXCore's code, its dispatcher included.  So when the system call that comes
  * back in a new process is a fork, the callback does not return into that code:
  * the child makes a context of its own, forgets the parent's threads, and jumps
- * back to the level's ocerz_fex_run with the guest state in the cpu.
+ * back to the level's ocerz_fex_run with the guest state in the cpu.  A native
+ * fork comes back through the bridge, the same way, and an outer level of the
+ * parent's that a callback returns to leaves for its run loop as well.
  *
  * ---- faults ----
  * FEXCore's ordered loads and stores fault when misaligned across 16 bytes, and
@@ -104,6 +106,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <pthread.h>
 #include <vector>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
@@ -155,7 +158,9 @@ struct FexThread {
     int step;
 };
 
-fextl::unique_ptr<FEXCore::Context::Context> g_ctx;
+/* Never destroyed: a host thread's levels are taken apart when it ends, which at exit can be after static
+ * destructors have run. */
+FEXCore::Context::Context *g_ctx;
 std::once_flag g_init_once;
 uint64_t g_sentinel;
 pid_t g_pid;
@@ -175,19 +180,35 @@ void destroy_level(FexThread *ft)
     delete ft;
 }
 
+/* A host thread's levels live on the heap and are taken apart by a pthread key's destructor, which runs when the
+ * thread ends but not at exit(): exit() runs C++ thread_local destructors first, and atexit handlers and C++
+ * destructors still call guest code after them (native mode's exit is the host's). */
 struct Levels {
     FexThread *at[MAX_LEVELS];
     int active;
-    ~Levels()
-    {
-        for (int i = 0; i < MAX_LEVELS; i++)
-            if (at[i] && at[i]->generation == g_generation)
-                destroy_level(at[i]);
-    }
 };
 
-thread_local Levels t_levels;
+pthread_key_t g_levels_key;
+thread_local Levels *t_lv;
 thread_local FexThread *t_cur;
+
+void levels_gone(void *p)
+{
+    auto *lv = (Levels *)p;
+    for (int i = 0; i < MAX_LEVELS; i++)
+        if (lv->at[i] && lv->at[i]->generation == g_generation)
+            destroy_level(lv->at[i]);
+    delete lv;
+}
+
+Levels &levels()
+{
+    if (!t_lv) {
+        t_lv = new Levels {};
+        pthread_setspecific(g_levels_key, t_lv);
+    }
+    return *t_lv;
+}
 
 void to_cpu(FexThread *ft)
 {
@@ -200,6 +221,7 @@ void to_cpu(FexThread *ft)
     cpu->fs_base = S.fs_cached;
     cpu->gs_base = S.gs_cached;
     cpu->mxcsr = S.mxcsr;
+    cpu->fcw = S.FCW;
     __uint128_t lo[16], hi[16];
     g_ctx->ReconstructXMMRegisters(ft->thread, lo, hi);
     uint64_t upper = 0;
@@ -225,6 +247,7 @@ void from_cpu(FexThread *ft)
     S.fs_cached = cpu->fs_base;
     S.gs_cached = cpu->gs_base;
     S.mxcsr = cpu->mxcsr;
+    S.FCW = cpu->fcw;
     __uint128_t lo[16], hi[16];
     for (int i = 0; i < 16; i++) {
         lo[i] = (__uint128_t)cpu->xmm[i].hi << 64 | cpu->xmm[i].lo;
@@ -242,6 +265,22 @@ bool must_leave(FexThread *ft, int r)
 
 void fork_child_restart();
 
+/* After a call out of guest code (a system call, a bridged native call, which may have run callbacks of its own):
+ * in a forked child the context is made anew, and a level of the old one does not go back into code this process
+ * cannot run but jumps to its ocerz_fex_run, the guest state in the cpu, where the run loop goes on with a new one. */
+void leave_if_forked(FexThread *ft, int r)
+{
+    if (getpid() != g_pid)
+        fork_child_restart();
+    if (ft->generation == g_generation)
+        return;
+    ft->leave = true;
+    ft->cpu_current = true;
+    ft->step = r;
+    ft->resume_rip = ft->cpu->rip;
+    _longjmp(ft->out, 1);
+}
+
 void fex_syscall(FEXCore::Core::CpuStateFrame *Frame)
 {
     FexThread *ft = t_cur;
@@ -252,14 +291,7 @@ void fex_syscall(FEXCore::Core::CpuStateFrame *Frame)
     cpu->cur_rip = at;
     cpu->rip = at + 2;
     int r = ocerz_handle_syscall(ft->vm, cpu);
-    if (getpid() != g_pid) {
-        fork_child_restart();
-        ft->leave = true;
-        ft->cpu_current = true;
-        ft->step = r;
-        ft->resume_rip = cpu->rip;
-        _longjmp(ft->out, 1);
-    }
+    leave_if_forked(ft, r);
     from_cpu(ft);
     if (must_leave(ft, r)) {
         ft->leave = true;
@@ -277,6 +309,7 @@ void trap_dispatch(uint64_t slot)
     cpu->cur_rip = slot;
     cpu->rip = slot;
     int r = ocerz_dyldapi_dispatch(ft->vm, cpu);
+    leave_if_forked(ft, r);
     uint64_t back = cpu->rip;
     if (must_leave(ft, r)) {
         ft->leave = true;
@@ -447,6 +480,7 @@ void fex_init()
         if (level <= LogMan::ERROR || getenv("OCERZ_FEX_LOG"))
             fprintf(stderr, "ocerz: FEXCore: %s\n", m);
     });
+    pthread_key_create(&g_levels_key, levels_gone);
     FEXCore::Config::Initialize();
     /* Apple's processors have no FEAT_RNG, and macOS programs use rdrand where CPUID offers it. */
     FEXCore::Config::Set(FEXCore::Config::CONFIG_SOFTWARERNG, "1");
@@ -466,7 +500,7 @@ void new_context()
 {
     g_pid = getpid();
     g_generation++;
-    g_ctx = FEXCore::Context::Context::CreateNewContext(host_features());
+    g_ctx = FEXCore::Context::Context::CreateNewContext(host_features()).release();
     g_ctx->SetSignalDelegator(&g_signals);
     g_ctx->SetSyscallHandler(&g_syscalls);
     g_ctx->SetThunkHandler(&g_thunks);
@@ -486,11 +520,13 @@ void new_context()
  * and taking them apart would run their destructors against it. */
 void fork_child_restart()
 {
-    (void)g_ctx.release();
+    g_ctx = nullptr;
     g_all.clear();
     new (&g_all_lock) std::mutex();
+    Levels &lv = levels();
     for (int i = 0; i < MAX_LEVELS; i++)
-        t_levels.at[i] = nullptr;
+        lv.at[i] = nullptr;
+    lv.active = 0;
     new_context();
 }
 
@@ -569,18 +605,19 @@ bool commpage_load(arm_thread_state64_t *ss, uint32_t insn)
 extern "C" int ocerz_fex_run(OcerzVM *vm, OcerzCPU *cpu)
 {
     std::call_once(g_init_once, fex_init);
+    Levels &lv = levels();
     const uintptr_t here = (uintptr_t)__builtin_frame_address(0);
-    while (t_levels.active > 0 && t_levels.at[t_levels.active - 1]->frame <= here)
-        t_levels.active--;
-    t_cur = t_levels.active > 0 ? t_levels.at[t_levels.active - 1] : nullptr;
-    const int depth = t_levels.active;
+    while (lv.active > 0 && (!lv.at[lv.active - 1] || lv.at[lv.active - 1]->frame <= here))
+        lv.active--;
+    t_cur = lv.active > 0 ? lv.at[lv.active - 1] : nullptr;
+    const int depth = lv.active;
     if (depth >= MAX_LEVELS) {
         fprintf(stderr, "ocerz: fatal: guest calls nested more than %d deep\n", MAX_LEVELS);
         return OCERZ_STEP_FATAL;
     }
-    FexThread *ft = t_levels.at[depth];
+    FexThread *ft = lv.at[depth];
     if (!ft)
-        ft = t_levels.at[depth] = new_level();
+        ft = lv.at[depth] = new_level();
     auto &S = ft->thread->CurrentFrame->State;
     if (ft->cpu != cpu)
         S.callret_sp = (uint64_t)ft->thread->CallRetStackBase + CALLRET_SIZE / 4;
@@ -593,10 +630,10 @@ extern "C" int ocerz_fex_run(OcerzVM *vm, OcerzCPU *cpu)
 
     FexThread *outer = t_cur;
     t_cur = ft;
-    t_levels.active = depth + 1;
+    lv.active = depth + 1;
     if (_setjmp(ft->out) == 0)
         g_ctx->ExecuteThread(ft->thread);
-    t_levels.active = depth;
+    lv.active = depth;
     t_cur = outer;
 
     if (!ft->leave) {
@@ -733,4 +770,13 @@ extern "C" void ocerz_fex_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]
     out[1] = r.ebx;
     out[2] = r.ecx;
     out[3] = r.edx;
+}
+
+extern "C" int ocerz_fex_pc_in_code(const void *pc)
+{
+    const Levels *lv = t_lv;
+    for (int i = 0; lv && i < lv->active; i++)
+        if (g_ctx->IsAddressInCodeBuffer(lv->at[i]->thread, (uintptr_t)pc))
+            return 1;
+    return 0;
 }

@@ -242,6 +242,7 @@
  * unmasked does not trap.  _FE_DFL_ENV and _FE_DFL_DISABLE_SSE_DENORMS_ENV are
  * var records holding the x86 defaults (src/vdylib.c).
  */
+#include "ocerz/fex.h"
 #include "ocerz/sysbridge.h"
 #include "ocerz/abi.h"
 #include "ocerz/apidb.h"
@@ -1048,7 +1049,8 @@ static int sb_translated_frame_below(struct OcerzVM *vm)
     uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
     for (int depth = 0; depth < 65536 && fp >= bottom && fp + 16 <= top && (fp & 7) == 0; depth++) {
         const uintptr_t *record = (const uintptr_t *)fp;
-        if (ocerz_jit_pc_in_arena(vm, (const void *)record[1]))
+        if (ocerz_jit_pc_in_arena(vm, (const void *)record[1]) ||
+            (ocerz_engine_pc_in_code && ocerz_engine_pc_in_code((const void *)record[1])))
             return 1;
         if (record[0] <= fp)
             break;

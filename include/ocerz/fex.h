@@ -24,6 +24,10 @@
  * ocerz's own code, and fails where they cannot be read, so the suspend tries
  * again.
  *
+ * ocerz_engine_pc_in_code, when set, says whether a host pc is in the engine's
+ * translated code on the calling thread, for the walks that look for a
+ * translated frame beneath a native call.
+ *
  * ocerz_engine_cpuid, when set, is the engine's CPUID, eax ebx ecx edx, which
  * the x86 hw.optional sysctls follow.
  *
@@ -53,6 +57,7 @@ extern int (*ocerz_engine_async)(void *uc);
 extern void (*ocerz_engine_invalidate)(uint64_t addr, uint64_t len);
 extern int (*ocerz_engine_gprs_at)(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
 extern void (*ocerz_engine_cpuid)(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+extern int (*ocerz_engine_pc_in_code)(const void *pc);
 
 int ocerz_fex_run(struct OcerzVM *vm, struct OcerzCPU *cpu);
 int ocerz_fex_fault(int sig, siginfo_t *si, void *uc);
@@ -60,6 +65,7 @@ int ocerz_fex_async(void *uc);
 void ocerz_fex_invalidate(uint64_t addr, uint64_t len);
 int ocerz_fex_gprs_at(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
 void ocerz_fex_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+int ocerz_fex_pc_in_code(const void *pc);
 
 #ifdef __cplusplus
 }
