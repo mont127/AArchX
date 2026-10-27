@@ -68,6 +68,10 @@ void ocerz_jit_thread_appears(struct OcerzVM *vm);
 void ocerz_jit_fork_appears(struct OcerzVM *vm);
 void ocerz_jit_note_inherit_share(void);
 void ocerz_jit_guest_suspends(struct OcerzVM *vm);
+/* Hardware TSO (src/cpu.c): the calling thread asks for it before running guest code, and a refusal while the process
+   relies on it makes ordered code order in software from here on (ocerz_jit_hwtso_lost) before the thread goes on. */
+void ocerz_jit_hwtso_thread(struct OcerzVM *vm);
+void ocerz_jit_hwtso_lost(struct OcerzVM *vm);
 /* OCERZ_SINGLE_RUNNER: this thread stops (a system call) and starts again running guest code; leave answers whether
    it was counted, and only then does the matching enter count it again. */
 int ocerz_jit_sr_leave(void);

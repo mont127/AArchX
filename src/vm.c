@@ -4209,6 +4209,7 @@ OcerzCPU *ocerz_thread_attach(OcerzVM *vm)
         return NULL;
     }
     ocerz_jit_thread_appears(vm);
+    ocerz_jit_hwtso_thread(vm);
     ocerz_cpu_register(cpu);
     pthread_mutex_lock(&g_cpus_lock);
     if (g_attach_stacks_n < OCERZ_ATTACH_MAX) {
@@ -4469,6 +4470,7 @@ static void vm_fatal_where(const OcerzCPU *cpu)
 static int vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_vm_run_cpu(OcerzVM *vm, OcerzCPU *cpu)
 {
+    ocerz_jit_hwtso_thread(vm);   /* before any guest code, interpreted too (src/cpu.c) */
     int counted = cpu != &vm->cpu && ocerz_jit_sr_thread_start();   /* main runs from ocerz_jit_create */
     int rc = vm_run_cpu(vm, cpu);
     if (counted)

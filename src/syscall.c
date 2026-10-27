@@ -1664,6 +1664,7 @@ static void ocerz_fork_parent(void)
 
 static void ocerz_fork_child(void)
 {
+    ocerz_hwtso_postfork_child();
     ocerz_mem_pin_refresh();
     ocerz_mem_postfork();
     ocerz_jit_postfork();

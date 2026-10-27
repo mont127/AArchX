@@ -92,6 +92,23 @@
  * condition in JTF across the load, and an arm that borrowed JTF made a cmov
  * from a straddling address take the wrong side.
  *
+ * With hardware TSO (ocerz_hwtso_on, src/cpu.c) the processor keeps the order
+ * for every thread that runs translated code, so an ordered translation's loads
+ * and stores, scalar and vector, are the plain forms (mem_plain_access_ok and
+ * the helpers that ask it, hw_tso_ordered).  Its atomics are not: the plain
+ * model is not "plain loads and stores" but "one observer", and it makes a
+ * lock-prefixed instruction, xchg, cmpxchg, cmpxchg8b/16b and bts to memory a
+ * load, an operation and a store, which the order alone does not make atomic.
+ * Those still test !g_plain_mem and stay LSE atomics with acquire and release,
+ * which also gives a locked instruction its full barrier, and so does mfence's
+ * dmb.  A process therefore still retires its plain blocks when a second
+ * observer appears; what it retires them to costs about what they did.  Such a
+ * block is no use to a thread without the order, so its translation-cache key
+ * says it was made for it (tc_key), and a thread that is refused the order
+ * while the process has it retires every ordered block before it runs one
+ * (ocerz_jit_hwtso_lost); the threads that have the order may finish the block
+ * they are in.
+ *
  * ---- flags ----
  * Flags are deferred: an instruction records {kind, size, dst, src} and the
  * flags are materialized only if something reads them.  On top of that sit
@@ -1209,6 +1226,8 @@ static int g_no_addincfuse;
 static int g_no_fault_recipes;
 
 static int g_plain_mem;
+/* the ordered model's loads and stores are ordered by the processor (hardware TSO, see "memory ordering") */
+static inline int hw_tso_ordered(void) { return !g_plain_mem && __atomic_load_n(&ocerz_hwtso_on, __ATOMIC_RELAXED); }
 
 static uint64_t g_chain_target;
 static uint32_t *g_chain_epi;
@@ -1826,6 +1845,7 @@ static int vec_tso_relaxed(void)
 static int g_vec_int_move;
 static int vec_plain_size(int size)
 {
+    if (hw_tso_ordered()) return 1;
     static int mode = -1;
     if (mode < 0) mode = getenv("OCERZ_TSO_NARROW") ? atoi(getenv("OCERZ_TSO_NARROW")) : 0;
     if (!vec_tso_relaxed() || size > 8 || mode == 0) return vec_tso_relaxed();
@@ -1858,12 +1878,12 @@ static void al_mark(uint64_t key)
     }
     g_al_all = 1;
 }
-static inline int stack_plain_access_ok(void) { return g_plain_mem || stack_plain_ok(); }
+static inline int stack_plain_access_ok(void) { return g_plain_mem || hw_tso_ordered() || stack_plain_ok(); }
 /* The source of the load being emitted when dep_plain_mark let it be plain. */
 static const X86Operand *g_dep_plain_op;
 static inline int mem_plain_access_ok(const X86Operand *m)
 {
-    if (g_plain_mem) return 1;
+    if (g_plain_mem || hw_tso_ordered()) return 1;
     if (m && m == g_dep_plain_op) return 1;
     return stack_plain_ok() && m->base == OCERZ_RSP && !m->riprel;
 }
@@ -2204,6 +2224,7 @@ static __attribute__((noinline, cold, preserve_most)) void jit_perfstat_one(cons
 
 typedef struct JitThr {
     int frames, parked, dead;
+    int tso_checked;            /* this thread asked for hardware TSO (ocerz_jit_hwtso_thread); its own field */
     uint64_t sr_gen;            /* the single-runner generation this thread last synced to */
     OcerzCPU *cpu;
     struct JitThr *next;
@@ -2239,8 +2260,10 @@ static JitThr *jit_thr(void)
         return t;
     for (t = __atomic_load_n(&g_jit_thr, __ATOMIC_ACQUIRE); t; t = t->next) {
         int one = 1;
-        if (__atomic_compare_exchange_n(&t->dead, &one, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+        if (__atomic_compare_exchange_n(&t->dead, &one, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+            t->tso_checked = 0;   /* a dead thread's, taken over: this thread has not asked */
             break;
+        }
     }
     if (!t) {
         t = (JitThr *)calloc(1, sizeof *t);
@@ -5793,7 +5816,7 @@ static void emit_granule_cross_test(A64Buf *b, int size, int ra, int scratch)
 
 static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int scratch)
 {
-    if (g_plain_mem || g_ea_plain) {
+    if (g_plain_mem || g_ea_plain || hw_tso_ordered()) {
         a64_str(b, size, rv, ra, 0);
         return;
     }
@@ -5838,7 +5861,7 @@ static void emit_guest_store_ordered(A64Buf *b, int size, int rv, int ra, int sc
 
 static void emit_guest_load_ordered(A64Buf *b, int size, int rd, int ra, int scratch)
 {
-    if (g_plain_mem || g_ea_plain) {
+    if (g_plain_mem || g_ea_plain || hw_tso_ordered()) {
         a64_ldr(b, size, rd, ra, 0);
         return;
     }
@@ -22453,7 +22476,7 @@ static void dep_plain_mark(const X86Insn *insns, int n)
     if (off < 0) off = getenv("OCERZ_NO_DEP_PLAIN") ? 1 : 0;
     if (log < 0) log = getenv("OCERZ_DEP_PLAIN_LOG") ? 1 : 0;
     for (int i = 0; i < n; i++) g_dep_plain[i] = 0;
-    if (off || g_plain_mem) return;
+    if (off || g_plain_mem || hw_tso_ordered()) return;
     for (int i = 0; i + 1 < n; i++) {
         int r = dep_load_dest(&insns[i]);
         if (r < 0) continue;
@@ -23637,13 +23660,30 @@ static uint64_t tc_mix(uint64_t h, uint64_t w)
     return h ^ (h >> 29);
 }
 
+/*
+ * An ordered block made for hardware TSO accesses memory plainly and is wrong
+ * for a process without the order, so its key differs from a software-ordered
+ * one's: OCERZ_TC_KEY_HWTSO above an address, or the hash mixed once more for
+ * a disk image's block, whose key has no bit to spare.  A process keeps
+ * finding and loading only the model it runs, however the two shared a store.
+ */
+#define TC_HWTSO_SALT 0x48775453784f5244ull
 static uint64_t tc_key(uint64_t rip, int mode32)
 {
-    uint64_t k = g_tc_img_hi ? OCERZ_TC_KEY_IMAGE | (tc_mix(g_tc_img_id, rip - g_tc_img_lo) & (OCERZ_TC_KEY_IMAGE - 1))
-                             : rip;
     /* under the single runner the bit is the mode, of which a rip's memory model follows (memfn) */
     int plain = g_sr ? t_sr_kbit != 0 : g_plain_mem;
+    int hw = hw_tso_ordered();
+    uint64_t k = rip | (hw ? OCERZ_TC_KEY_HWTSO : 0);
+    if (g_tc_img_hi) {
+        uint64_t h = tc_mix(g_tc_img_id, rip - g_tc_img_lo);
+        k = OCERZ_TC_KEY_IMAGE | ((hw ? tc_mix(h, TC_HWTSO_SALT) : h) & (OCERZ_TC_KEY_IMAGE - 1));
+    }
     return k | (mode32 ? OCERZ_TC_KEY_M32 : 0) | (plain ? OCERZ_TC_KEY_PLAIN : 0);
+}
+/* the address of an address-keyed record's block */
+static inline uint64_t tc_key_rip(uint64_t key)
+{
+    return key & ~(OCERZ_TC_KEY_PLAIN | (key & OCERZ_TC_KEY_IMAGE ? 0 : OCERZ_TC_KEY_HWTSO));
 }
 
 static uint64_t tc_hash_range(uint64_t h, uint64_t lo, const uint8_t *p, uint64_t n)
@@ -24316,7 +24356,7 @@ static void *tc_prep(const OcerzTcRecHead *h, uint64_t key)
     TcPrep *p = (TcPrep *)malloc(sizeof *p);
     if (!p)
         return NULL;
-    if (!tc_parse(h, &p->v) || !(p->blk = tc_build_blk(&p->v, key & ~OCERZ_TC_KEY_PLAIN, 0))) {
+    if (!tc_parse(h, &p->v) || !(p->blk = tc_build_blk(&p->v, tc_key_rip(key), 0))) {
         free(p);
         return NULL;
     }
@@ -24662,7 +24702,7 @@ static int tc_ahead_one(OcerzJit *jit, OcerzTcRecHead *rec, uint64_t key, void *
     if (g_tcb_n == TC_BATCH_MAX)
         tc_batch_end(jit);
     int img = (key & OCERZ_TC_KEY_IMAGE) != 0;
-    uint64_t rip = img ? tc_image_rec_rip(rec, (const TcPrep *)prep) : key & ~OCERZ_TC_KEY_PLAIN;
+    uint64_t rip = img ? tc_image_rec_rip(rec, (const TcPrep *)prep) : tc_key_rip(key);
     uint64_t jk = jit_key(rip, 0);
     int got = 0;
     int ok = !(key & OCERZ_TC_KEY_M32) && rip && !cache_lookup(jit, rip, 0) && !tcb_find(jk) &&
@@ -27944,8 +27984,9 @@ OcerzJit *ocerz_jit_create(struct OcerzVM *vm)
     jit->vm = vm;
     jit->plain_mem = !vm->jit_ordered_required &&
         (vm->jit_plain_mem || getenv("OCERZ_PLAIN_MEM") != NULL);
+    /* under hardware TSO the ordered translations cost what plain ones do, and the single runner has nothing to win */
     if (jit->plain_mem && ocerz_mode == OCERZ_MODE_CACHE && !ocerz_low_base && !m32_active &&
-        ENV_ON("OCERZ_SINGLE_RUNNER")) {
+        ENV_ON("OCERZ_SINGLE_RUNNER") && !__atomic_load_n(&ocerz_hwtso_on, __ATOMIC_ACQUIRE)) {
         g_sr = 1;
         g_sr_vm = vm;
         g_sr_runners = 1;
@@ -29344,6 +29385,43 @@ void ocerz_jit_guest_suspends(struct OcerzVM *vm)
     if (g_sr && vm && vm->jit && !g_sr_sticky)
         ocerz_jit_require_ordered(vm);
 }
+/*
+ * Hardware TSO for the calling thread (src/cpu.c), asked once before it runs
+ * guest code: from the run loop, ocerz_thread_attach and, for anything that
+ * reaches translated code another way, the dispatcher.  A refusal while the
+ * process relies on the order gives it up: every ordered block, made for the
+ * order, is retired, under the JIT lock and before the flag drops, so no
+ * translation made after sees it set and a thread that reads it clear finds
+ * none of those blocks left to run; the refused thread runs nothing before.
+ * Threads that have the order may finish the block they are in.  A process
+ * still in the plain model keeps its blocks, which are the same either way.
+ * For good: a process never gets the order back.
+ */
+void ocerz_jit_hwtso_thread(struct OcerzVM *vm)
+{
+    jit_thr()->tso_checked = 1;
+    if (!ocerz_hwtso_thread())
+        ocerz_jit_hwtso_lost(vm);
+}
+
+void ocerz_jit_hwtso_lost(struct OcerzVM *vm)
+{
+    jl_acquire(__LINE__);
+    OcerzJit *jit = vm ? vm->jit : NULL;
+    int was = __atomic_load_n(&ocerz_hwtso_on, __ATOMIC_ACQUIRE);
+    if (was) {
+        if (jit && !jit->plain_mem)
+            invalidate_all_locked(jit);
+        ocerz_hwtso_off();
+    }
+    jl_release();
+    if (!was)
+        return;
+    if (vm)
+        ocerz_vm_purge_jit_ras(vm);
+    OCERZ_LOG("hardware TSO: given up (a thread was refused it); ordered code orders in software from here\n");
+}
+
 void ocerz_jit_fork_appears(struct OcerzVM *vm)
 {
     if (g_sr && vm && vm->jit && !__atomic_load_n(&g_sr_inherit_share, __ATOMIC_SEQ_CST))
@@ -29505,7 +29583,8 @@ void ocerz_jit_prefault(struct OcerzVM *vm, size_t records)
  */
 void ocerz_jit_start_ordered(struct OcerzVM *vm)
 {
-    if (!vm || g_sr || ENV_ON("OCERZ_SINGLE_RUNNER"))   /* the single runner starts plain and keeps both */
+    /* the single runner starts plain and keeps both; under hardware TSO it does not run (ocerz_jit_create) */
+    if (!vm || g_sr || (ENV_ON("OCERZ_SINGLE_RUNNER") && !__atomic_load_n(&ocerz_hwtso_on, __ATOMIC_ACQUIRE)))
         return;
     vm->jit_plain_mem = 0;
     OcerzJit *jit = vm->jit;
@@ -29586,6 +29665,8 @@ void ocerz_jit_postfork_child(void)
         }
     __atomic_store_n(&g_flush_req, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_chain_ndefer, 0, __ATOMIC_RELAXED);
+    if (self)   /* it asked again for hardware TSO (ocerz_hwtso_postfork_child); its dispatcher acts on the answer */
+        self->tso_checked = 0;
     if (g_sr) {   /* the forking thread is the only one, in its system call */
         pthread_mutex_init(&g_sr_lock, NULL);
         pthread_mutex_init(&g_sr_nudge_lock, NULL);
@@ -30583,6 +30664,9 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
 
     if (__builtin_expect(__atomic_load_n(&g_flush_req, __ATOMIC_SEQ_CST), 0))
         return OCERZ_EUNSUP;
+    JitThr *t = jit_thr();
+    if (__builtin_expect(!t->tso_checked, 0))
+        ocerz_jit_hwtso_thread(vm);
     if (__builtin_expect(g_sr, 0)) {
         if (!t_sr_counted)
             sr_uncounted();
@@ -30672,7 +30756,6 @@ int ocerz_jit_step(struct OcerzVM *vm, OcerzCPU *cpu)
             return OCERZ_STEP_FATAL;
         }
     }
-    JitThr *t = jit_thr();
     int base = __atomic_load_n(&t->frames, __ATOMIC_RELAXED);
     t->cpu = cpu;
     __atomic_store_n(&t->frames, base + 1, __ATOMIC_SEQ_CST);

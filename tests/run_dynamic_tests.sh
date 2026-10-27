@@ -1204,6 +1204,110 @@ run_sr_case() {
 }
 
 run_sr_case dsr_switch
+# hw_tso.c and hardware TSO (src/cpu.c; src/jit.c, "memory ordering").  -v
+# names the decision once, and a multithreaded run still goes ordered and keeps
+# x86's order whatever it was: without the entitlement the kernel refuses
+# thread_set_x86_64_compat (kr=5 on macOS 27) and software keeps it.
+# OCERZ_NO_HW_TSO=1 never asks.  Under the unsafe OCERZ_PRETEND_HW_TSO ordered
+# code loads and stores plainly and only its atomics must still hold
+# ("atomic"); with OCERZ_PRETEND_HW_TSO_REFUSE=2 the first new thread is
+# refused, the process gives the order up, and all of it must hold again, here
+# and in native mode.  Then three launches against one store, the knobs being
+# outside its fingerprint: a pretending one writes ordered records keyed for the
+# order (OCERZ_TC_KEY_HWTSO in the shared cache's), one that never asks shares
+# the store but must look none of them up, and one refused mid-run may look
+# them up only before it is refused; both litmus runs must find nothing.
+hwtso_result() {
+    if [ -z "$2" ]; then
+        echo "PASS $1"; pass=$((pass+1))
+    else
+        echo "FAIL $1 ($2)"; fail=$((fail+1))
+    fi
+}
+run_hwtso_case() {
+    local name="$1" dir="$TMP/$1" why n m
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -O1 -o "$dir/$name" tests/dynamic/hw_tso.c 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    OCERZ_ORDERLOG=1 run_bounded "$dir/def.out" "$dir/def.err" "$OCERZ" -v "$dir/$name"
+    why=""
+    n=$(grep -cE '^ocerz: hardware TSO: (on|off)' "$dir/def.err")
+    if [ "$(cat "$dir/def.out")" != OK ]; then
+        why="got out='$(cat "$dir/def.out")'"
+    elif [ "$n" != 1 ]; then
+        why="$n decision lines"
+    elif ! grep -qE '^ocerz: hardware TSO: (on$|off \(kr=[0-9-]+\)$|off \(.*(macOS|kernel))' "$dir/def.err"; then
+        why="decision: $(grep -E '^ocerz: hardware TSO' "$dir/def.err" | head -1)"
+    elif ! grep -q 'ORDERED memory required' "$dir/def.err"; then
+        why="its threads did not make it ordered"
+    fi
+    hwtso_result "$name-default" "$why"
+    OCERZ_NO_HW_TSO=1 run_bounded "$dir/no.out" "$dir/no.err" "$OCERZ" -v "$dir/$name"
+    why=""
+    if [ "$(cat "$dir/no.out")" != OK ]; then
+        why="got out='$(cat "$dir/no.out")'"
+    elif ! grep -q '^ocerz: hardware TSO: off (OCERZ_NO_HW_TSO)$' "$dir/no.err"; then
+        why="no 'off (OCERZ_NO_HW_TSO)' line"
+    fi
+    hwtso_result "$name-off" "$why"
+    OCERZ_PRETEND_HW_TSO=1 run_bounded "$dir/at.out" "$dir/at.err" "$OCERZ" -v "$dir/$name" atomic
+    why=""
+    if [ "$(cat "$dir/at.out")" != OK ]; then
+        why="the atomics broke: got out='$(cat "$dir/at.out")'"
+    elif ! grep -q '^ocerz: hardware TSO: on (pretended' "$dir/at.err"; then
+        why="not pretended"
+    fi
+    hwtso_result "$name-atomic" "$why"
+    for m in jit native; do
+        if [ $m = native ]; then
+            OCERZ_PRETEND_HW_TSO=1 OCERZ_PRETEND_HW_TSO_REFUSE=2 \
+                run_bounded "$dir/rf.out" "$dir/rf.err" "$OCERZ" -v -native "$dir/$name"
+        else
+            OCERZ_PRETEND_HW_TSO=1 OCERZ_PRETEND_HW_TSO_REFUSE=2 \
+                run_bounded "$dir/rf.out" "$dir/rf.err" "$OCERZ" -v "$dir/$name"
+        fi
+        why=""
+        if [ "$(cat "$dir/rf.out")" != OK ]; then
+            why="got out='$(cat "$dir/rf.out")'"
+        elif ! grep -q '^ocerz: hardware TSO: refused to thread' "$dir/rf.err"; then
+            why="no thread was refused"
+        elif ! grep -q '^ocerz: hardware TSO: given up' "$dir/rf.err"; then
+            why="the process kept the order"
+        fi
+        hwtso_result "$name-refused-$m" "$why"
+    done
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_MIN_FREE_MB=0 OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_TRACE=1 \
+        OCERZ_PRETEND_HW_TSO=1 run_bounded "$dir/t1.out" "$dir/t1.err" "$OCERZ" -v "$dir/$name" count
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_MIN_FREE_MB=0 OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_TRACE=1 \
+        OCERZ_NO_HW_TSO=1 run_bounded "$dir/t2.out" "$dir/t2.err" "$OCERZ" -v "$dir/$name" count
+    OCERZ_TCACHE=on OCERZ_TCACHE_DIR="$dir/store" OCERZ_TCACHE_MIN_FREE_MB=0 OCERZ_TCACHE_LOG=1 OCERZ_TCACHE_TRACE=1 \
+        OCERZ_PRETEND_HW_TSO=1 OCERZ_PRETEND_HW_TSO_REFUSE=2 \
+        run_bounded "$dir/t3.out" "$dir/t3.err" "$OCERZ" -v "$dir/$name" count
+    local salted='key=0x1[0-9a-f]{15} ' s1 s2 gave
+    s1=$(grep -h 'TCACHE.* store ' "$dir/t1.err" | sed 's/.* store //; s/ .*//')
+    s2=$(grep -h 'TCACHE.* store ' "$dir/t2.err" | sed 's/.* store //; s/ .*//')
+    gave=$(grep -n '^ocerz: hardware TSO: given up' "$dir/t3.err" | head -1 | cut -d: -f1)
+    why=""
+    if ! grep -qE "$salted" "$dir/t1.err"; then
+        why="the pretending launch keyed no record for the order"
+    elif [ -z "$s1" ] || [ "$s1" != "$s2" ]; then
+        why="the launches used different stores ('$s1', '$s2')"
+    elif [ "$(cat "$dir/t2.out")" != 0 ] || [ "$(cat "$dir/t3.out")" != 0 ]; then
+        why="forbidden outcomes: '$(cat "$dir/t2.out")' without the order, '$(cat "$dir/t3.out")' refused"
+    elif grep -qE "$salted" "$dir/t2.err"; then
+        why="a launch without the order looked up a record made for it"
+    elif ! grep -q ' HIT ' "$dir/t2.err"; then
+        why="the launch without the order loaded nothing from the shared store"
+    elif [ -z "$gave" ]; then
+        why="the refused launch kept the order"
+    elif tail -n +"$gave" "$dir/t3.err" | grep -qE "$salted"; then
+        why="the refused launch looked up a record made for the order after giving it up"
+    fi
+    hwtso_result "$name-tcache" "$why"
+}
+
+run_hwtso_case dhw_tso
 # src/syslink.c: an ocerz an import of which loads NULL (a macOS that moved it to another of libSystem's
 # libraries) executes ocerz-umbrella beside its real file, found through a symbolic link, with its arguments, and
 # with none there says so and exits 127; OCERZ_TEST_SYSLINK_FALLBACK=1 takes that path with every import there.

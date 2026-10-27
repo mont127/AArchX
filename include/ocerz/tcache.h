@@ -6,12 +6,13 @@
  * block again; src/tcache.c only stores records and finds them.  A record
  * starts with an OcerzTcRecHead whose key is the guest address with the
  * block's mode bits above it (OCERZ_TC_KEY_M32 for a 32-bit block,
- * OCERZ_TC_KEY_PLAIN for a block translated under the plain memory model;
- * for a block of a disk image, which moves from run to run, OCERZ_TC_KEY_IMAGE
- * and a hash of the image's identity and the block's offset in it stand in for
- * the address), whose size counts the whole record, head included, in a
- * multiple of eight bytes; sum is the store's, and a record handed to
- * ocerz_tcache_put may leave it zero.
+ * OCERZ_TC_KEY_PLAIN for a block translated under the plain memory model,
+ * OCERZ_TC_KEY_HWTSO for one translated ordered for hardware TSO; for a block
+ * of a disk image, which moves from run to run, OCERZ_TC_KEY_IMAGE and a hash
+ * of the image's identity and the block's offset in it stand in for the
+ * address, and hardware TSO is mixed into that hash instead), whose size counts
+ * the whole record, head included, in a multiple of eight bytes; sum is the
+ * store's, and a record handed to ocerz_tcache_put may leave it zero.
  *
  * ocerz_tcache_mode answers what OCERZ_TCACHE asks for: OCERZ_TC_ON, the
  * default, which loads and records; OCERZ_TC_OFF, for "off" or "0";
@@ -54,6 +55,7 @@ enum { OCERZ_TC_OFF = 0, OCERZ_TC_ROUNDTRIP, OCERZ_TC_ON, OCERZ_TC_VERIFY };
 #define OCERZ_TC_KEY_M32 (1ull << 63)
 #define OCERZ_TC_KEY_PLAIN (1ull << 62)
 #define OCERZ_TC_KEY_IMAGE (1ull << 61)
+#define OCERZ_TC_KEY_HWTSO (1ull << 60)
 #define OCERZ_TC_REC_MAGIC 0x32524354u
 #define OCERZ_TC_PROF_PLAIN (1ull << 62)
 #define OCERZ_TC_PROF_ORDERED (1ull << 61)

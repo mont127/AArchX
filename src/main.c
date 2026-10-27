@@ -13,10 +13,13 @@
  * The process also starts in the single-observer ("plain") memory model and
  * only retires it when a second observer actually appears - a thread, a
  * fork/spawn, a hostwq worker or a writable shared mapping - which the syscall
- * layer does through ocerz_jit_require_ordered().  OCERZ_NOJIT_EXE interprets
- * only the processes whose command line matches, and since the environment
- * inherits through Wine's exec chain that singles one process out for the
- * full-visibility interpreter while the rest stay on the JIT.
+ * layer does through ocerz_jit_require_ordered().  Whether the processor keeps
+ * the order for it (hardware TSO, src/cpu.c) is decided here as well, on the
+ * main thread and after OCERZ_EXE_ENV, so a per-program OCERZ_NO_HW_TSO counts.
+ * OCERZ_NOJIT_EXE interprets only the processes whose command line matches,
+ * and since the environment inherits through Wine's exec chain that singles
+ * one process out for the full-visibility interpreter while the rest stay on
+ * the JIT.
  * OCERZ_STRACE_EXE turns on the syscall trace the same way, for one process of
  * Wine's tree instead of all of them, and OCERZ_EXE_ENV sets variables the same
  * way: "cs2.exe:OCERZ_NO_SUPERBLOCK=1,OCERZ_TSO_STRICT=1;other.exe:..." gives
@@ -613,6 +616,7 @@ int main(int argc, char **argv)
         ocerz_vm_init(&avm);
         avm.jit_enabled = !nojit && getenv("OCERZ_NOJIT") == NULL;
         avm.jit_plain_mem = getenv("OCERZ_NO_PLAIN_MEM") ? 0 : 1;
+        ocerz_hwtso_enable();
         char selfpath[PATH_MAX];
         uint32_t sl = sizeof selfpath;
         return aot_main(&avm, argc - i, argv + i, aot == 2, _NSGetExecutablePath(selfpath, &sl) == 0 ? selfpath : argv[0]);
@@ -684,6 +688,7 @@ int main(int argc, char **argv)
         }
     }
 
+    ocerz_hwtso_enable();   /* after OCERZ_EXE_ENV, before any guest code (src/cpu.c) */
     int dynamic = ocerz_peek_dynamic(load_path);
     if (dynamic == -2) {
         if (m32_is_i386(load_path))

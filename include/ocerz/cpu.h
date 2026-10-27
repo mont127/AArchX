@@ -196,5 +196,15 @@ int ocerz_afp(void);
 uint64_t ocerz_afp_host(void);
 uint64_t ocerz_afp_guest(void);
 void ocerz_afp_restore(uint64_t fpcr);
+/* Hardware TSO (src/cpu.c).  ocerz_hwtso_on: every thread that runs guest code has the x86 memory order from the
+ * processor, so ordered translations need not keep it themselves; main decides it (ocerz_hwtso_enable) and only
+ * ocerz_hwtso_off, under the JIT lock, takes it back.  ocerz_hwtso_thread asks for the calling thread once and
+ * answers whether it may run translated code as things stand: 0 means the process relies on the order and this
+ * thread was refused it, and the caller must give the order up (ocerz_jit_hwtso_lost) before running anything. */
+extern int ocerz_hwtso_on;
+void ocerz_hwtso_enable(void);
+int ocerz_hwtso_thread(void);
+void ocerz_hwtso_off(void);
+void ocerz_hwtso_postfork_child(void);
 
 #endif

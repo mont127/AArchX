@@ -108,8 +108,43 @@ counts as shared memory only when another process can see it: a private one,
 like the buffers the system's logging library maps into nearly every program,
 leaves memory plain.
 
+Apple's processors can keep x86's order themselves, one thread at a time
+(`thread_set_x86_64_compat`). When every thread that runs x86 code gets it, the
+ordered forms are plain loads and stores again and only locked instructions
+stay atomic. macOS grants it only to a program holding the restricted
+`com.apple.developer.cross-architecture-support` entitlement, which needs a
+developer team's signature and a provisioning profile in an application bundle;
+without it the request is refused and ordering stays in translated code. `-v`
+prints `hardware TSO: on` or `hardware TSO: off (...)`. An unsigned or ad-hoc
+signed ocerz is refused (`off (kr=5)`) and runs exactly as before.
+
+To sign an ocerz that gets it, with a developer team whose provisioning profile
+grants `com.apple.developer.cross-architecture-support` (or the `-unmanaged`
+variant):
+
+1. Make a bundle: `AArchX.app/Contents/MacOS/ocerz`, `AArchX.app/Contents/Info.plist`
+   with `CFBundleExecutable` = `ocerz`, `CFBundlePackageType` = `APPL` and
+   `CFBundleIdentifier` = the App ID the profile is for, and the profile copied
+   to `AArchX.app/Contents/embedded.provisionprofile`.
+2. Write an entitlements file with the cross-architecture key the profile grants
+   (only that one: claiming an entitlement the profile does not grant gets the
+   program killed at launch), `com.apple.application-identifier` =
+   `TEAMID.bundle.id` and `com.apple.developer.team-identifier` = `TEAMID`.
+   `security cms -D -i profile.provisionprofile` shows what the profile grants.
+3. `codesign --force --sign "<identity>" --entitlements ocerz.entitlements AArchX.app`
+4. ocerz looks for `runtime/` next to its own executable. Run the bundled one
+   with `OCERZ_APIDB=<install>/runtime/apis`, or copy `runtime/` into
+   `Contents/MacOS/` before signing.
+5. Check: `AArchX.app/Contents/MacOS/ocerz -v <threaded program>` prints
+   `hardware TSO: on`; `tests/dynamic/hw_tso.c` built for x86_64 and run with
+   `count` prints 0; then run `make check` with that ocerz. The granted path has
+   never run on a signed build, and the same entitlement may change the
+   process's page size, which ocerz assumes to be 16 KB.
+
 | Variable | Effect |
 | --- | --- |
+| `OCERZ_NO_HW_TSO=1` | never ask for the processor's ordering |
+| `OCERZ_PRETEND_HW_TSO=1` | unsafe, for measuring only: act as if every thread had the processor's ordering; threaded programs can compute wrong results |
 | `OCERZ_NO_PLAIN_MEM=1` | use ordered forms from the start |
 | `OCERZ_NO_REMAP_PLAIN=1` | use ordered forms once any mapping the kernel hands the program has to be moved into guest memory, private or not, as before 2026-10-09 |
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |

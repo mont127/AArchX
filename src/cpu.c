@@ -26,6 +26,38 @@
  * fourteen nanoseconds, as much as the rest of the crossing.  OCERZ_NO_AFP=1
  * keeps the software path everywhere.
  *
+ * Hardware TSO is the same kind of switch for memory order.  Translated code
+ * that more than one thread runs keeps x86's total store order itself, with
+ * acquire loads and release stores (src/jit.c, "memory ordering"), at about
+ * 17% of 7-Zip's compression under Wine.  Apple's processors keep that order
+ * in hardware, and a translator turns it on one thread at a time with
+ * thread_set_x86_64_compat(1) (mach/mach_traps.h).  The kernel grants it only
+ * to a process holding com.apple.developer.cross-architecture-support or its
+ * -unmanaged twin and otherwise answers KERN_FAILURE and changes nothing.  Both are restricted entitlements:
+ * a binary signed ad hoc that claims either is killed at launch, so it takes
+ * an ocerz signed by a developer team as the main executable of an application
+ * bundle whose embedded provisioning profile grants the entitlement.  Nothing
+ * in this tree signs that way, and without it everything below answers "off".
+ * ocerz_hwtso_enable decides once, from main and on the main thread, as
+ * ocerz_afp_enable does: OCERZ_NO_HW_TSO=1 never asks, a kernel that says it
+ * has no cross-architecture support (os_cross_arch_is_supported) is not asked,
+ * and otherwise the main thread asks for itself and ocerz_hwtso_on records the
+ * answer.  Both calls are looked up by name, because an import a macOS lacks
+ * loads as NULL and sends the launch to ocerz-umbrella (src/syslink.c), which
+ * could not start on that macOS either.  Every other thread asks for itself,
+ * once, through ocerz_hwtso_thread before it runs guest code (the run loop,
+ * ocerz_thread_attach, and the dispatcher for whatever else gets there); one
+ * the kernel refuses while the process relies on the order makes it give the
+ * order up for good (ocerz_jit_hwtso_lost) before that thread runs anything.
+ * A forked child asks again for its one thread.  -v logs every answer.
+ * OCERZ_PRETEND_HW_TSO=1 grants every thread without asking the kernel.  It
+ * is UNSAFE and only for measuring what the order is worth on a Mac without
+ * the entitlement: translated code then counts on an order the processor does
+ * not keep, and a threaded program can compute wrong results.
+ * OCERZ_PRETEND_HW_TSO_REFUSE=<n> with it refuses the n-th thread to ask, the
+ * main thread being the first, which is how the tests reach the path of a
+ * thread refused while others run.
+ *
  * Reset installs Darwin's flat 64-bit user selectors, which is what `mov %ss, r`
  * reads out of reset.
  */
@@ -36,7 +68,12 @@
 #include "ocerz/mode.h"
 
 #include <arm_acle.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/sysctl.h>
 
 #define CPU_FPCR_AH 0x2ull
@@ -55,6 +92,81 @@ void ocerz_afp_enable(void)
 int ocerz_afp(void)
 {
     return g_afp;
+}
+
+int ocerz_hwtso_on;
+static int g_hwtso_decided, g_hwtso_pretend, g_hwtso_refuse_at, g_hwtso_asks;
+static kern_return_t (*g_hwtso_set)(uint32_t enable);
+static __thread int t_hwtso;   /* this thread asked: 1 granted, -1 refused */
+
+static kern_return_t hwtso_ask(void)
+{
+    int n = __atomic_add_fetch(&g_hwtso_asks, 1, __ATOMIC_RELAXED);
+    if (g_hwtso_pretend)
+        return n == g_hwtso_refuse_at ? KERN_FAILURE : KERN_SUCCESS;
+    return g_hwtso_set ? g_hwtso_set(1) : KERN_NOT_SUPPORTED;
+}
+
+void ocerz_hwtso_enable(void)
+{
+    if (g_hwtso_decided)
+        return;
+    g_hwtso_decided = 1;
+    const char *why = NULL;
+    const char *p = getenv("OCERZ_PRETEND_HW_TSO");
+    if (getenv("OCERZ_NO_HW_TSO")) {
+        why = "OCERZ_NO_HW_TSO";
+    } else if (p && *p && strcmp(p, "0") != 0) {
+        const char *r = getenv("OCERZ_PRETEND_HW_TSO_REFUSE");
+        g_hwtso_pretend = 1;
+        g_hwtso_refuse_at = r ? atoi(r) : 0;
+    } else {
+        bool (*supported)(uint32_t) = (bool (*)(uint32_t))dlsym(RTLD_DEFAULT, "os_cross_arch_is_supported");
+        g_hwtso_set = (kern_return_t (*)(uint32_t))dlsym(RTLD_DEFAULT, "thread_set_x86_64_compat");
+        if (!g_hwtso_set)
+            why = "this macOS has no thread_set_x86_64_compat";
+        else if (supported && !supported(1 /* OS_CROSS_ARCH_X86_64 */))
+            why = "the kernel has no cross-architecture support";
+    }
+    if (why) {
+        OCERZ_LOG("hardware TSO: off (%s)\n", why);
+        return;
+    }
+    kern_return_t kr = hwtso_ask();
+    t_hwtso = kr == KERN_SUCCESS ? 1 : -1;
+    __atomic_store_n(&ocerz_hwtso_on, kr == KERN_SUCCESS, __ATOMIC_RELEASE);
+    if (kr != KERN_SUCCESS)
+        OCERZ_LOG("hardware TSO: off (kr=%d)\n", (int)kr);
+    else
+        OCERZ_LOG("hardware TSO: on%s\n", g_hwtso_pretend ? " (pretended, OCERZ_PRETEND_HW_TSO: unsafe)" : "");
+}
+
+int ocerz_hwtso_thread(void)
+{
+    if (!__atomic_load_n(&ocerz_hwtso_on, __ATOMIC_ACQUIRE))
+        return 1;
+    if (!t_hwtso) {
+        kern_return_t kr = hwtso_ask();
+        t_hwtso = kr == KERN_SUCCESS ? 1 : -1;
+        if (kr != KERN_SUCCESS) {
+            uint64_t tid = 0;
+            pthread_threadid_np(NULL, &tid);
+            OCERZ_LOG("hardware TSO: refused to thread %#llx (kr=%d)\n", (unsigned long long)tid, (int)kr);
+        }
+    }
+    return t_hwtso > 0;
+}
+
+void ocerz_hwtso_off(void)
+{
+    __atomic_store_n(&ocerz_hwtso_on, 0, __ATOMIC_RELEASE);
+}
+
+/* the forking thread is the child's only one: it asks again, in case the kernel did not carry the mode across */
+void ocerz_hwtso_postfork_child(void)
+{
+    t_hwtso = 0;
+    (void)ocerz_hwtso_thread();
 }
 
 /* Host code run with FPCR.AH set computes differently: AppKit's TextKit upgrade of an archived NSTextView faulted in

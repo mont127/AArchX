@@ -10,9 +10,10 @@
  * it came from: this ocerz binary's LC_UUID, the memory mode and the host
  * bases it maps the guest at, the machine model, and every OCERZ_ variable in
  * the environment apart from the few that only steer logging, the loader or
- * this cache.  A different build or a different knob therefore opens a
- * different directory, and nothing inside one directory needs a version check
- * of its own.  Opening a store touches its directory.  Directories of other
+ * this cache, and the hardware TSO ones (src/cpu.c), whose memory model a
+ * record's key carries already (src/jit.c, tc_key).  A different build or a
+ * different knob therefore opens a different directory, and nothing inside one
+ * directory needs a version check of its own.  Opening a store touches its directory.  Directories of other
  * fingerprints are removed once they have not been touched for a day, and the
  * least recently touched go sooner while they hold more than 2 GB together, so
  * rebuilding ocerz does not pile up stores; one touched within the last hour
@@ -305,6 +306,7 @@ static int env_ignored(const char *kv)
         "OCERZ_NO_TCACHE_BATCH=", "OCERZ_NO_TCACHE_ORDSTART=", "OCERZ_NO_TCACHE_PREP=", "OCERZ_NO_TCACHE_KEYS=", "OCERZ_NO_JIT_PREFAULT=", "OCERZ_NO_LAZY_PREFAULT=", "OCERZ_NO_TCACHE_PRISTINE=", "OCERZ_SR_LOG=", "OCERZ_SR_VERIFY=", "OCERZ_SR_HOLD_US=", "OCERZ_NO_MAP_FILES=",
         "OCERZ_NO_CACHE_HOLDER=", "OCERZ_CACHE_HOLDER_IDLE=", "OCERZ_CACHE_HOLDER_DIR=",
         "OCERZ_NO_TCACHE_INSTALLER=", "OCERZ_TCACHE_INSTALLER_MIN=",
+        "OCERZ_NO_HW_TSO=", "OCERZ_PRETEND_HW_TSO=", "OCERZ_PRETEND_HW_TSO_REFUSE=",
     };
     for (size_t i = 0; i < sizeof skip / sizeof skip[0]; i++)
         if (!strncmp(kv, skip[i], strlen(skip[i])))
