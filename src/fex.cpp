@@ -37,6 +37,14 @@
  * is under ocerz's interpreter.  FEXCore raises no divide error: arm64's divide
  * answers 0 for a zero divisor.
  *
+ * A thread looping in translated code, with no system call to notice anything
+ * at, is stopped through its interrupt page: every compiled block FEXCore emits
+ * on macOS stores to that page first and records its guest rip
+ * (tools/fex-macos.patch), so protecting the page stops the thread at a block's
+ * start, the one place its registers and rip are known to agree.  FEXCore can
+ * name only a block's start for a pc inside it, so stopping it anywhere else
+ * would run the block's first instructions twice.
+ *
  * ocerz answers some addresses itself that hold no code a host could map: the
  * dyld API's trap slots and the sentinel a call from ocerz returns to, both
  * below 4 GB, where macOS gives an arm64 process no memory.  Each is a FEXCore
@@ -315,9 +323,10 @@ const FEXCore::SignalDelegatorConfig &g_signals_config();
 }
 
 /* The guest registers FEXCore held in host registers when translated code faulted, put in its state. */
-void spill_host_regs(FexThread *ft, ucontext_t *uc)
+void spill_host_regs(FexThread *ft, ucontext_t *uc, mcontext_t mc = nullptr)
 {
-    auto *mc = uc->uc_mcontext;
+    if (!mc)
+        mc = uc->uc_mcontext;
     auto &S = ft->thread->CurrentFrame->State;
     const auto &cfg = g_signals_config();
     S.rip = g_ctx->RestoreRIPFromHostPC(ft->thread, mc->__ss.__pc);
@@ -584,6 +593,28 @@ extern "C" int ocerz_fex_run(OcerzVM *vm, OcerzCPU *cpu)
     return ft->step;
 }
 
+/* A store to the protected interrupt page.  At a check in translated code the thread is at a block's start, so it
+ * leaves there if it still must; anywhere else (the dispatcher stores to the page too) the store is stepped over and
+ * the page stays protected for the next check. */
+static int interrupt_stop(FexThread *ft, mcontext_t mc)
+{
+    if (!g_ctx->IsAddressInCodeBuffer(ft->thread, (uintptr_t)mc->__ss.__pc)) {
+        mc->__ss.__pc += 4;
+        return 1;
+    }
+    mprotect(ft->thread->InterruptFaultPage, sizeof ft->thread->InterruptFaultPage, PROT_READ | PROT_WRITE);
+    if (ft->leave || ft->thread->CurrentFrame->InSyscallInfo != 0 || !must_leave(ft, OCERZ_STEP_OK))
+        return 1;
+    spill_host_regs(ft, (ucontext_t *)nullptr, mc);
+    auto &S = ft->thread->CurrentFrame->State;
+    ft->leave = true;
+    ft->step = OCERZ_STEP_OK;
+    ft->resume_rip = S.rip;
+    S.rip = (uint64_t)&fex_exit_hlt;
+    mc->__ss.__pc = g_signals_config().AbsoluteLoopTopAddressFillSRA;
+    return 1;
+}
+
 /* In order: the call-return stack running past its guard pages, which happens when calls are left by something
  * other than their ret (a signal handler's sigreturn, a longjmp) and is answered as FEX's frontends answer it, by
  * putting the stack pointer, x25 in translated code, back to its starting place; a commpage read, a misaligned ordered access (x0..x28, fp, lr and sp lie in that order in the thread
@@ -597,10 +628,13 @@ extern "C" int ocerz_fex_fault(int sig, siginfo_t *si, void *uc)
         return 0;
     auto *mc = ((ucontext_t *)uc)->uc_mcontext;
     uintptr_t pc = (uintptr_t)mc->__ss.__pc;
-    if (!g_ctx->IsAddressInCodeBuffer(ft->thread, pc))
+    if (!g_ctx->IsAddressInCodeBuffer(ft->thread, pc) &&
+        (uint64_t)(uintptr_t)si->si_addr - (uint64_t)(uintptr_t)ft->thread->InterruptFaultPage >= sizeof ft->thread->InterruptFaultPage)
         return 0;
     const uint64_t a = (uint64_t)(uintptr_t)si->si_addr;
     const uint64_t esr = mc->__es.__esr, ec = (esr >> 26) & 0x3f;
+    if (a - (uint64_t)(uintptr_t)ft->thread->InterruptFaultPage < sizeof ft->thread->InterruptFaultPage)
+        return interrupt_stop(ft, mc);
     if (a - (uint64_t)(uintptr_t)ft->callret < CALLRET_SIZE + 2 * CALLRET_GUARD) {
         mc->__ss.__x[25] = (uint64_t)(uintptr_t)ft->thread->CallRetStackBase + CALLRET_SIZE / 4;
         return 1;
@@ -627,24 +661,15 @@ extern "C" int ocerz_fex_fault(int sig, siginfo_t *si, void *uc)
     return 0;
 }
 
-/* Called from a signal handler: a thread that must leave (exit, end, a signal to take) and was interrupted in
- * translated code is sent to the loop top with its registers spilled and the guest aimed at fex_exit_hlt. */
+/* Called from a signal handler: a thread that must leave (exit, end, a signal to take) protects its interrupt page,
+ * so the next interrupt check in translated code - at every compiled block's start (tools/fex-macos.patch) - faults
+ * where its registers and rip agree, and ocerz_fex_fault stops it there. */
 extern "C" int ocerz_fex_async(void *uc)
 {
     FexThread *ft = t_cur;
-    if (!ft || !uc || ft->leave || ft->thread->CurrentFrame->InSyscallInfo != 0 || !must_leave(ft, OCERZ_STEP_OK))
+    if (!ft || ft->leave || !must_leave(ft, OCERZ_STEP_OK))
         return 0;
-    auto *mc = ((ucontext_t *)uc)->uc_mcontext;
-    if (!g_ctx->IsAddressInCodeBuffer(ft->thread, (uintptr_t)mc->__ss.__pc))
-        return 0;
-    spill_host_regs(ft, (ucontext_t *)uc);
-    auto &S = ft->thread->CurrentFrame->State;
-    ft->leave = true;
-    ft->step = OCERZ_STEP_OK;
-    ft->resume_rip = S.rip;
-    S.rip = (uint64_t)&fex_exit_hlt;
-    mc->__ss.__pc = g_signals_config().AbsoluteLoopTopAddressFillSRA;
-    return 1;
+    return mprotect(ft->thread->InterruptFaultPage, sizeof ft->thread->InterruptFaultPage, PROT_READ) == 0;
 }
 
 extern "C" void ocerz_fex_invalidate(uint64_t addr, uint64_t len)

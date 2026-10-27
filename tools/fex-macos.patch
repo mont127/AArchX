@@ -28,7 +28,7 @@ index 87a110c..ad91f93 100644
    // We ensure this by remapping a temporary buffer onto the PROT_NONE
    // placeholder page in CodeBuffer. Some constraints to keep in mind are:
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index 63280a4..58acb55 100644
+index 63280a4..b29763b 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -8,6 +8,7 @@ desc: Glues Frontend, OpDispatcher and IR Opts & Compilation, LookupCache, Dispa
@@ -39,7 +39,18 @@ index 63280a4..58acb55 100644
  #include <cstdint>
  #ifdef ZYDIS_DISASSEMBLER
  #include <Zydis/Zydis.h>
-@@ -862,6 +863,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+@@ -368,6 +369,10 @@ bool ContextImpl::InitCore() {
+     // If gdbserver is enabled then this needs to be enabled.
+     Config.NeedsPendingInterruptFaultCheck = true;
+   }
++#ifdef __APPLE__
++  // The macOS frontend stops a thread looping in translated code through the interrupt page.
++  Config.NeedsPendingInterruptFaultCheck = true;
++#endif
+ 
+   if constexpr (BLOCK_DEBUGGING) {
+     // If the developer wants to do any single-stepping points or watch points.
+@@ -862,6 +867,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
  
    auto Thread = Frame->Thread;
    FEXCORE_PROFILE_SCOPED("CompileBlock");
@@ -80,7 +91,7 @@ index 5c0e656..e7159d6 100644
      sincos(src, &sin, &cos);
  #endif
 diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
-index 2a7e575..2c4830d 100644
+index 2a7e575..0b9f0fb 100644
 --- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
 @@ -11,6 +11,7 @@ desc: Main glue logic of the arm64 splatter backend
@@ -124,7 +135,20 @@ index 2a7e575..2c4830d 100644
  
    const auto PrevNumAllocations = Relocations.size();
  
-@@ -1175,6 +1181,7 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
+@@ -983,6 +989,12 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+       PendingTargetLabel = nullptr;
+ 
+       BindOrRestart(Target);
++#ifdef __APPLE__
++      // Every block a branch can reach checks the interrupt page and knows its guest RIP, so a thread stopped there
++      // is at a guest instruction boundary with its registers whole: loops inside one compiled block stop too.
++      DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
++      EmitSuspendInterruptCheck();
++#endif
+     }
+ 
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+@@ -1175,6 +1187,7 @@ CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> H
    // we stored it aligned, better still be?
    LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
    auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());
@@ -157,6 +181,24 @@ index 998f46a..a89cf1b 100644
  #else
    // We always need to spill x8 since we can't know if it is live at this SSA location
    uint32_t SpillMask = 1U << 8;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 7e86e37..d95f7da 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3116,7 +3116,13 @@ void OpDispatchBuilder::SIDTOp(OpcodeArgs) {
+     IDTStoreSize = OpSize::i32Bit;
+   }
+ 
++#ifdef __APPLE__
++  // macOS's x86 libraries take their CPU number from the IDT limit (libdispatch indexes per-CPU heaps by it), so a
++  // limit of 0xfff sends them 4095 slots past their data; answer CPU 0, as ProcessorID does here.
++  _StoreMemGPRAutoTSO(OpSize::i16Bit, DestAddress, Constant(0));
++#else
+   _StoreMemGPRAutoTSO(OpSize::i16Bit, DestAddress, Constant(0xfff));
++#endif
+   _StoreMemGPRAutoTSO(IDTStoreSize, AddressMode {.Base = DestAddress, .Offset = 2, .AddrSize = OpSize::i64Bit}, Constant(IDTAddress));
+ }
+ 
 diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
 index eee5023..3709874 100644
 --- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
@@ -405,6 +447,35 @@ index 67fe0ca..2979d9d 100644
  #include <linux/magic.h>
  #include <sys/stat.h>
  #include <sys/vfs.h>
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index 42feabb..1415dd7 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -87,7 +87,11 @@ struct UnalignedExclusiveStore {
+   uint8_t Size;
+ };
+ 
++#ifdef __APPLE__
++struct alignas(16384) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
++#else
+ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
++#endif
+   FEXCore::Core::CpuStateFrame* const CurrentFrame = &BaseFrameState;
+ 
+   FEXCore::Context::Context* const CTX;
+@@ -122,7 +126,12 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   FEXCore::Core::CpuStateFrame BaseFrameState {};
+ 
+   // Can be reprotected as RO to trigger an interrupt at generated code block entrypoints
++#ifdef __APPLE__
++  // macOS's host pages are 16 KB, so the page that can be protected on its own is one of those.
++  alignas(16384) uint8_t InterruptFaultPage[16384];
++#else
+   alignas(FEXCore::Utils::FEX_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_PAGE_SIZE];
++#endif
+ };
+ static_assert(std::is_standard_layout_v<FEXCore::Core::InternalThreadState>);
+ // Maximum unsigned-offset store range for fault page.
 diff --git a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
 index c4cadf4..f5ff7cf 100644
 --- a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
