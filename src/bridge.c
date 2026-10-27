@@ -2078,13 +2078,16 @@ static const char *br_sqlite_db_config_args(int op, const char **callback)
     return "";
 }
 
-static int br_sqlite_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *name,
-                              const char *named_notation, int op_index,
-                              const char *(*classes_of)(int, const char **))
+/* A variadic function whose named argument op_index says what follows it: classes_of gives the classes, c for a
+   function that crosses as a native trampoline with the prototype it sets in *callback, or NULL for an op that does
+   not cross, which is refused with what refused says. */
+static int br_op_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *lib, const char *name,
+                          const char *named_notation, int op_index,
+                          const char *(*classes_of)(int, const char **), const char *refused)
 {
     void *fn = *cache;
     if (!fn) {
-        fn = ocerz_bridge_host_symbol(BR_SQLITE, name);
+        fn = ocerz_bridge_host_symbol(lib, name);
         if (!fn) {
             fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", name);
             exit(OCERZ_BRIDGE_UNIMPL_EXIT);
@@ -2101,8 +2104,7 @@ static int br_sqlite_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *
     const char *callback = NULL;
     const char *classes = classes_of(op, &callback);
     if (!classes) {
-        fprintf(stderr, "ocerz: bridge: %s _%s op %d installs a table of functions, which does not cross\n",
-                BR_SQLITE, name, op);
+        fprintf(stderr, "ocerz: bridge: %s _%s op %d %s, which does not cross\n", lib, name, op, refused);
         exit(OCERZ_BRIDGE_UNIMPL_EXIT);
     }
     uint64_t slots[4] = { 0 };
@@ -2124,7 +2126,7 @@ static int br_sqlite_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *
         slots[n++] = w;
     }
     struct OcerzBridgeFrame outer;
-    ocerz_bridge_raise(&outer, BR_SQLITE, name, named_notation, fn);
+    ocerz_bridge_raise(&outer, lib, name, named_notation, fn);
     ocerz_abi_call_native(fn, call.x, call.v, slots, 8 * (uint64_t)n, NULL, call.rx, call.rv);
     ocerz_bridge_lower(&outer);
     ocerz_abi_write_result(&named, cpu, &call);
@@ -2134,13 +2136,133 @@ static int br_sqlite_variadic(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *
 static int br_sqlite3_config(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static void *_Atomic fn;
-    return br_sqlite_variadic(vm, cpu, &fn, "sqlite3_config", "i(i)", 0, br_sqlite_config_args);
+    return br_op_variadic(vm, cpu, &fn, BR_SQLITE, "sqlite3_config", "i(i)", 0, br_sqlite_config_args,
+                          "installs a table of functions");
 }
 
 static int br_sqlite3_db_config(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static void *_Atomic fn;
-    return br_sqlite_variadic(vm, cpu, &fn, "sqlite3_db_config", "i(pi)", 1, br_sqlite_db_config_args);
+    return br_op_variadic(vm, cpu, &fn, BR_SQLITE, "sqlite3_db_config", "i(pi)", 1, br_sqlite_db_config_args,
+                          "installs a table of functions");
+}
+
+/* libcurl's setters take one argument after the option, and the option's number says its type by the range it is in
+   (curl.h, CURLOPTTYPE_*): a long below 10000; an object, string, list or callback-data pointer below 20000; a
+   function below 30000; a curl_off_t below 40000; a struct curl_blob pointer below 50000.  A function crosses as a
+   native trampoline with the prototype curl.h gives that option's callback; an option whose callback is not listed
+   here is refused.  curl_easy_getinfo's one argument is always a pointer to the answer.  Hearts of Iron IV's
+   libPDXSDK.dylib sets up its transfers with them. */
+#define BR_CURL "/usr/lib/libcurl.4.dylib"
+
+static const char *br_curl_easy_callback(int op)
+{
+    switch (op) {
+    case 20011: case 20012: case 20079: case 20196:  /* WRITE, READ, HEADER, INTERLEAVE: curl_write_callback */
+        return "L(pLLp)";
+    case 20056: return "i(pdddd)";        /* PROGRESS: curl_progress_callback */
+    case 20094: return "i(pipLp)";        /* DEBUG: curl_debug_callback */
+    case 20108: return "i(ppp)";          /* SSL_CTX: curl_ssl_ctx_callback */
+    case 20130: return "i(pip)";          /* IOCTL: curl_ioctl_callback */
+    case 20148: return "i(pii)";          /* SOCKOPT: curl_sockopt_callback */
+    case 20163: return "i(pip)";          /* OPENSOCKET: curl_opensocket_callback */
+    case 20167: return "i(pli)";          /* SEEK: curl_seek_callback */
+    case 20184: return "i(pppip)";        /* SSH_KEY: curl_sshkeycallback */
+    case 20198: return "l(ppi)";          /* CHUNK_BGN: curl_chunk_bgn_callback */
+    case 20199: return "l(p)";            /* CHUNK_END: curl_chunk_end_callback */
+    case 20200: return "i(ppp)";          /* FNMATCH: curl_fnmatch_callback */
+    case 20208: return "i(pi)";           /* CLOSESOCKET: curl_closesocket_callback */
+    case 20219: return "i(pllll)";        /* XFERINFO: curl_xferinfo_callback */
+    case 20272: return "i(ppp)";          /* RESOLVER_START: curl_resolver_start_callback */
+    case 20283: return "i(pp)";           /* TRAILER: curl_trailer_callback */
+    case 20301: return "i(ppp)";          /* HSTSREAD: curl_hstsread_callback */
+    case 20303: return "i(pppp)";         /* HSTSWRITE: curl_hstswrite_callback */
+    case 20312: return "i(pppii)";        /* PREREQ: curl_prereq_callback */
+    case 20316: return "i(pipL)";         /* SSH_HOSTKEY: curl_sshhostkeycallback */
+    default: return NULL;
+    }
+}
+
+static const char *br_curl_multi_callback(int op)
+{
+    switch (op) {
+    case 20001: return "i(piipp)";        /* SOCKETFUNCTION: curl_socket_callback */
+    case 20004: return "i(plp)";          /* TIMERFUNCTION: curl_multi_timer_callback */
+    case 20014: return "i(ppLpp)";        /* PUSHFUNCTION: curl_push_callback */
+    default: return NULL;
+    }
+}
+
+static const char *br_curl_by_range(int op, const char **callback, const char *(*callback_of)(int))
+{
+    *callback = NULL;
+    if (op < 0)
+        return NULL;
+    if (op < 10000 || (op >= 30000 && op < 40000))
+        return "l";
+    if (op < 20000 || (op >= 40000 && op < 50000))
+        return "p";
+    if (op < 30000)
+        return (*callback = callback_of(op)) ? "c" : NULL;
+    return NULL;
+}
+
+static const char *br_curl_easy_args(int op, const char **callback)
+{
+    return br_curl_by_range(op, callback, br_curl_easy_callback);
+}
+
+static const char *br_curl_multi_args(int op, const char **callback)
+{
+    return br_curl_by_range(op, callback, br_curl_multi_callback);
+}
+
+static const char *br_curl_getinfo_args(int op, const char **callback)
+{
+    (void)op;
+    *callback = NULL;
+    return "p";
+}
+
+/* CURLSHOPT_SHARE and _UNSHARE take a curl_lock_data, _LOCKFUNC and _UNLOCKFUNC the lock functions, _USERDATA a
+   pointer. */
+static const char *br_curl_share_args(int op, const char **callback)
+{
+    *callback = NULL;
+    switch (op) {
+    case 1: case 2: return "i";
+    case 3: *callback = "v(piip)"; return "c";
+    case 4: *callback = "v(pip)"; return "c";
+    case 5: return "p";
+    default: return NULL;
+    }
+}
+
+static int br_curl_easy_setopt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_op_variadic(vm, cpu, &fn, BR_CURL, "curl_easy_setopt", "i(pi)", 1, br_curl_easy_args,
+                          "is not an option this bridge knows the argument of");
+}
+
+static int br_curl_easy_getinfo(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_op_variadic(vm, cpu, &fn, BR_CURL, "curl_easy_getinfo", "i(pi)", 1, br_curl_getinfo_args, "");
+}
+
+static int br_curl_multi_setopt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_op_variadic(vm, cpu, &fn, BR_CURL, "curl_multi_setopt", "i(pi)", 1, br_curl_multi_args,
+                          "is not an option this bridge knows the argument of");
+}
+
+static int br_curl_share_setopt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    return br_op_variadic(vm, cpu, &fn, BR_CURL, "curl_share_setopt", "i(pi)", 1, br_curl_share_args,
+                          "is not an option this bridge knows the argument of");
 }
 
 #define BR_COREGRAPHICS "/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics"
@@ -2963,6 +3085,10 @@ static const BrHandler g_br_handlers[] = {
     { "vt_decompression_session_create", br_vt_decompression_session_create },
     { "sqlite3_config", br_sqlite3_config },
     { "sqlite3_db_config", br_sqlite3_db_config },
+    { "curl_easy_setopt", br_curl_easy_setopt },
+    { "curl_easy_getinfo", br_curl_easy_getinfo },
+    { "curl_multi_setopt", br_curl_multi_setopt },
+    { "curl_share_setopt", br_curl_share_setopt },
     { "cm_block_buffer_create_with_memory_block", br_cm_block_buffer_create_with_memory_block },
     { "cm_block_buffer_append_memory_block", br_cm_block_buffer_append_memory_block },
     { "cm_block_buffer_create_contiguous", br_cm_block_buffer_create_contiguous },

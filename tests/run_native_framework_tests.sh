@@ -47,6 +47,7 @@ for arch in x86_64 arm64; do
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_videotoolbox.c -framework CoreMedia \
         -framework CoreVideo -framework VideoToolbox -framework CoreFoundation -o "$work/videotoolbox.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_sqlite.c -lsqlite3 -o "$work/sqlite.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_curl.c -lcurl -o "$work/curl.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror -fno-objc-arc tests/dynamic/native_metal_events.m \
         -framework Foundation -framework Metal -o "$work/metal_events.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_wine_imports.c \
@@ -96,6 +97,7 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/audio.arm64" > "$work/audio.expected"
 "$work/videotoolbox.arm64" > "$work/videotoolbox.expected"
 "$work/sqlite.arm64" > "$work/sqlite.expected"
+"$work/curl.arm64" > "$work/curl.expected"
 "$work/metal_events.arm64" > "$work/metal_events.expected"
 "$work/wine_imports.arm64" > "$work/wine_imports.expected"
 "$work/bundle_id.arm64" "$work/fw.arm64/OcerzProbe.framework/OcerzProbe" > "$work/bundle_id.expected"
@@ -170,6 +172,10 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/sqlite.x86_64" > "$work/sqlite.$engine.out" 2> "$work/sqlite.$engine.err"
     cmp "$work/sqlite.expected" "$work/sqlite.$engine.out"
     echo "PASS native sqlite3_config and sqlite3_db_config $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/curl.x86_64" > "$work/curl.$engine.out" 2> "$work/curl.$engine.err"
+    cmp "$work/curl.expected" "$work/curl.$engine.out"
+    echo "PASS native curl_easy_setopt, curl_easy_getinfo, curl_multi_setopt and curl_share_setopt $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/ldt.x86_64" > "$work/ldt.$engine.out" 2> "$work/ldt.$engine.err"
     cmp "$work/ldt.expected" "$work/ldt.$engine.out"

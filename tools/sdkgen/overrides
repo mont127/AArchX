@@ -1583,6 +1583,17 @@ library /usr/lib/libsqlite3.dylib
 special _sqlite3_config sqlite3_config
 special _sqlite3_db_config sqlite3_db_config
 
+# libcurl's setters are variadic too, with one argument whose type the option's
+# number says (curl.h, CURLOPTTYPE_*); curl_easy_getinfo's is always a pointer
+# to the answer.  Hearts of Iron IV's libPDXSDK.dylib uses them.
+
+library /usr/lib/libcurl.4.dylib
+
+special _curl_easy_setopt curl_easy_setopt
+special _curl_easy_getinfo curl_easy_getinfo
+special _curl_multi_setopt curl_multi_setopt
+special _curl_share_setopt curl_share_setopt
+
 # MTLSetShaderCachePath and MTLGetShaderCachePath are exported but in no
 # header.  DXMT's winemetal.so declares them (src/winemetal/unix/cache.c) as
 # taking and answering the shader cache directory as an NSString.
