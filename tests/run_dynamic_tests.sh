@@ -132,6 +132,35 @@ run_file_case() {
     done
 }
 
+# like run_file_case but a Swift source, for the Swift runtime and Swift
+# concurrency; skips cleanly if no x86_64 Swift toolchain is present.
+run_swift_file_case() {
+    local name="$1" src="$2" want_out="$3"
+    shift 3
+    if ! xcrun swiftc -target x86_64-apple-macos13 -O -o "$TMP/$name" "$src" "$@" 2>/dev/null; then
+        echo "SKIP $name (no x86_64 swift toolchain)"; return
+    fi
+
+    local mode got_out got_code out_file err_file
+    for mode in jit no-jit; do
+        out_file="$TMP/$name.$mode.out"
+        err_file="$TMP/$name.$mode.err"
+        if [ "$mode" = no-jit ]; then
+            run_bounded "$out_file" "$err_file" "$OCERZ" -no-jit "$TMP/$name"
+        else
+            run_bounded "$out_file" "$err_file" "$OCERZ" "$TMP/$name"
+        fi
+        got_code=$?
+        got_out=$(cat "$out_file")
+        if [ "$got_out" = "$want_out" ] && [ "$got_code" = 0 ]; then
+            echo "PASS $name-$mode (out='$got_out' exit=$got_code)"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$mode (got out='$got_out' exit=$got_code; want out='$want_out' exit=0)"
+            fail=$((fail+1))
+        fi
+    done
+}
+
 # like run_file_case but a C++ source, so the Itanium unwinder and libc++ are
 # exercised; skips cleanly if no x86_64 C++ toolchain is present.
 run_cpp_file_case() {
@@ -1295,6 +1324,7 @@ run_holder_case() {
 run_syslink_case
 run_holder_case
 run_file_case datomic_counter tests/dynamic/atomic_counter.c 'OK'
+run_swift_file_case dswift_task_sync tests/dynamic/swift_task_sync.swift 'sum 40425'
 run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 export OCERZ_TSO_NARROW=1
 run_file_case dtso_narrow tests/dynamic/tso_narrow.c 'OK'

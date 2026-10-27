@@ -1452,6 +1452,9 @@ void ocerz_unstick_start(void);
 
 #define OCERZ_WQ_FLAG_OVERCOMMIT 0x10000ull
 #define OCERZ_PTHREAD_PRIORITY_OVERCOMMIT 0x80000000ull
+/* A request for, or a thread of, libdispatch's cooperative pool: Swift concurrency's global executor runs there. */
+#define OCERZ_PTHREAD_PRIORITY_COOPERATIVE 0x08000000ull
+#define OCERZ_WQ_FLAG_COOPERATIVE 0x01000000ull
 
 static void wl_dqdump(const char *tag, uint64_t id, unsigned cpun, unsigned kp)
 {
@@ -2430,6 +2433,10 @@ extern uint32_t ocerz_peek_pending_async_sig(void);
 static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
 {
     uint64_t op = a[0];
+    if (OCERZ_ENV_ON("OCERZ_WQLOG"))
+        fprintf(stderr, "WQ cpu#%u op=%#llx a1=%#llx a2=%#llx a3=%#llx hostwq=%d\n", cpu->cpu_number,
+                (unsigned long long)op, (unsigned long long)a[1], (unsigned long long)a[2],
+                (unsigned long long)a[3], ocerz_hostwq_on());
     if (op == 0x4) {
         cpu->wq_returned = 1;
         cpu->terminated = 1;
@@ -2496,7 +2503,10 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
         ret_ok(cpu, 0);
         return OCERZ_STEP_OK;
     }
-    if (op == 0x20) {
+    /* 0x20 asks for threads; 0x30 (REQTHREADS2) is how libdispatch asks for cooperative ones, and dropping it left
+     * every Swift task unrun: Hearts of Iron IV's main thread waited forever in NSSpeechSynthesizer's init for one
+     * that AXCoreUtilities runs synchronously. */
+    if (op == 0x20 || op == 0x30) {
 
         if (ocerz_hostwq_on()) {
             ocerz_hostwq_register(vm);
@@ -2552,7 +2562,8 @@ static int sys_workq_kernreturn(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
             t.gpr[OCERZ_RCX] = 0;
             t.gpr[OCERZ_R8] = 0x40000ull | 0x200000ull | 0x4000ull | (uint64_t)qos_idx
                             | ((prio & OCERZ_PTHREAD_PRIORITY_OVERCOMMIT)
-                               ? OCERZ_WQ_FLAG_OVERCOMMIT : 0);
+                               ? OCERZ_WQ_FLAG_OVERCOMMIT : 0)
+                            | ((prio & OCERZ_PTHREAD_PRIORITY_COOPERATIVE) ? OCERZ_WQ_FLAG_COOPERATIVE : 0);
             t.gpr[OCERZ_R9] = 0;
             t.gs_base = pth + 0xe0;
             t.sig_altstack_sp = 0;
@@ -3731,7 +3742,10 @@ static void ocerz_hostwq_queue_cb(ocerz_pthread_priority_t pri)
     t.gpr[OCERZ_R8] = OCERZ_WQ_FLAG_BASE | (uint64_t)qos_idx
                     | (registered ? OCERZ_WQ_FLAG_REUSE : 0)
                     | (((uint64_t)pri & OCERZ_PTHREAD_PRIORITY_OVERCOMMIT)
-                       ? OCERZ_WQ_FLAG_OVERCOMMIT : 0);
+                       ? OCERZ_WQ_FLAG_OVERCOMMIT : 0)
+                    | (((uint64_t)pri & OCERZ_PTHREAD_PRIORITY_COOPERATIVE) ? OCERZ_WQ_FLAG_COOPERATIVE : 0);
+    if (OCERZ_ENV_ON("OCERZ_WQLOG"))
+        fprintf(stderr, "WQCB pri=%#llx r8=%#llx\n", (unsigned long long)pri, (unsigned long long)t.gpr[OCERZ_R8]);
     t.gpr[OCERZ_R9] = 0;
     t.gs_base = pth + 0xe0;
     ocerz_init_gate_wait();
