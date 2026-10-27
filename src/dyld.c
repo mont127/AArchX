@@ -610,7 +610,9 @@ static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v;
  * slice, and of a universal file never touches the others.  libperl.dylib is 9 MB, both slices, and was read whole in
  * 1.4 ms of every perl launch; sqlite3's 6 MB executable was read three times, to peek at it, to name it and to run
  * it.  free_file gives back what read_file mapped and frees anything else; a file it cannot map, or the 1025th still
- * mapped, is read as before.
+ * mapped, is read as before.  The mapping is read-only and resilient to code signing: once anything has loaded a file
+ * with a broken signature (Rosetta running Hearts of Iron IV's libtbb.dylib), the kernel checks every page mapped
+ * from it, and touching a page that fails killed ocerz with "Code Signature Invalid".
  */
 #define RF_MAX 1024
 static struct { uint8_t *p; size_t n; } g_rf[RF_MAX];
@@ -629,7 +631,8 @@ static uint8_t *read_file(const char *path, size_t *len_out)
     }
     pthread_mutex_lock(&g_rf_lock);
     uint8_t *buf = g_rf_n < RF_MAX && !getenv("OCERZ_NO_MAP_FILES")
-                 ? (uint8_t *)mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) : (uint8_t *)MAP_FAILED;
+                 ? (uint8_t *)mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE | MAP_RESILIENT_CODESIGN, fd, 0)
+                 : (uint8_t *)MAP_FAILED;
     if (buf != (uint8_t *)MAP_FAILED) {
         g_rf[g_rf_n].p = buf;
         g_rf[g_rf_n].n = (size_t)sz;
@@ -3635,7 +3638,7 @@ static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64
                 uint64_t sa = (uint64_t)((int64_t)rd64(sec + 32) + slide), ssz = rd64(sec + 40);
                 if (ty == 0x16) {
                     for (uint64_t o = 0; o + 4 <= ssz; o += 4) {
-                        uint64_t fn = mh + rd32((const uint8_t *)(uintptr_t)(sa + o));
+                        uint64_t fn = mh + rd32((const uint8_t *)ocerz_g2h(sa + o));
                         if (getenv("OCERZ_INITLOG"))
                             fprintf(stderr, "INIT mh=%#llx fn=%#llx\n",
                                     (unsigned long long)mh, (unsigned long long)fn);
@@ -3645,7 +3648,7 @@ static void run_image_inits(OcerzVM *vm, uint64_t mh, const uint64_t *ia, uint64
                     }
                 } else if (ty == 0x09) {
                     for (uint64_t o = 0; o + 8 <= ssz; o += 8) {
-                        uint64_t fn = rd64((const uint8_t *)(uintptr_t)(sa + o));
+                        uint64_t fn = rd64((const uint8_t *)ocerz_g2h(sa + o));
                         if (fn) {
                             if (getenv("OCERZ_INITLOG"))
                                 fprintf(stderr, "INIT mh=%#llx fn=%#llx\n",
