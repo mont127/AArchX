@@ -1882,11 +1882,29 @@ static void al_mark(uint64_t key)
 static inline int stack_plain_access_ok(void) { return g_plain_mem || hw_tso_ordered() || stack_plain_ok(); }
 /* The source of the load being emitted when dep_plain_mark let it be plain. */
 static const X86Operand *g_dep_plain_op;
+/*
+ * Frame-pointer locals.  Code built with frame pointers, the macOS x86-64
+ * default, keeps rbp at its frame and addresses its locals as [rbp - N]: the
+ * thread's own stack, as an rsp-based access is, so ordered code leaves them
+ * plain on the same terms (stack_plain_ok).  Only a negative displacement
+ * without an index counts, which is how a local is addressed and seldom how a
+ * field is reached through a pointer kept in rbp.  Windows code under Wine
+ * uses rbp as an ordinary register often enough that a Wine process orders it.
+ * A tclsh loop in ordered mode: 505 -> 446 ms, of 403 with no ordering at all.
+ * OCERZ_NO_RBP_PLAIN=1 orders them everywhere.
+ */
+static inline int rbp_local(const X86Operand *m)
+{
+    static int on = -1;
+    if (on < 0) on = !getenv("OCERZ_NO_RBP_PLAIN") && !ocerz_wine_process;
+    return on && m->base == OCERZ_RBP && m->index == OCERZ_REG_NONE && m->disp < 0;
+}
+
 static inline int mem_plain_access_ok(const X86Operand *m)
 {
     if (g_plain_mem || hw_tso_ordered()) return 1;
     if (m && m == g_dep_plain_op) return 1;
-    return stack_plain_ok() && m->base == OCERZ_RSP && !m->riprel;
+    return stack_plain_ok() && (m->base == OCERZ_RSP || rbp_local(m)) && !m->riprel;
 }
 static inline int jgb_usable(void);
 static inline int mem_fast_forms_ok(void) { return jgb_usable() && !mem_guard_needed(); }
