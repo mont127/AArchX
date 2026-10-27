@@ -3,7 +3,7 @@
 ## Command line
 
 ```text
-usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--] program [args...]
+usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-fex] [-path file] [--] program [args...]
        ocerz version
 ```
 
@@ -15,6 +15,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-path file] [--
 | `-no-jit` | interpret this process only, without translating |
 | `-native` | bind the guest against native arm64 frameworks instead of the x86 shared cache |
 | `-cache` | bind the guest against Apple's x86-64 shared cache; the default |
+| `-fex` | run the guest's code on FEXCore, FEX-Emu's translator, instead of AArchX's own (experimental, see [Modes](modes.md#fexcore--fex)) |
 | `-path file` | load `file`, and keep every following argument for the guest |
 | `--` | end of AArchX's own options |
 | `version` | print the name and version |

@@ -100,3 +100,61 @@ native mode there is one deliberate exception. A system tool that has an arm64
 slice of its own and is not a shell or another launcher runs as itself rather
 than under AArchX, since nothing about it needs translating;
 `OCERZ_NO_NATIVE_CHILDREN=1` turns that off.
+
+## FEXCore (-fex)
+
+`-fex` replaces the part of AArchX that translates x86-64 instructions with
+FEXCore, the translator library of [FEX-Emu](https://github.com/FEX-Emu/FEX).
+Everything around the processor stays AArchX's: loading the program, cache and
+native mode, guest memory, system calls, threads and signals. It works in
+either mode, and the programs a guest starts run on FEXCore too. 32-bit
+programs (m32) keep AArchX's own translator.
+
+```sh
+./ocerz -fex ./program
+./ocerz -fex -native ./program
+```
+
+It is experimental. It is there to compare the two translators and as a second
+opinion when AArchX's own one gets a program wrong; AArchX's translator is
+faster and stays the default. Under `-fex` the dynamic-linking suite passes 284
+of its 466 cases; most of the rest need the low-memory layout Wine uses, or test
+parts of AArchX's own translator such as the translation cache.
+
+| | AArchX's translator | `-fex` |
+| --- | --- | --- |
+| Hearts of Iron IV, start to main menu | 23 s | 73 s |
+| Copy loop (xbench `memcpy`) | 0.070 s | 0.453 s, 0.102 s with `FEX_TSOENABLED=0` |
+| x87 loop (xbench `x87`) | 0.072 s | 1.515 s, 0.027 s with `FEX_X87REDUCEDPRECISION=1` |
+
+Rosetta takes 16 s, 0.080 s and 0.956 s for the same three.
+
+What it needs and what it does not do yet:
+
+- macOS 14.4 or newer. On an older system `-fex` says so and stops; the same
+  ocerz still runs without it.
+- Wine, and any other program that needs memory below 4 GB, does not run:
+  FEXCore runs guest code at the addresses the guest uses, and macOS keeps the
+  low 4 GB from arm64 processes.
+- x87 arithmetic is computed in software at full 80-bit precision and can
+  round differently from Rosetta.
+- Features of AArchX's own translator, such as the translation cache, do not
+  apply.
+
+FEXCore's own settings are read from `FEX_<OPTION>` environment variables, as
+FEX-Emu reads them. Two that matter for speed:
+
+| Variable | Effect |
+| --- | --- |
+| `FEX_TSOENABLED=0` | drop x86's memory ordering: much faster memory access, but a threaded program can go wrong |
+| `FEX_X87REDUCEDPRECISION=1` | compute x87 at double precision: much faster, slightly different results |
+
+Release packages include `-fex` from 1.0, with the license notices of FEXCore
+and the libraries it links in `licenses/`. To build it from source:
+
+```sh
+tools/fex-build.sh ~/fex        # fetches FEX-Emu at a pinned revision, applies tools/fex-macos.patch, builds FEXCore
+make FEX=~/fex
+```
+
+A plain `make` builds ocerz without FEXCore; `-fex` then says so and stops.
