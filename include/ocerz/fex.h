@@ -35,6 +35,9 @@
  * translations for (ocerz_jit_invalidate_range): a write to a page of guest
  * code, an unmap, a protection change.
  *
+ * ocerz_engine_ldt, when set, hears every LDT entry ocerz sets, as the 8-byte
+ * descriptor, so the engine's segment loads find what i386_set_ldt put there.
+ *
  * FEXCore is linked only by `make FEX=<dir>` (OCERZ_HAVE_FEX); a plain build
  * has no -fex.  ocerz_fex_supported says whether this Mac can run it: FEXCore's
  * locks wait with os_sync_wait_on_address (macOS 14.4) and the memory it hands
@@ -58,6 +61,7 @@ extern int (*ocerz_engine_run)(struct OcerzVM *vm, struct OcerzCPU *cpu);
 extern int (*ocerz_engine_fault)(int sig, siginfo_t *si, void *uc);
 extern int (*ocerz_engine_async)(void *uc);
 extern void (*ocerz_engine_invalidate)(uint64_t addr, uint64_t len);
+extern void (*ocerz_engine_ldt)(uint32_t index, uint64_t desc);
 extern int (*ocerz_engine_gprs_at)(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
 extern void (*ocerz_engine_cpuid)(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 extern int (*ocerz_engine_pc_in_code)(const void *pc);
@@ -66,6 +70,7 @@ int ocerz_fex_run(struct OcerzVM *vm, struct OcerzCPU *cpu);
 int ocerz_fex_fault(int sig, siginfo_t *si, void *uc);
 int ocerz_fex_async(void *uc);
 void ocerz_fex_invalidate(uint64_t addr, uint64_t len);
+void ocerz_fex_ldt(uint32_t index, uint64_t desc);
 int ocerz_fex_gprs_at(struct OcerzCPU *cpu, const void *host_state, uint64_t out[16]);
 void ocerz_fex_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 int ocerz_fex_pc_in_code(const void *pc);

@@ -29,7 +29,7 @@
  * ---- leaving FEXCore ----
  * A system call runs inside FEXCore's callback and guest code goes on from where
  * it says.  When the call ends the guest's run (an exit, a thread's end, a
- * pending signal), the callback points the guest at fex_exit_hlt instead.  The
+ * pending signal), the callback points the guest at the exit HLT stub instead.  The
  * context runs with fault-free synchronous faults, so a HLT, an int3 or a ud2
  * reaches fex_sync_fault with the guest state spilled, and that jumps back to
  * the level's ocerz_fex_run, which hands the run loop its step code.  An int3
@@ -51,7 +51,7 @@
  * to arm64 frameworks is one more such slot.  Each is a FEXCore
  * thunk trampoline, which leaves the address in R11 and goes on at code ocerz
  * holds in its own memory, since FEXCore reads guest code through host
- * pointers: the sentinel goes to fex_exit_hlt, and a trap slot to fex_trap_insn,
+ * pointers: the sentinel goes to the exit HLT stub, and a trap slot to fex_trap_insn's copy,
  * FEXCore's thunk instruction, which calls fex_trap with the guest registers
  * spilled.  fex_trap runs ocerz_dyldapi_dispatch; that returns to the caller
  * itself, and the thunk instruction pops a return address of its own, so the
@@ -91,6 +91,8 @@
  */
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
+#include <FEXCore/Core/GuestAddressMap.h>
+#include <FEXCore/Core/HostTimer.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Core/SignalDelegator.h>
@@ -109,6 +111,8 @@
 #include <pthread.h>
 #include <vector>
 #include <sys/mman.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <sys/sysctl.h>
 #include <sys/ucontext.h>
 
@@ -120,6 +124,7 @@ extern "C" {
 #include "ocerz/flags.h"
 #include "ocerz/interp.h"
 #include "ocerz/mem.h"
+#include "ocerz/mode.h"
 #include "ocerz/syscall.h"
 #include "ocerz/vm.h"
 }
@@ -130,11 +135,16 @@ using FEXCore::X86State::REG_R11;
 
 constexpr uint16_t MACOS_USER_CS = 0x2b;
 constexpr uint16_t MACOS_USER_SS = 0x23;
+constexpr uint16_t MACOS_USER_CS32 = 0x1b;
 constexpr size_t CALLRET_GUARD = 16384;
 constexpr size_t CALLRET_SIZE = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+/* The thread's segment table follows the call-return stack's top guard, 64 KB, as far as a selector reaches:
+ * translated code reads it through FEXCore::GuestMap and FEXCore's frontend reads it directly, so the mapping lies
+ * where the two agree.  The LDT is the process's, g_ldt, filled by ocerz_fex_ldt. */
+constexpr size_t GDT_PAGE = 0x10000;
+constexpr size_t CALLRET_MAP = CALLRET_SIZE + 2 * CALLRET_GUARD + GDT_PAGE;
 constexpr int MAX_LEVELS = 128;
 
-const uint8_t fex_exit_hlt = 0xf4;
 
 struct TrapInsn {
     uint8_t op[2];
@@ -143,12 +153,20 @@ struct TrapInsn {
 const TrapInsn fex_trap_insn = {{0x0f, 0x3f}, {'o', 'c', 'e', 'r', 'z', ' ', 'd', 'y', 'l', 'd', ' ', 'a', 'p', 'i'}};
 const TrapInsn fex_bridge_insn = {{0x0f, 0x3f}, {'o', 'c', 'e', 'r', 'z', ' ', 'b', 'r', 'i', 'd', 'g', 'e'}};
 
+/* The code FEXCore is pointed at for ocerz's own purposes - the HLT that leaves translated code and the two thunk
+ * instructions - is copied into a guest page of its own rather than run from ocerz's image: FEXCore fetches guest
+ * code through FEXCore::GuestMap, and in a Wine process ocerz's image lies inside the guest's low window. */
+constexpr uint64_t STUB_HLT = 0, STUB_TRAP = 16, STUB_BRIDGE = 64;
+uint64_t g_stubs;
+inline uint64_t exit_hlt() { return g_stubs + STUB_HLT; }
+uint64_t *g_ldt;
+
 struct FexThread {
     uint64_t generation;
     OcerzVM *vm;
     OcerzCPU *cpu;
     FEXCore::Core::InternalThreadState *thread;
-    FEXCore::Core::CPUState::gdt_segment gdt[32];
+    FEXCore::Core::CPUState::gdt_segment *gdt;
     uint8_t *callret;
     jmp_buf out;
     uintptr_t frame;
@@ -176,7 +194,7 @@ void destroy_level(FexThread *ft)
         std::erase(g_all, ft);
     }
     g_ctx->DestroyThread(ft->thread);
-    munmap(ft->callret, CALLRET_SIZE + 2 * CALLRET_GUARD);
+    munmap(ft->callret, CALLRET_MAP);
     delete ft;
 }
 
@@ -264,6 +282,8 @@ bool must_leave(FexThread *ft, int r)
 }
 
 void fork_child_restart();
+void tsc_timer();
+uint8_t *map_untranslated(size_t len);
 
 /* After a call out of guest code (a system call, a bridged native call, which may have run callbacks of its own):
  * in a forked child the context is made anew, and a level of the old one does not go back into code this process
@@ -297,7 +317,7 @@ void fex_syscall(FEXCore::Core::CpuStateFrame *Frame)
         ft->leave = true;
         ft->step = r;
         ft->resume_rip = cpu->rip;
-        S.rip = (uint64_t)&fex_exit_hlt;
+        S.rip = exit_hlt();
     }
 }
 
@@ -315,10 +335,10 @@ void trap_dispatch(uint64_t slot)
         ft->leave = true;
         ft->step = r;
         ft->resume_rip = back;
-        back = (uint64_t)&fex_exit_hlt;
+        back = exit_hlt();
     }
     cpu->gpr[OCERZ_RSP] -= 8;
-    *(uint64_t *)cpu->gpr[OCERZ_RSP] = back;
+    ocerz_st(cpu->gpr[OCERZ_RSP], 8, back);
     from_cpu(ft);
 }
 
@@ -341,7 +361,7 @@ const FEXCore::SignalDelegatorConfig &g_signals_config();
     OcerzCPU *cpu = ft->cpu;
     const auto fault = Frame->SynchronousFaultData;
     auto &S = Frame->State;
-    if (S.rip == (uint64_t)&fex_exit_hlt) {
+    if (S.rip == exit_hlt()) {
         if (!ft->leave) {
             to_cpu(ft);
             ft->leave = true;
@@ -353,9 +373,50 @@ const FEXCore::SignalDelegatorConfig &g_signals_config();
     }
     to_cpu(ft);
     cpu->cur_rip = cpu->rip;
-    int delivered = 0;
-    if (fault.TrapNo == FEXCore::X86State::X86_TRAPNO_BP || fault.TrapNo == FEXCore::X86State::X86_TRAPNO_DB)
-        delivered = ocerz_signal_deliver(cpu, OCERZ_SIGTRAP, cpu->rip, 0, 0);
+    /* The faults FEXCore raises itself, as ocerz's interpreter and crash_handler deliver them: a fetch from memory
+     * that is not code (FEXCore's decoder stops there), ud2, a divide error.  FEXCore's signal numbers are the
+     * host's, its si_codes Linux's: SI_KERNEL (0x80), which a hlt or int n gets, has no macOS counterpart. */
+    int sig = fault.Signal, code = fault.si_code;
+    uint64_t addr = 0;
+    uint32_t err = fault.err_code;
+    switch (fault.TrapNo) {
+    case FEXCore::X86State::X86_TRAPNO_BP:
+    case FEXCore::X86State::X86_TRAPNO_DB:
+        sig = OCERZ_SIGTRAP;
+        addr = cpu->rip;
+        code = 0;
+        err = 0;
+        break;
+    case FEXCore::X86State::X86_TRAPNO_PF:
+        sig = SIGSEGV;
+        addr = cpu->rip;
+        code = ocerz_addr_committed(addr) == 1 ? SEGV_ACCERR : SEGV_MAPERR;
+        err = 0x14;
+        break;
+    case FEXCore::X86State::X86_TRAPNO_DE:
+        sig = OCERZ_SIGFPE;
+        addr = cpu->rip;
+        code = OCERZ_FPE_INTDIV;
+        break;
+    case FEXCore::X86State::X86_TRAPNO_UD:
+        if (ocerz_is_wqthread_exit(cpu->rip)) {
+            cpu->terminated = 1;
+            ft->leave = true;
+            ft->step = OCERZ_STEP_OK;
+            ft->resume_rip = cpu->rip;
+            from_cpu(ft);
+            _longjmp(ft->out, 1);
+        }
+        sig = SIGILL;
+        addr = cpu->rip;
+        code = ILL_ILLOPC;
+        break;
+    default:
+        if (code == 0x80)
+            code = 0;
+        break;
+    }
+    int delivered = sig ? ocerz_signal_deliver(cpu, sig, addr, code, err) : 0;
     if (!delivered)
         fprintf(stderr, "ocerz: guest fault: x86 trap %u, signal %u, at rip %#llx\n", (unsigned)fault.TrapNo,
                 (unsigned)fault.Signal, (unsigned long long)cpu->rip);
@@ -390,9 +451,22 @@ public:
     {
         fex_syscall(Frame);
     }
-    FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState *, uint64_t) override
+    /* Code FEXCore may read, a guest page at a time: a guest call through a null pointer (an import bound to
+     * nothing, as winedmo.so's ffmpeg ones are without ffmpeg) must give the guest a fault at that address, not a
+     * host one in the middle of FEXCore's compiler, which in a Wine process unwound out of a half-written block
+     * and faulted again in every later compile.  A free page, a guard or a page with neither read nor execute
+     * access is not code, nor is the low 4 GB outside a Wine process (ocerz's own page zero, where nothing of the
+     * guest's lies then); anything else ocerz does not map itself (the shared cache, lazily mapped) is taken to be. */
+    FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState *, uint64_t Address) override
     {
-        return {0, UINT64_MAX, true};
+        constexpr uint64_t page = 0x1000, host_pagezero_end = 0x100000000ull;
+        const uint64_t base = Address & ~(page - 1);
+        if (!FEXCore::GuestMap.Enabled && Address < host_pagezero_end)
+            return {base, 0, false};
+        const int mapped = ocerz_addr_mapped(Address), prot = ocerz_addr_prot(Address);
+        if (mapped == 0 || (mapped == 1 && (prot < 0 || !(prot & (PROT_READ | PROT_EXEC)))))
+            return {base, 0, false};
+        return {base, page, true};
     }
     std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState *,
                                                                                    uint64_t) override
@@ -456,7 +530,8 @@ FEXCore::HostFeatures host_features()
     hf.SupportsFRINTTS = feat("hw.optional.arm.FEAT_FRINTTS");
     hf.SupportsRPRES = feat("hw.optional.arm.FEAT_RPRES");
     hf.SupportsECV = feat("hw.optional.arm.FEAT_ECV");
-    hf.SupportsWFXT = feat("hw.optional.arm.FEAT_WFxT");
+    /* No WAITPKG: umwait and tpause deadlines are in TSC units, which tsc_timer makes nanoseconds. */
+    hf.SupportsWFXT = false;
     hf.SupportsI8MM = feat("hw.optional.arm.FEAT_I8MM");
     hf.SupportsDotProd = feat("hw.optional.arm.FEAT_DotProd");
     hf.SupportsBF16 = feat("hw.optional.arm.FEAT_BF16");
@@ -465,6 +540,15 @@ FEXCore::HostFeatures host_features()
     hf.SupportsAVX = true;
     hf.SupportsAES256 = hf.SupportsAES;
     hf.SupportsPreserveAllABI = true;
+    /* FEXCore sizes its per-CPU CPUID data (the brand string leaves 0x80000002-4, the hybrid flag) by the MIDRs it is
+     * given, and indexes it by getcpu, which the macOS port answers 0.  macOS does not expose MIDR_EL1, so every core
+     * is an Apple one of no part FEXCore names; with none listed, Wine's first brand-string query read past an empty
+     * table. */
+    int ncpu = 1;
+    size_t ncpu_len = sizeof ncpu;
+    if (sysctlbyname("hw.ncpu", &ncpu, &ncpu_len, nullptr, 0) != 0 || ncpu < 1)
+        ncpu = 1;
+    hf.CPUMIDRs.assign((size_t)ncpu, 0x61u << 24);
     hf.ProcessFeatures.HostType = FEXCore::HostFeatures::HostTypeEnum::Linux;
     hf.ProcessFeatures.Is64BitMode = 1;
     hf.ProcessFeatures.SupportsFaultFreeSynchronousFaults = 1;
@@ -493,6 +577,33 @@ void fex_init()
             FEXCore::Config::Set(option, v);
     FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
     FEXCore::Config::Set(FEXCore::Config::CONFIG_INTERPRETER_INSTALLED, "0");
+    /* A Wine process keeps the guest's low window and top strip elsewhere (ocerz_mem_init_low_shadow); FEXCore
+     * translates its accesses the way ocerz_g2h does, which needs the window at a power of two above its own end. */
+    if (ocerz_low_base) {
+        if (ocerz_mode == OCERZ_MODE_NATIVE || (ocerz_low_base & (ocerz_low_base - 1)) || ocerz_low_base < OCERZ_LOW_LIMIT) {
+            fprintf(stderr, "ocerz: fatal: -fex cannot run this program's low memory layout (window at %#llx%s)\n",
+                    (unsigned long long)ocerz_low_base, ocerz_mode == OCERZ_MODE_NATIVE ? ", native mode" : "");
+            exit(64);
+        }
+        FEXCore::GuestMap = {true, OCERZ_LOW_LIMIT, (uint32_t)__builtin_ctzll(ocerz_low_base), OCERZ_TOP_LO,
+                             OCERZ_TOP_HI, ocerz_top_base};
+    }
+    tsc_timer();
+    g_ldt = (uint64_t *)map_untranslated(GDT_PAGE);
+    if (!g_ldt || mprotect(g_ldt, GDT_PAGE, PROT_READ | PROT_WRITE) != 0) {
+        fprintf(stderr, "ocerz: fatal: no memory for FEXCore's LDT\n");
+        exit(70);
+    }
+    g_stubs = ocerz_map_anywhere(OCERZ_HOST_PAGE_SIZE, PROT_READ | PROT_WRITE);
+    if (!g_stubs) {
+        fprintf(stderr, "ocerz: fatal: no memory for FEXCore's stubs\n");
+        exit(70);
+    }
+    ocerz_st(g_stubs + STUB_HLT, 1, 0xf4);
+    for (size_t i = 0; i < sizeof(TrapInsn); i++) {
+        ocerz_st(g_stubs + STUB_TRAP + i, 1, ((const uint8_t *)&fex_trap_insn)[i]);
+        ocerz_st(g_stubs + STUB_BRIDGE + i, 1, ((const uint8_t *)&fex_bridge_insn)[i]);
+    }
     new_context();
 }
 
@@ -510,10 +621,10 @@ void new_context()
         exit(70);
     }
     g_sentinel = ocerz_vm_call_sentinel();
-    g_ctx->AddThunkTrampolineIRHandler(g_sentinel, (uintptr_t)&fex_exit_hlt);
+    g_ctx->AddThunkTrampolineIRHandler(g_sentinel, exit_hlt());
     for (uint64_t off = 0; off <= 0x2000; off += 8)
-        g_ctx->AddThunkTrampolineIRHandler(OCERZ_DYLDAPI_LO + off, (uintptr_t)&fex_trap_insn);
-    g_ctx->AddPlainTrampolineIRHandler(OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF, (uintptr_t)&fex_bridge_insn);
+        g_ctx->AddThunkTrampolineIRHandler(OCERZ_DYLDAPI_LO + off, g_stubs + STUB_TRAP);
+    g_ctx->AddPlainTrampolineIRHandler(OCERZ_DYLDAPI_LO + OCERZ_BRIDGE_OFF, g_stubs + STUB_BRIDGE);
 }
 
 /* In a forked child: the parent's context and threads stay where they are, unused, since their code cannot run here
@@ -530,24 +641,82 @@ void fork_child_restart()
     new_context();
 }
 
+/* A PROT_NONE host mapping whose addresses FEXCore::GuestMap leaves as they are, or null. */
+uint8_t *map_untranslated(size_t len)
+{
+    uintptr_t hint = 0;
+    for (int tries = 0; tries < 2; tries++) {
+        void *p = mmap((void *)hint, len, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED)
+            return nullptr;
+        const uint64_t a = (uint64_t)(uintptr_t)p;
+        if (FEXCore::GuestMap.ToHost(a) == a && FEXCore::GuestMap.ToHost(a + len - 1) == a + len - 1)
+            return (uint8_t *)p;
+        munmap(p, len);
+        hint = OCERZ_TOP_HI;
+    }
+    return nullptr;
+}
+
+/* rdtsc gives nanoseconds of the host's mach_absolute_time, as ocerz's own translation does (emit_rdtsc in jit.c):
+ * the timer the host commpage names, plus the commpage's offset, scaled by the timebase.  The x86 commpage's
+ * nanotime block, and every guest time ocerz converts, take the TSC for nanoseconds.  FEXCore's own TSC is
+ * CNTVCT_EL0 shifted to at least 1 GHz, and macOS 27 on the M5 runs CNTVCT_EL0 at 1 GHz in a program it executed
+ * and at 24 MHz in a forked child: there it came to 1.536 GHz, the child's clock ran half again too fast, and a
+ * daemonized wineserver timed out every wait its clients asked for at once (wineboot's five minutes included). */
+constexpr uint64_t HOST_TIMER_OFFSET = 0x0000000FFFFFC088ull, HOST_TIMER_KIND = 0x0000000FFFFFC090ull;
+void tsc_timer()
+{
+    static const uint64_t zero = 0;
+    mach_timebase_info_data_t tb {};
+    if (mach_timebase_info(&tb) != KERN_SUCCESS || !tb.numer || !tb.denom)
+        tb.numer = tb.denom = 1;
+    auto &t = FEXCore::TSCTimer;
+    t.Numer = tb.numer;
+    t.Denom = tb.denom;
+    t.OffsetAddr = HOST_TIMER_OFFSET;
+    switch (*(volatile uint8_t *)(uintptr_t)HOST_TIMER_KIND) {
+    case 1: t.Mrs = 0xd53be040u; t.Isb = true; break;  /* CNTVCT_EL0 */
+    case 2: t.Mrs = 0xd53be0c0u; break;                /* CNTVCTSS_EL0 */
+    case 3: t.Mrs = 0xd53cfac0u; break;                /* Apple's ACNTVCT_EL0 */
+    default: {
+        /* No timer userspace may read: CNTVCT_EL0 at its own frequency, which is right until a fork. */
+        uint64_t f = 0;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        t.Mrs = 0xd53be040u;
+        t.Isb = true;
+        t.OffsetAddr = (uint64_t)(uintptr_t)&zero;
+        t.Numer = 1000000000u;
+        t.Denom = f && f <= UINT32_MAX ? (uint32_t)f : 1000000000u;
+        break;
+    }
+    }
+}
+
 FexThread *new_level()
 {
     auto *ft = new FexThread {};
     ft->generation = g_generation;
     ft->thread = g_ctx->CreateThread();
+    ft->callret = map_untranslated(CALLRET_MAP);
+    if (!ft->callret) {
+        fprintf(stderr, "ocerz: fatal: no memory for FEXCore's call stack\n");
+        exit(70);
+    }
+    ft->gdt = (FEXCore::Core::CPUState::gdt_segment *)(ft->callret + CALLRET_SIZE + 2 * CALLRET_GUARD);
+    mprotect(ft->gdt, GDT_PAGE, PROT_READ | PROT_WRITE);
     auto &S = ft->thread->CurrentFrame->State;
     S.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT] = ft->gdt;
-    S.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = ft->gdt;
+    S.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_LDT] = (FEXCore::Core::CPUState::gdt_segment *)g_ldt;
     S.cs_idx = MACOS_USER_CS;
     S.ss_idx = MACOS_USER_SS;
     auto *cs = FEXCore::Core::CPUState::GetSegmentFromIndex(S, S.cs_idx);
     FEXCore::Core::CPUState::SetGDTLimit(cs, 0xF'FFFFU);
     cs->L = 1;
-    ft->callret = (uint8_t *)mmap(nullptr, CALLRET_SIZE + 2 * CALLRET_GUARD, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (ft->callret == MAP_FAILED) {
-        fprintf(stderr, "ocerz: fatal: no memory for FEXCore's call stack\n");
-        exit(70);
-    }
+    /* The 32-bit user code segment, flat, which Wine's 32-bit code runs in. */
+    auto *cs32 = FEXCore::Core::CPUState::GetSegmentFromIndex(S, MACOS_USER_CS32);
+    FEXCore::Core::CPUState::SetGDTLimit(cs32, 0xF'FFFFU);
+    cs32->D = 1;
     ft->thread->CallRetStackBase = ft->callret + CALLRET_GUARD;
     mprotect(ft->thread->CallRetStackBase, CALLRET_SIZE, PROT_READ | PROT_WRITE);
     ft->thread->CurrentFrame->Pointers.SynchronousExceptionHandler = (uint64_t)&fex_sync_fault;
@@ -665,7 +834,7 @@ static int interrupt_stop(FexThread *ft, mcontext_t mc)
     ft->leave = true;
     ft->step = OCERZ_STEP_OK;
     ft->resume_rip = S.rip;
-    S.rip = (uint64_t)&fex_exit_hlt;
+    S.rip = exit_hlt();
     mc->__ss.__pc = g_signals_config().AbsoluteLoopTopAddressFillSRA;
     return 1;
 }
@@ -728,6 +897,13 @@ extern "C" int ocerz_fex_async(void *uc)
     if (!ft || ft->leave || !must_leave(ft, OCERZ_STEP_OK))
         return 0;
     return mprotect(ft->thread->InterruptFaultPage, sizeof ft->thread->InterruptFaultPage, PROT_READ) == 0;
+}
+
+/* Called with ocerz's LDT lock held, for every entry i386_set_ldt (or m32) sets. */
+extern "C" void ocerz_fex_ldt(uint32_t index, uint64_t desc)
+{
+    if (g_ldt && index < GDT_PAGE / 8)
+        __atomic_store_n(&g_ldt[index], desc, __ATOMIC_RELEASE);
 }
 
 extern "C" void ocerz_fex_invalidate(uint64_t addr, uint64_t len)

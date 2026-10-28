@@ -15,7 +15,13 @@
 # memory writable or executable, never both; MADV_DONTNEED zero-fills through
 # MADV_ZERO as Linux's does; the 4 KB guard pages after code buffers are left
 # out, 16 KB host pages being larger than the space they guard; and the code
-# cache, which needs mremap, refuses to run.
+# cache, which needs mremap, refuses to run.  For ocerz's own needs: every
+# guest load and store, and the frontend's code fetch, go through
+# FEXCore::GuestMap, which ocerz sets in a Wine process (whose low 4 GB live
+# elsewhere); rdtsc reads the timer FEXCore::TSCTimer names, which ocerz sets to
+# mach_absolute_time's; a 64-bit process may write FS and GS (an LDT selector
+# brings its base); x18 is never allocated; and guest address 0 never matches an
+# empty lookup-cache entry.
 #
 # MACOSX_DEPLOYMENT_TARGET and SDKROOT, when set, reach CMake, so a release
 # build's FEXCore targets the same macOS as the ocerz it is linked into.

@@ -1059,6 +1059,58 @@ int main(void) {
          (uint32_t)got_runtime == expected_runtime ? 0 : 91;
 }' '' 0
 
+# A forked child's clock is its parent's: under -fex macOS runs the arm64 counter FEXCore read at 24 MHz in a
+# forked child and at 1 GHz in an executed program, the child's time ran half again too fast, and a daemonized
+# wineserver timed out every wait at once.
+run_case dfork_clock '
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <mach/mach_time.h>
+int main(void) {
+  int fd[2];
+  if (pipe(fd)) return 1;
+  mach_timebase_info_data_t tb;
+  mach_timebase_info(&tb);
+  uint64_t before = mach_absolute_time(), c = 0;
+  pid_t p = fork();
+  if (p == 0) { usleep(100000); c = mach_absolute_time(); write(fd[1], &c, sizeof c); _exit(0); }
+  read(fd[0], &c, sizeof c);
+  waitpid(p, 0, 0);
+  uint64_t after = mach_absolute_time();
+  double ms = (double)(c - before) * tb.numer / tb.denom / 1e6;
+  puts(c > before && c <= after && ms >= 90 ? "fork clock ok" : "fork clock differs");
+  return 0;
+}' 'fork clock ok' 0
+# A call through a null pointer is a SIGSEGV at address 0 the handler can leave, each time: under -fex it was a
+# fault in FEXCore's compiler reading code at 0, then a branch to host address 0 from an empty lookup entry.
+run_case dnull_call '
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+static sigjmp_buf jb;
+static void *volatile addr = (void *)1;
+static volatile int sig;
+static void h(int s, siginfo_t *si, void *uc) { (void)uc; sig = s; addr = si->si_addr; siglongjmp(jb, 1); }
+int main(void) {
+  struct sigaction sa = {0};
+  sa.sa_sigaction = h;
+  sa.sa_flags = SA_SIGINFO;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGSEGV, &sa, 0);
+  sigaction(SIGBUS, &sa, 0);
+  void (*volatile f)(void) = 0;
+  for (int i = 0; i < 3; i++) {
+    sig = 0;
+    if (!sigsetjmp(jb, 1))
+      f();
+    if (sig != SIGSEGV || addr != 0) { printf("null call %d: signal %d at %p\n", i, sig, addr); return 1; }
+  }
+  puts("null call SIGSEGV at 0");
+  return 0;
+}' 'null call SIGSEGV at 0' 0
+
 run_file_case dfork_signal tests/dynamic/fork_signal.c 'fork signal ok'
 run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
 run_file_case dsignal_restart tests/dynamic/signal_restart.c 'OK'

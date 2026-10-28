@@ -8613,6 +8613,7 @@ struct ocerz_ldt_entry {
     uint8_t  present;
 };
 static struct ocerz_ldt_entry g_ldt[OCERZ_LDT_MAX];
+static uint64_t ocerz_ldt_pack(const struct ocerz_ldt_entry *e);
 static int g_ldt_next = 1;
 static pthread_mutex_t g_ldt_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_ldt_installed;
@@ -8664,6 +8665,8 @@ void ocerz_ldt_install(uint32_t sel, uint64_t base, uint32_t limit,
         g_ldt_next = (int)idx + 1;
     if (g_ldt[idx].present)
         g_ldt_installed = 1;
+    if (ocerz_engine_ldt)
+        ocerz_engine_ldt(idx, ocerz_ldt_pack(&g_ldt[idx]));
     pthread_mutex_unlock(&g_ldt_lock);
 }
 
@@ -8724,6 +8727,8 @@ long ocerz_ldt_call(int num, int32_t start, uint64_t descs, int32_t count)
             ocerz_ldt_unpack(ocerz_ld(descs + (uint64_t)i * 8, 8), &g_ldt[idx + i]);
             if (g_ldt[idx + i].present)
                 g_ldt_installed = 1;
+            if (ocerz_engine_ldt)
+                ocerz_engine_ldt((uint32_t)(idx + i), ocerz_ldt_pack(&g_ldt[idx + i]));
         }
         pthread_mutex_unlock(&g_ldt_lock);
         if (getenv("OCERZ_LDTLOG"))

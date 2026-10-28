@@ -117,9 +117,9 @@ programs (m32) keep AArchX's own translator.
 
 It is experimental. It is there to compare the two translators and as a second
 opinion when AArchX's own one gets a program wrong; AArchX's translator is
-faster and stays the default. Under `-fex` the dynamic-linking suite passes 284
-of its 466 cases; most of the rest need the low-memory layout Wine uses, or test
-parts of AArchX's own translator such as the translation cache.
+faster and stays the default. Under `-fex` the dynamic-linking suite passes 387
+of its 468 cases; most of the rest test parts of AArchX's own translator, such as
+the translation cache, or x87 results and flags that come out differently.
 
 | | AArchX's translator | `-fex` |
 | --- | --- | --- |
@@ -133,9 +133,10 @@ What it needs and what it does not do yet:
 
 - macOS 14.4 or newer. On an older system `-fex` says so and stops; the same
   ocerz still runs without it.
-- Wine, and any other program that needs memory below 4 GB, does not run:
-  FEXCore runs guest code at the addresses the guest uses, and macOS keeps the
-  low 4 GB from arm64 processes.
+- Wine runs, its 64-bit programs and its 32-bit ones through WoW64. macOS
+  keeps the low 4 GB from arm64 processes, so AArchX keeps a Wine process's low
+  memory elsewhere, and FEXCore finds it there as AArchX's translator does.
+  Making a new Wine prefix takes 29 s, against 18 s with AArchX's translator.
 - x87 arithmetic is computed in software at full 80-bit precision and can
   round differently from Rosetta.
 - Features of AArchX's own translator, such as the translation cache, do not

@@ -127,7 +127,7 @@ make apis
 | Hearts of Iron IV, Intel only | reaches its main menu in 23 s in cache mode and 22 s in native mode (Rosetta 16 s), and under `-fex` in both (October 2026) |
 | Ollama | command line and server work, and the menu-bar app runs |
 | Bundled apps: Chess, Calculator, TextEdit and others | open their windows (measured on macOS 26; arm64 only on macOS 27) |
-| Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window; WineHQ's 32-bit Wine for macOS runs `cmd` through m32 (October 2026) |
+| Wine | 32-bit Notepad and WineMine through WoW64; Windows Steam reaches its main window; WineHQ's 32-bit Wine for macOS runs `cmd` through m32; Wine also runs under `-fex` (October 2026) |
 | Batman: Arkham Asylum, a 32-bit Mac game | plays through m32 at about 61 fps, launched from Steam and signed in to it (October 2026) |
 | Other 32-bit Mac games | Left 4 Dead 2 and Call of Duty: Modern Warfare 3 from Steam; AssaultCube, SuperTuxKart, Neverball, Battle for Wesnoth, Teeworlds, Nexuiz, ScummVM, DOSBox, Warzone 2100, Armagetron Advanced, Chocolate Doom, Enigma, Pingus, LinCity-NG and Sauerbraten (October 2026) |
 | 32-bit Mac apps | Adium, VLC 1.1.12 and Kega Fusion open their windows (October 2026) |

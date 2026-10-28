@@ -72,7 +72,8 @@ src/fex.o: src/fex.cpp include/ocerz/fex.h
 	clang++ $(FEX_CXXFLAGS) -c -o $@ $<
 endif
 
-ocerz: $(OBJS) $(FEX_OBJS)
+# A rebuilt FEXCore relinks ocerz; FEX_LIBS is empty without FEX.
+ocerz: $(OBJS) $(FEX_OBJS) $(filter %.a,$(FEX_LIBS))
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(FEX_OBJS) $(SYSLIBS) $(LDLIBS) $(FEX_LIBS)
 	$(CC) $(LDFLAGS) -o ocerz-umbrella $(OBJS) $(FEX_OBJS) $(LDLIBS) $(FEX_LIBS)
 
