@@ -1114,6 +1114,7 @@ int main(void) {
 run_file_case dfork_signal tests/dynamic/fork_signal.c 'fork signal ok'
 run_file_case dthread_signal tests/dynamic/thread_signal.c 'OK'
 run_file_case dsignal_restart tests/dynamic/signal_restart.c 'OK'
+run_file_case dsignal_flags tests/dynamic/signal_flags.c 'OK'
 run_native_file_case dsignal_restart tests/dynamic/signal_restart.c 'OK'
 run_file_case dx87_top_entry tests/dynamic/x87_top_entry.c 'OK'
 run_file_case dshmem_coherence tests/dynamic/shmem_coherence.c 'OK'

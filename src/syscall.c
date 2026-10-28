@@ -401,6 +401,7 @@
 #include "ocerz/apidb.h"
 #include "ocerz/vdylib.h"
 #include "ocerz/tcache.h"
+#include "ocerz/flags.h"
 
 #include <stddef.h>
 #include <sys/mman.h>
@@ -4648,6 +4649,10 @@ int ocerz_signal_deliver(OcerzCPU *cpu, int sig, uint64_t fault_addr, int si_cod
     ocerz_st(mc + 128, 8, cpu->gpr[OCERZ_R14]);
     ocerz_st(mc + 136, 8, cpu->gpr[OCERZ_R15]);
     ocerz_st(mc + 144, 8, cpu->rip);
+    /* A block can leave its flags as a record (cc_op) for the block after it, as a side exit does with the compare
+       its jcc tested, and a signal delivered between two blocks finds them there.  The frame takes them as rflags:
+       the handler's own blocks replace the record, and sigreturn gives back only the frame. */
+    ocerz_flags_materialize(cpu);
     ocerz_st(mc + 152, 8, cpu->rflags);
     ocerz_st(mc + 160, 8, cpu->cs_sel);
     if (full) {
