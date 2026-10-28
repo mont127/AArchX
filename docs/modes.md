@@ -136,7 +136,8 @@ What it needs and what it does not do yet:
 - Wine runs, its 64-bit programs and its 32-bit ones through WoW64. macOS
   keeps the low 4 GB from arm64 processes, so AArchX keeps a Wine process's low
   memory elsewhere, and FEXCore finds it there as AArchX's translator does.
-  Making a new Wine prefix takes 29 s, against 18 s with AArchX's translator.
+  Making a new Wine prefix takes 29 s, against 12 s with AArchX's translator
+  and 8 s with Rosetta ([Performance](performance.md) has more).
 - x87 arithmetic is computed in software at full 80-bit precision and can
   round differently from Rosetta.
 - Features of AArchX's own translator, such as the translation cache, do not

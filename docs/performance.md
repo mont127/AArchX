@@ -58,6 +58,53 @@ static build wins eleven and loses four, none by more than five percent.
 An older run on an Apple M2 Max, in September 2026, gave thirteen wins and two
 ties on the static build; the numbers above supersede it.
 
+## AArchX, `-fex` and Wine, 28 October 2026
+
+The dynamic build again, on the same Apple M5 with macOS 27, five repetitions,
+now with the two x87 kernels, once on AArchX's own translator and once under
+`-fex` (`OCERZ_FEX=1`), both against Rosetta:
+
+| Kernel | AArchX | `-fex` |
+| --- | ---: | ---: |
+| `icall` | 1.00x | **0.99x** |
+| `jtab` | **0.98x** | **0.98x** |
+| `depchain` | **0.90x** | **0.90x** |
+| `brmiss` | **0.98x** | 1.05x |
+| `memcpy` | **0.72x** | 5.85x |
+| `str` | **0.77x** | 1.10x |
+| `hash` | 1.00x | 1.01x |
+| `idiv` | **0.99x** | 1.00x |
+| `fpsse` | **0.86x** | **0.99x** |
+| `fpvec` | **0.82x** | 1.12x |
+| `chase` | 1.00x | 1.22x |
+| `qsort` | **0.98x** | 1.08x |
+| `leafcall` | **0.49x** | 1.28x |
+| `mixed` | **0.85x** | 1.44x |
+| `vm` | **0.70x** | **0.89x** |
+| `x87` | **0.06x** | 1.61x |
+| `x87pc24` | **0.08x** | 1.62x |
+
+AArchX is faster on fourteen and within half a percent of Rosetta on `icall`,
+`hash` and `chase`; `-fex` is faster on four, within one percent on three and
+slower on ten. Since September `leafcall`
+went from 1.03x to 0.49x and `vm` from 0.84x to 0.70x. `-fex` keeps x86's memory
+ordering on every access, which is most of its `memcpy` time
+(`FEX_TSOENABLED=0` drops it, at the cost of threaded programs), and computes
+x87 in software at full 80-bit precision.
+
+Wine 11.16 Staging as MacNdCheese ships it, wall time, medians: a new prefix
+twice, then ten starts of each `cmd` on a ready prefix with its wineserver
+already running, and three runs of a 200,000-step `for /l` loop in `cmd`. Each
+engine had its own copy of the prefix, and AArchX ran with its translation
+cache on, as it does by default.
+
+| | Rosetta | AArchX | `-fex` |
+| --- | ---: | ---: | ---: |
+| Make a new prefix (`cmd /c echo` on an empty one) | 8.0 s | 12.3 s | 29.0 s |
+| Start 64-bit `cmd` | 0.15 s | 0.19 s | 0.61 s |
+| Start 32-bit `cmd` (WoW64) | 0.09 s | 0.13 s | 0.33 s |
+| The loop, start included | 0.56 s | 0.70 s | 1.57 s |
+
 ## What makes it fast
 
 - **The guest's registers stay in registers.** All sixteen general registers and

@@ -45,7 +45,8 @@ Mac's own arm64 frameworks, so they need no x86 system libraries at all.
   the Mac's own arm64 frameworks instead.
 - **A second translator.** `-fex` runs the program's code on FEXCore, FEX-Emu's
   translator, instead of AArchX's own (experimental), to compare the two or to
-  get past a program AArchX's translator gets wrong.
+  get past a program AArchX's translator gets wrong. Wine runs under it too,
+  64-bit and 32-bit Windows programs alike.
 - **Correct before fast.** The interpreter is the reference: every guest test
   runs both interpreted and translated and the two must match byte for byte,
   and 40,044 i386 sequences are compared register by register.
@@ -141,21 +142,38 @@ together with what Steam, the GPU and Wine took to get there.
 ## Performance
 
 AArchX time divided by Rosetta time, so **lower is better** and anything under
-1.0 is faster than Rosetta. Fifteen kernels, linked against libSystem, in cache
-mode, on an Apple M5 with macOS 27 (2026-09-21):
+1.0 is faster than Rosetta. Seventeen kernels, linked against libSystem, in
+cache mode, on an Apple M5 with macOS 27 (2026-10-28). AArchX is faster on
+fourteen and within half a percent of Rosetta on the last three:
 
 ```mermaid
 xychart-beta
     title "AArchX time / Rosetta time (lower is better, 1.0 = tie)"
-    x-axis [memcpy, str, fpvec, mixed, vm, fpsse, depchain, icall, brmiss, qsort, jtab, hash, idiv, chase, leafcall]
+    x-axis [x87, x87pc24, leafcall, vm, memcpy, str, fpvec, mixed, fpsse, depchain, qsort, brmiss, jtab, idiv, icall, hash, chase]
     y-axis "x Rosetta" 0 --> 1.2
-    bar [0.72, 0.77, 0.80, 0.83, 0.84, 0.86, 0.90, 0.93, 0.97, 0.97, 0.98, 0.99, 0.99, 1.00, 1.03]
+    bar [0.06, 0.08, 0.49, 0.70, 0.72, 0.77, 0.82, 0.85, 0.86, 0.90, 0.98, 0.98, 0.98, 0.99, 1.00, 1.00, 1.00]
 ```
+
+Wine, measured the same day with the Wine 11 that MacNdCheese ships, and
+`-fex` beside the other two:
+
+| | Rosetta | AArchX | `-fex` |
+| --- | ---: | ---: | ---: |
+| Make a new Wine prefix | 8.0 s | 12.3 s | 29.0 s |
+| Start 64-bit `cmd`, wineserver running | 0.15 s | 0.19 s | 0.61 s |
+| Start 32-bit `cmd` (WoW64) | 0.09 s | 0.13 s | 0.33 s |
+| A 200,000-step loop in `cmd` | 0.56 s | 0.70 s | 1.57 s |
+| Kernels above, against Rosetta | | 14 faster, 3 within 0.5% | 4 faster, 3 within 1%, 10 slower |
+
+`-fex` is a second opinion, not the fast path: it keeps x86's memory ordering on
+every access, even in a program with one thread, so a copy loop takes 5.8 times
+Rosetta's time, and it computes x87 in software.
 
 AVX2 and FMA loops mostly beat Rosetta too, and a call from native mode into the
 Mac's frameworks costs about 17 ns. Startup is the weak spot: everything a large
 application runs is translated the first time it runs, so Windows Steam under
-Wine needs about 33 s to its main window where Rosetta needs 11 to 12.
+Wine needs about 33 s to its main window where Rosetta needs 11 to 12, and
+short-lived programs like the ones above still start slower than under Rosetta.
 [Performance](docs/performance.md) has every mode, the method and the
 remaining costs.
 
