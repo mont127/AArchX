@@ -1081,6 +1081,8 @@ static struct ocerz_sysctl_ovr g_sysctl_ovr[] = {
     { "hw.pagesize",            0, NULL,     4096,        {0}, 0, 0, 0 },
     { "hw.pagesize32",          0, NULL,     4096,        {0}, 0, 0, 0 },
     { "vm.pagesize",            0, NULL,     4096,        {0}, 0, 0, 0 },
+    /* an Intel Mac's cache line is 64 bytes, the M-series' 128 (tools/native-diff.py, sysfacts) */
+    { "hw.cachelinesize",       0, NULL,     64,          {0}, 0, 0, 0 },
 };
 
 static void ocerz_sysctl_ovr_resolve(void)

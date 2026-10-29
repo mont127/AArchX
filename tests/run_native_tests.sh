@@ -13008,6 +13008,8 @@ exit 0" ]; then
 # answered an x86 program that it ran on an arm64 Mac: uname -m printed arm64.
 # They answer what cache mode's system calls answer (src/syscall.c), so the
 # fixture prints the same lines in both modes, and uname -m prints x86_64.
+# hw.cachelinesize is an Intel Mac's 64 in both (tools/native-diff.py found
+# both answering the host's 128).
 case_native_x86_identity() {
     local name=native_x86_identity reason="" d="$TMP/native_x86_identity"
     rm -rf "$d"; mkdir -p "$d"
@@ -13051,6 +13053,7 @@ int main(void)
     num("hw.optional.avx2_0");
     str("machdep.cpu.features");
     num("hw.pagesize");
+    num("hw.cachelinesize");
     int mib[4];
     size_t n = 4;
     int v = 0, r = sysctlnametomib("hw.optional.sse4_2", mib, &n);
@@ -13074,7 +13077,8 @@ EOC
     if [ "$CACHE_OK" = 1 ] && ! cmp -s "$d/native.out" "$d/cache.out"; then
         reason="native mode answered '$(diff "$d/cache.out" "$d/native.out" | grep '^>' | head -1 | cut -c3-)' where cache mode answered '$(diff "$d/cache.out" "$d/native.out" | grep '^<' | head -1 | cut -c3-)'"
     elif ! grep -qx "hw.machine 0 'x86_64'" "$d/native.out" || ! grep -qx "HW_MACHINE 0 'x86_64'" "$d/native.out" ||
-         ! grep -qx "sysctl.proc_translated 0 4 0x1" "$d/native.out"; then
+         ! grep -qx "sysctl.proc_translated 0 4 0x1" "$d/native.out" ||
+         ! grep -qx "hw.cachelinesize 0 8 0x40" "$d/native.out"; then
         reason="native mode did not answer as an x86 process under translation: $(tr '\n' ';' < "$d/native.out" | cut -c1-200)"
     fi
     record "$name" "$reason" "$(wc -l < "$d/native.out" | tr -d ' ') lines"
