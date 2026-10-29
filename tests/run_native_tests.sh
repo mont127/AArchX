@@ -12499,6 +12499,103 @@ case_native_bound() {
 # parses it and builds its image again while CoreFoundation's stay kept.  The
 # guest reads a data export (kCFBooleanTrue) too, an absolute address a kept
 # image carries over from the run that built it.
+# Two libraries that link each other, each with a class whose superclass is the other's, and a category of one's
+# on the other's class (Photoshop's frameworks do this).  Defining classes one library at a time read libA's
+# classes while only libB was bound, and the launch died with SIGSEGV; they are defined together now
+# (ocerz_objcbridge_define_images).
+case_native_objc_cycle() {
+    local name=native_objc_cycle reason="" d="$TMP/native_objc_cycle"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/a0.m" <<'EOC'
+#import <Foundation/Foundation.h>
+@interface AObj : NSObject
+- (int)a;
+@end
+@implementation AObj
+- (int)a { return 1; }
+@end
+EOC
+    cat > "$d/b.m" <<'EOC'
+#import <Foundation/Foundation.h>
+@interface AObj : NSObject
+- (int)a;
+@end
+@interface BObj : NSObject
+- (int)b;
+@end
+@implementation BObj
+- (int)b { return 2; }
+@end
+@interface BChild : AObj
+@end
+@implementation BChild
+- (int)a { return [super a] + 20; }
+@end
+@interface AObj (FromB)
+- (int)fromB;
+@end
+@implementation AObj (FromB)
+- (int)fromB { return 300; }
+@end
+EOC
+    cat > "$d/a.m" <<'EOC'
+#import <Foundation/Foundation.h>
+@interface AObj : NSObject
+- (int)a;
+@end
+@implementation AObj
+- (int)a { return 1; }
+@end
+@interface BObj : NSObject
+- (int)b;
+@end
+@interface AChild : BObj
+@end
+@implementation AChild
+- (int)b { return [super b] + 10; }
+@end
+EOC
+    cat > "$d/main.m" <<'EOC'
+#import <Foundation/Foundation.h>
+@interface AObj : NSObject
+- (int)a;
+- (int)fromB;
+@end
+@interface BObj : NSObject
+- (int)b;
+@end
+@interface AChild : BObj
+@end
+@interface BChild : AObj
+@end
+int main(void) {
+    @autoreleasepool {
+        printf("%d %d %d\n", [[AChild new] b], [[BChild new] a], [[AObj new] fromB]);
+    }
+    return 0;
+}
+EOC
+    if ! (cd "$d" &&
+          clang -arch x86_64 -fobjc-arc -framework Foundation -dynamiclib -install_name @rpath/libA.dylib -o libA.dylib a0.m &&
+          clang -arch x86_64 -fobjc-arc -framework Foundation -dynamiclib -install_name @rpath/libB.dylib -o libB.dylib b.m -L. -lA &&
+          clang -arch x86_64 -fobjc-arc -framework Foundation -dynamiclib -install_name @rpath/libA.dylib -o libA.dylib a.m -L. -lB &&
+          clang -arch x86_64 -fobjc-arc -framework Foundation -o cyc main.m -L. -lA -lB -Wl,-rpath,@executable_path) \
+          >"$d/cc.log" 2>&1; then
+        record "$name" "the fixtures did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/cyc"
+    local rc=$?
+    if [ "$rc" != 0 ] || [ "$(cat "$d/out")" != "12 21 300" ]; then
+        reason="it printed '$(tr '\n' ' ' < "$d/out")' and exited $rc, want '12 21 300' and 0: $(tail -1 "$d/err" | cut -c1-160)"
+    fi
+    record "$name" "$reason" "classes and a category across two libraries that link each other"
+}
+
 case_native_kept() {
     local name=native_kept reason="" d="$TMP/native_kept" i
     local ls_img=/usr/lib/libSystem.B.dylib cf_img=/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
@@ -15587,6 +15684,7 @@ case_sys sys_strings "$SYS_STRINGS_BIN" "$SYS_STRINGS_ARM64" sys_strings "$SYS_S
 case_sys_strings_inplace
 case_sys_strings_fault
 case_native_x86_identity
+case_native_objc_cycle
 case_native_kept
 case_native_tcache
 

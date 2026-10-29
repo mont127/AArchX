@@ -4174,12 +4174,24 @@ static void dimg_note_rpath_name(DynImage *d, const char *name)
     dimg_index(d);
 }
 
+/* While a native launch binds the program and the libraries it loads at launch, their classes wait, and are
+   defined together with the main image's once all of them are bound (ocerz_objcbridge_define_images), as dyld
+   hands the runtime the whole launch at once.  One library at a time, Photoshop's dvaappsupport, which links a
+   library that links it back, read that library's classes before its fixups were applied, and the junk pointer it
+   found ended the launch with SIGSEGV. */
+static DynImage *g_launch_objc[DYN_DIMG_MAX];
+static int g_launch_objc_n, g_launch_objc_defer;
+
 static void canonicalize_objc_selrefs(DynImage *img)
 {
     int64_t slide = img->slide;
     const uint8_t *h = (const uint8_t *)ocerz_g2h(img->load_base);
     if (ocerz_mode == OCERZ_MODE_NATIVE) {
         ocerz_objcbridge_fix_selrefs(h, slide);
+        if (g_launch_objc_defer && g_launch_objc_n < DYN_DIMG_MAX) {
+            g_launch_objc[g_launch_objc_n++] = img;
+            return;
+        }
         ocerz_objcbridge_define_image(h, slide);
         return;
     }
@@ -6623,11 +6635,14 @@ static uint64_t ndl_dlopen_locked(struct OcerzVM *vm, const char *path, int mode
             order[n++] = &g_dimgs[i];
     if (n > 1)
         qsort(order, (size_t)n, sizeof order[0], ndl_seq_cmp);
+    const uint8_t *mhs[DYN_DIMG_MAX];
+    int64_t slides[DYN_DIMG_MAX];
     for (int i = 0; i < n; i++) {
-        const uint8_t *h = (const uint8_t *)ocerz_g2h(order[i]->load_base);
-        ocerz_objcbridge_fix_selrefs(h, (int64_t)order[i]->slide);
-        ocerz_objcbridge_define_image(h, (int64_t)order[i]->slide);
+        mhs[i] = (const uint8_t *)ocerz_g2h(order[i]->load_base);
+        slides[i] = (int64_t)order[i]->slide;
+        ocerz_objcbridge_fix_selrefs(mhs[i], slides[i]);
     }
+    ocerz_objcbridge_define_images(mhs, slides, n);
     if (dimg_find_by_install_name(OCERZ_OBJC_LIBOBJC))
         ocerz_objcbridge_install_uncaught();
     for (int f = 0; f < g_ndl_objc_n && !vm->exited; f++) {
@@ -7295,6 +7310,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     RpathList main_rpaths;
     collect_rpaths(&img, NULL, &main_rpaths);
     g_flat_defer = ocerz_mode == OCERZ_MODE_NATIVE;
+    g_launch_objc_defer = ocerz_mode == OCERZ_MODE_NATIVE;
     g_main_loading = &img;
     load_disk_deps(&cache, &img, &main_rpaths);
     flat_flush(&cache);
@@ -7337,7 +7353,18 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         native_publish();
         native_tlv_register_loaded(img.load_base);
         ocerz_objcbridge_fix_selrefs((const uint8_t *)ocerz_g2h(img.load_base), img.slide);
-        ocerz_objcbridge_define_image((const uint8_t *)ocerz_g2h(img.load_base), img.slide);
+        static const uint8_t *mhs[DYN_DIMG_MAX + 1];
+        static int64_t slides[DYN_DIMG_MAX + 1];
+        int k = 0;
+        for (int i = 0; i < g_launch_objc_n; i++) {
+            mhs[k] = (const uint8_t *)ocerz_g2h(g_launch_objc[i]->load_base);
+            slides[k++] = g_launch_objc[i]->slide;
+        }
+        mhs[k] = (const uint8_t *)ocerz_g2h(img.load_base);
+        slides[k++] = img.slide;
+        g_launch_objc_defer = 0;
+        g_launch_objc_n = 0;
+        ocerz_objcbridge_define_images(mhs, slides, k);
         if (dimg_find_by_install_name(OCERZ_OBJC_LIBOBJC))
             ocerz_objcbridge_install_uncaught();
         protect_ro_flush();

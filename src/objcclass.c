@@ -1370,35 +1370,6 @@ void ocerz_objcbridge_swift_destroy(void *object, uint64_t destroy)
     errno = entered;
 }
 
-static void oc_define_classes(const OcSect *list, uint32_t image_flags)
-{
-    int n = (int)(list->size / 8);
-    if (n <= 0)
-        return;
-    uint64_t *classes = malloc((size_t)n * sizeof *classes), *supers = malloc((size_t)n * sizeof *supers);
-    int *order = malloc((size_t)n * sizeof *order);
-    if (!classes || !supers || !order)
-        oc_stop("no memory to order %d guest classes", n);
-    for (int i = 0; i < n; i++) {
-        classes[i] = oc_word(list->addr + 8 * (uint64_t)i);
-        OcerzObjcClass c;
-        ocerz_objc_read_class(classes[i], &c);
-        supers[i] = c.superclass;
-    }
-    int culprit = -1;
-    int rc = ocerz_objc_class_order(classes, supers, n, order, &culprit);
-    if (rc == OCERZ_OBJC_CYCLE)
-        oc_stop("guest class %s is its own superclass, through a chain of superclasses",
-                oc_class_label(classes[culprit]));
-    if (rc != OCERZ_OBJC_OK)
-        oc_stop("cannot order %d guest classes by superclass: %s", n, ocerz_objc_refusal(rc));
-    for (int i = 0; i < n; i++)
-        oc_define_class(classes[order[i]], image_flags);
-    free(classes);
-    free(supers);
-    free(order);
-}
-
 static void *oc_category_class(const OcerzObjcCategory *cat, uint64_t addr)
 {
     const char *catname = oc_str(cat->name);
@@ -1554,48 +1525,116 @@ static void oc_hook_image_names(void)
                                                                     (void *)&g_oc_prev_image_name);
 }
 
-int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide)
+int ocerz_objcbridge_define_images(const uint8_t *const *mhs, const int64_t *slides, int n)
 {
-    OcImage im;
-    oc_scan(mh, slide, &im);
-    if (!im.classlist.size && !im.catlist.size && !im.catlist2.size && !im.protolist.size && !im.protorefs.size)
+    if (n <= 0)
         return 0;
-
+    OcImage *im = calloc((size_t)n, sizeof *im);
+    uint32_t *flags = calloc((size_t)n, sizeof *flags);
+    int *take = calloc((size_t)n, sizeof *take);
+    if (!im || !flags || !take)
+        oc_stop("no memory to define %d guest images", n);
     pthread_mutex_lock(&g_oc_lock);
-    uint64_t key = (uint64_t)(uintptr_t)mh;
-    if (oc_map_find(&g_oc_images, key)) {
+    int any = 0, nclasses = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t key = (uint64_t)(uintptr_t)mhs[i];
+        oc_scan(mhs[i], slides[i], &im[i]);
+        if ((!im[i].classlist.size && !im[i].catlist.size && !im[i].catlist2.size && !im[i].protolist.size &&
+             !im[i].protorefs.size) || oc_map_find(&g_oc_images, key))
+            continue;
+        oc_map_put(&g_oc_images, key, 1);
+        take[i] = 1;
+        any = 1;
+        flags[i] = im[i].imageinfo.size >= 8 ? oc_u32(im[i].imageinfo.addr + 4) : 0;
+        nclasses += (int)(im[i].classlist.size / 8);
+    }
+    if (!any) {
         pthread_mutex_unlock(&g_oc_lock);
+        free(im);
+        free(flags);
+        free(take);
         return 0;
     }
-    oc_map_put(&g_oc_images, key, 1);
     oc_hook_image_names();
-    g_oc_defining = key;
-    uint32_t flags = im.imageinfo.size >= 8 ? oc_u32(im.imageinfo.addr + 4) : 0;
     int defined = 0;
 
-    for (uint64_t off = 0; off + 8 <= im.protolist.size; off += 8)
-        oc_protocol(oc_word(im.protolist.addr + off), 0);
-    for (uint64_t off = 0; off + 8 <= im.protorefs.size; off += 8) {
-        uint64_t word = im.protorefs.addr + off, ref = oc_word(word);
-        void *native = oc_protocol(ref, 0);
-        if (native && ocerz_h2g(native) != ref)
-            ocerz_st(word, 8, ocerz_h2g(native));
+    for (int i = 0; i < n; i++) {
+        if (!take[i])
+            continue;
+        for (uint64_t off = 0; off + 8 <= im[i].protolist.size; off += 8)
+            oc_protocol(oc_word(im[i].protolist.addr + off), 0);
+        for (uint64_t off = 0; off + 8 <= im[i].protorefs.size; off += 8) {
+            uint64_t word = im[i].protorefs.addr + off, ref = oc_word(word);
+            void *native = oc_protocol(ref, 0);
+            if (native && ocerz_h2g(native) != ref)
+                ocerz_st(word, 8, ocerz_h2g(native));
+        }
     }
 
-    oc_define_classes(&im.classlist, flags);
-    defined += (int)(im.classlist.size / 8);
-    for (uint64_t off = 0; off + 8 <= im.catlist.size; off += 8, defined++)
-        oc_define_category(oc_word(im.catlist.addr + off), flags);
-    for (uint64_t off = 0; off + 8 <= im.catlist2.size; off += 8, defined++)
-        oc_define_category(oc_word(im.catlist2.addr + off), flags);
+    if (nclasses > 0) {
+        uint64_t *classes = malloc((size_t)nclasses * sizeof *classes);
+        uint64_t *supers = malloc((size_t)nclasses * sizeof *supers);
+        uint32_t *cflags = malloc((size_t)nclasses * sizeof *cflags);
+        int *order = malloc((size_t)nclasses * sizeof *order);
+        if (!classes || !supers || !cflags || !order)
+            oc_stop("no memory to order %d guest classes", nclasses);
+        int k = 0;
+        for (int i = 0; i < n; i++) {
+            if (!take[i])
+                continue;
+            for (uint64_t off = 0; off + 8 <= im[i].classlist.size; off += 8, k++) {
+                classes[k] = oc_word(im[i].classlist.addr + off);
+                OcerzObjcClass c;
+                ocerz_objc_read_class(classes[k], &c);
+                supers[k] = c.superclass;
+                cflags[k] = flags[i];
+            }
+        }
+        int culprit = -1;
+        int rc = ocerz_objc_class_order(classes, supers, nclasses, order, &culprit);
+        if (rc == OCERZ_OBJC_CYCLE)
+            oc_stop("guest class %s is its own superclass, through a chain of superclasses",
+                    oc_class_label(classes[culprit]));
+        if (rc != OCERZ_OBJC_OK)
+            oc_stop("cannot order %d guest classes by superclass: %s", nclasses, ocerz_objc_refusal(rc));
+        for (int c = 0; c < nclasses; c++)
+            oc_define_class(classes[order[c]], cflags[order[c]]);
+        defined += nclasses;
+        free(classes);
+        free(supers);
+        free(cflags);
+        free(order);
+    }
 
-    for (uint64_t off = 0; off + 8 <= im.nlclslist.size; off += 8)
-        oc_schedule_class(oc_word(im.nlclslist.addr + off));
-    for (uint64_t off = 0; off + 8 <= im.nlcatlist.size; off += 8)
-        oc_schedule_category(oc_word(im.nlcatlist.addr + off), flags);
+    for (int i = 0; i < n; i++) {
+        if (!take[i])
+            continue;
+        for (uint64_t off = 0; off + 8 <= im[i].catlist.size; off += 8, defined++)
+            oc_define_category(oc_word(im[i].catlist.addr + off), flags[i]);
+        for (uint64_t off = 0; off + 8 <= im[i].catlist2.size; off += 8, defined++)
+            oc_define_category(oc_word(im[i].catlist2.addr + off), flags[i]);
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (!take[i])
+            continue;
+        g_oc_defining = (uint64_t)(uintptr_t)mhs[i];
+        for (uint64_t off = 0; off + 8 <= im[i].nlclslist.size; off += 8)
+            oc_schedule_class(oc_word(im[i].nlclslist.addr + off));
+        for (uint64_t off = 0; off + 8 <= im[i].nlcatlist.size; off += 8)
+            oc_schedule_category(oc_word(im[i].nlcatlist.addr + off), flags[i]);
+    }
     g_oc_defining = 0;
     pthread_mutex_unlock(&g_oc_lock);
+    free(im);
+    free(flags);
+    free(take);
     return defined;
+}
+
+int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide)
+{
+    return ocerz_objcbridge_define_images(&mh, &slide, 1);
 }
 
 static int oc_run_load_list(struct OcerzVM *vm, const OcLoad *loads, size_t n, uint64_t stack_top)

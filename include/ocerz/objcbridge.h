@@ -53,6 +53,14 @@
  * describes what follows.
  *
  * ---- guest classes ----
+ * ocerz_objcbridge_define_images defines a set of images at once, as dyld hands
+ * the runtime every image a launch or a dlopen brings: the protocols of all of
+ * them, then their classes in one order by superclass across the set, then
+ * their categories.  Two libraries that link each other, as Photoshop's do,
+ * can each subclass or extend a class of the other, which one image at a time
+ * cannot define in any order.  Every image in the set must have had its fixups
+ * and selector pass.  ocerz_objcbridge_define_image is the set of one.
+ *
  * ocerz_objcbridge_define_image defines, in the native runtime, every
  * protocol, class and category of one mapped image, mh and slide as for
  * ocerz_objcbridge_fix_selrefs, whose pass must already have run over it.  The
@@ -285,6 +293,7 @@ typedef struct OcerzObjcAttribute {
 int ocerz_objcbridge_fix_selrefs(const uint8_t *mh, int64_t slide);
 void ocerz_objcbridge_install_uncaught(void);
 int ocerz_objcbridge_define_image(const uint8_t *mh, int64_t slide);
+int ocerz_objcbridge_define_images(const uint8_t *const *mhs, const int64_t *slides, int n);
 int ocerz_objcbridge_run_loads(struct OcerzVM *vm, uint64_t stack_top);
 int ocerz_objcbridge_run_image_loads(struct OcerzVM *vm, const uint8_t *mh, uint64_t stack_top);
 int ocerz_objcbridge_is_defined(uint64_t cls);
