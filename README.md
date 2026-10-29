@@ -134,7 +134,7 @@ make apis
 | 32-bit Mac apps | Adium, VLC 1.1.12 and Kega Fusion open their windows (October 2026) |
 | Older Intel apps, native mode | Transmission, Sequel Pro, HandBrake and VLC 2.2 open their windows (October 2026) |
 | Counter-Strike 2, under Wine with D3DMetal | reaches its window, then stops on an error Rosetta does not hit |
-| Photoshop | stops during startup |
+| Photoshop | stops during startup; in native mode every import now binds (`ocerz -check`, October 2026) |
 
 Every result is dated and explained in [Compatibility](docs/compatibility.md),
 together with what Steam, the GPU and Wine took to get there.
@@ -214,8 +214,8 @@ contributors.
 | x86-64 guest suite, interpreted and translated | 150 / 150 |
 | x86-64 differential, interpreter against JIT | 111 / 111 |
 | i386 differential, in each of two memory layouts | 40,044 / 40,044 |
-| dynamic-linking suite | 466 / 466 |
-| native-mode suite | 91 / 91 |
+| dynamic-linking suite | 472 / 472 |
+| native-mode suite | 99 / 99 |
 | 32-bit (m32) programs | 81 / 81, one more skipped without a Steam database |
 
 Counted on macOS 27 in October 2026. [Testing](docs/testing.md) says what
