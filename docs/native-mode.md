@@ -179,6 +179,56 @@ Guest code that never crosses pays nothing, which is why the last two rows are a
 
 The mode is process-wide and fixed before the VM starts, because the JIT materializes its trap-window bounds once, and a spawned child inherits it through `OCERZ_MODE`, even one started with no environment at all. `tests/run_native_tests.sh` pins all of this end to end. `tests/unit/test_apidb.c`, `test_vdylib.c`, `test_bridge.c`, `test_abi.c`, `test_callback.c`, `test_objcbridge.c` and `test_blocks.c` pin the database format and its refusals, the synthesized image, the crossings built from the database and the calls ocerz answers itself, argument placement across the signature space, the trampoline bank, the Objective-C encodings, formats, sends and class realization, and the block wrappers, their lifetimes and the guest's block runtime; `test_syscall.c` pins the argument vector and environment a spawned or exec'd child is started with.
 
+## Will a program run?
+
+`ocerz -check` answers that without running the program. It loads the program,
+an application bundle or its executable, and every library it loads at launch
+as native mode would, binds every import, and stops before any of the
+program's code runs. Then it says how each import will be answered:
+
+- it crosses to the Mac's own framework (a `fn` or `data` record);
+- ocerz answers it (a `special` or `var` record, an Objective-C ivar offset,
+  the lazy binder);
+- it binds in the program's own code or a guest library, such as the guest
+  C++ runtime;
+- it binds to a stub, and the program stops with a named message if it ever
+  calls it, which many programs never do with most of what they import;
+- it binds to a placeholder (`OCERZ_STUB_MISSING=1`, or a library macOS
+  removed);
+- it is missing, and native mode will not start the program; `no-library`
+  when native mode has nothing for the library at all.
+
+```sh
+./ocerz -check /Applications/Some.app             # a summary, then every stub and missing import
+OCERZ_CHECK_ALL=1 ./ocerz -check Some.app         # every import: kind, library, name, reason, importer
+```
+
+It exits 0 when everything binds to something that runs, 1 when some imports
+are stubs or placeholders, and 71 when native mode would refuse the program. It
+cannot see the libraries a program `dlopen`s later, or the Objective-C messages
+it sends, which cross by selector while it runs.
+
+`tools/native-coverage.py` runs the check over many programs (`--scan
+/Applications` finds every app bundle with an x86_64 executable) and ranks
+what native mode lacks by how many programs import it: libraries it has no
+database for, the Swift names in libraries it has, and every C or Objective-C
+stub with the reason it is one. That is the order in which bridging would let
+the most programs run. `--anonymous` numbers the programs instead of naming
+them, for a report that is shared.
+
+On 29 October 2026 one Mac's programs went through it: the three Intel-only
+apps installed there and the x86_64 slices of 27 third-party universal apps.
+Six bind completely, and ten bind with a few stubs they may never call.
+Fourteen are refused. Eleven of those are refused only for Swift: the Swift
+runtime, SwiftUI, Combine and the Swift overlays of Foundation and the other
+frameworks. One is refused for AdSupport, one for libffi, and one for names it
+expects another of its libraries to supply in the flat namespace. Among C and
+Objective-C names, the gaps most programs import are GSS's Kerberos functions
+(ten programs; stubs, because their structures are packed differently on
+Intel), `pthread_cancel` (nine), `syscall`, `objc_loadClassref` and
+`sqlite3_vfs_find` (seven each), and `JSClassCreate`, malloc's fork hooks and
+libxml2's parser contexts (six each).
+
 ## What native mode cannot run yet
 
 Each of these stops a program with a named message, exit 71 when an import cannot bind or 72 when a bound export has no crossing, rather than running it wrongly:

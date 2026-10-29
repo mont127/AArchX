@@ -55,6 +55,10 @@ extern uint64_t ocerz_main_mh;
 
 int ocerz_peek_dynamic(const char *path);
 int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, char **envp);
+
+/* -check: load and bind the program in native mode, report how each of its imports will be answered, and stop
+   before any of its code runs (dyld.c, native_check_report). */
+extern int ocerz_native_check;
 int ocerz_dyld_aot(struct OcerzVM *vm, int n, char **paths, int deps, char **envp);
 int ocerz_dyld_filetype(const char *path);
 uint64_t ocerz_dyld_file_ident(const char *path);

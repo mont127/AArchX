@@ -248,6 +248,7 @@ static int aot_main(OcerzVM *vm, int n, char **images, int deps, const char *sel
 static void usage(void)
 {
     fprintf(stderr, "usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-fex] [-path file] [--] program [args...]\n"
+                    "       ocerz -check program\n"
                     "       ocerz -aot|-aot-deps image [image...]\n"
                     "       ocerz -aot-all\n"
                     "       ocerz version\n");
@@ -709,6 +710,10 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-cache") == 0) {
             ocerz_mode = OCERZ_MODE_CACHE;
             mode_from_flag = 1;
+        } else if (strcmp(argv[i], "-check") == 0) {
+            ocerz_native_check = 1;
+            ocerz_mode = OCERZ_MODE_NATIVE;
+            mode_from_flag = 1;
         } else if (strcmp(argv[i], "-fex") == 0) {
             setenv("OCERZ_FEX", "1", 1);
         } else if (strcmp(argv[i], "-path") == 0 && i + 1 < argc) {
@@ -857,6 +862,11 @@ int main(int argc, char **argv)
     if (dynamic < 0) {
         OCERZ_FATAL("cannot read %s\n", load_path);
         return 65;
+    }
+    if (ocerz_native_check && (ocerz_mode != OCERZ_MODE_NATIVE || m32_is_i386(load_path))) {
+        OCERZ_FATAL("-check looks at a 64-bit Intel program in native mode; %s\n",
+                    ocerz_mode != OCERZ_MODE_NATIVE ? "it does not apply in cache mode" : "this one is 32-bit (m32)");
+        return 64;
     }
     if (!dynamic && ocerz_mode == OCERZ_MODE_NATIVE) {
         OCERZ_FATAL("native mode cannot run the static image %s\n", load_path);

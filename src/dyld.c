@@ -2058,6 +2058,159 @@ static uint64_t cache_flat_loaded_ex(OcerzCache *cache, const char *name, int *f
     return 0;
 }
 
+/*
+ * -check (main.c) asks whether a program can run in native mode without running
+ * it: the program and every library it loads at launch are loaded and bound as
+ * for a run, each import is noted here with how it was answered, and the run
+ * stops after the main image's fixups (native_check_report) with nothing of the
+ * program's executed.  An import crosses to the Mac's framework (a fn or data
+ * record), is answered by ocerz itself (special and var records, Objective-C ivar
+ * offsets), binds in the program's own code or a guest library, binds to a stub
+ * that stops the program with a named message if it is ever called, binds to a
+ * placeholder (OCERZ_STUB_MISSING, or a library macOS removed), or is missing,
+ * which makes native mode refuse to start the program.  A weak import nothing
+ * exports is left NULL as on a Mac without it.  The record kind comes from the
+ * API database of the library the import names when that library is a virtual
+ * one, and otherwise from the image the bound address lies in.  Imports are kept
+ * once per library and name, with a count of the images that asked for them.
+ * What the check cannot see: libraries the program dlopens later, and the
+ * Objective-C messages it sends, which cross by selector at run time.
+ */
+int ocerz_native_check;
+
+typedef struct NativeCheck {
+    char *lib, *sym, *from;
+    const char *kind, *reason;
+    int refs;
+} NativeCheck;
+static NativeCheck *g_check;
+static int g_check_n, g_check_cap;
+
+static int ndl_covers(uint64_t mh, uint64_t addr, uint64_t len, int *readonly);
+
+static const char *native_check_kind(const OcerzApiEntry *e)
+{
+    switch (e->kind) {
+    case OCERZ_API_FN:
+    case OCERZ_API_DATA: return "bridged";
+    case OCERZ_API_VAR:
+    case OCERZ_API_SPECIAL: return "ocerz";
+    case OCERZ_API_STUB: return "stub";
+    }
+    return "ocerz";
+}
+
+static void native_check_note(const DynImage *img, const char *name, const char *tgt, int libord, int weak,
+                              int found, int placeholder, uint64_t value)
+{
+    const char *lib = libord == -1 ? "(main executable)" : tgt && tgt[0] ? tgt : "(flat)";
+    const char *kind = "ocerz", *reason = "";
+    if (!found) {
+        kind = weak ? "absent-weak" : "missing";
+        /* A library native mode has nothing for at all, rather than one missing a name: Swift's runtime and
+           overlays, SwiftUI and Combine, which no API database can describe, and libraries macOS dropped. */
+        if (tgt && tgt[0] && !ocerz_vdylib_have(tgt) && !dimg_find_by_install_name(tgt) &&
+            !dimg_find_by_path(tgt))
+            reason = "no-library";
+    } else if (placeholder) {
+        kind = "placeholder";
+    } else if (strcmp(name, "dyld_stub_binder") == 0) {
+        kind = "ocerz";   /* the loader makes every lazy bind itself (vdylib.c), so nothing reaches it */
+    } else {
+        /* Where the import bound decides first: libSystem's unwinder names bind in the guest's libunwind
+           (ocerz_image_self_resolve_ex) though libSystem's database stubs them.  A specials' trampoline page and a
+           data export's native address lie in no image, and the library the import names says what they are. */
+        const DynImage *in = NULL;
+        const DynImage *main = g_main_dimg_valid ? &g_main_dimg : g_main_loading;
+        if (main && ndl_covers(main->load_base, value, 1, NULL))
+            in = main;
+        for (int i = 0; !in && i < g_dimgs_n; i++)
+            if (ndl_covers(g_dimgs[i].load_base, value, 1, NULL))
+                in = &g_dimgs[i];
+        const char *apilib = in ? (in->is_virtual ? in->install_name : NULL) : tgt && ocerz_vdylib_have(tgt) ? tgt : NULL;
+        const OcerzApiLibrary *api = apilib ? ocerz_apidb_library(apilib) : NULL;
+        const OcerzApiEntry *e = api ? ocerz_apidb_find(api, name) : NULL;
+        if (e) {
+            kind = native_check_kind(e);
+            reason = e->kind == OCERZ_API_STUB && e->reason ? e->reason : "";
+        } else if (in) {
+            kind = "guest";
+        }
+    }
+    for (int i = 0; i < g_check_n; i++)
+        if (strcmp(g_check[i].sym, name) == 0 && strcmp(g_check[i].lib, lib) == 0) {
+            g_check[i].refs++;
+            return;
+        }
+    if (g_check_n == g_check_cap) {
+        int cap = g_check_cap ? g_check_cap * 2 : 1024;
+        NativeCheck *grown = realloc(g_check, (size_t)cap * sizeof *grown);
+        if (!grown)
+            return;
+        g_check = grown;
+        g_check_cap = cap;
+    }
+    NativeCheck *c = &g_check[g_check_n++];
+    c->lib = strdup(lib);
+    c->sym = strdup(name);
+    c->from = strdup(img->path);
+    c->kind = kind;
+    c->reason = reason;
+    c->refs = 1;
+}
+
+static int native_check_order(const void *a, const void *b)
+{
+    const NativeCheck *x = a, *y = b;
+    int c = strcmp(x->kind, y->kind);
+    if (!c)
+        c = strcmp(x->lib, y->lib);
+    return c ? c : strcmp(x->sym, y->sym);
+}
+
+/* The report, on stdout: a summary and every import that keeps the program from running or may stop it, or with
+   OCERZ_CHECK_ALL=1 every import as tab-separated kind, library, name, reason and first importer (what
+   tools/native-coverage.sh reads).  Exit status: 0 when everything binds to something that runs, 1 when some
+   imports bind to stubs or placeholders, 71 when native mode would refuse to start the program. */
+static int native_check_report(const char *path)
+{
+    static const char *const kinds[] = {"bridged", "ocerz", "guest", "stub", "placeholder", "missing", "absent-weak"};
+    int count[sizeof kinds / sizeof kinds[0]] = {0};
+    qsort(g_check, (size_t)g_check_n, sizeof *g_check, native_check_order);
+    for (int i = 0; i < g_check_n; i++)
+        for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++)
+            if (strcmp(g_check[i].kind, kinds[k]) == 0)
+                count[k]++;
+    int images = g_dimgs_n + 1;
+    const char *all = getenv("OCERZ_CHECK_ALL");
+    if (all && *all && strcmp(all, "0") != 0) {
+        for (int i = 0; i < g_check_n; i++)
+            printf("%s\t%s\t%s\t%s\t%s\n", g_check[i].kind, g_check[i].lib, g_check[i].sym, g_check[i].reason,
+                   g_check[i].from);
+    } else {
+        printf("%s: %d imports, from the program and %d librar%s it loads at launch\n", path, g_check_n, images - 1,
+               images - 1 == 1 ? "y" : "ies");
+        printf("  %6d cross to the Mac's own frameworks\n", count[0]);
+        printf("  %6d are answered by ocerz\n", count[1]);
+        printf("  %6d bind in the program's own code or guest libraries\n", count[2]);
+        printf("  %6d bind to stubs, which stop the program if it calls one\n", count[3]);
+        if (count[4])
+            printf("  %6d bind to placeholders that return 0 or nil\n", count[4]);
+        printf("  %6d are missing, so native mode will not start the program\n", count[5]);
+        if (count[6])
+            printf("  %6d weak imports this Mac does not have stay NULL, as they would without ocerz\n", count[6]);
+        for (int i = 0; i < g_check_n; i++) {
+            const NativeCheck *c = &g_check[i];
+            if (strcmp(c->kind, "stub") && strcmp(c->kind, "placeholder") && strcmp(c->kind, "missing"))
+                continue;
+            printf("%-11s %s in %s%s%s%s\n", c->kind, c->sym, c->lib, c->reason[0] ? " (" : "", c->reason,
+                   c->reason[0] ? ")" : "");
+        }
+    }
+    fflush(stdout);
+    return count[5] || g_native_miss_dropped ? 71 : count[3] || count[4] ? 1 : 0;
+}
+
 static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *name,
                                int libord, int weak)
 {
@@ -2161,6 +2314,8 @@ static uint64_t resolve_import(OcerzCache *cache, DynImage *img, const char *nam
         value = native_missing_stub(name, libord == -1 ? "(main executable)" : tgt);
         found = 1;
     }
+    if (ocerz_native_check)
+        native_check_note(img, name, tgt, libord, weak, found, stub, value);
     if (!found && !weak) {
         if (ocerz_mode == OCERZ_MODE_NATIVE) {
             native_miss_add(libord == -1 ? "(main executable)" : tgt, name, img->path);
@@ -7329,6 +7484,11 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     }
     protect_ro_segments(&img);
 
+    if (ocerz_native_check) {
+        int rc = native_check_report(path);
+        free_file(buf);
+        return rc;
+    }
     if (ocerz_mode == OCERZ_MODE_NATIVE && g_native_miss_n > 0) {
         for (int i = 0; i < g_native_miss_n; i++)
             fprintf(stderr, "ocerz: native: no bridge for %s in %s\n",

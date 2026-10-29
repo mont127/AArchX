@@ -12499,6 +12499,62 @@ case_native_bound() {
 # parses it and builds its image again while CoreFoundation's stay kept.  The
 # guest reads a data export (kCFBooleanTrue) too, an absolute address a kept
 # image carries over from the run that built it.
+# ocerz -check loads and binds a program as native mode would, runs none of it, and says how each import will be
+# answered (dyld.c, native_check_report): a program that binds completely exits 0, one whose imports include a stub
+# exits 1 and names it, one that links a library native mode does not have exits 71 and names the import.  None of
+# the three prints "ran", which each would if its code ran.  libffi is the missing library because no API database
+# describes it; if one ever does, pick another.
+case_native_check() {
+    local name=native_check reason="" d="$TMP/native_check" rc
+    local appkit=/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
+    local cf=/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/ok.c" <<'EOC'
+#include <stdio.h>
+#include <CoreFoundation/CoreFoundation.h>
+int main(void) { printf("ran %ld\n", (long)CFStringGetLength(CFSTR("ok"))); return 0; }
+EOC
+    cat > "$d/stubbed.c" <<'EOC'
+#include <stdio.h>
+extern long NSRunAlertPanel(void *title, void *msg, void *def, void *alt, void *other, ...);
+int main(int argc, char **argv) { puts("ran"); if (argc > 5) NSRunAlertPanel(0, 0, 0, 0, 0); return 0; }
+EOC
+    cat > "$d/missing.c" <<'EOC'
+#include <stdio.h>
+extern int ffi_prep_cif(void *, int, unsigned, void *, void **);
+int main(int argc, char **argv) { puts("ran"); if (argc > 5) ffi_prep_cif(0, 0, 0, 0, 0); return 0; }
+EOC
+    if ! clang -arch x86_64 -O1 -o "$d/ok" "$d/ok.c" -framework CoreFoundation >"$d/cc.log" 2>&1 ||
+       ! clang -arch x86_64 -O1 -o "$d/stubbed" "$d/stubbed.c" -framework AppKit >>"$d/cc.log" 2>&1 ||
+       ! clang -arch x86_64 -O1 -o "$d/missing" "$d/missing.c" -lffi >>"$d/cc.log" 2>&1; then
+        record "$name" "the fixtures did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    local f
+    for f in ok stubbed missing; do
+        run_bounded "$d/$f.out" "$d/$f.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -check "$d/$f"
+        echo "rc $?" >> "$d/$f.out"
+    done
+    run_bounded "$d/all.out" "$d/all.err" env OCERZ_CHECK_ALL=1 OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -check "$d/ok"
+    if grep -q "^ran" "$d"/*.out; then
+        reason="a checked program ran: $(grep -l '^ran' "$d"/*.out | head -1)"
+    elif ! grep -q "^rc 0$" "$d/ok.out" || ! grep -q " 0 bind to stubs" "$d/ok.out" || ! grep -q " 0 are missing" "$d/ok.out"; then
+        reason="the complete program did not check clean: $(tr '\n' ' ' < "$d/ok.out" | cut -c1-200)"
+    elif ! grep -q "^rc 1$" "$d/stubbed.out" || ! grep -Fq "_NSRunAlertPanel in $appkit (variadic)" "$d/stubbed.out"; then
+        reason="the program importing a stub did not exit 1 naming NSRunAlertPanel: $(tr '\n' ' ' < "$d/stubbed.out" | cut -c1-200)"
+    elif ! grep -q "^rc 71$" "$d/missing.out" || ! grep -Fq "_ffi_prep_cif in /usr/lib/libffi.dylib (no-library)" "$d/missing.out"; then
+        reason="the program linking libffi did not exit 71 naming ffi_prep_cif: $(tr '\n' ' ' < "$d/missing.out" | cut -c1-200)"
+    elif ! awk -F'\t' -v cf="$cf" '$1 == "bridged" && $2 == cf && $3 == "_CFStringGetLength" { f = 1 } END { exit !f }' \
+            "$d/all.out"; then
+        reason="OCERZ_CHECK_ALL=1 did not list CFStringGetLength as bridged: $(head -3 "$d/all.out" | tr '\n' ' ' | cut -c1-200)"
+    fi
+    record "$name" "$reason" "complete, stubbed and missing"
+}
+
 # Two libraries that link each other, each with a class whose superclass is the other's, and a category of one's
 # on the other's class (Photoshop's frameworks do this).  Defining classes one library at a time read libA's
 # classes while only libB was bound, and the launch died with SIGSEGV; they are defined together now
@@ -15684,6 +15740,7 @@ case_sys sys_strings "$SYS_STRINGS_BIN" "$SYS_STRINGS_ARM64" sys_strings "$SYS_S
 case_sys_strings_inplace
 case_sys_strings_fault
 case_native_x86_identity
+case_native_check
 case_native_objc_cycle
 case_native_kept
 case_native_tcache
