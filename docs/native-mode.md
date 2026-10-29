@@ -242,6 +242,40 @@ native mode a lazy flat import that nothing defines at launch now waits for
 its first call. The last import it lacked, TWAIN's `DSM_Entry`, now has a
 database.
 
+## Comparing with Rosetta
+
+`tools/native-diff.py` runs the same x86_64 probes under Rosetta, cache mode
+and native mode and lists every line where they disagree. Rosetta runs
+Apple's x86_64 libraries, so it gives the answer an Intel Mac gives. A line
+where only native mode differs is the bridge's doing; one where only cache
+mode differs is the translator's.
+
+The probes are in `tests/native-diff`: the printf and scanf families, text to
+number conversion, time formatting in fixed zones, CoreFoundation, Foundation,
+what a program learns about the machine, and one the tool generates from
+libSystem's API database, which calls every side-effect-free function whose
+arguments and result are all numbers (libm, character classes) on a fixed set
+of inputs. Floating-point results are compared by their bits. Differences of a
+few units in the last place, of NaN signs, and of long double precision are
+counted apart, and `tests/native-diff/accepted` lists the differences already
+understood, each with its reason. A run takes under two minutes and exits 1
+when it finds anything else.
+
+```sh
+tools/native-diff.py                  # every probe
+tools/native-diff.py printf foundation
+tools/native-diff.py --show-accepted  # the accepted differences too
+```
+
+Its first run found native mode refusing every `%L` and `%n` conversion and
+scanf's long doubles and positional arguments, every fork child that used an
+Objective-C class after the program had waited on anything (libobjc's fork
+check, now off in ocerz), and both modes reporting the host's 128-byte cache
+line where an Intel Mac reports 64. Those are fixed. What remains is accepted:
+native mode's long double is a double, cache mode keeps the x87 stack as
+doubles and keeps no SSE exception flags, and the two libms disagree on
+high-order Bessel functions and on which zero `fmax` and `fmin` return.
+
 ## What native mode cannot run yet
 
 Each of these stops a program with a named message, exit 71 when an import cannot bind or 72 when a bound export has no crossing, rather than running it wrongly:
