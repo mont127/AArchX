@@ -199,7 +199,6 @@ static const char *const kCFBridged[] = {
 #define NCFBRIDGED (sizeof kCFBridged / sizeof kCFBridged[0])
 
 static const char *const kNoDescriptor[][2] = {
-    { "/usr/lib/libSystem.B.dylib", "dyld_stub_binder" },
     { "/usr/lib/libSystem.B.dylib", "__dyld_bind_fully_image_containing_address" },
     { "/usr/lib/libSystem.B.dylib", "_forkpty" },
     { "/usr/lib/libSystem.B.dylib", "___stack_chk_guard" },
@@ -222,6 +221,7 @@ static const char *const kDlSpecials[] = {
     "_dyld_get_active_platform", "_dyld_program_sdk_at_least", "_dyld_program_minos_at_least",
     "_dyld_sdk_at_least", "_dyld_minos_at_least", "__dyld_is_memory_immutable",
     "_dyld_shared_cache_some_image_overridden", "__dyld_shared_cache_contains_path", "__dyld_get_image_uuid",
+    "dyld_stub_binder",
 };
 #define NDLSPECIALS (sizeof kDlSpecials / sizeof kDlSpecials[0])
 

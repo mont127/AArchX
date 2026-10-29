@@ -255,8 +255,9 @@
 # lookup-and-bind calls describe host dyld's own images and tables, none of
 # which is the guest's - and so does the NSModule-era API.  The getsect and
 # get_end family read the host's main executable, which is ocerz.
-# dyld_stub_binder is only reached by a lazy bind the loader failed to make, so
-# a stub that names it is the honest answer.
+# dyld_stub_binder is a special: it is reached by a lazy import the loader left
+# unbound because nothing loaded at launch defined it, and binds it on that
+# first call as dyld does (ocerz_dyld_lazy_bind).
 #
 # Process identity: host dyld's _NSGetExecutablePath names ocerz's executable and
 # _NSGetMachExecuteHeader ocerz's header, so both are specials answering the
@@ -805,7 +806,7 @@ special _getsegbyname getsegbyname
 stub _get_end override
 stub _get_etext override
 stub _get_edata override
-stub dyld_stub_binder override
+special dyld_stub_binder dyld_stub_binder
 
 special __NSGetExecutablePath NSGetExecutablePath
 special __NSGetMachExecuteHeader NSGetMachExecuteHeader

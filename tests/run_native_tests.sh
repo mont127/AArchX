@@ -12644,6 +12644,58 @@ EOC
     record "$name" "$reason" "classes and a category across two libraries that link each other"
 }
 
+# A program linked -undefined dynamic_lookup with classic lazy binding (before macOS 12) imports a name nothing it
+# loads at launch defines, and dlopens the library that does before its first call (Photoshop's libmkl_core does
+# this with MKL's BLAS names).  Native mode leaves the lazy pointer on the __stub_helper entry and binds it in
+# dyld_stub_binder on that first call (ocerz_dyld_lazy_bind), as dyld does: it prints "21 41".  With a library that
+# does not define it, the call ends the program with 71 naming the import; -check counts it as lazy and exits 0.
+case_native_lazy_flat() {
+    local name=native_lazy_flat reason="" d="$TMP/native_lazy_flat" rc
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/provider.c" <<'EOC'
+int provided(int x) { return x + 1; }
+EOC
+    cat > "$d/other.c" <<'EOC'
+int unrelated(int x) { return x; }
+EOC
+    cat > "$d/main.c" <<'EOC'
+#include <dlfcn.h>
+#include <stdio.h>
+extern int provided(int);
+int main(int argc, char **argv) {
+    if (argc < 2 || !dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL)) { printf("dlopen: %s\n", dlerror()); return 1; }
+    printf("%d %d\n", provided(20), provided(40));
+    return 0;
+}
+EOC
+    if ! (cd "$d" &&
+          clang -arch x86_64 -mmacosx-version-min=10.15 -dynamiclib -o libprovider.dylib provider.c &&
+          clang -arch x86_64 -mmacosx-version-min=10.15 -dynamiclib -o libother.dylib other.c &&
+          clang -arch x86_64 -mmacosx-version-min=10.15 -Wl,-no_fixup_chains -Wl,-undefined,dynamic_lookup \
+              -o lazyflat main.c) >"$d/cc.log" 2>&1; then
+        record "$name" "the fixtures did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/lazyflat" "$d/libprovider.dylib"
+    rc=$?
+    run_bounded "$d/miss.out" "$d/miss.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/lazyflat" "$d/libother.dylib"
+    local mrc=$?
+    run_bounded "$d/check.out" "$d/check.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -check "$d/lazyflat"
+    local crc=$?
+    if [ "$rc" != 0 ] || [ "$(cat "$d/out")" != "21 41" ]; then
+        reason="it printed '$(tr '\n' ' ' < "$d/out")' and exited $rc, want '21 41' and 0: $(tail -1 "$d/err" | cut -c1-160)"
+    elif [ "$mrc" != 71 ] || ! grep -Fq "lazy import _provided has no definition" "$d/miss.err"; then
+        reason="with no definition it exited $mrc, want 71 naming _provided: $(tail -1 "$d/miss.err" | cut -c1-160)"
+    elif [ "$crc" != 0 ] || ! grep -q " 1 lazy imports" "$d/check.out" || ! grep -q " 0 are missing" "$d/check.out"; then
+        reason="-check exited $crc, want 0 with one lazy import: $(tr '\n' ' ' < "$d/check.out" | cut -c1-200)"
+    fi
+    record "$name" "$reason" "a lazy flat import bound on its first call"
+}
+
 # A chained-fixups import table has three layouts, chosen by the largest addend an import carries: 4-byte entries,
 # 8-byte ones with a 32-bit addend (&table[300] in another library), and 16-byte ones with a 64-bit addend.  The
 # loader read every table as the first, so each ordinal bound another import's name or the empty one, in either mode
@@ -15856,6 +15908,7 @@ case_sys_strings_fault
 case_native_x86_identity
 case_native_check
 case_native_objc_cycle
+case_native_lazy_flat
 case_native_import_addends
 case_native_flat_nonlazy
 case_native_kept

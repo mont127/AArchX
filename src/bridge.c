@@ -1330,6 +1330,23 @@ static int br_settle(struct OcerzVM *vm, OcerzCPU *cpu)
     return OCERZ_STEP_OK;
 }
 
+/* dyld_stub_binder (ocerz_dyld_lazy_bind): the helper's two pushes come off the stack and the call goes on to the
+   function just bound, every register as the caller left it.  An import nothing defines even now ends the program
+   with its name, where dyld would abort on the same call. */
+static int br_dyld_stub_binder(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    uint64_t rsp = cpu->gpr[OCERZ_RSP], target = 0;
+    char name[512];
+    if (!ocerz_dyld_lazy_bind(ocerz_ld(rsp, 8), ocerz_ld(rsp + 8, 8), &target, name, sizeof name)) {
+        fprintf(stderr, "ocerz: native: lazy import %s has no definition in any loaded image\n", name);
+        ocerz_vm_request_exit(vm, 71);
+        return OCERZ_STEP_EXIT;
+    }
+    cpu->gpr[OCERZ_RSP] = rsp + 16;
+    cpu->rip = target;
+    return br_settle(vm, cpu);
+}
+
 void ocerz_bridge_return(OcerzCPU *cpu, uint64_t rax)
 {
     br_return(cpu, rax);
@@ -2931,6 +2948,7 @@ static const BrHandler g_br_handlers[] = {
     { "error",           br_error },
     { "bzero",           br_bzero },
     { "tlv_bootstrap",   br_tlv_bootstrap },
+    { "dyld_stub_binder", br_dyld_stub_binder },
     { "stack_chk_fail",  br_stack_chk_fail },
     { "chkstk",          br_chkstk },
     { "sigaction",       br_sigaction },

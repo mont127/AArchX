@@ -59,6 +59,10 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
 /* -check: load and bind the program in native mode, report how each of its imports will be answered, and stop
    before any of its code runs (dyld.c, native_check_report). */
 extern int ocerz_native_check;
+
+/* dyld_stub_binder in native mode: bind the lazy import at offset in the lazy-bind information of the image whose
+   __dyld_private is at image_private, on its first call (dyld.c). */
+int ocerz_dyld_lazy_bind(uint64_t image_private, uint64_t offset, uint64_t *target, char *name, size_t n);
 int ocerz_dyld_aot(struct OcerzVM *vm, int n, char **paths, int deps, char **envp);
 int ocerz_dyld_filetype(const char *path);
 uint64_t ocerz_dyld_file_ident(const char *path);

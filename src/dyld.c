@@ -2069,7 +2069,8 @@ static uint64_t cache_flat_loaded_ex(OcerzCache *cache, const char *name, int *f
  * that stops the program with a named message if it is ever called, binds to a
  * placeholder (OCERZ_STUB_MISSING, or a library macOS removed), or is missing,
  * which makes native mode refuse to start the program.  A weak import nothing
- * exports is left NULL as on a Mac without it.  The record kind comes from the
+ * exports is left NULL as on a Mac without it, and a lazy flat-namespace import
+ * nothing loaded at launch defines binds when it is first called (flat_flush).  The record kind comes from the
  * API database of the library the import names when that library is a virtual
  * one, and otherwise from the image the bound address lies in.  Imports are kept
  * once per library and name, with a count of the images that asked for them.
@@ -2077,6 +2078,7 @@ static uint64_t cache_flat_loaded_ex(OcerzCache *cache, const char *name, int *f
  * Objective-C messages it sends, which cross by selector at run time.
  */
 int ocerz_native_check;
+static int g_check_lazy;   /* set while a lazy flat import is resolved quietly, to bind on first call if it misses */
 
 typedef struct NativeCheck {
     char *lib, *sym, *from;
@@ -2106,7 +2108,7 @@ static void native_check_note(const DynImage *img, const char *name, const char 
     const char *lib = libord == -1 ? "(main executable)" : tgt && tgt[0] ? tgt : "(flat)";
     const char *kind = "ocerz", *reason = "";
     if (!found) {
-        kind = weak ? "absent-weak" : "missing";
+        kind = g_check_lazy ? "lazy" : weak ? "absent-weak" : "missing";
         /* A library native mode has nothing for at all, rather than one missing a name: Swift's runtime and
            overlays, SwiftUI and Combine, which no API database can describe, and libraries macOS dropped. */
         if (tgt && tgt[0] && !ocerz_vdylib_have(tgt) && !dimg_find_by_install_name(tgt) &&
@@ -2115,7 +2117,7 @@ static void native_check_note(const DynImage *img, const char *name, const char 
     } else if (placeholder) {
         kind = "placeholder";
     } else if (strcmp(name, "dyld_stub_binder") == 0) {
-        kind = "ocerz";   /* the loader makes every lazy bind itself (vdylib.c), so nothing reaches it */
+        kind = "ocerz";   /* bridge.c's special, reached only by a lazy flat import nothing defined at launch */
     } else {
         /* Where the import bound decides first: libSystem's unwinder names bind in the guest's libunwind
            (ocerz_image_self_resolve_ex) though libSystem's database stubs them.  A specials' trampoline page and a
@@ -2174,7 +2176,8 @@ static int native_check_order(const void *a, const void *b)
    imports bind to stubs or placeholders, 71 when native mode would refuse to start the program. */
 static int native_check_report(const char *path)
 {
-    static const char *const kinds[] = {"bridged", "ocerz", "guest", "stub", "placeholder", "missing", "absent-weak"};
+    static const char *const kinds[] = {"bridged", "ocerz", "guest", "stub", "placeholder", "missing", "absent-weak",
+                                        "lazy"};
     int count[sizeof kinds / sizeof kinds[0]] = {0};
     qsort(g_check, (size_t)g_check_n, sizeof *g_check, native_check_order);
     for (int i = 0; i < g_check_n; i++)
@@ -2199,6 +2202,9 @@ static int native_check_report(const char *path)
         printf("  %6d are missing, so native mode will not start the program\n", count[5]);
         if (count[6])
             printf("  %6d weak imports this Mac does not have stay NULL, as they would without ocerz\n", count[6]);
+        if (count[7])
+            printf("  %6d lazy imports nothing loaded at launch defines bind when first called, as under dyld\n",
+                   count[7]);
         for (int i = 0; i < g_check_n; i++) {
             const NativeCheck *c = &g_check[i];
             if (strcmp(c->kind, "stub") && strcmp(c->kind, "placeholder") && strcmp(c->kind, "missing"))
@@ -2743,13 +2749,21 @@ static int flat_defer(DynImage *img, uint64_t addr, const char *name, int64_t ad
     return 1;
 }
 
+/* In native mode a lazy one that nothing loaded by then defines stays as the image left it, its lazy pointer on the
+   __stub_helper entry, and binds on its first call through dyld_stub_binder (ocerz_dyld_lazy_bind), as under
+   dyld, for a program that loads the definition itself later.  Cache mode still writes 0 there. */
 static void flat_flush(OcerzCache *cache)
 {
     g_flat_defer = 0;
+    int native = ocerz_mode == OCERZ_MODE_NATIVE;
     for (size_t i = 0; i < g_flat_pending_n; i++) {
         FlatPending *f = &g_flat_pending[i];
-        uint64_t v = resolve_import(cache, f->img, f->name, BIND_SPECIAL_DYLIB_FLAT_LOOKUP, f->weak);
-        ocerz_st(f->addr, 8, v ? v + (uint64_t)f->addend : 0);
+        int quiet = f->lazy && native;
+        g_check_lazy = quiet;
+        uint64_t v = resolve_import(cache, f->img, f->name, BIND_SPECIAL_DYLIB_FLAT_LOOKUP, quiet || f->weak);
+        g_check_lazy = 0;
+        if (v || !quiet)
+            ocerz_st(f->addr, 8, v ? v + (uint64_t)f->addend : 0);
     }
     free(g_flat_pending);
     g_flat_pending = NULL;
@@ -2763,12 +2777,23 @@ static void flat_flush(OcerzCache *cache)
  * program binds to itself was a search of 3,900 images that found nothing:
  * 1,743 of them, 621 ms, in ffmpeg -version.
  */
-/* One bind of the classic streams. */
+/* One bind of the classic streams.  A lazy flat bind outside the launch (a dlopened library's) that nothing
+   defines yet is left on its stub helper in native mode, to bind on first call. */
 static void classic_bind(DynImage *img, OcerzCache *cache, uint64_t addr, const char *name, int libord, int weak,
                          int64_t addend, int is_lazy, ClassicMemo *memo)
 {
-    if (libord == BIND_SPECIAL_DYLIB_FLAT_LOOKUP && g_flat_defer && flat_defer(img, addr, name, addend, weak, is_lazy))
-        return;
+    if (libord == BIND_SPECIAL_DYLIB_FLAT_LOOKUP) {
+        if (g_flat_defer && flat_defer(img, addr, name, addend, weak, is_lazy))
+            return;
+        if (is_lazy && ocerz_mode == OCERZ_MODE_NATIVE) {
+            g_check_lazy = 1;
+            uint64_t lv = resolve_import(cache, img, name, libord, 1);
+            g_check_lazy = 0;
+            if (lv)
+                ocerz_st(addr, 8, lv + (uint64_t)addend);
+            return;
+        }
+    }
     uint64_t v = classic_resolve(img, cache, name, libord, weak, memo);
     ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
 }
@@ -7830,4 +7855,68 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
     vm->cpu.gpr[OCERZ_RSP] = rsp;
     vm->cpu.rip = img.main_entry;
     return ocerz_vm_run(vm);
+}
+
+/*
+ * dyld_stub_binder, native mode (bridge.c's special).  A binary linked with classic lazy binding jumps there from
+ * its __stub_helper the first time it calls a lazy import whose pointer the loader left unbound, which in native
+ * mode is a lazy flat-namespace import nothing loaded at launch defined (flat_flush).  The helper has pushed the
+ * import's offset in the image's lazy-bind information, then the address of the image's __dyld_private, so the
+ * image is the one that address lies in.  The import is resolved among everything loaded now, its lazy pointer
+ * written, and the bound address handed back; 0 when nothing defines it even now, with the name in name.
+ */
+int ocerz_dyld_lazy_bind(uint64_t image_private, uint64_t offset, uint64_t *target, char *name, size_t n)
+{
+    snprintf(name, n, "?");
+    pthread_mutex_lock(&g_load_lock);
+    DynImage *img = NULL;
+    if (g_main_dimg_valid && ndl_covers(g_main_dimg.load_base, image_private, 8, NULL))
+        img = &g_main_dimg;
+    for (int i = 0; !img && i < g_dimgs_n; i++)
+        if (!g_dimgs[i].is_virtual && ndl_covers(g_dimgs[i].load_base, image_private, 8, NULL))
+            img = &g_dimgs[i];
+    int ok = 0;
+    if (img && img->lazy_bind_size && offset < img->lazy_bind_size) {
+        const uint8_t *p = img->slice + img->lazy_bind_off + offset;
+        const uint8_t *end = img->slice + img->lazy_bind_off + img->lazy_bind_size;
+        uint64_t addr = 0;
+        int64_t addend = 0;
+        int libord = 0, bind = 0;
+        const char *sym = NULL;
+        while (p < end && !bind) {
+            uint8_t op = *p & 0xf0, imm = *p & 0x0f;
+            p++;
+            if (op == 0x10) {
+                libord = imm;
+            } else if (op == 0x20) {
+                libord = (int)self_uleb(&p, end);
+            } else if (op == 0x30) {
+                libord = imm ? (int)(int8_t)(0xf0 | imm) : 0;
+            } else if (op == 0x40) {
+                sym = (const char *)p;
+                p += strnlen(sym, (size_t)(end - p)) + 1;
+            } else if (op == 0x60) {
+                addend = self_sleb(&p, end);
+            } else if (op == 0x70) {
+                uint64_t off = self_uleb(&p, end);
+                if (imm < (uint8_t)img->seg_count)
+                    addr = img->seg_vmaddr[imm] + img->slide + off;
+            } else if (op == 0x90) {
+                bind = 1;
+            } else {
+                break;
+            }
+        }
+        if (bind && sym && addr) {
+            snprintf(name, n, "%s", sym);
+            uint64_t v = resolve_import(g_run_cache, img, sym, libord, 1);
+            if (v) {
+                ocerz_st(addr, 8, v + (uint64_t)addend);
+                *target = v + (uint64_t)addend;
+                ok = 1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_load_lock);
+    return ok;
 }

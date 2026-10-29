@@ -304,13 +304,11 @@
  * A binary linked with classic lazy binding, which is every Intel binary built
  * for a macOS older than 12, imports dyld_stub_binder from libSystem whether or
  * not it ever reaches it: its __stub_helper entries jump there to bind a lazy
- * pointer on first call.  The loader applies lazy binds eagerly, so no helper
- * ever runs, but the import still has to bind or the whole program is refused
- * with 71 before its first instruction.  Its name is the one symbol with no
- * leading underscore, because dyld defines it in assembly rather than in C, and
- * libSystem's database exports it as a stub record; a guest that did reach it
- * would name it and stop, which is the honest answer to a lazy bind the loader
- * failed to make.
+ * pointer on first call.  The loader applies lazy binds eagerly, so a helper
+ * runs only for a lazy flat-namespace import nothing loaded at launch defined,
+ * and the special (bridge.c, ocerz_dyld_lazy_bind) binds that on its first call
+ * as dyld does.  Its name is the one symbol with no leading underscore, because
+ * dyld defines it in assembly rather than in C.
  */
 #include "ocerz/vdylib.h"
 #include "ocerz/abi.h"
