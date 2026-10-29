@@ -12491,14 +12491,6 @@ case_native_bound() {
     record "$name" "$reason" "unbound=$n"
 }
 
-# What a native launch keeps beside the translation cache's store (src/apidb.c,
-# src/vdylib.c).  A first run parses the API databases its libraries need,
-# builds their images and keeps both; a second loads the parsed copies and the
-# kept images, parses and builds nothing, and still draws its own
-# ___stack_chk_guard; and once libSystem's database changes, the next run
-# parses it and builds its image again while CoreFoundation's stay kept.  The
-# guest reads a data export (kCFBooleanTrue) too, an absolute address a kept
-# image carries over from the run that built it.
 # ocerz -check loads and binds a program as native mode would, runs none of it, and says how each import will be
 # answered (dyld.c, native_check_report): a program that binds completely exits 0, one whose imports include a stub
 # exits 1 and names it, one that links a library native mode does not have exits 71 and names the import.  None of
@@ -12652,6 +12644,73 @@ EOC
     record "$name" "$reason" "classes and a category across two libraries that link each other"
 }
 
+# A chained-fixups import table has three layouts, chosen by the largest addend an import carries: 4-byte entries,
+# 8-byte ones with a 32-bit addend (&table[300] in another library), and 16-byte ones with a 64-bit addend.  The
+# loader read every table as the first, so each ordinal bound another import's name or the empty one, in either mode
+# (dyld.c, apply_fixups; Photoshop's dvaui has the second layout).
+case_native_import_addends() {
+    local name=native_import_addends reason="" d="$TMP/native_import_addends" mode f want got
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/data.c" <<'EOC'
+int table[1000] = { [0] = 7, [300] = 42, [999] = 99 };
+int first(void) { return 1; }
+int second(void) { return 2; }
+int third(void) { return 3; }
+EOC
+    cat > "$d/a32.c" <<'EOC'
+#include <stdio.h>
+extern int table[];
+extern int first(void), second(void), third(void);
+int *far = &table[300];
+int *farther = &table[999];
+int (*fns[])(void) = { first, second, third };
+int main(void) { printf("%d %d %d %d %d %d\n", table[0], *far, *farther, fns[0](), fns[1](), fns[2]()); return 0; }
+EOC
+    cat > "$d/a64.c" <<'EOC'
+#include <stdio.h>
+extern int table[];
+extern int first(void), second(void), third(void);
+char *huge = (char *)table + 0x123456789LL;
+int *far = &table[300];
+int (*fns[])(void) = { first, second, third };
+int main(void) {
+    printf("%llx %d %d %d %d\n", (unsigned long long)(huge - (char *)table), *far, fns[0](), fns[1](), fns[2]());
+    return 0;
+}
+EOC
+    if ! (cd "$d" &&
+          clang -arch x86_64 -mmacosx-version-min=12.0 -dynamiclib -install_name @rpath/libdata.dylib -o libdata.dylib data.c &&
+          clang -arch x86_64 -mmacosx-version-min=12.0 -Wl,-fixup_chains -o a32 a32.c -L. -ldata -Wl,-rpath,@executable_path &&
+          clang -arch x86_64 -mmacosx-version-min=12.0 -Wl,-fixup_chains -o a64 a64.c -L. -ldata -Wl,-rpath,@executable_path) \
+          >"$d/cc.log" 2>&1; then
+        record "$name" "the fixtures did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    for mode in "" -native; do
+        for f in a32 a64; do
+            [ "$f" = a32 ] && want="7 42 99 1 2 3" || want="123456789 42 1 2 3"
+            run_bounded "$d/$f.out" "$d/$f.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$d/$f"
+            got=$(cat "$d/$f.out")
+            if [ -z "$reason" ] && [ "$got" != "$want" ]; then
+                reason="$f${mode:+ $mode} printed '$got', want '$want': $(tail -1 "$d/$f.err" | cut -c1-160)"
+            fi
+        done
+    done
+    record "$name" "$reason" "32- and 64-bit import addends in both modes"
+}
+
+# What a native launch keeps beside the translation cache's store (src/apidb.c,
+# src/vdylib.c).  A first run parses the API databases its libraries need,
+# builds their images and keeps both; a second loads the parsed copies and the
+# kept images, parses and builds nothing, and still draws its own
+# ___stack_chk_guard; and once libSystem's database changes, the next run
+# parses it and builds its image again while CoreFoundation's stay kept.  The
+# guest reads a data export (kCFBooleanTrue) too, an absolute address a kept
+# image carries over from the run that built it.
 case_native_kept() {
     local name=native_kept reason="" d="$TMP/native_kept" i
     local ls_img=/usr/lib/libSystem.B.dylib cf_img=/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
@@ -15742,6 +15801,7 @@ case_sys_strings_fault
 case_native_x86_identity
 case_native_check
 case_native_objc_cycle
+case_native_import_addends
 case_native_kept
 case_native_tcache
 

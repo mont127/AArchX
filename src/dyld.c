@@ -2439,6 +2439,14 @@ static void protect_ro_drop(const DynImage *img)
     g_ro_pending_n = n;
 }
 
+/*
+ * The import table has three layouts, which the linker picks by the largest
+ * addend an import carries (a bind pointer holds only 8 bits of one): 4-byte
+ * entries with none, 8-byte ones with a 32-bit addend, and 16-byte ones with a
+ * 16-bit library ordinal and a 64-bit addend.  Reading every table as the first
+ * bound each ordinal to another import's name, or to the empty name in an
+ * addend word: Photoshop's dvaui has the second.
+ */
 static int apply_fixups(DynImage *img, OcerzCache *cache)
 {
     g_ord_img = NULL;
@@ -2449,6 +2457,11 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
     uint32_t imports_off = rd32(cf + 8);
     uint32_t symbols_off = rd32(cf + 12);
     uint32_t imports_cnt = rd32(cf + 16);
+    uint32_t imports_format = rd32(cf + 20);
+    if (imports_format < 1 || imports_format > 3 || rd32(cf + 24) != 0) {
+        OCERZ_FATAL("unsupported chained import format %u, symbols format %u\n", imports_format, rd32(cf + 24));
+        return OCERZ_EUNSUP;
+    }
     uint64_t *ivals = imports_cnt && imports_cnt < (1u << 24) ? (uint64_t *)calloc(imports_cnt, sizeof *ivals) : NULL;
     uint8_t *idone = ivals ? (uint8_t *)calloc(imports_cnt, 1) : NULL;
     if (ivals && !idone) { free(ivals); ivals = NULL; }
@@ -2483,10 +2496,24 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
                     uint64_t addend = (raw >> 24) & 0xff;
                     uint64_t value = 0;
                     if (ordinal < imports_cnt) {
-                        uint32_t imp = rd32(cf + imports_off + ordinal * 4);
-                        uint32_t noff = imp >> 9;
-                        int libord = (int8_t)(imp & 0xff);
-                        int weakimp = (imp >> 8) & 1;
+                        uint32_t noff;
+                        int libord, weakimp;
+                        uint64_t iaddend = 0;
+                        if (imports_format == 3) {
+                            uint64_t imp = rd64(cf + imports_off + (uint64_t)ordinal * 16);
+                            libord = (int16_t)(imp & 0xffff);
+                            weakimp = (int)(imp >> 16) & 1;
+                            noff = (uint32_t)(imp >> 32);
+                            iaddend = rd64(cf + imports_off + (uint64_t)ordinal * 16 + 8);
+                        } else {
+                            uint32_t esz = imports_format == 2 ? 8 : 4;
+                            uint32_t imp = rd32(cf + imports_off + (uint64_t)ordinal * esz);
+                            libord = (int8_t)(imp & 0xff);
+                            weakimp = (imp >> 8) & 1;
+                            noff = imp >> 9;
+                            if (imports_format == 2)
+                                iaddend = (uint64_t)(int64_t)(int32_t)rd32(cf + imports_off + (uint64_t)ordinal * 8 + 4);
+                        }
                         const char *name = (const char *)(cf + symbols_off + noff);
                         if (idone && idone[ordinal]) {
                             value = ivals[ordinal];
@@ -2494,6 +2521,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
                             value = resolve_import(cache, img, name, libord, weakimp);
                             if (idone) { ivals[ordinal] = value; idone[ordinal] = 1; }
                         }
+                        value += iaddend;
                     }
                     ocerz_st(addr, 8, value + addend);
                 } else {
