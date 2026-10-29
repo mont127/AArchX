@@ -18,6 +18,30 @@ implementation, so if a program works interpreted and fails translated, the bug
 is in the JIT and worth reporting. If it fails both ways, the cause is in the
 loader, the system-call layer or the libraries.
 
+## Sending a report
+
+When a program does not run, `-report` writes what is needed to look into it
+into one file:
+
+```sh
+/Applications/AArchX.app/Contents/Resources/aarchx/ocerz -report "/Applications/Some Game.app"
+ocerz -report -native ./program arg     # flags and arguments as for a normal run
+```
+
+It runs the program as the same command without `-report` would, so use it
+the way the program normally starts and quit it as usual (or press Ctrl-C).
+The report then holds the AArchX version and build date, the Mac's model and
+macOS version, whether Rosetta and the x86_64 shared cache are there, the
+program's bundle identifier, version and architectures, the `OCERZ_` and
+`DYLD_` variables set, what `ocerz -check` says of an x86_64 program, how the
+run ended and how long it took, every line ocerz printed, and the last lines
+the program wrote to standard error. The program's ordinary output is not
+kept. The home folder reads `~`, user folders `/Users/<user>`, and the login,
+full name and computer name are replaced too; read the file before sending it
+all the same. It goes to the Desktop, or to `OCERZ_REPORT_DIR`. Any other
+`OCERZ_` switch set for the run, a log such as `OCERZ_M32LOG=calls`, applies
+as usual and is recorded.
+
 ## The messages
 
 **`no bridge for <symbol> in <library>`, exit 71.** Native mode could not bind

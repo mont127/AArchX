@@ -13003,6 +13003,50 @@ exit 0" ]; then
     record "$name" "$reason" "+initialize in a fork child after a wait"
 }
 
+# ocerz -report (src/report.c): the program runs as the same command without -report would, and the report holds the
+# Mac and the program, -check's summary for an x86_64 program, how the run ended in words, ocerz's lines and the
+# program's own standard error, with the home folder read as ~ and any /Users/<name> as /Users/<user>.  The program
+# here calls a stub (exit 72) after writing its home folder and another user's to standard error.
+case_report() {
+    local name=report reason="" d="$TMP/report"
+    rm -rf "$d"; mkdir -p "$d/out" "$d/home/Desktop"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/alert.c" <<'EOC'
+#include <stdio.h>
+#include <stdlib.h>
+extern long NSRunAlertPanel(void *title, void *msg, void *def, void *alt, void *other, ...);
+int main(void) {
+    fprintf(stderr, "settings in %s/Library and /Users/someone/Documents\n", getenv("HOME"));
+    NSRunAlertPanel(0, 0, 0, 0, 0);
+    return 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -o "$d/alert" "$d/alert.c" -framework AppKit >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/run.out" "$d/run.err" env HOME="$d/home" OCERZ_REPORT_DIR="$d/out" OCERZ_NO_CACHE_HOLDER=1 \
+        "$OCERZ" -report -native "$d/alert"
+    local rc=$? r
+    r=$(ls "$d/out"/AArchX-report-alert-*.txt 2>/dev/null | head -1)
+    if [ "$rc" != 72 ]; then
+        reason="-report exited $rc, want the program's 72: $(tail -1 "$d/run.err" | cut -c1-160)"
+    elif [ -z "$r" ]; then
+        reason="no report in OCERZ_REPORT_DIR: $(tail -1 "$d/run.err" | cut -c1-160)"
+    elif ! grep -q "^AArchX field report" "$r" || ! grep -q "^macOS " "$r" || ! grep -q "^== ocerz -check" "$r" ||
+         ! grep -q "1 bind to stubs" "$r" || ! grep -q "^exit 72: it called something native mode has no crossing for" "$r" ||
+         ! grep -q "_NSRunAlertPanel not implemented" "$r"; then
+        reason="the report lacks a section: $(grep '^==' "$r" | tr '\n' ' ' | cut -c1-200)"
+    elif grep -qF "$d/home" "$r" || grep -q "/Users/someone" "$r" ||
+         ! grep -qF "settings in ~/Library and /Users/<user>/Documents" "$r"; then
+        reason="the report kept a home folder: $(grep 'settings in' "$r" | cut -c1-160)"
+    fi
+    record "$name" "$reason" "a stub's exit 72, reported"
+}
+
 # What native mode tells a guest about the machine.  Its uname, sysctl,
 # sysctlbyname and sysctlnametomib reach the host's own functions, which
 # answered an x86 program that it ran on an arm64 Mac: uname -m printed arm64.
@@ -16010,6 +16054,7 @@ case_native_import_addends
 case_native_flat_nonlazy
 case_native_scanf_long_double
 case_native_fork_initialize
+case_report
 case_native_kept
 case_native_tcache
 

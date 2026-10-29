@@ -5,6 +5,7 @@
 ```text
 usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-fex] [-path file] [--] program [args...]
        ocerz -check program
+       ocerz -report [flags] program [args...]
        ocerz version
 ```
 
@@ -18,6 +19,7 @@ usage: ocerz [-v] [-trace] [-strace] [-no-jit] [-native|-cache] [-fex] [-path fi
 | `-cache` | bind the guest against Apple's x86-64 shared cache; the default |
 | `-fex` | run the guest's code on FEXCore, FEX-Emu's translator, instead of AArchX's own (experimental, see [Modes](modes.md#fexcore--fex)) |
 | `-check` | load and bind the program as native mode would, run none of it, and say how each import will be answered; exits 0, 1 when some imports are stubs, 71 when native mode would refuse it (see [Native mode](native-mode.md#will-a-program-run)) |
+| `-report` | run the program as the flags after it say and write a field report to the Desktop: this Mac, the AArchX build, the program, `-check` for an x86_64 one, how the run ended and everything ocerz printed, with the user's name and home folder taken out (see [Troubleshooting](troubleshooting.md#sending-a-report)); `OCERZ_REPORT_DIR` writes it elsewhere |
 | `-path file` | load `file`, and keep every following argument for the guest |
 | `--` | end of AArchX's own options |
 | `version` | print the name and version |
