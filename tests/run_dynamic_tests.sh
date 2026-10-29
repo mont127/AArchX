@@ -832,7 +832,7 @@ run_legacy_format_case() {
 }
 
 run_app_bundle_case() {
-    local name="$1" want_out="$2"
+    local name="$1" want_out="$2" format="${3:-xml}"
     local app="$TMP/$name/Probe.app"
     mkdir -p "$app/Contents/MacOS"
     if ! clang -arch x86_64 -o "$app/Contents/MacOS/probe_exe" tests/dynamic/app_bundle.c 2>/dev/null; then
@@ -850,6 +850,10 @@ run_app_bundle_case() {
 </dict>
 </plist>
 EOP
+    # A binary Info.plist, as Xcode writes for some apps (Remote Desktop Manager's), names the same executable.
+    if [ "$format" != xml ] && ! plutil -convert "$format" "$app/Contents/Info.plist"; then
+        echo "FAIL $name (plutil)"; fail=$((fail+1)); return
+    fi
     local mode out_file err_file got_out got_code
     for mode in jit no-jit; do
         out_file="$TMP/$name.$mode.out"
@@ -1495,6 +1499,7 @@ run_file_case ddlopen_cryptex tests/dynamic/dlopen_cryptex.c 'OK'
 run_file_case ddlopen_cache_alias tests/dynamic/dlopen_cache_alias.c 'OK'
 run_legacy_format_case dlegacy_format 'OK'
 run_app_bundle_case dapp_bundle 'MacOS probe_exe'
+run_app_bundle_case dapp_bundle_bplist 'MacOS probe_exe' binary1
 run_insert_case dinsert_libraries "$(printf 'inserted\nmain env=kept carrier=gone')"
 dyldslots_out=$(tools/dyldslots.sh --check 2>&1)
 case "$dyldslots_out" in
