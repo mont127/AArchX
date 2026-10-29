@@ -298,6 +298,9 @@ pass ImageIO.h
 library GSS /System/Library/Frameworks/GSS.framework/Versions/A/GSS System/Library/Frameworks/GSS.framework/GSS.tbd
 pass GSS.h
 
+library TWAIN /System/Library/Frameworks/TWAIN.framework/Versions/A/TWAIN System/Library/Frameworks/TWAIN.framework/TWAIN.tbd
+pass TWAIN.h
+
 library WebKit /System/Library/Frameworks/WebKit.framework/Versions/A/WebKit System/Library/Frameworks/WebKit.framework/WebKit.tbd
 language objective-c
 pass WebKit.h

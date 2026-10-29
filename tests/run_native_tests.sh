@@ -12495,7 +12495,7 @@ case_native_bound() {
 # answered (dyld.c, native_check_report): a program that binds completely exits 0, one whose imports include a stub
 # exits 1 and names it, one that links a library native mode does not have exits 71 and names the import.  None of
 # the three prints "ran", which each would if its code ran.  libffi is the missing library because no API database
-# describes it; if one ever does, pick another.
+# describes it; if one ever does, pick another.  The complete one links TWAIN too, the one import Photoshop lacked.
 case_native_check() {
     local name=native_check reason="" d="$TMP/native_check" rc
     local appkit=/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
@@ -12508,7 +12508,12 @@ case_native_check() {
     cat > "$d/ok.c" <<'EOC'
 #include <stdio.h>
 #include <CoreFoundation/CoreFoundation.h>
-int main(void) { printf("ran %ld\n", (long)CFStringGetLength(CFSTR("ok"))); return 0; }
+#include <TWAIN/TWAIN.h>
+int main(int argc, char **argv) {
+    printf("ran %ld\n", (long)CFStringGetLength(CFSTR("ok")));
+    if (argc > 5) DSM_Entry(0, 0, 0, 0, 0, 0);
+    return 0;
+}
 EOC
     cat > "$d/stubbed.c" <<'EOC'
 #include <stdio.h>
@@ -12520,7 +12525,7 @@ EOC
 extern int ffi_prep_cif(void *, int, unsigned, void *, void **);
 int main(int argc, char **argv) { puts("ran"); if (argc > 5) ffi_prep_cif(0, 0, 0, 0, 0); return 0; }
 EOC
-    if ! clang -arch x86_64 -O1 -o "$d/ok" "$d/ok.c" -framework CoreFoundation >"$d/cc.log" 2>&1 ||
+    if ! clang -arch x86_64 -O1 -o "$d/ok" "$d/ok.c" -framework CoreFoundation -framework TWAIN >"$d/cc.log" 2>&1 ||
        ! clang -arch x86_64 -O1 -o "$d/stubbed" "$d/stubbed.c" -framework AppKit >>"$d/cc.log" 2>&1 ||
        ! clang -arch x86_64 -O1 -o "$d/missing" "$d/missing.c" -lffi >>"$d/cc.log" 2>&1; then
         record "$name" "the fixtures did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
