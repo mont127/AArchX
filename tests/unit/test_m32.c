@@ -954,13 +954,105 @@ static void test_removed_calls(void)
     int32_t st = (int32_t)call("__LSCopyDefaultSchemeHandlerURL", 2, (uint32_t[]){ m32_handle(cfstr(NULL, "http", 0x08000100)), DATA + 0x21b0 });
     uint32_t app = m32_rd(DATA + 0x21b0);
     check("_LSCopyDefaultSchemeHandlerURL answers a URL or none", (st == 0 && app != 0) || (st == -10814 && app == 0));
-    m32_wr(DATA + 0x21b4, 0);   /* CL_SUCCESS, as a program's local could be */
-    check("clCreateContextFromType answers no context", call("_clCreateContextFromType", 5,
-                                                         (uint32_t[]){ 0, 4 /* CL_DEVICE_TYPE_GPU */, 0, 0, DATA + 0x21b4 }) == 0 &&
-                                                         (int32_t)m32_rd(DATA + 0x21b4) == -1);
-    m32_wr(DATA + 0x21b4, 0);
-    check("... and clCreateContext", call("_clCreateContext", 6, (uint32_t[]){ 0, 1, DATA + 0x21b8, 0, 0, DATA + 0x21b4 }) == 0 &&
-                                     (int32_t)m32_rd(DATA + 0x21b4) == -1);
+}
+
+/* OpenCL on the Mac's own (src/m32_cl.c): a whole run through the specials with i386 arguments, on the GPU.  A
+ * cl_bitfield (device type, memory flags, queue properties, map flags) takes two argument words. */
+static void test_opencl(void)
+{
+    enum { CLD = DATA + 0x8000, PLAT = CLD, NUM = CLD + 4, DEV = CLD + 8, ERR = CLD + 12, RETSZ = CLD + 16,
+           BUF = CLD + 0x20, PROPS = CLD + 0x60, SEEN = CLD + 0x70, KEEP = CLD + 0x74, SRC = CLD + 0x100,
+           SRCP = CLD + 0x200, NAME = CLD + 0x210, HOSTDATA = CLD + 0x240, ARG = CLD + 0x260, GLOBAL = CLD + 0x270,
+           EVENT = CLD + 0x274, OUT = CLD + 0x280, NOTIFY = CODE + 0x3d00 };
+    m32_wr(NUM, 0);
+    check("clGetPlatformIDs", call("_clGetPlatformIDs", 3, (uint32_t[]){ 1, PLAT, NUM }) == 0 && m32_rd(NUM) == 1 &&
+                              m32_is_handle(m32_rd(PLAT)));
+    uint32_t plat = m32_rd(PLAT);
+    call("_clGetPlatformInfo", 5, (uint32_t[]){ plat, 0x0901 /* CL_PLATFORM_VERSION */, 64, BUF, RETSZ });
+    check("clGetPlatformInfo's string, answered in place", !strncmp(m32_h(BUF), "OpenCL ", 7) &&
+                                                          m32_rd(RETSZ) == strlen(m32_h(BUF)) + 1);
+    check("clGetDeviceIDs: a GPU", call("_clGetDeviceIDs", 6, (uint32_t[]){ plat, 4 /* GPU */, 0, 1, DEV, NUM }) == 0 &&
+                                   m32_rd(NUM) == 1);
+    uint32_t dev = m32_rd(DEV);
+    memset(m32_h(BUF), 0, 16);
+    call("_clGetDeviceInfo", 5, (uint32_t[]){ dev, 0x1005 /* CL_DEVICE_MAX_WORK_ITEM_SIZES */, 12, BUF, RETSZ });
+    check("a size_t array shrinks to the guest's words", m32_rd(RETSZ) == 12 && m32_rd(BUF) && m32_rd(BUF + 4) &&
+                                                         m32_rd(BUF + 8) && !m32_rd(BUF + 12));
+    call("_clGetDeviceInfo", 5, (uint32_t[]){ dev, 0x1005, 0, 0, RETSZ });
+    check("... and its size, asked alone", m32_rd(RETSZ) == 12);
+    call("_clGetDeviceInfo", 5, (uint32_t[]){ dev, 0x1031 /* CL_DEVICE_PLATFORM */, 4, BUF, RETSZ });
+    check("an object answer is the guest's handle", m32_rd(BUF) == plat && m32_rd(RETSZ) == 4);
+
+    m32_wr(PROPS, 0x1084 /* CL_CONTEXT_PLATFORM */);
+    m32_wr(PROPS + 4, plat);
+    m32_wr(PROPS + 8, 0);
+    m32_wr(ERR, 0x5555);
+    uint32_t ctx = call("_clCreateContextFromType", 6, (uint32_t[]){ PROPS, 4, 0, 0, 0, ERR });
+    check("clCreateContextFromType with the platform property", ctx && m32_rd(ERR) == 0);
+    m32_wr(ERR, 0);
+    m32_wr(KEEP, 0x7777);
+    check("no context of a type the Mac lacks, the error in the sixth word, not in user_data",
+          call("_clCreateContextFromType", 6, (uint32_t[]){ 0, 8 /* ACCELERATOR */, 0, 0, KEEP, ERR }) == 0 &&
+          (int32_t)m32_rd(ERR) == -1 && m32_rd(KEEP) == 0x7777);
+    call("_clGetContextInfo", 5, (uint32_t[]){ ctx, 0x1081 /* CL_CONTEXT_DEVICES */, 4, BUF, RETSZ });
+    check("clGetContextInfo's devices", m32_rd(BUF) == dev && m32_rd(RETSZ) == 4);
+    call("_clGetContextInfo", 5, (uint32_t[]){ ctx, 0x1082 /* CL_CONTEXT_PROPERTIES */, 12, BUF, RETSZ });
+    check("clGetContextInfo's properties, the platform the guest's handle", m32_rd(BUF) == 0x1084 &&
+                                                                         m32_rd(BUF + 4) == plat && m32_rd(RETSZ) == 12);
+    uint32_t q = call("_clCreateCommandQueue", 5, (uint32_t[]){ ctx, dev, 0, 0, ERR });
+    check("clCreateCommandQueue", q && m32_rd(ERR) == 0);
+
+    put_str(SRC, "__kernel void add(__global int *a, int k) { a[get_global_id(0)] += k; }");
+    m32_wr(SRCP, SRC);
+    uint32_t prog = call("_clCreateProgramWithSource", 5, (uint32_t[]){ ctx, 1, SRCP, 0, ERR });
+    check("clCreateProgramWithSource", prog && m32_rd(ERR) == 0);
+    /* void notify(cl_program p, void *data) { *(cl_program *)data = p; } */
+    static const uint8_t notify[] = { 0x8b, 0x44, 0x24, 0x08, 0x8b, 0x4c, 0x24, 0x04, 0x89, 0x08, 0xc3 };
+    memcpy(m32_h(NOTIFY), notify, sizeof notify);
+    m32_wr(SEEN, 0);
+    check("clBuildProgram calls its callback with the program, on the guest's thread",
+          call("_clBuildProgram", 6, (uint32_t[]){ prog, 1, DEV, 0, NOTIFY, SEEN }) == 0 && m32_rd(SEEN) == prog);
+    put_str(NAME, "add");
+    uint32_t k = call("_clCreateKernel", 3, (uint32_t[]){ prog, NAME, ERR });
+    check("clCreateKernel", k && m32_rd(ERR) == 0);
+
+    static const int32_t data[4] = { 1, 2, 3, 4 };
+    memcpy(m32_h(HOSTDATA), data, sizeof data);
+    uint32_t mem = call("_clCreateBuffer", 6, (uint32_t[]){ ctx, 0x21 /* READ_WRITE | COPY_HOST_PTR */, 0, 16, HOSTDATA, ERR });
+    check("clCreateBuffer from guest memory", mem && m32_rd(ERR) == 0);
+    m32_wr(ARG, mem);
+    check("a 4-byte cl_mem argument crosses as the host's 8", call("_clSetKernelArg", 4, (uint32_t[]){ k, 0, 4, ARG }) == 0);
+    m32_wr(ARG + 4, 10);
+    check("an int argument stays 4 bytes", call("_clSetKernelArg", 4, (uint32_t[]){ k, 1, 4, ARG + 4 }) == 0);
+    m32_wr(GLOBAL, 4);
+    m32_wr(EVENT, 0);
+    check("clEnqueueNDRangeKernel answers an event", call("_clEnqueueNDRangeKernel", 9,
+                                                         (uint32_t[]){ q, k, 1, 0, GLOBAL, 0, 0, 0, EVENT }) == 0 &&
+                                                    m32_is_handle(m32_rd(EVENT)));
+    check("clWaitForEvents", call("_clWaitForEvents", 2, (uint32_t[]){ 1, EVENT }) == 0);
+    call("_clEnqueueReadBuffer", 9, (uint32_t[]){ q, mem, 1, 0, 16, OUT, 0, 0, 0 });
+    check("the kernel ran on the guest's numbers", (int32_t)m32_rd(OUT) == 11 && (int32_t)m32_rd(OUT + 12) == 14);
+
+    uint32_t p = call("_clEnqueueMapBuffer", 11, (uint32_t[]){ q, mem, 1, 3 /* READ | WRITE */, 0, 0, 16, 0, 0, 0, ERR });
+    check("a mapping the guest can reach, holding the buffer", p && p < M32_HANDLE_LO && m32_rd(ERR) == 0 &&
+                                                               (int32_t)m32_rd(p) == 11 && (int32_t)m32_rd(p + 12) == 14);
+    if (p) {
+        m32_wr(p, 100);
+        check("clEnqueueUnmapMemObject", call("_clEnqueueUnmapMemObject", 6, (uint32_t[]){ q, mem, p, 0, 0, 0 }) == 0);
+    }
+    call("_clFinish", 1, (uint32_t[]){ q });
+    call("_clEnqueueReadBuffer", 9, (uint32_t[]){ q, mem, 1, 0, 16, OUT, 0, 0, 0 });
+    check("what the guest wrote into the mapping is in the buffer", (int32_t)m32_rd(OUT) == 100);
+    call("_clGetKernelWorkGroupInfo", 6, (uint32_t[]){ k, dev, 0x11B0 /* CL_KERNEL_WORK_GROUP_SIZE */, 4, BUF, RETSZ });
+    check("clGetKernelWorkGroupInfo's size_t", m32_rd(BUF) > 0 && m32_rd(RETSZ) == 4);
+    call("_clGetMemObjectInfo", 5, (uint32_t[]){ mem, 0x1102 /* CL_MEM_SIZE */, 4, BUF, RETSZ });
+    check("clGetMemObjectInfo's size", m32_rd(BUF) == 16 && m32_rd(RETSZ) == 4);
+    check("everything releases", !call("_clReleaseEvent", 1, (uint32_t[]){ m32_rd(EVENT) }) &&
+                                 !call("_clReleaseMemObject", 1, (uint32_t[]){ mem }) &&
+                                 !call("_clReleaseKernel", 1, (uint32_t[]){ k }) &&
+                                 !call("_clReleaseProgram", 1, (uint32_t[]){ prog }) &&
+                                 !call("_clReleaseCommandQueue", 1, (uint32_t[]){ q }) &&
+                                 !call("_clReleaseContext", 1, (uint32_t[]){ ctx }));
 }
 
 static void test_menus_controls(uint32_t w)
@@ -2406,6 +2498,7 @@ int main(int argc, char **argv)
     test_sF();
     test_cg();
     test_removed_calls();
+    test_opencl();
     test_sdl_shims();
     test_game_libs();
     test_image_order();
