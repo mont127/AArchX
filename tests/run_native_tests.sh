@@ -12703,6 +12703,61 @@ EOC
     record "$name" "$reason" "32- and 64-bit import addends in both modes"
 }
 
+# Under dyld a launch's images are all loaded before any is bound, so a flat-namespace import finds a definition in
+# a library loaded after the one importing it.  ocerz binds as each image loads, and Photoshop's libmkl_intel_lp64
+# points __got and __data at names that libmkl_sequential, loaded after it, defines; every flat bind of the launch
+# now waits for the whole set (dyld.c, flat_defer), from the classic streams and from chained fixups alike.
+case_native_flat_nonlazy() {
+    local name=native_flat_nonlazy reason="" d="$TMP/native_flat_nonlazy" kind mode flags got
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/user.c" <<'EOC'
+extern int later(int);
+extern int later_data;
+int (*later_fn)(int) = later;
+int *later_ptr = &later_data;
+int use(int x) { return later_fn(x) + *later_ptr; }
+EOC
+    cat > "$d/definer.c" <<'EOC'
+int later_data = 1000;
+int later(int x) { return x * 2; }
+EOC
+    cat > "$d/main.c" <<'EOC'
+#include <stdio.h>
+extern int use(int);
+int main(void) { printf("%d\n", use(21)); return 0; }
+EOC
+    for kind in classic chained; do
+        if [ "$kind" = classic ]; then
+            flags="-mmacosx-version-min=10.15 -Wl,-no_fixup_chains"
+        else
+            flags="-mmacosx-version-min=12.0 -Wl,-fixup_chains"
+        fi
+        mkdir -p "$d/$kind"
+        # shellcheck disable=SC2086
+        if ! (cd "$d" &&
+              clang -arch x86_64 $flags -dynamiclib -install_name @rpath/libdefiner.dylib -o $kind/libdefiner.dylib definer.c &&
+              clang -arch x86_64 $flags -dynamiclib -install_name @rpath/libuser.dylib -Wl,-undefined,dynamic_lookup \
+                  -o $kind/libuser.dylib user.c &&
+              clang -arch x86_64 $flags -o $kind/flat main.c -L$kind -luser -ldefiner -Wl,-rpath,@executable_path) \
+              >"$d/cc.log" 2>&1; then
+            record "$name" "the $kind fixtures did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+            return
+        fi
+        for mode in "" -native; do
+            run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$d/$kind/flat"
+            got=$(cat "$d/out")
+            if [ -z "$reason" ] && [ "$got" != "1042" ]; then
+                reason="$kind${mode:+ $mode} printed '$got', want '1042': $(tail -1 "$d/err" | cut -c1-160)"
+            fi
+        done
+    done
+    record "$name" "$reason" "flat imports defined by a later launch library, classic and chained, both modes"
+}
+
 # What a native launch keeps beside the translation cache's store (src/apidb.c,
 # src/vdylib.c).  A first run parses the API databases its libraries need,
 # builds their images and keeps both; a second loads the parsed copies and the
@@ -15802,6 +15857,7 @@ case_native_x86_identity
 case_native_check
 case_native_objc_cycle
 case_native_import_addends
+case_native_flat_nonlazy
 case_native_kept
 case_native_tcache
 

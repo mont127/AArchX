@@ -2439,6 +2439,9 @@ static void protect_ro_drop(const DynImage *img)
     g_ro_pending_n = n;
 }
 
+static int g_flat_defer;
+static int flat_defer(DynImage *img, uint64_t addr, const char *name, int64_t addend, int weak, int lazy);
+
 /*
  * The import table has three layouts, which the linker picks by the largest
  * addend an import carries (a bind pointer holds only 8 bits of one): 4-byte
@@ -2515,6 +2518,9 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
                                 iaddend = (uint64_t)(int64_t)(int32_t)rd32(cf + imports_off + (uint64_t)ordinal * 8 + 4);
                         }
                         const char *name = (const char *)(cf + symbols_off + noff);
+                        if (libord == BIND_SPECIAL_DYLIB_FLAT_LOOKUP && g_flat_defer &&
+                            flat_defer(img, addr, name, (int64_t)(iaddend + addend), weakimp, 0))
+                            goto next_fixup;
                         if (idone && idone[ordinal]) {
                             value = ivals[ordinal];
                         } else {
@@ -2533,6 +2539,7 @@ static int apply_fixups(DynImage *img, OcerzCache *cache)
                     value |= high8 << 56;
                     ocerz_st(addr, 8, value);
                 }
+            next_fixup:
                 if (next == 0)
                     break;
                 addr += (uint64_t)next * 4;
@@ -2707,18 +2714,22 @@ static void classic_rebase(DynImage *img)
 }
 
 /*
- * A lazy flat-namespace bind is resolved on first call under dyld,
- * so after every image the program links has loaded.  ocerz binds eagerly as
- * each image loads, and LÖVE's love.framework imports Lua's API flat while the
- * executable loads Lua.framework after it.  While the main executable's
- * dependencies load, such binds wait here and are resolved once all are in.
+ * dyld binds a launch's images once all of them are loaded, and a lazy
+ * flat-namespace bind only on first call, so a flat lookup sees every image the
+ * program loads at launch.  ocerz binds eagerly as each image loads: LÖVE's
+ * love.framework imports Lua's API flat while the executable loads
+ * Lua.framework after it, and Photoshop's libmkl_intel_lp64 points __got and
+ * __data at MKL's BLAS and threader names, which libmkl_sequential, loaded
+ * after it, defines.  While the main executable's dependencies load, every
+ * flat bind waits here, lazy or not, from the classic streams or chained
+ * fixups, and is resolved once all are in.
  */
-typedef struct { DynImage *img; uint64_t addr; const char *name; int64_t addend; } FlatPending;
+typedef struct { DynImage *img; uint64_t addr; const char *name; int64_t addend; int weak, lazy; } FlatPending;
 static FlatPending *g_flat_pending;
 static size_t g_flat_pending_n, g_flat_pending_cap;
 static int g_flat_defer;
 
-static int flat_defer(DynImage *img, uint64_t addr, const char *name, int64_t addend)
+static int flat_defer(DynImage *img, uint64_t addr, const char *name, int64_t addend, int weak, int lazy)
 {
     if (g_flat_pending_n == g_flat_pending_cap) {
         size_t cap = g_flat_pending_cap ? g_flat_pending_cap * 2 : 256;
@@ -2728,7 +2739,7 @@ static int flat_defer(DynImage *img, uint64_t addr, const char *name, int64_t ad
         g_flat_pending = p;
         g_flat_pending_cap = cap;
     }
-    g_flat_pending[g_flat_pending_n++] = (FlatPending){ img, addr, name, addend };
+    g_flat_pending[g_flat_pending_n++] = (FlatPending){ img, addr, name, addend, weak, lazy };
     return 1;
 }
 
@@ -2737,7 +2748,7 @@ static void flat_flush(OcerzCache *cache)
     g_flat_defer = 0;
     for (size_t i = 0; i < g_flat_pending_n; i++) {
         FlatPending *f = &g_flat_pending[i];
-        uint64_t v = resolve_import(cache, f->img, f->name, BIND_SPECIAL_DYLIB_FLAT_LOOKUP, 0);
+        uint64_t v = resolve_import(cache, f->img, f->name, BIND_SPECIAL_DYLIB_FLAT_LOOKUP, f->weak);
         ocerz_st(f->addr, 8, v ? v + (uint64_t)f->addend : 0);
     }
     free(g_flat_pending);
@@ -2752,6 +2763,16 @@ static void flat_flush(OcerzCache *cache)
  * program binds to itself was a search of 3,900 images that found nothing:
  * 1,743 of them, 621 ms, in ffmpeg -version.
  */
+/* One bind of the classic streams. */
+static void classic_bind(DynImage *img, OcerzCache *cache, uint64_t addr, const char *name, int libord, int weak,
+                         int64_t addend, int is_lazy, ClassicMemo *memo)
+{
+    if (libord == BIND_SPECIAL_DYLIB_FLAT_LOOKUP && g_flat_defer && flat_defer(img, addr, name, addend, weak, is_lazy))
+        return;
+    uint64_t v = classic_resolve(img, cache, name, libord, weak, memo);
+    ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+}
+
 static void classic_bind_stream(DynImage *img, OcerzCache *cache,
                                 const uint8_t *p, const uint8_t *end, int is_lazy, int weak_stream)
 {
@@ -2804,35 +2825,23 @@ static void classic_bind_stream(DynImage *img, OcerzCache *cache,
         case 0x80:
             addr += self_uleb(&p, end);
             break;
-        case 0x90: {
-            if (is_lazy && g_flat_defer && libord == BIND_SPECIAL_DYLIB_FLAT_LOOKUP &&
-                flat_defer(img, addr, name, addend)) {
-                addr += 8;
-                break;
-            }
-            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
-            ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+        case 0x90:
+            classic_bind(img, cache, addr, name, libord, weak, addend, is_lazy, &memo);
             addr += 8;
             break;
-        }
-        case 0xa0: {
-            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
-            ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+        case 0xa0:
+            classic_bind(img, cache, addr, name, libord, weak, addend, is_lazy, &memo);
             addr += 8 + self_uleb(&p, end);
             break;
-        }
-        case 0xb0: {
-            uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
-            ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+        case 0xb0:
+            classic_bind(img, cache, addr, name, libord, weak, addend, is_lazy, &memo);
             addr += 8 + (uint64_t)imm * 8;
             break;
-        }
         case 0xc0: {
             uint64_t cnt = self_uleb(&p, end);
             uint64_t skip = self_uleb(&p, end);
             for (uint64_t i = 0; i < cnt; i++) {
-                uint64_t v = classic_resolve(img, cache, name, libord, weak, &memo);
-                ocerz_st(addr, 8, v ? v + (uint64_t)addend : 0);
+                classic_bind(img, cache, addr, name, libord, weak, addend, is_lazy, &memo);
                 addr += 8 + skip;
             }
             break;
@@ -7492,7 +7501,7 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
 
     RpathList main_rpaths;
     collect_rpaths(&img, NULL, &main_rpaths);
-    g_flat_defer = ocerz_mode == OCERZ_MODE_NATIVE;
+    g_flat_defer = 1;
     g_launch_objc_defer = ocerz_mode == OCERZ_MODE_NATIVE;
     g_main_loading = &img;
     load_disk_deps(&cache, &img, &main_rpaths);
