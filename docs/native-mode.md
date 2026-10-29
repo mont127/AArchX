@@ -196,7 +196,10 @@ program's code runs. Then it says how each import will be answered:
 - it binds to a placeholder (`OCERZ_STUB_MISSING=1`, or a library macOS
   removed);
 - it is missing, and native mode will not start the program; `no-library`
-  when native mode has nothing for the library at all.
+  when native mode has nothing for the library at all;
+- it is a lazy flat-namespace import that nothing loaded at launch defines,
+  and binds when it is first called, as under dyld, to whatever the program
+  has loaded by then.
 
 ```sh
 ./ocerz -check /Applications/Some.app             # a summary, then every stub and missing import
@@ -229,11 +232,21 @@ Intel), `pthread_cancel` (nine), `syscall`, `objc_loadClassref` and
 `sqlite3_vfs_find` (seven each), and `JSClassCreate`, malloc's fork hooks and
 libxml2's parser contexts (six each).
 
+The program refused for flat-namespace names now binds completely, with a few
+stubs. Three loader bugs stood in its way. A flat import was looked up as each
+library loaded, so it missed a name defined by a library loaded later in the
+same launch; dyld loads them all first. A chained-fixups import table whose
+imports carry addends, with 8- or 16-byte entries, was read as 4-byte entries
+and bound the wrong names. Both of those affected cache mode too. And in
+native mode a lazy flat import that nothing defines at launch now waits for
+its first call. The last import it lacked, TWAIN's `DSM_Entry`, now has a
+database.
+
 ## What native mode cannot run yet
 
 Each of these stops a program with a named message, exit 71 when an import cannot bind or 72 when a bound export has no crossing, rather than running it wrongly:
 
-- **Frameworks without a database.** A hundred and seventy-seven libraries have one, a file each under `runtime/apis/macos/27.0/`: libSystem, libobjc, CoreFoundation, Foundation, AppKit, CoreGraphics, ApplicationServices, CoreServices, Carbon, Cocoa, Security, IOKit, Metal, OpenGL, QuartzCore, ImageIO, WebKit, CoreData, Contacts, CloudKit, Network, UniformTypeIdentifiers, AddressBook, AudioUnit, PDFKit, MetalKit, Kerberos, JavaScriptCore, ScreenCaptureKit, SceneKit, SpriteKit, GameKit, MapKit, NetworkExtension, ColorSync, Quartz, the audio and video frameworks, sqlite3, libxml2, libxslt, libcurl, libedit, libexpat, libsasl2, libpam and libcompression, and the smaller dylibs a program picks up on the way, libz, libbz2, libiconv, libsandbox, libcups and libresolv among them. libxo, libmd and libarchive have databases whose exports are all stubs, since no SDK header declares them. Other system libraries still need one, and unsupported exports within these databases remain stubs. Missing imports are named; `dlopen` of a native library without a database answers NULL with `native library without an API database`. The system frameworks' Swift APIs, WebKit and GameKit remain among the gaps for larger applications.
+- **Frameworks without a database.** A hundred and eighty libraries have one, a file each under `runtime/apis/macos/27.0/`: libSystem, libobjc, CoreFoundation, Foundation, AppKit, CoreGraphics, ApplicationServices, CoreServices, Carbon, Cocoa, Security, IOKit, Metal, OpenGL, QuartzCore, ImageIO, WebKit, CoreData, Contacts, CloudKit, Network, UniformTypeIdentifiers, AddressBook, AudioUnit, PDFKit, MetalKit, Kerberos, JavaScriptCore, ScreenCaptureKit, SceneKit, SpriteKit, GameKit, MapKit, NetworkExtension, ColorSync, Quartz, the audio and video frameworks, sqlite3, libxml2, libxslt, libcurl, libedit, libexpat, libsasl2, libpam and libcompression, and the smaller dylibs a program picks up on the way, libz, libbz2, libiconv, libsandbox, libcups and libresolv among them. libxo, libmd and libarchive have databases whose exports are all stubs, since no SDK header declares them. Other system libraries still need one, and unsupported exports within these databases remain stubs. Missing imports are named; `dlopen` of a native library without a database answers NULL with `native library without an API database`. The system frameworks' Swift APIs, WebKit and GameKit remain among the gaps for larger applications.
 - **C++ boundaries.** The optional LLVM guest runtime covers tested strings, containers, streams, regular expressions, RTTI, threads, futures and guest C++ exception unwinding. It does not make C++ objects interchangeable with native ARM C++ objects, and exceptions cannot unwind through native bridge frames. Broader application compatibility still depends on the remaining system API bridges.
 - **Exceptions.** With the guest runtime installed (`make guest-cxx`), C++ exceptions unwind between guest frames and guest dylibs, and so do Objective-C ones: `@throw`, `@try`, `@catch` by class, subclass or `id`, `@finally`, `@synchronized` and rethrow work, the guest's exceptions being built on its own libc++abi as Apple's libobjc builds them on the C++ runtime. An exception a native method raises, `[NSException raise:...]` or Foundation's range and argument checks, is caught where the send returns to the guest and thrown on into the guest's frames. One that is never caught calls the uncaught-exception handler and aborts, as it does natively. A guest exception still cannot unwind out of a callback native code made into the guest, nor a native C++ exception into the guest; both end as uncaught. Without the guest runtime the Objective-C exception calls stop the program with a named message.
 - **Programs a guest starts.** A system tool a guest starts, one under `/usr`, `/bin`, `/sbin`, `/System` or `/Library/Apple` that has an arm64 slice and is not a shell or another launcher (`sh`, `env`, `xargs`, `perl`, `python3` and the like, which go on to start programs of their own), runs as itself: nothing about it needs translating, and its x86_64 slice would often need a library native mode only has stubs for, as `wc` does with libxo. `OCERZ_NO_NATIVE_CHILDREN=1` runs those under ocerz too. Everything else a guest starts runs under ocerz in native mode and stops the way any program does when it needs what native mode lacks. A program with neither slice ocerz can use is refused, as it is in cache mode. `forkpty`, `daemon` and `wordexp` are stubs, and a `fork` inside a callback that translated code made is refused.
