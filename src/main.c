@@ -630,6 +630,20 @@ static void restore_guest_insertion(void)
     unsetenv("OCERZ_GUEST_DYLD_INSERT_LIBRARIES");
 }
 
+/*
+ * In a fork child, libobjc refuses to run a class's +initialize if the process
+ * had ever had a second thread, and crashes instead ("may have been in progress
+ * in another thread when fork() was called"); the flag is sticky, a joined
+ * thread or a libdispatch worker sets it too.  In native mode that libobjc is
+ * the host's, and the process is ocerz's, whose unstick monitor (vm.c) starts
+ * at the guest's first call that can wait: a single-threaded program that waits,
+ * forks and uses Foundation in the child, which an Intel Mac runs, was killed.
+ * A __DATA,__objc_fork_ok section in the main executable turns the check off,
+ * as an executable built for a macOS older than 10.13 has it off.  The guest's
+ * own x86 libobjc, in cache mode, goes by the guest's executable instead.
+ */
+__attribute__((used, section("__DATA,__objc_fork_ok"))) static int g_objc_fork_ok = 1;
+
 int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "-hold-cache") == 0)   /* before anything else: it is no launch */

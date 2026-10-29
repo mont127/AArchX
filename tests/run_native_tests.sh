@@ -12954,6 +12954,55 @@ EOC
     record "$name" "$reason" "scanf %Lf and %n\$"
 }
 
+# In a fork child, libobjc crashes rather than run a class's +initialize if the process ever had a second thread
+# ("may have been in progress in another thread when fork() was called").  Native mode's libobjc is the host's and
+# the process is ocerz's, whose unstick monitor starts at the guest's first call that can wait, so a single-threaded
+# program that slept, forked and used a class in the child was killed where an Intel Mac runs it.  ocerz carries a
+# __DATA,__objc_fork_ok section (main.c), which turns that check off (found by tools/native-diff.py, whose
+# CoreFoundation and Foundation cases each run in a fork).
+case_native_fork_initialize() {
+    local name=native_fork_initialize reason="" d="$TMP/native_fork_initialize"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/fork.m" <<'EOC'
+#import <Foundation/Foundation.h>
+#include <objc/runtime.h>
+#include <sys/wait.h>
+@interface Fresh : NSObject
+@end
+@implementation Fresh
++ (void)initialize { printf("initialize\n"); fflush(stdout); }
+@end
+int main(void) {
+    usleep(1000);   /* a call that can wait, as a program's first read or sleep */
+    pid_t p = fork();
+    if (p == 0) {
+        [objc_getClass("Fresh") new];
+        [NSString stringWithFormat:@"%d", 1];
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    printf("%s %d\n", WIFSIGNALED(st) ? "signal" : "exit", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
+    return 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -fobjc-arc -framework Foundation -o "$d/fork" "$d/fork.m" >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/fork"
+    local rc=$?
+    if [ "$rc" != 0 ] || [ "$(cat "$d/out")" != "initialize
+exit 0" ]; then
+        reason="it printed '$(tr '\n' '|' < "$d/out")' and exited $rc, want 'initialize|exit 0|' and 0: $(grep -m1 objc "$d/err" | cut -c1-160)"
+    fi
+    record "$name" "$reason" "+initialize in a fork child after a wait"
+}
+
 # What native mode tells a guest about the machine.  Its uname, sysctl,
 # sysctlbyname and sysctlnametomib reach the host's own functions, which
 # answered an x86 program that it ran on an arm64 Mac: uname -m printed arm64.
@@ -15956,6 +16005,7 @@ case_native_lazy_flat
 case_native_import_addends
 case_native_flat_nonlazy
 case_native_scanf_long_double
+case_native_fork_initialize
 case_native_kept
 case_native_tcache
 
