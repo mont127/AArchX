@@ -341,6 +341,7 @@
 #include "ocerz/vdylib.h"
 #include "ocerz/vm.h"
 
+#include <math.h>
 #include <Block.h>
 #include <ctype.h>
 #include <dlfcn.h>
@@ -1129,15 +1130,13 @@ int ocerz_objc_format_classes(const char *fmt, int dialect, char *out, size_t ou
         case 'G':
         case 'a':
         case 'A':
-            if (len == 'L') {
-                *why = "a long double conversion (%L)";
-                return -1;
-            }
-            cls = 'd';
+            /* a long double is gathered as the host's, a double: what an Intel Mac prints for any value a double
+               holds, except that %La spells it in a double's hex digits rather than the x87 significand's */
+            cls = len == 'L' ? 'D' : 'd';
             break;
         case 'n':
-            *why = "%n, which writes through its argument";
-            return -1;
+            cls = 'p';   /* the guest's int, short, char or long, written where it is: the address is the host's */
+            break;
         case '@':
             if (dialect == OCERZ_OBJC_FMT_C) {
                 *why = "%@, which a C format does not have";
@@ -1722,6 +1721,40 @@ static int ob_gather_format(const char *what, const char *text, int dialect, con
     return n;
 }
 
+/* an x87 extended value and back, for the long doubles a format moves (the host's long double is a double) */
+static double ob_f80_to_double(uint64_t mant, uint16_t se)
+{
+    int exp = se & 0x7fff;
+    double v = exp == 0 && mant == 0 ? 0.0
+             : exp == 0x7fff ? ((mant << 1) == 0 ? INFINITY : NAN)
+             : ldexp((double)mant / 9223372036854775808.0, exp - 16383);
+    return se & 0x8000 ? -v : v;
+}
+
+static void ob_double_to_f80(double v, uint8_t out[10])
+{
+    uint64_t b, mant;
+    memcpy(&b, &v, 8);
+    uint16_t se = (uint16_t)((b >> 48) & 0x8000);
+    int e = (int)((b >> 52) & 0x7ff);
+    uint64_t frac = b & ((1ull << 52) - 1);
+    if (e == 0x7ff) {
+        se |= 0x7fff;
+        mant = 0x8000000000000000ull | (frac << 11);
+    } else if (e == 0 && frac == 0) {
+        mant = 0;
+    } else if (e == 0) {   /* a double's subnormal is an extended normal */
+        int shift = __builtin_clzll(frac);
+        mant = frac << shift;
+        se |= (uint16_t)(15372 - shift);
+    } else {
+        mant = 0x8000000000000000ull | (frac << 11);
+        se |= (uint16_t)(e - 1023 + 16383);
+    }
+    memcpy(out, &mant, 8);
+    memcpy(out + 8, &se, 2);
+}
+
 static int ob_gather_va_format(const char *what, const char *text, int dialect,
                               uint64_t address, uint64_t *slots)
 {
@@ -1742,6 +1775,15 @@ static int ob_gather_va_format(const char *what, const char *text, int dialect,
         ob_stop("%s: invalid guest va_list offsets (gp=%u fp=%u)", what, gp, fp);
     for (int k = 0; k < n; k++) {
         uint64_t from;
+        if (classes[k] == 'D') {
+            if (!overflow)
+                ob_stop("%s: null guest va_list overflow area", what);
+            overflow = (overflow + 15) & ~15ull;
+            double d = ob_f80_to_double(ocerz_ld(overflow, 8), (uint16_t)ocerz_ld(overflow + 8, 2));
+            overflow += 16;
+            memcpy(&slots[k], &d, sizeof d);
+            continue;
+        }
         if (classes[k] == 'd' && fp < 176) {
             if (!saved)
                 ob_stop("%s: null guest va_list register save area", what);
@@ -2659,9 +2701,11 @@ static int ob_veneer_call(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn, int g
     return ob_settle(vm, cpu);
 }
 
-static int ob_scan_count(const char *what, const char *text)
+/* the pointers a scanf format stores through, and which of them are long doubles (wide[k]); with %n$ the pointers
+ * are the arguments up to the highest position, which the host's scanf walks to by position as the guest's does */
+static int ob_scan_count(const char *what, const char *text, char *wide)
 {
-    int n = 0;
+    int n = 0, top = 0, mode = 0;   /* mode 1: sequential, 2: positional */
     const unsigned char *p = (const unsigned char *)text;
     while (*p) {
         if (*p != '%') {
@@ -2675,6 +2719,17 @@ static int ob_scan_count(const char *what, const char *text)
         }
         if (*p == '\0')
             ob_stop("%s refuses the format \"%.200s\": it ends in a lone percent", what, text);
+        int at = 0;
+        const unsigned char *d = p;
+        while (*d >= '0' && *d <= '9')
+            d++;
+        if (d > p && *d == '$') {
+            at = atoi((const char *)p);
+            if (mode == 1 || at < 1 || at > OCERZ_OBJC_VARIADIC_MAX)
+                ob_stop("%s refuses the format \"%.200s\": %s", what, text,
+                        mode == 1 ? "it mixes positional and sequential arguments" : "a position is out of range");
+            p = d + 1;
+        }
         int suppress = 0;
         if (*p == '*') {
             suppress = 1;
@@ -2682,8 +2737,6 @@ static int ob_scan_count(const char *what, const char *text)
         }
         while (*p >= '0' && *p <= '9')
             p++;
-        if (*p == '$')
-            ob_stop("%s refuses the format \"%.200s\": it has positional arguments", what, text);
         int is_L = 0;
         if (p[0] == 'h' && p[1] == 'h')
             p += 2;
@@ -2699,8 +2752,6 @@ static int ob_scan_count(const char *what, const char *text)
             ob_stop("%s refuses the format \"%.200s\": it ends inside a conversion", what, text);
         unsigned char c = *p;
         if (c == '[') {
-            if (is_L)
-                ob_stop("%s refuses the format \"%.200s\": it reads a long double", what, text);
             p++;
             if (*p == '^')
                 p++;
@@ -2710,8 +2761,15 @@ static int ob_scan_count(const char *what, const char *text)
                 p++;
             if (*p != ']')
                 ob_stop("%s refuses the format \"%.200s\": it ends inside a scanset", what, text);
-            if (!suppress)
+            if (!suppress && !at && mode == 2)
+                ob_stop("%s refuses the format \"%.200s\": it mixes positional and sequential arguments", what, text);
+            if (!suppress && at) {
+                mode = 2;
+                top = at > top ? at : top;
+            } else if (!suppress) {
+                mode = 1;
                 n++;
+            }
             p++;
             continue;
         }
@@ -2737,12 +2795,24 @@ static int ob_scan_count(const char *what, const char *text)
         default:
             ob_stop("%s refuses the format \"%.200s\": it has an unsupported conversion", what, text);
         }
-        if (is_L)
-            ob_stop("%s refuses the format \"%.200s\": it reads a long double", what, text);
-        if (!suppress)
-            n++;
+        if (!suppress && !at && mode == 2)
+            ob_stop("%s refuses the format \"%.200s\": it mixes positional and sequential arguments", what, text);
+        if (!suppress) {
+            int k = at ? at - 1 : n;
+            if (k < OCERZ_OBJC_VARIADIC_MAX)
+                wide[k] = is_L && strchr("fFeEgGaA", c) != NULL;
+            if (at) {
+                mode = 2;
+                top = at > top ? at : top;
+            } else {
+                mode = 1;
+                n++;
+            }
+        }
         p++;
     }
+    if (mode == 2)
+        n = top;
     if (n > OCERZ_OBJC_VARIADIC_MAX)
         ob_stop("%s refuses the format \"%.200s\": it takes more arguments than cross", what, text);
     return n;
@@ -2761,7 +2831,8 @@ static int ob_scan_veneer_call(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn, 
 
     uint64_t fmt = ob_named(&named, cpu, vn->fmt, 'p');
     const char *text = fmt ? (const char *)(uintptr_t)fmt : "";
-    int n = ob_scan_count(sym, text);
+    char wide[OCERZ_OBJC_VARIADIC_MAX] = { 0 };
+    int n = ob_scan_count(sym, text, wide);
 
     uint64_t slots[OCERZ_OBJC_VARIADIC_MAX];
     if (guest_va) {
@@ -2799,7 +2870,23 @@ static int ob_scan_veneer_call(struct OcerzVM *vm, OcerzCPU *cpu, ObVeneer *vn, 
             ocerz_abi_va_arg(&va, cpu, 'p', &slots[k]);
     }
 
+    /* a long double the host stores is a double: it goes to a double of ours, marked with a signalling NaN no
+       conversion produces, and is widened into the guest's 80 bits if the host stored one */
+    static const uint64_t unset = 0x7ff0deadbeef0001ull;
+    uint64_t temps[OCERZ_OBJC_VARIADIC_MAX], dest[OCERZ_OBJC_VARIADIC_MAX];
+    for (int k = 0; k < n; k++)
+        if (wide[k]) {
+            dest[k] = slots[k];
+            temps[k] = unset;
+            slots[k] = (uint64_t)(uintptr_t)&temps[k];
+        }
     int err = ob_perform(cpu, &named, vfn, slots, n, 1, sym);
+    for (int k = 0; k < n; k++)
+        if (wide[k] && temps[k] != unset && dest[k]) {
+            double d;
+            memcpy(&d, &temps[k], 8);
+            ob_double_to_f80(d, (uint8_t *)(uintptr_t)dest[k]);
+        }
     ocerz_bridge_lower(&outer);
     errno = err;
     return ob_settle(vm, cpu);

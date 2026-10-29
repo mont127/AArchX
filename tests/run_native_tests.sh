@@ -12915,6 +12915,45 @@ case_native_tcache() {
     record "$name" "$reason" "kept=$saved loaded=$loaded same=$vok"
 }
 
+# scanf's long double conversions and positional arguments (objcbridge.c, ob_scan_count): both refused the program
+# with exit 72.  A %Lf the host stores is a double, widened into the guest's 80 bits; %n$ hands the host the pointers
+# up to the highest position, which it walks to as the guest's scanf does.  The long doubles print through printf's
+# %L, which converts the guest's 80 bits to the host's double (found by tools/native-diff.py, strconv and printf).
+case_native_scanf_long_double() {
+    local name=native_scanf_long_double reason="" d="$TMP/native_scanf_long_double"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/scan.c" <<'EOC'
+#include <stdio.h>
+#include <string.h>
+int main(void) {
+    long double a = 0, b = 0;
+    int r = sscanf("2.75 -1e3", "%Lf %Lg", &a, &b);
+    unsigned char bits[10];
+    memcpy(bits, &a, 10);
+    printf("%d %.3Lf %.1Lf %02x%02x\n", r, a, b, bits[9], bits[8]);
+    int x = 0, y = 0;
+    r = sscanf("5 6", "%2$d %1$d", &x, &y);
+    printf("%d %d %d\n", r, x, y);
+    return 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -o "$d/scan" "$d/scan.c" >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(head -1 "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/scan"
+    local rc=$? want="2 2.750 -1000.0 4000
+2 6 5"
+    if [ "$rc" != 0 ] || [ "$(cat "$d/out")" != "$want" ]; then
+        reason="it printed '$(tr '\n' '|' < "$d/out")' and exited $rc, want '$(echo "$want" | tr '\n' '|')' and 0: $(tail -1 "$d/err" | cut -c1-160)"
+    fi
+    record "$name" "$reason" "scanf %Lf and %n\$"
+}
+
 # What native mode tells a guest about the machine.  Its uname, sysctl,
 # sysctlbyname and sysctlnametomib reach the host's own functions, which
 # answered an x86 program that it ran on an arm64 Mac: uname -m printed arm64.
@@ -15916,6 +15955,7 @@ case_native_objc_cycle
 case_native_lazy_flat
 case_native_import_addends
 case_native_flat_nonlazy
+case_native_scanf_long_double
 case_native_kept
 case_native_tcache
 

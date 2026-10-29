@@ -1103,9 +1103,19 @@ int ocerz_abi_va_arg(OcerzAbiVaList *va, const OcerzCPU *cpu, char cls, uint64_t
     if (!va || !cpu || !out)
         return OCERZ_EUNDEF;
     *out = 0;
-    if (cls != 'i' && cls != 'u' && cls != 'l' && cls != 'L' && cls != 'p' && cls != 'd')
+    if (cls != 'i' && cls != 'u' && cls != 'l' && cls != 'L' && cls != 'p' && cls != 'd' && cls != 'D')
         return OCERZ_EUNSUP;
 
+    /* a long double is never in a register: the next even stack slot holds its 80 bits, and the host's long
+       double is a double, which is what comes out (as for a named D argument) */
+    if (cls == 'D') {
+        va->gslot += va->gslot & 1;
+        uint64_t at = cpu->gpr[OCERZ_RSP] + 8 + 8 * (uint64_t)va->gslot;
+        double d = abi_f80_to_double(ocerz_ld(at, 8), (uint16_t)ocerz_ld(at + 8, 2));
+        va->gslot += 2;
+        memcpy(out, &d, sizeof d);
+        return OCERZ_OK;
+    }
     uint64_t raw = abi_guest_next(cpu, cls == 'd', &va->gi, &va->gf, &va->gslot);
     if (cls == 'p')
         *out = raw ? (uint64_t)(uintptr_t)ocerz_g2h(raw) : 0;

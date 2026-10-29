@@ -21,7 +21,7 @@ for engine in jit interpreter slow-bridge; do
     grep -q 'native mode, shared cache not mapped' "$work/$engine.err"
     grep -Eq 'BRIDGESTAT.*crossings=[1-9][0-9]*' "$work/$engine.err"
     echo "PASS native va_list formats $engine"
-    for refusal in positional long-double writeback; do
+    for refusal in positional; do
         rc=0
         env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \
             "$repo/ocerz" "${args[@]}" "$work/formats.x86_64" "reject-$refusal" \

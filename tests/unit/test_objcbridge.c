@@ -687,6 +687,10 @@ static const FormatCase kFormats[] = {
     { OCERZ_OBJC_FMT_C, "%hhd %hd %ld %lld %qd %jd %zd %td", "iillllll" },
     { OCERZ_OBJC_FMT_C, "%lu %llx %zu %tx %jo", "lllll" },
     { OCERZ_OBJC_FMT_C, "%Ld", "i" },
+    /* a long double (D: read from the overflow area, handed over as the host's double) and %n's pointer */
+    { OCERZ_OBJC_FMT_C, "%Lf %Le %Lg %La %LE %LA", "DDDDDD" },
+    { OCERZ_OBJC_FMT_CF, "%Lg %d %@", "Dip" },
+    { OCERZ_OBJC_FMT_C, "%n %d %hhn %lln", "pipp" },
     { OCERZ_OBJC_FMT_C, "%D %O %U", "lll" },
     { OCERZ_OBJC_FMT_C, "%c %lc %C %s %ls %S %p", "iiipppL" },
     { OCERZ_OBJC_FMT_C, "%f %e %g %a %F %E %G %A %lf", "ddddddddd" },
@@ -716,10 +720,6 @@ typedef struct FormatRefusal {
 } FormatRefusal;
 
 static const FormatRefusal kFormatRefusals[] = {
-    { OCERZ_OBJC_FMT_C, "%n", "%n" },
-    { OCERZ_OBJC_FMT_C, "%d %hhn", "%n" },
-    { OCERZ_OBJC_FMT_C, "%Lf", "long double" },
-    { OCERZ_OBJC_FMT_CF, "%Lg", "long double" },
     { OCERZ_OBJC_FMT_C, "%1$d %d", "mixed" },
     { OCERZ_OBJC_FMT_C, "%d %1$d", "mixed" },
     { OCERZ_OBJC_FMT_C, "%2$d", "no conversion takes" },
@@ -1336,12 +1336,6 @@ static void r_bitfield(OcerzCPU *cpu)
     cpu->gpr[OCERZ_RDX] = ocerz_h2g(sel("decimalValue"));
 }
 
-static void r_printf_n(OcerzCPU *cpu)
-{
-    cpu->gpr[OCERZ_RDI] = ocerz_h2g("count %n");
-    cpu->gpr[OCERZ_RSI] = scratch + 0x100;
-}
-
 static void r_va_null(OcerzCPU *cpu)
 {
     cpu->gpr[OCERZ_RDI] = scratch + 0x100;
@@ -1405,7 +1399,6 @@ static const Refusal kRefusals[] = {
       "setHashFunction:] cannot cross: argument 0 is an x86 function pointer" },
     { "a bitfield result", r_bitfield, ocerz_objc_msgSend_stret, "decimalValue] cannot cross: its method type"
       " encoding {" },
-    { "printf %n", r_printf_n, ocerz_fmt_printf, "_printf refuses the format \"count %n\": it has %n" },
     { "a null va_list", r_va_null, ocerz_fmt_vsnprintf, "_vsnprintf: null guest va_list" },
     { "invalid va_list GP offsets", r_va_offsets, ocerz_fmt_vsnprintf, "invalid guest va_list offsets" },
     { "invalid va_list FP offsets", r_va_fp_offset, ocerz_fmt_vsnprintf, "invalid guest va_list offsets" },

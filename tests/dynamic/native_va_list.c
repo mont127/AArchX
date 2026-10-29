@@ -112,6 +112,16 @@ static void refuse_format(const char *format, ...)
     free(result);
 }
 
+/* %n through a va_list: the count lands in the guest's int */
+static int count_through(char *buffer, size_t size, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    int r = vsnprintf(buffer, size, format, args);
+    va_end(args);
+    return r;
+}
+
 static char *allocate_format(const char *format, ...)
 {
     va_list args;
@@ -140,12 +150,6 @@ int main(int argc, char **argv)
     if (argc == 2) {
         if (strcmp(argv[1], "reject-positional") == 0)
             refuse_format("%1$d %d", 1, 2);   /* positional and sequential mixed */
-        else if (strcmp(argv[1], "reject-long-double") == 0)
-            refuse_format("%Lf", (long double)1.5);
-        else if (strcmp(argv[1], "reject-writeback") == 0) {
-            int count = 0;
-            refuse_format("%n", &count);
-        }
         return 1;
     }
     check("plain percent %", "plain percent %%");
@@ -158,6 +162,14 @@ int main(int argc, char **argv)
     check("    3.50", "%*.*f", 8, 2, 3.5);
     check("255 65535 4294967295 18446744073709551615 -1 -2 42 -43",
           "%hhu %hu %u %llu %hhd %hd %zu %td", 255, 65535, ~0u, ~0ull, -1, -2, (size_t)42, (ptrdiff_t)-43);
+    /* long doubles, which x86-64 passes in the overflow area at 16-byte alignment, among values in registers and
+       past them; the host's long double is a double, and any value a double holds prints the same */
+    check("7 1.500000 x 2.5 -2.50e+00 9 0.125", "%d %Lf %s %.1f %.2Le %d %Lg", 7, 1.5L, "x", 2.5, -2.5L, 9, 0.125L);
+    check("1 2 3 4 5 6 1.25 7 8", "%d %d %d %d %d %d %Lg %d %d", 1, 2, 3, 4, 5, 6, 1.25L, 7, 8);
+    int seen = -1, after = -1;
+    char counted[32];
+    assert(count_through(counted, sizeof counted, "abc%nde%hnf", &seen, &after) == 6 && seen == 3 && (short)after == 5);
+    puts("count 3 5");
     pthread_t threads[4];
     for (uintptr_t i = 0; i < 4; i++)
         assert(pthread_create(&threads[i], NULL, format_thread, (void *)i) == 0);
