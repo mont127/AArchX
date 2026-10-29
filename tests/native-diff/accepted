@@ -1,0 +1,22 @@
+# Differences tools/native-diff.py knows and accepts: <probe> <where> <key regex> | <why> (the bar between spaces)
+# where is native, cache, both or any.  A difference that matches is counted as accepted and does not fail the run;
+# anything else is new.
+
+# Native mode's long double is the host's, a double (abi.h, class D).
+printf  native  ^long double [^/]*/[45]$   | 1e-4000 and 1e+4000 are outside a double's range
+printf  native  ^long double %L?a/         | %La spells a double's hex digits, not the x87 significand's
+printf  native  ^long double %\.20Lg/      | twenty digits are more than a double holds
+strconv native  /strtold$                  | strtold parses into a double: its range and precision
+scalar  native  ^scalar __fpclassifyl/     | 1e-310 is a normal long double and a subnormal double
+
+# Cache mode keeps the x87 stack as doubles (x87.c), so long double functions have a double's range and precision.
+scalar  cache   ^scalar \w+l/              | x87 values kept as doubles
+scalar  both    ^scalar \w+l/              | x87 values kept as doubles, and native mode's long double is a double
+
+# What the two libms answer differently, both within what C allows.
+scalar  native  ^scalar (jn|yn)/           | Bessel functions of high order: the libms differ by more than 16 ulps
+scalar  native  ^scalar f(max|min)[fl]?/   | which zero fmax and fmin answer for -0 and +0, which C leaves open
+
+# Deliberate.
+sysfacts native ^sysconf/THREAD_STACK_MIN$ | the host's minimum, which pthread_attr_setstacksize enforces
+sysfacts cache  ^fenv/                     | the translator keeps no SSE exception flags, for speed

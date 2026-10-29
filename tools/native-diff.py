@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Run the same x86_64 probes under Rosetta, cache mode and native mode, and say where they disagree.
+
+Rosetta runs Apple's x86_64 libraries on Apple's own translator, so it is the answer an Intel Mac gives.  Cache mode
+runs the same libraries through ocerz's translator, native mode crosses each call to the arm64 frameworks.  A line
+where cache mode agrees with Rosetta and native mode does not is the bridge's doing; one where native mode agrees and
+cache mode does not is the translator's; one where both differ is either, or the probe asking about the machine.
+
+The probes are the C and Objective-C files in tests/native-diff (probe.h says how one is written), and one this tool
+generates: every libSystem function in the API database whose arguments and result are all numbers and whose name is
+on an allow-list of side-effect-free families (libm, the classification and character-class calls, the bit and
+absolute-value ones), called on a fixed set of inputs, each result printed as its bits.
+
+Floating-point results are compared by their bits and, where they differ, measured in units in the last place; a
+long double is also compared after rounding to a double, since native mode keeps a double of one.  Those differences
+are counted apart from the rest, because a different libm or a narrower long double is not the same kind of finding
+as a wrong answer: ulp (16 or fewer apart), long-double (equal, or 16 or fewer of a double's ulps apart, once both
+are rounded to doubles) and nan (two NaNs whose bits differ: x86's default NaN is negative, arm64's positive).
+
+    tools/native-diff.py                      # every probe, a summary, then each difference
+    tools/native-diff.py printf strconv       # just these probes
+    tools/native-diff.py --keep DIR           # keep the binaries and the three outputs of each probe in DIR
+
+Differences already understood are listed in tests/native-diff/accepted, each with its reason (a long double native
+mode keeps as a double, two libms that answer differently within what C allows); they are counted as accepted and
+shown only with --show-accepted.  The tool exits 1 when any probe has a difference outside the ulp, long-double and
+nan kinds that the list does not accept, 0 otherwise.
+"""
+import argparse
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROBES = os.path.join(ROOT, "tests", "native-diff")
+
+# ---- the generated probe of scalar functions ----
+
+ALLOW = [
+    r"_(acos|asin|atan|atan2|cos|sin|tan|acosh|asinh|atanh|cosh|sinh|tanh|exp|exp2|expm1|log|log10|log1p|log2|logb|"
+    r"ilogb|fabs|cbrt|hypot|pow|sqrt|erf|erfc|lgamma|tgamma|ceil|floor|nearbyint|rint|lrint|llrint|round|lround|"
+    r"llround|trunc|fmod|remainder|copysign|nextafter|nexttoward|fdim|fmax|fmin|fma|ldexp|scalbn|scalbln|scalb|j0|j1|"
+    r"jn|y0|y1|yn)[fl]?",
+    r"___(exp10|sinpi|cospi|tanpi)f?",
+    r"___fpclassify[dfl]", r"___(inline_)?(isfinite|isinf|isnan|isnormal|signbit)[dfl]",
+    r"_(abs|labs|llabs|imaxabs|ffs|ffsl|ffsll|fls|flsl|flsll)", r"___(powidf2|powisf2)",
+    r"_(is(alnum|alpha|ascii|blank|cntrl|digit|graph|hexnumber|ideogram|lower|number|phonogram|print|punct|rune|"
+    r"space|special|upper|xdigit))", r"_isw[a-z]+", r"_(toupper|tolower|toascii|towupper|towlower|digittoint|btowc|"
+    r"wctob|wcwidth)", r"___(tolower|toupper|maskrune|istype|isctype|wcwidth)",
+]
+ALLOW_RE = re.compile("^(?:" + "|".join(ALLOW) + ")$")
+CTYPES = {"b": "signed char", "B": "unsigned char", "h": "short", "H": "unsigned short", "i": "int",
+          "u": "unsigned", "l": "long", "L": "unsigned long", "f": "float", "d": "double", "D": "long double"}
+
+DOUBLES = ["0.0", "-0.0", "1.0", "-1.0", "0.5", "-0.5", "2.0", "3.0", "10.0", "0.1", "1e-310", "1e-30", "1e30",
+           "1e300", "-1e300", "3.141592653589793", "-3.141592653589793", "1.5707963267948966", "2.718281828459045",
+           "100.5", "-2.5", "709.78", "710.0", "1e-5", "INFINITY", "-INFINITY", "NAN"]
+DOUBLES_2 = ["0.0", "-0.0", "1.0", "-1.0", "0.5", "2.0", "10.0", "1e-310", "1e300", "-2.5", "INFINITY", "NAN"]
+DOUBLES_3 = ["0.0", "1.0", "-1.0", "0.5", "1e300", "NAN"]
+INTS = ["0", "1", "-1", "2", "7", "31", "32", "63", "64", "100", "255", "1000", "65535", "0x7fffffff",
+        "(-0x7fffffff - 1)"]
+INTS_2 = ["0", "1", "-1", "2", "31", "64", "1000", "(-0x7fffffff - 1)"]
+CHARS = [str(c) for c in range(-1, 257)] + ["0x3b1", "0x4e2d", "0x1f600", "0xff21", "0x2028", "0x660"]
+
+
+def scalar_functions(db):
+    out = []
+    for line in open(db):
+        f = line.split()
+        if len(f) < 4 or f[0] != "fn":
+            continue
+        m = re.match(r"^([bBhHiulLfdD])\(([bBhHiulLfdD]*)\)$", f[3])
+        if m and ALLOW_RE.match(f[1]) and "$" not in f[1]:
+            out.append((f[1], m.group(1), m.group(2)))
+    return out
+
+
+def gen_scalar(db, path):
+    funcs = scalar_functions(db)
+    lines = ['/* generated by tools/native-diff.py from %s */' % os.path.basename(db),
+             '#include <locale.h>', '#include <math.h>', '#include <stdio.h>', '#include "probe.h"', '']
+    for name, ret, args in funcs:
+        params = ", ".join(CTYPES[a] for a in args) or "void"
+        lines.append('extern %s nd%s(%s) __asm__("%s");' % (CTYPES[ret], name, params, name))
+    lines += ['', 'static void put_in(char c, long double v)', '{',
+              '    if (c == \'d\' || c == \'D\') out_dbl((double)v);',
+              '    else if (c == \'f\') out_flt((float)v);',
+              '    else out_d((int64_t)v);', '}', '',
+              'static void put_ret(char c, long double v, int64_t iv)', '{',
+              '    if (c == \'d\') out_dbl((double)v);', '    else if (c == \'f\') out_flt((float)v);',
+              '    else if (c == \'D\') out_ldbl(v);', '    else out_d(iv);', '}', '',
+              'int main(void)', '{']
+    for name, ret, args in funcs:
+        ctype_like = any(k in name for k in ("is", "to", "digittoint", "btowc", "wctob", "wcwidth", "maskrune"))
+        for loc in (["C", "en_US.UTF-8"] if ctype_like else [None]):
+            case = "scalar %s%s" % (name[1:], " " + loc if loc else "")
+            lines.append('    CASE("%s") {' % case)
+            if loc:
+                lines.append('        setlocale(LC_ALL, "%s");' % loc)
+            sets = []
+            for a in args:
+                if a in "fdD":
+                    sets.append(DOUBLES if len(args) == 1 else DOUBLES_2 if len(args) == 2 else DOUBLES_3)
+                elif ctype_like:
+                    sets.append(CHARS)
+                else:
+                    sets.append(INTS if len(args) == 1 else INTS_2)
+            for i, a in enumerate(args):
+                lines.append('        static const %s in%d[] = { %s };' % (
+                    "double" if a in "fdD" else "long long", i, ", ".join(sets[i])))
+            indent = "        "
+            for i in range(len(args)):
+                lines.append(indent + 'for (size_t i%d = 0; i%d < sizeof in%d / sizeof *in%d; i%d++) {' % (i, i, i, i, i))
+                indent += "    "
+            call_args = ", ".join("(%s)in%d[i%d]" % (CTYPES[a], i, i) for i, a in enumerate(args))
+            lines.append(indent + 'out_s(probe_case); out_s("/");')
+            for i, a in enumerate(args):
+                if i:
+                    lines.append(indent + 'out_s(",");')
+                lines.append(indent + "put_in('%s', (long double)(%s)in%d[i%d]);" % (a, CTYPES[a], i, i))
+            lines.append(indent + 'out_s(" = ");')
+            if ret in "fdD":
+                lines.append(indent + "put_ret('%s', (long double)nd%s(%s), 0);" % (ret, name, call_args))
+            else:
+                lines.append(indent + "put_ret('%s', 0, (int64_t)nd%s(%s));" % (ret, name, call_args))
+            lines.append(indent + 'out_end();')
+            for i in range(len(args)):
+                indent = indent[:-4]
+                lines.append(indent + '}')
+            lines.append('    }')
+    lines += ['    return 0;', '}', '']
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    return len(funcs)
+
+
+# ---- running ----
+
+def build(src, out):
+    cc = "clang"
+    flags = ["-arch", "x86_64", "-O1", "-w", "-I", PROBES, "-o", out, src]
+    if src.endswith(".m"):
+        flags += ["-fobjc-arc", "-framework", "Foundation"]
+    if "cf" in os.path.basename(src) or src.endswith(".m"):
+        flags += ["-framework", "CoreFoundation"]
+    r = subprocess.run([cc] + flags, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write("native-diff: %s did not build:\n%s" % (src, r.stderr[-2000:]))
+        return False
+    return True
+
+
+def run(cmd, out_path, timeout):
+    env = dict(os.environ)
+    env.setdefault("OCERZ_NO_CACHE_HOLDER", "1")
+    with open(out_path, "w") as out, open(out_path + ".err", "w") as err:
+        try:
+            p = subprocess.run(cmd, stdout=out, stderr=err, env=env, timeout=timeout, stdin=subprocess.DEVNULL)
+            rc = p.returncode
+        except subprocess.TimeoutExpired:
+            rc = "timeout"
+    pairs = []
+    for line in open(out_path, errors="replace"):
+        line = line.rstrip("\n")
+        k, sep, v = line.partition(" = ")
+        # an object's address in a description (a CFNumber, an NSIndexSet) differs from run to run
+        v = re.sub(r"0x[0-9a-f]{9,16}\b", "0x<address>", v)
+        pairs.append((k, v) if sep else (line, ""))
+    return rc, pairs
+
+
+# ---- comparing ----
+
+def ulps(a, b, kind):
+    if kind == "d":
+        x, y = (struct.unpack("<q", struct.pack("<Q", int(v, 16)))[0] for v in (a, b))
+    else:
+        x, y = (struct.unpack("<i", struct.pack("<I", int(v, 16)))[0] for v in (a, b))
+    if (x < 0) != (y < 0):
+        return None
+    return abs(x - y)
+
+
+def is_nan(t, h):
+    v = int(h, 16)
+    if t == "d":
+        return (v >> 52) & 0x7ff == 0x7ff and v & ((1 << 52) - 1)
+    if t == "f":
+        return (v >> 23) & 0xff == 0xff and v & ((1 << 23) - 1)
+    return (v >> 64) & 0x7fff == 0x7fff and v & ((1 << 63) - 1)
+
+
+def ldbl_to_double(h):
+    v = int(h, 16)
+    sign, exp, mant = v >> 79, (v >> 64) & 0x7fff, v & ((1 << 64) - 1)
+    if exp == 0x7fff:
+        return "nan" if mant & ((1 << 63) - 1) else ("-inf" if sign else "inf")
+    if exp == 0 and mant == 0:
+        return "-0" if sign else "0"
+    try:
+        x = math.ldexp(mant, exp - 16383 - 63)
+    except OverflowError:
+        x = math.inf
+    return repr(-x if sign else x)
+
+
+def kind_of(ref, other):
+    """how other differs from ref: 'ulp', 'long-double' or 'value'"""
+    m1, m2 = re.match(r"^([dfD]):([0-9a-f]+)(.*)$", ref), re.match(r"^([dfD]):([0-9a-f]+)(.*)$", other)
+    if m1 and m2 and m1.group(1) == m2.group(1) and m1.group(3) == m2.group(3):
+        t = m1.group(1)
+        if is_nan(t, m1.group(2)) and is_nan(t, m2.group(2)):
+            return "nan"   # x86's default NaN is negative, arm64's positive
+        if t == "D":
+            # both rounded to doubles: equal, or a few of a double's ulps apart (cache mode's x87 keeps doubles)
+            a, b = ldbl_to_double(m1.group(2)), ldbl_to_double(m2.group(2))
+            if a == b:
+                return "long-double"
+            try:
+                u = ulps("%016x" % struct.unpack("<Q", struct.pack("<d", float(a)))[0],
+                         "%016x" % struct.unpack("<Q", struct.pack("<d", float(b)))[0], "d")
+            except ValueError:
+                u = None
+            return "long-double" if u is not None and u <= 16 else "value"
+        u = ulps(m1.group(2), m2.group(2), t)
+        return "ulp" if u is not None and u <= 16 else "value"
+    if re.search(r"\bD:", ref) and re.search(r"\bD:", other):
+        a = re.sub(r"D:([0-9a-f]{20})", lambda m: "D~" + ldbl_to_double(m.group(1)), ref)
+        b = re.sub(r"D:([0-9a-f]{20})", lambda m: "D~" + ldbl_to_double(m.group(1)), other)
+        if a == b:
+            return "long-double"
+    return "value"
+
+
+def compare(ros, cache, native):
+    """per key: (where, kind, values) for every key some run disagrees on"""
+    keys, seen = [], set()
+    maps = []
+    for pairs in (ros, cache, native):
+        d = {}
+        for k, v in pairs:
+            d.setdefault(k, v)
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+        maps.append(d)
+    out = []
+    for k in keys:
+        r, c, n = (m.get(k) for m in maps)
+        if r == c == n:
+            continue
+        # a case that died in one run takes all its lines with it: one line, under the case's name, says so
+        if r is not None and (c is None or n is None):
+            case = k.split("/")[0]
+            if (c is None and case in maps[1]) or (n is None and case in maps[2]):
+                continue
+        where = "native" if c == r else "cache" if n == r else "both"
+        kinds = set()
+        for v in ((n,) if where == "native" else (c,) if where == "cache" else (c, n)):
+            kinds.add("missing" if v is None else "refused" if v and v.startswith("<exit 7") else
+                      "crash" if v and v.startswith("<") else kind_of(r or "", v) if r is not None else "value")
+        kind = "value" if "value" in kinds else sorted(kinds)[0]
+        out.append((k, where, kind, r, c, n))
+    return out
+
+
+def load_accepted(path):
+    out = []
+    if not path or not os.path.exists(path):
+        return out
+    for line in open(path):
+        line = line.split("#", 1)[0] if line.lstrip().startswith("#") else line
+        rule, _, why = line.partition(" | ")   # a pattern may hold a |, never with spaces round it
+        f = rule.split(None, 2)   # the pattern is the rest, spaces and all
+        if len(f) == 3:
+            out.append((f[0], f[1], re.compile(f[2].strip()), why.strip()))
+    return out
+
+
+def accepted(rules, probe, where, key):
+    for p, w, rx, why in rules:
+        if p == probe and (w == "any" or w == where) and rx.search(key):
+            return why
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("names", nargs="*", help="probes to run (default: all)")
+    ap.add_argument("--ocerz", default=os.path.join(ROOT, "ocerz"))
+    ap.add_argument("--db", default=None, help="libSystem's API database (default: runtime/apis/macos/*/)")
+    ap.add_argument("--keep", help="keep the binaries and outputs here")
+    ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--limit", type=int, default=40, help="differences shown per probe (0: all)")
+    ap.add_argument("--quiet-kinds", default="ulp,long-double,nan", help="kinds counted but not listed")
+    ap.add_argument("--accepted", default=os.path.join(PROBES, "accepted"), help="the known differences")
+    ap.add_argument("--show-accepted", action="store_true", help="list accepted differences too")
+    args = ap.parse_args()
+    rules = load_accepted(args.accepted)
+
+    work = args.keep or tempfile.mkdtemp(prefix="native-diff.")
+    os.makedirs(work, exist_ok=True)
+    db = args.db
+    if not db:
+        base = os.path.join(ROOT, "runtime", "apis", "macos")
+        vers = sorted(os.listdir(base)) if os.path.isdir(base) else []
+        db = os.path.join(base, vers[-1], "libSystem.B.dylib.api") if vers else None
+    sources = sorted(os.path.join(PROBES, f) for f in os.listdir(PROBES) if f.endswith((".c", ".m")))
+    if db and os.path.exists(db):
+        gen = os.path.join(work, "scalar.c")
+        n = gen_scalar(db, gen)
+        sources.append(gen)
+        print("native-diff: scalar probe: %d functions from %s" % (n, os.path.relpath(db, ROOT)))
+    if args.names:
+        sources = [s for s in sources if os.path.splitext(os.path.basename(s))[0] in args.names]
+
+    quiet = set(args.quiet_kinds.split(",")) if args.quiet_kinds else set()
+    failing = 0
+    report = []
+    for src in sources:
+        name = os.path.splitext(os.path.basename(src))[0]
+        exe = os.path.join(work, name)
+        if not build(src, exe):
+            failing += 1
+            continue
+        runs = []
+        for mode, cmd in (("rosetta", ["arch", "-x86_64", exe]), ("cache", [args.ocerz, exe]),
+                          ("native", [args.ocerz, "-native", exe])):
+            runs.append(run(cmd, os.path.join(work, "%s.%s" % (name, mode)), args.timeout))
+        diffs = compare(*(r[1] for r in runs))
+        for i, d in enumerate(diffs):
+            why = accepted(rules, name, d[1], d[0]) if d[2] not in quiet else None
+            if why:
+                diffs[i] = d[:2] + ("accepted",) + d[3:] + (why,)
+        counts = {}
+        for d in diffs:
+            counts[(d[1], d[2])] = counts.get((d[1], d[2]), 0) + 1
+        rcs = " ".join("%s=%s" % (m, r[0]) for m, r in zip(("rosetta", "cache", "native"), runs))
+        summary = ", ".join("%s %s %d" % (w, k, c) for (w, k), c in sorted(counts.items())) or "all agree"
+        print("%-10s %5d lines  %s  [%s]" % (name, len(runs[0][1]), summary, rcs))
+        if any(k not in quiet and k != "accepted" for (_, k) in counts):
+            failing += 1
+        shown = [d for d in diffs if d[2] not in quiet and (d[2] != "accepted" or args.show_accepted)]
+        if shown:
+            report.append((name, shown))
+    for name, shown in report:
+        print("\n== %s" % name)
+        for d in shown[: args.limit or None]:
+            k, where, kind, r, c, n = d[:6]
+            print("%s [%s %s]%s" % (k, where, kind, " " + d[6] if len(d) > 6 else ""))
+            print("    rosetta %s" % r)
+            if where != "native":
+                print("    cache   %s" % c)
+            if where != "cache":
+                print("    native  %s" % n)
+        if args.limit and len(shown) > args.limit:
+            print("    ... %d more (--limit 0)" % (len(shown) - args.limit))
+    if not args.keep:
+        shutil.rmtree(work, ignore_errors=True)
+    return 1 if failing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
