@@ -1,0 +1,18 @@
+carry 782cc9d3ee0163c9
+wtail -1 1 0 1
+bits 0: 100000020 100000020 100000040 100000040
+bits 1: 10000000000 1f 200000000 3f
+bits 2: 1 1e 1 3e
+bits 80000000: 1f 10000000000 1f 20
+bits ffffffff: 10000000000 10000000000 200000000 20
+bits 100000000: 100000020 100000020 20 1f
+bits 8000000000000000: 100000020 100000020 3f 200000000
+bits ffffffffffffffff: 10000000000 10000000000 200000000 200000000
+bits 10: 4 1b 4 3b
+bits ff00: 8 10 8 30
+heap 400000010 500000020 1 0
+shifts 0a96648117e677be
+narrow d262f22aca74e723
+shiftcf a2774d46c2be8394
+strings up: s+31 d+31 acc d5cec7c0b9b2aba4 dst ee0a11181f262d343b424950575e656c 737a81888f969da4abb2b9c0c7ced5ee eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+strings down: s+10 d+10 acc b2aba49d968f8881 dst eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee eeee81888f969da4abb2b9eec7ceeeee e3eaf1f8eeeeeeee1b222930373e454c eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee

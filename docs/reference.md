@@ -167,6 +167,12 @@ bug is in what that switch controls.
 | `OCERZ_NO_AFP=1` | check NaN results in translated code even where the processor can produce x86's NaNs itself |
 | `OCERZ_NO_JIT_MMX=1` | run MMX instructions in the interpreter |
 | `OCERZ_NO_HIGH8_ARITH=1` | run arithmetic, compares, moves and setcc on ah, ch, dh and bh in the interpreter, in 64-bit code as in 32-bit |
+| `OCERZ_NO_ADC_NARROW=1` | run `adc` and `sbb` on an 8- or 16-bit register in the interpreter |
+| `OCERZ_NO_BITCOUNT_FLAGS=1` | run a `tzcnt` or `lzcnt` whose carry or zero flag is read afterwards in the interpreter |
+| `OCERZ_NO_INLINE_STRING=1` | run a `movs`, `stos` or `lods` without a `rep` prefix in the interpreter |
+| `OCERZ_NO_SHIFT_CL_DEAD=1` | treat a shift or rotate by `cl` as reading every flag even when nothing after it reads one, which keeps the flags of the instruction before it alive |
+| `OCERZ_NO_NARROW_LOGIC_NZCV=1` | keep the flags of an `and`, `or` or `xor` into an 8- or 16-bit register in the flag record instead of passing them straight to the jcc, setcc or cmov after it |
+| `OCERZ_NO_SHIFT_CF_NZCV=1` | keep the carry of a shift by a constant in the flag record instead of testing the bit it moves out and passing that straight to the `jc`, `jnc`, `setc`, `adc` or `sbb` after it |
 | `OCERZ_NO_SHIFT_MEM_IMM=1` | run a shift of memory by an immediate (`shr dword [ebp-0x3c], 2`) in the interpreter, in 64-bit code as in 32-bit |
 | `OCERZ_NZCV_GAP=<n>` | hand a compare's flags straight to the setcc, cmov, adc, sbb or jcc reading them only across at most n instructions between (0 to 8, default 8; 3 was the limit before 2026-10-11) |
 | `OCERZ_NO_NZCV_GAP_LOAD=1` | end the window at a load, instead of letting a load sit in it and building the flags again from the compare's record after it |

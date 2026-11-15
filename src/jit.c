@@ -4665,6 +4665,20 @@ static int emit_shift_mem_imm(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
+/* CF for the consumer that asked for it (g_nzcv_want) from a shift by cnt of the value in src: the last bit the
+   shift will move out, tested before it does, in bt's NZCV. */
+static void shift_cf_nzcv(A64Buf *b, int sf, int src, unsigned op, unsigned cnt, int bits)
+{
+    if (!g_nzcv_want) return;
+    unsigned bit = op == OCERZ_OP_SHL ? (unsigned)bits - cnt : cnt - 1;
+    if (!a64_try_ands_imm(b, sf, A64_ZR, src, 1ull << bit)) {
+        a64_lsr_imm(b, sf, JTU, src, (int)bit);
+        (void)a64_try_ands_imm(b, sf, A64_ZR, JTU, 1);
+    }
+    g_nzcv_kind = NZCV_KIND_BT;
+    g_nzcv_from = g_cur_insn_idx;
+}
+
 static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (!g_defer)
@@ -4718,6 +4732,8 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
                 else if (g_cur_insns_fwd() && g_cur_insn_idx >= 0 && g_mov_sink_at[g_cur_insn_idx] >= 0)
                     rn = pin_hreg(pin_slot(g_cur_insns_fwd()[g_mov_sink_at[g_cur_insn_idx]].ops[1].reg));
             }
+            if (op == OCERZ_OP_SHL || op == OCERZ_OP_SHR || op == OCERZ_OP_SAR)
+                shift_cf_nzcv(b, sf, rn, op, cnt, bits);
             switch (op) {
             case OCERZ_OP_SHL: a64_lsl_imm(b, sf, rd, rn, (int)cnt); break;
             case OCERZ_OP_SHR: a64_lsr_imm(b, sf, rd, rn, (int)cnt); break;
@@ -4728,6 +4744,8 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
         }
     }
     emit_gpr_rd(b, sf, JT0, d->reg);
+    if (op == OCERZ_OP_SHL || op == OCERZ_OP_SHR || op == OCERZ_OP_SAR)
+        shift_cf_nzcv(b, sf, JT0, op, cnt, bits);
 
     switch (op) {
     case OCERZ_OP_SHL: a64_lsl_imm(b, sf, JT2, JT0, (int)cnt); break;
@@ -4740,7 +4758,6 @@ static int emit_shift(A64Buf *b, const X86Insn *insn, uint64_t need)
     if (need == 0)
         return 1;
 
-    (void)bits;
     a64_mov_imm64(b, JT1, cnt);
     unsigned kind = op == OCERZ_OP_SHL ? OCERZ_CC_SHL
                   : op == OCERZ_OP_SHR ? OCERZ_CC_SHR : OCERZ_CC_SAR;
@@ -5455,6 +5472,14 @@ static int insn_stack_only(const X86Insn *in)
 static const X86Insn *g_cur_insns;
 static int g_cur_insns_n;
 static int insn_may_write_gpr(const X86Insn *in, unsigned reg);
+/* shl, shr, sar, rol or ror whose count is not an immediate: the forms flags_live has read every flag */
+static int insn_shift_by_cl(const X86Insn *in)
+{
+    if (in->op != OCERZ_OP_SHL && in->op != OCERZ_OP_SHR && in->op != OCERZ_OP_SAR &&
+        in->op != OCERZ_OP_ROL && in->op != OCERZ_OP_ROR)
+        return 0;
+    return !(in->nops >= 2 && in->ops[1].kind == OCERZ_OPK_IMM);
+}
 /*
  * The Wine guards' view of a block's writes, a guest register at a time,
  * built in one backward pass the first time the block asks about the
@@ -7893,6 +7918,8 @@ static int nzcv_producer_candidate(const X86Insn *p)
     case OCERZ_OP_BSF: case OCERZ_OP_BSR:
     case OCERZ_OP_BT: case OCERZ_OP_BTS: case OCERZ_OP_BTR: case OCERZ_OP_BTC:
         return 1;
+    case OCERZ_OP_SHL: case OCERZ_OP_SHR: case OCERZ_OP_SAR:
+        return p->nops == 2 && p->ops[1].kind == OCERZ_OPK_IMM && !ENV_ON("OCERZ_NO_SHIFT_CF_NZCV");
     default:
         return 0;
     }
@@ -7976,6 +8003,7 @@ static int nzcv_gap_ok(const X86Insn *insns, int m, int k)
                         p->op == OCERZ_OP_ADD ? OCERZ_CC_ADD :
                         (p->op == OCERZ_OP_BSF || p->op == OCERZ_OP_BSR) ? OCERZ_CC_SUB :
                         (p->op == OCERZ_OP_BT || p->op == OCERZ_OP_BTS || p->op == OCERZ_OP_BTR || p->op == OCERZ_OP_BTC) ? NZCV_KIND_BT :
+                        (p->op == OCERZ_OP_SHL || p->op == OCERZ_OP_SHR || p->op == OCERZ_OP_SAR) ? NZCV_KIND_BT :
                         OCERZ_CC_LOGIC;
         int dc = nzcv_dc_for(kind, in->cc);
         return dc >= 0 && dc != A64_AL && dc != A64_NV;
@@ -8276,6 +8304,22 @@ static int nzcv_fuse_producer_core(const X86Insn *insns, int ci)
         else if (bo->kind != OCERZ_OPK_IMM) return -1;
         return k;
     }
+    if (p->op == OCERZ_OP_SHL || p->op == OCERZ_OP_SHR || p->op == OCERZ_OP_SAR) {
+        /*
+         * A shift of a register by a constant leaves in CF the last bit it shifted out, which emit_shift
+         * tests in the value before shifting it, as bt's bit: the kind is bt's, and so are the conditions.
+         * Wine's memcpy copies a tail by shr r, 1; jae for each power of two, and each jae called
+         * ocerz_flags_materialize.  A zero or sign test after the shift tests the result's register
+         * (value_cond_fuse_producer).  OCERZ_NO_SHIFT_CF_NZCV=1.
+         */
+        if (cc != OCERZ_CC_B && cc != OCERZ_CC_AE) return -1;
+        if (p->nops != 2 || p->seg != OCERZ_SEG_NONE) return -1;
+        const X86Operand *sd = &p->ops[0], *sc = &p->ops[1];
+        if (sd->kind != OCERZ_OPK_REG || sd->high8 || (sd->size != 4 && sd->size != 8) || pin_slot(sd->reg) < 0 ||
+            (rsp_is_ptr() && sd->reg == OCERZ_RSP)) return -1;
+        if (sc->kind != OCERZ_OPK_IMM || (sc->imm & (sd->size == 8 ? 63u : 31u)) == 0) return -1;
+        return k;
+    }
     switch (p->op) {
     case OCERZ_OP_CMP: case OCERZ_OP_SUB: kind = OCERZ_CC_SUB; if (cc_after_subs(cc) < 0) return -1; break;
     case OCERZ_OP_ADD:                    kind = OCERZ_CC_ADD; if (cc_after_adds(cc) < 0) return -1; break;
@@ -8302,6 +8346,16 @@ static int nzcv_fuse_producer_core(const X86Insn *insns, int ci)
             else if (sr->kind != OCERZ_OPK_IMM) return -1;
             if (cc != OCERZ_CC_E && cc != OCERZ_CC_NE && cc != OCERZ_CC_B && cc != OCERZ_CC_AE &&
                 cc != OCERZ_CC_A && cc != OCERZ_CC_BE) return -1;
+        } else if (p->op == OCERZ_OP_AND || p->op == OCERZ_OP_OR || p->op == OCERZ_OP_XOR) {
+            /*
+             * and, or and xor into a byte or word register, from a register or an immediate: emit_arith_narrow
+             * sets N and Z from the result, C and V clear, so every condition a wide one answers is answered.
+             * Without it the pair went through the flag record in memory, 30 instructions for or r10b, cl; je,
+             * which is how compilers join two conditions without a branch.  OCERZ_NO_NARROW_LOGIC_NZCV=1.
+             */
+            if (d->kind != OCERZ_OPK_REG || ENV_ON("OCERZ_NO_NARROW_LOGIC_NZCV")) return -1;
+            if (sr->kind == OCERZ_OPK_REG) { if (pin_slot(sr->reg) < 0 || (rsp_is_ptr() && sr->reg == OCERZ_RSP)) return -1; }
+            else if (sr->kind != OCERZ_OPK_IMM) return -1;
         } else return -1;
         return k;
     }
@@ -8657,10 +8711,55 @@ static void emit_cc_predicate_ex(A64Buf *b, unsigned cc, int want_direct)
     a64_subs_imm(b, 1, A64_ZR, JTF, 0);
 }
 
+/*
+ * adc and sbb on an 8- or 16-bit register, from a register or an immediate: the carry as a 0 or 1, the two
+ * operands at their width, the sum or difference put back into the register's low bits (bits 8-15 for ah, ch,
+ * dh and bh), and, when a flag is read after, the record the wide form leaves.  Wine's wcscmp ends in
+ * seta al; sbb al, 0, and every one went to the interpreter.  OCERZ_NO_ADC_NARROW=1 interprets them again.
+ */
+static int emit_adc_sbb_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
+{
+    const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
+    int size = d->size, bits = size * 8;
+    int dh = d->high8, sh = s->kind == OCERZ_OPK_REG && s->high8;
+    if (ENV_ON("OCERZ_NO_ADC_NARROW")) return 0;
+    if (s->kind == OCERZ_OPK_REG) { if (s->size != size) return 0; }
+    else if (s->kind != OCERZ_OPK_IMM) return 0;
+    if (rsp_is_ptr() && (d->reg == OCERZ_RSP || (s->kind == OCERZ_OPK_REG && s->reg == OCERZ_RSP))) return 0;
+    int is_sbb = insn->op == OCERZ_OP_SBB;
+    emit_cc_predicate(b, OCERZ_CC_B);
+    a64_cset(b, JTU, A64_NE);
+    emit_gpr_rd(b, 1, JT0, d->reg);
+    if (dh) a64_ubfx(b, 0, JTT, JT0, 8, 8);
+    else if (size == 1) a64_uxtb(b, JTT, JT0);
+    else a64_uxth(b, JTT, JT0);
+    if (s->kind == OCERZ_OPK_REG) {
+        emit_gpr_rd(b, 1, JT1, s->reg);
+        if (sh) a64_ubfx(b, 0, JT1, JT1, 8, 8);
+        else if (size == 1) a64_uxtb(b, JT1, JT1);
+        else a64_uxth(b, JT1, JT1);
+    } else
+        a64_mov_imm64(b, JT1, (uint64_t)s->imm & (size == 1 ? 0xffull : 0xffffull));
+    if (is_sbb) { a64_sub_reg(b, 0, JT2, JTT, JT1, 0); a64_sub_reg(b, 0, JT2, JT2, JTU, 0); }
+    else        { a64_add_reg(b, 0, JT2, JTT, JT1, 0); a64_add_reg(b, 0, JT2, JT2, JTU, 0); }
+    a64_bfi(b, 1, JT0, JT2, dh ? 8 : 0, bits);
+    emit_gpr_wr(b, JT0, d->reg);
+    if (need) {
+        a64_mov_imm64(b, JT0, ocerz_cc_pack(is_sbb ? OCERZ_CC_SUB : OCERZ_CC_ADD, size, 0));
+        a64_mov_imm64(b, JTA, ocerz_cc_pack(is_sbb ? OCERZ_CC_SUB : OCERZ_CC_ADD, size, 1));
+        a64_subs_imm(b, 1, A64_ZR, JTU, 0);
+        a64_csel(b, 1, JT0, JTA, JT0, A64_NE);
+        a64_stp_off(b, JTT, JT1, 20, CC_SRC_OFF);
+        a64_str(b, 4, JT0, 20, CC_OP_OFF);
+    }
+    return 1;
+}
+
 static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (!g_defer) return 0;
+    if (d->kind == OCERZ_OPK_REG && (d->size == 1 || d->size == 2)) return emit_adc_sbb_narrow(b, insn, need);
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
     if (rsp_is_ptr() && d->reg == OCERZ_RSP) return 0;
     if (s->kind == OCERZ_OPK_REG) { if (s->high8 || s->size != d->size) return 0; }
@@ -8733,6 +8832,19 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
     return 1;
 }
 
+/*
+ * NZCV for the consumer that asked for it (g_nzcv_want) from an and, or or xor into a byte or word register,
+ * whose result's low bits are in res: an adds of the result shifted to the top of a 32-bit register sets N from
+ * its sign bit and Z from its bits and clears C and V, as ands does for a wide one.
+ */
+static void narrow_logic_nzcv(A64Buf *b, unsigned op, int res, int bits)
+{
+    if (!g_nzcv_want || (op != OCERZ_OP_AND && op != OCERZ_OP_OR && op != OCERZ_OP_XOR)) return;
+    a64_adds_reg(b, 0, A64_ZR, A64_ZR, res, 32 - bits);
+    g_nzcv_kind = OCERZ_CC_LOGIC;
+    g_nzcv_from = g_cur_insn_idx;
+}
+
 static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
@@ -8776,6 +8888,7 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
             default:           a64_eor_reg(b, 0, JT2, rd, JT1, 0); break;
             }
             a64_bfi(b, 1, rd, JT2, 0, bits);
+            narrow_logic_nzcv(b, op, JT2, bits);
             return 1;
         }
         if (size == 1) a64_uxtb(b, JTT, rd); else a64_uxth(b, JTT, rd);
@@ -8791,6 +8904,7 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
         else if (op == OCERZ_OP_SUB) emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, size, 0), JTT, JT1);
         else { if (size == 1) a64_uxtb(b, JT2, JT2); else a64_uxth(b, JT2, JT2);
                emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2); }
+        narrow_logic_nzcv(b, op, JT2, bits);
         return 1;
     }
     if (!need && !dh && !sh && pin_slot(d->reg) >= 0 && !(rsp_is_ptr() && d->reg == OCERZ_RSP)) {
@@ -8818,6 +8932,7 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
         default:           a64_eor_reg(b, 0, JT2, rd, rm, 0); break;
         }
         a64_bfi(b, 1, rd, JT2, 0, bits);
+        narrow_logic_nzcv(b, op, JT2, bits);
         return 1;
     }
     if (s_mem) {
@@ -8856,6 +8971,7 @@ static int emit_arith_narrow(A64Buf *b, const X86Insn *insn, uint64_t need)
             emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_LOGIC, size, 0), JT2, JT2);
         }
     }
+    if (!dh && !sh) narrow_logic_nzcv(b, op, JT2, bits);
     return 1;
 }
 
@@ -13259,10 +13375,23 @@ static int emit_sse(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *
     }
 }
 
+/*
+ * tzcnt and lzcnt define CF (the source was 0) and ZF (the result is 0) and leave the rest undefined.  With one
+ * of the two read, they are a deferred SUB record whose operands give exactly those: 0 - 1 for a zero source
+ * (borrow, not equal), 0 - 0 for a zero result, 1 - 0 otherwise.  Only when no other flag is read after: an
+ * earlier instruction's SF or OF read past a tzcnt would be the record's instead.  They were interpreted
+ * whenever a flag was live after them.  OCERZ_NO_BITCOUNT_FLAGS=1 interprets them again.
+ */
+static int bitcount_flags_ok(const X86Insn *insn, uint64_t need)
+{
+    if (insn->op != OCERZ_OP_TZCNT && insn->op != OCERZ_OP_LZCNT) return 0;
+    if (g_cur_live_after & OCERZ_FL_ALL & ~(uint64_t)(OCERZ_CF | OCERZ_ZF)) return 0;
+    return !(need & ~(uint64_t)(OCERZ_CF | OCERZ_ZF)) && !ENV_ON("OCERZ_NO_BITCOUNT_FLAGS");
+}
 static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     if (!g_defer || insn->nops != 2 || insn->seg != OCERZ_SEG_NONE) return 0;
-    if (need != 0) return 0;
+    if (need != 0 && !bitcount_flags_ok(insn, need)) return 0;
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1];
     if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return 0;
     if (s->size != d->size) return 0;
@@ -13290,10 +13419,20 @@ static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
         if (g_nzcv_want) { g_nzcv_kind = OCERZ_CC_SUB; g_nzcv_from = g_cur_insn_idx; }
         return 1;
     case OCERZ_OP_TZCNT:
-        a64_rbit(b, sf, rd, rs); a64_clz(b, sf, rd, rd);
-        return 1;
     case OCERZ_OP_LZCNT:
-        a64_clz(b, sf, rd, rs);
+        if (need) {
+            a64_subs_imm(b, sf, A64_ZR, rs, 0);
+            a64_cset(b, JTT, A64_EQ);
+        }
+        if (insn->op == OCERZ_OP_TZCNT) { a64_rbit(b, sf, rd, rs); a64_clz(b, sf, rd, rd); }
+        else a64_clz(b, sf, rd, rs);
+        if (need) {
+            a64_subs_imm(b, sf, A64_ZR, rd, 0);
+            a64_cset(b, JT0, A64_NE);
+            a64_sub_reg(b, 0, JT0, JT0, JTT, 0);
+            a64_mov_reg(b, 0, JT1, JTT);
+            emit_defer_flags(b, ocerz_cc_pack(OCERZ_CC_SUB, d->size, 0), JT0, JT1);
+        }
         return 1;
     case OCERZ_OP_POPCNT:
         a64_fmov_v_from_x(b, sf, VX0, rs);
@@ -13306,6 +13445,61 @@ static int emit_bitscan(A64Buf *b, const X86Insn *insn, uint64_t need)
 }
 
 #define RFLAGS_OFF ((uint32_t)offsetof(OcerzCPU, rflags))
+/*
+ * One movs, stos or lods, without a rep prefix: the load from [rsi] or the read of rax, the store to [rdi] or
+ * the write of rax, and rsi and rdi moved on by the operand's size.  The accesses are made as a mov's are, so
+ * they are ordered and guarded as the layout asks, and nothing of the guest's has changed when one faults.
+ * With the direction flag set (read from rflags, where cld and std keep it) the instruction goes to the
+ * interpreter, in an arm out of line.  Wine's memcpy copies its last bytes with single movsq, movsd, movsw and
+ * movsb, each of which was a trip to the interpreter.  OCERZ_NO_INLINE_STRING=1 interprets them again.
+ */
+static int emit_string_single(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int *n_exits)
+{
+    int size = insn->opsize, op = insn->op;
+    if (insn->rep != OCERZ_REP_NONE || insn->seg != OCERZ_SEG_NONE || insn->addrsize != 8 || insn->mode32) return 0;
+    if (size != 1 && size != 2 && size != 4 && size != 8) return 0;
+    if (!g_defer || ENV_ON("OCERZ_NO_INLINE_STRING")) return 0;
+    X86Operand src, dst;
+    memset(&src, 0, sizeof src);
+    src.kind = OCERZ_OPK_MEM; src.base = OCERZ_RSI; src.index = OCERZ_REG_NONE; src.size = (uint8_t)size;
+    dst = src; dst.base = OCERZ_RDI;
+    uint32_t *start = b->p;
+    a64_ldr(b, 4, JT0, 20, RFLAGS_OFF);
+    uint32_t *site = a64_label(b);
+    a64_tbnz(b, JT0, 10, 0);
+    if (op == OCERZ_OP_STOS) {
+        emit_gpr_rd(b, 1, JT1, OCERZ_RAX);
+    } else {
+        if (!emit_mem_ea(b, insn, &src, JTA)) { b->p = start; return 0; }
+        (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_load_ordered(b, size, JT1, JTA, JTU);
+    }
+    if (op == OCERZ_OP_LODS) {
+        if (size >= 4) emit_gpr_wr(b, JT1, OCERZ_RAX);
+        else { emit_gpr_rd(b, 1, JT0, OCERZ_RAX); a64_bfi(b, 1, JT0, JT1, 0, size * 8); emit_gpr_wr(b, JT0, OCERZ_RAX); }
+    } else {
+        if (!emit_mem_ea(b, insn, &dst, JTA)) { b->p = start; return 0; }
+        (void)emit_commpage_guard(b, insn, JTA, NULL, NULL);
+        emit_add_const(b, JTA, ocerz_guest_base - ea_fold());
+        emit_guest_store_ordered(b, size, JT1, JTA, JTU);
+    }
+    for (int k = 0; k < 2; k++) {
+        unsigned r = k ? OCERZ_RDI : OCERZ_RSI;
+        if (k ? op == OCERZ_OP_LODS : op == OCERZ_OP_STOS) continue;
+        int ps = pin_slot(r);
+        if (ps >= 0) a64_add_imm(b, 1, pin_hreg(ps), pin_hreg(ps), (uint32_t)size);
+        else { emit_gpr_rd(b, 1, JT0, r); a64_add_imm(b, 1, JT0, JT0, (uint32_t)size); emit_gpr_wr(b, JT0, r); }
+    }
+    if (!oolslow_add(insn, &site, 1, a64_label(b))) {
+        uint32_t *done = a64_label(b);
+        a64_b(b, 0);
+        patch_any_branch(site, a64_label(b));
+        emit_slowcall_keep_lanes(b, insn, exit_sites, n_exits);
+        a64_patch_b(done, a64_label(b));
+    }
+    return 1;
+}
 /*
  * bt and its kin define CF alone (ZF is kept, the rest undefined), so with
  * another instruction's flags still deferred they materialized everything to
@@ -17013,6 +17207,10 @@ static int try_inline(A64Buf *b, const X86Insn *insn, uint64_t need,
         if (insn->ops[0].kind == OCERZ_OPK_MEM)
             return emit_rmw_mem(b, insn, need, exit_sites, n_exits);
         return emit_adc_sbb(b, insn, need);
+    case OCERZ_OP_MOVS:
+    case OCERZ_OP_STOS:
+    case OCERZ_OP_LODS:
+        return emit_string_single(b, insn, exit_sites, n_exits);
     case OCERZ_OP_CBW:
     case OCERZ_OP_CWD:
         return emit_cbw_cwd(b, insn);
@@ -25955,6 +26153,15 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
                     use &= ~(uint64_t)JIT_ARITH_FLAGS;
             }
             if (side_fused)
+                use = 0;
+            /*
+             * A shift or rotate by cl leaves the flags alone when its count is 0, so flags_live has it read
+             * every flag: with any read after it, what was there before is what is read.  With none read
+             * after it, it reads none either, and whatever set flags before it need not: ntdll's
+             * RtlAllocateHeap has tzcnt, rol eax, cl and a lock and, whose flags nobody reads, and the tzcnt
+             * was interpreted for a carry flag it had to leave.  OCERZ_NO_SHIFT_CL_DEAD=1 has it read them all.
+             */
+            if (!(live_seam & OCERZ_FL_ALL) && insn_shift_by_cl(&blk->insns[i]) && !ENV_ON("OCERZ_NO_SHIFT_CL_DEAD"))
                 use = 0;
             fl_need[i] = def & live_seam;
             fl_live[i] = live_seam;

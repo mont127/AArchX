@@ -1139,6 +1139,7 @@ run_golden_case dinline_misc tests/dynamic/inline_misc.c tests/dynamic/inline_mi
 run_golden_case dblock_cap tests/dynamic/block_cap.c tests/dynamic/block_cap.out
 run_golden_case dptest_flags tests/dynamic/ptest_flags.c tests/dynamic/ptest_flags.out
 run_golden_case dshift_cl_flags tests/dynamic/shift_cl_flags.c tests/dynamic/shift_cl_flags.out
+run_golden_case dwine_hot tests/dynamic/wine_hot.c tests/dynamic/wine_hot.out
 run_golden_case dret_flags_seam tests/dynamic/ret_flags_seam.c tests/dynamic/ret_flags_seam.out
 run_golden_case dshufps_self tests/dynamic/shufps_self.c tests/dynamic/shufps_self.out
 run_golden_case dcmp_mem_setcc tests/dynamic/cmp_mem_setcc.c tests/dynamic/cmp_mem_setcc.out
@@ -1896,6 +1897,10 @@ run_iosurface_low_stack_case diosurface_low_stack 'OK'
 run_rpath_system_case drpath_system 'the system libswiftCore was loaded'
 run_low_golden_case dsimd_low tests/guest/simd_pack_jit.c tests/guest/expect/simd_pack_jit.out
 run_low_golden_case dmmx_low tests/guest/mmx_jit.c tests/guest/expect/mmx_jit.out
+run_low_golden_case dwine_hot_low tests/dynamic/wine_hot.c tests/dynamic/wine_hot.out
+export OCERZ_NO_PLAIN_MEM=1
+run_low_golden_case dwine_hot_low_ordered tests/dynamic/wine_hot.c tests/dynamic/wine_hot.out
+unset OCERZ_NO_PLAIN_MEM
 export OCERZ_TSO_NARROW=1
 run_low_golden_case dtso_narrow_low tests/dynamic/tso_narrow.c tests/dynamic/tso_narrow.out
 unset OCERZ_TSO_NARROW
