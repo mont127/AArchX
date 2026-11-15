@@ -2038,12 +2038,14 @@ static int ea_cache_reusable(const A64Buf *b, const X86Operand *op);
 static void ea_cache_set(const A64Buf *b, const X86Operand *op);
 static int g_mem_hoist_greg2 = -1;
 static int g_mem_hoist_greg3 = -1;
+/* The scale counts only beside an index: it is set with one and otherwise still holds an earlier block's. */
 static inline uint64_t hoist_signature(void)
 {
     if (g_mem_hoist_greg < 0) return 0;
+    int scale = g_mem_hoist_aux_index >= 0 ? g_mem_hoist_aux_scale & 3 : 0;
     return 1ull | ((uint64_t)(g_mem_hoist_greg & 0xff) << 8) | ((uint64_t)((g_mem_hoist_greg2 + 1) & 0xff) << 16) |
            ((uint64_t)((g_mem_hoist_greg3 + 1) & 0xff) << 24) | ((uint64_t)((g_mem_hoist_aux_index + 1) & 0xff) << 32) |
-           ((uint64_t)(g_mem_hoist_aux_scale & 3) << 40) | ((uint64_t)((uint32_t)(g_mem_hoist_aux_disp + 0x8000) & 0xffff) << 44);
+           ((uint64_t)scale << 40) | ((uint64_t)((uint32_t)(g_mem_hoist_aux_disp + 0x8000) & 0xffff) << 44);
 }
 
 static inline int pin_slot(unsigned greg);
