@@ -4233,6 +4233,9 @@ OcerzCPU *ocerz_thread_attach(OcerzVM *vm)
                 (unsigned long long)tid);
         return NULL;
     }
+    /* A thread that runs guest code is cancelled only inside a bridged call that waits (sysbridge.c,
+       ocerz_sys_cancel_open), never inside ocerz, where it could hold a lock. */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     ocerz_jit_thread_appears(vm);
     ocerz_jit_hwtso_thread(vm);
     ocerz_cpu_register(cpu);

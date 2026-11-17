@@ -12988,6 +12988,142 @@ EOC
     record "$name" "$reason" "parse, XPath, output buffers and the push parser; a SAX handler is refused"
 }
 
+# pthread_cancel was a stub: the host's cancellation would have ended a thread inside ocerz as readily as inside a
+# call the guest made, and called its x86 cleanup handlers as arm64.  Now the host's cancel state is enabled only
+# for the length of a bridged call that waits in the kernel, behind a cleanup record that runs the guest's handlers
+# as guest code (sysbridge.c, "Thread cancellation").  The fixture cancels threads waiting in read, in sleep and
+# on a condition, expects their handlers and key destructors to have run and the joiner to get PTHREAD_CANCELED,
+# holds a cancel back with pthread_setcancelstate until pthread_testcancel, and lets a thread that reaches no
+# cancellation point return its own value.  Cache mode is not asked: there the guest's own libpthread makes the
+# request with a system call ocerz does not act on yet.
+case_native_cancel() {
+    local name=native_cancel reason="" d="$TMP/native_cancel" mode got rc n
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/cancel.c" <<'EOC'
+/* pthread_cancel as programs use it: a thread waiting in read, in sleep and on a condition is cancelled, its
+   cleanup handlers and key destructors run, the joiner gets PTHREAD_CANCELED; a thread with cancellation off
+   is cancelled only once it turns it on again; one that reaches no cancellation point returns normally. */
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static int pipes[4][2];
+static volatile int cleaned[4], destroyed, got_byte, started[5];
+static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+static pthread_key_t key;
+static void on_cancel(void *a) { cleaned[(long)a]++; }
+static void unlock_mu(void *a) { cleaned[(long)a]++; pthread_mutex_unlock(&mu); }
+static void on_key(void *v) { destroyed += (int)(long)v; }
+static void *in_read(void *a)
+{
+    char c;
+    pthread_setspecific(key, (void *)5);
+    pthread_cleanup_push(on_cancel, (void *)0);
+    pthread_cleanup_push(on_cancel, (void *)0);
+    started[0] = 1;
+    read(pipes[0][0], &c, 1);
+    pthread_cleanup_pop(0);
+    pthread_cleanup_pop(0);
+    return (void *)11;
+}
+static void *in_sleep(void *a)
+{
+    pthread_cleanup_push(on_cancel, (void *)1);
+    started[1] = 1;
+    for (;;) sleep(100);
+    pthread_cleanup_pop(0);
+    return (void *)12;
+}
+static void *in_cond(void *a)
+{
+    pthread_mutex_lock(&mu);
+    pthread_cleanup_push(unlock_mu, (void *)2);
+    started[2] = 1;
+    for (;;) pthread_cond_wait(&cv, &mu);
+    pthread_cleanup_pop(1);
+    return (void *)13;
+}
+static void *deferred(void *a)
+{
+    char c = 0;
+    int old = -1, type = -1;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &type);
+    pthread_cleanup_push(on_cancel, (void *)3);
+    started[3] = 1 + (old == PTHREAD_CANCEL_ENABLE) + 2 * (type == PTHREAD_CANCEL_DEFERRED);
+    if (read(pipes[3][0], &c, 1) == 1 && c == 'x') got_byte = 1;      /* cancelled by now, and not acted on */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old);
+    if (old != PTHREAD_CANCEL_DISABLE) got_byte = 100;
+    pthread_testcancel();
+    got_byte = 200;                                                    /* not reached */
+    pthread_cleanup_pop(0);
+    return (void *)14;
+}
+static void *no_point(void *a)
+{
+    volatile unsigned long x = 1;
+    started[4] = 1;
+    while (!started[0] || x < 50000000) x = x * 3 + 1 < x ? 1 : x + 1;  /* no cancellation point in here */
+    return (void *)15;
+}
+int main(void)
+{
+    unsigned bad = 0;
+    pthread_t t[5];
+    void *r[5] = { 0 };
+    void *(*fn[5])(void *) = { in_read, in_sleep, in_cond, deferred, no_point };
+    for (int i = 0; i < 4; i++) pipe(pipes[i]);
+    pthread_key_create(&key, on_key);
+    for (int i = 0; i < 5; i++) pthread_create(&t[i], NULL, fn[i], NULL);
+    for (int i = 0; i < 5; i++) while (!started[i]) usleep(1000);
+    usleep(20000);                                   /* the first three are waiting now */
+    pthread_mutex_lock(&mu); pthread_mutex_unlock(&mu);
+    for (int i = 0; i < 5; i++) if (pthread_cancel(t[i]) != 0) bad |= 1;
+    usleep(20000);
+    if (got_byte) bad |= 2;                          /* the fourth is still in its read */
+    write(pipes[3][1], "x", 1);
+    for (int i = 0; i < 5; i++) if (pthread_join(t[i], &r[i]) != 0) bad |= 4;
+    if (r[0] != PTHREAD_CANCELED || r[1] != PTHREAD_CANCELED || r[2] != PTHREAD_CANCELED || r[3] != PTHREAD_CANCELED) bad |= 8;
+    if (r[4] != (void *)15) bad |= 16;
+    if (cleaned[0] != 2 || cleaned[1] != 1 || cleaned[2] != 1 || cleaned[3] != 1) bad |= 32;
+    if (destroyed != 5) bad |= 64;
+    if (got_byte != 1 || started[3] != 4) bad |= 128;
+    if (pthread_mutex_trylock(&mu) != 0) bad |= 256; else pthread_mutex_unlock(&mu);
+    /* the process goes on: another thread starts, waits and ends by itself */
+    pthread_t more;
+    void *mr = 0;
+    started[0] = 0;
+    pthread_create(&more, NULL, in_read, NULL);
+    while (!started[0]) usleep(1000);
+    write(pipes[0][1], "y", 1);
+    if (pthread_join(more, &mr) != 0 || mr != (void *)11) bad |= 512;
+    if (pthread_cancel(more) != ESRCH && 0) bad |= 1024;
+    if (bad) printf("cancel bad:%x cleaned=%d,%d,%d,%d destroyed=%d got=%d r4=%ld\n", bad, cleaned[0], cleaned[1], cleaned[2], cleaned[3], destroyed, got_byte, (long)r[4]);
+    else printf("cancel ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -o "$d/cancel" "$d/cancel.c" >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    for mode in "-native" "-native" "-native" "-native -no-jit"; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$d/cancel"
+        rc=$?
+        got=$(cat "$d/out")
+        if [ -z "$reason" ] && { [ "$rc" != 0 ] || [ "$got" != "cancel ok" ]; }; then
+            reason="$mode exit $rc and printed '$got', want 'cancel ok': $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    record "$name" "$reason" "threads cancelled in read, sleep and a condition wait; handlers, destructors, deferral"
+}
+
 case_native_import_addends() {
     local name=native_import_addends reason="" d="$TMP/native_import_addends" mode f want got
     rm -rf "$d"; mkdir -p "$d"
@@ -16337,6 +16473,7 @@ case_native_import_addends
 case_native_syscall
 case_native_undeclared
 case_native_libxml2
+case_native_cancel
 case_native_flat_nonlazy
 case_native_scanf_long_double
 case_native_fork_initialize

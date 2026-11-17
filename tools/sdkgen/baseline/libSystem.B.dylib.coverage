@@ -1,10 +1,10 @@
 library /usr/lib/libSystem.B.dylib
 sdk macos 27.0
 exports 9653
-fn 2895
+fn 2893
 data 505
 var 9
-special 273
+special 276
 stub callback-struct 24
 stub complex 66
 stub float-width 13
@@ -12,7 +12,7 @@ stub layout 1
 stub no-arm64-declaration 26
 stub no-declaration 4976
 stub no-prototype 2
-stub override 332
+stub override 331
 stub struct-too-many-members 2
 stub va-list 3
 stub variadic 12
@@ -23,7 +23,7 @@ objc-classes 27
 objc-eh-types 0
 objc-ivars 0
 ld-pseudo-skipped 371
-overrides 732
+overrides 734
 override-shapes 0
 override-structs 0
 override-opaque 1

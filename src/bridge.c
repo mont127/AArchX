@@ -436,6 +436,7 @@ struct OcerzBridgeFn {
     BrInplaceBinding inplace[OCERZ_APIDB_INPLACE];
     uint64_t calls;
     int waits;                    /* BR_WAITS_*: the call can wait in the kernel for a signal to interrupt */
+    int cancels;                  /* and is a cancellation point: every one of those but the $NOCANCEL forms */
     struct OcerzBridgeFn *next;
 };
 
@@ -3710,6 +3711,9 @@ static const BrHandler g_br_handlers[] = {
     { "pthread_create",      ocerz_sys_pthread_create },
     { "pthread_exit",        ocerz_sys_pthread_exit },
     { "pthread_testcancel",  ocerz_sys_pthread_testcancel },
+    { "pthread_cancel",      ocerz_sys_pthread_cancel },
+    { "pthread_setcancelstate", ocerz_sys_pthread_setcancelstate },
+    { "pthread_setcanceltype", ocerz_sys_pthread_setcanceltype },
     { "Block_copy",                ocerz_block_special_copy },
     { "Block_object_assign",       ocerz_block_special_object_assign },
 };
@@ -3978,6 +3982,7 @@ static struct OcerzBridgeFn *br_make(const OcerzApiLibrary *api, const OcerzApiE
         }
         fn->register_only = ocerz_abi_register_only(&fn->parsed);
         fn->waits = br_waits(fn->host);
+        fn->cancels = fn->waits && !strstr(fn->sym, "$NOCANCEL") && !(fn->host && strstr(fn->host, "$NOCANCEL"));
     }
     fn->next = g_br_made;
     g_br_made = fn;
@@ -4271,7 +4276,17 @@ static int br_cross_waiting(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
         rc = OCERZ_STEP_OK;   /* the handler first, then the call */
         restart = 1;
     } else {
+        /* The one place a guest thread can be cancelled: the host's state is enabled for this call alone. */
+        struct OcerzCancelScope scope;
+        int cancel = fn->cancels && ocerz_sys_cancel_enabled();
+        if (cancel)
+            ocerz_sys_cancel_open(cpu->vm, cpu, &scope);
         rc = br_cross(fn, cpu);
+        if (cancel) {
+            int e = errno;
+            ocerz_sys_cancel_close(&scope);
+            errno = e;
+        }
         restart = rc == OCERZ_STEP_OK && fn->waits == BR_WAITS_RESTART && (int32_t)cpu->gpr[OCERZ_RAX] == -1 &&
                   errno == EINTR && ocerz_signals_restart(cpu);
     }

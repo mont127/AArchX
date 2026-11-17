@@ -649,6 +649,9 @@ int main(int argc, char **argv)
         }
     }
     OCERZ_LOG("mode: %s\n", ocerz_mode == OCERZ_MODE_NATIVE ? "native" : "cache");
+    /* The main thread runs guest code too: the host may cancel it only where native mode's bridge lets it
+       (sysbridge.c, ocerz_sys_cancel_open). */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     if (!ocerz_engine_run)
         ocerz_afp_enable();
     if (aot == 3 && i >= argc) {

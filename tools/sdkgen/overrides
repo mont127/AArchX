@@ -105,10 +105,15 @@
 # daemon and wordexp, which runs a shell, would start an x86 image with no
 # translator under it.  ocerz has to launch those through itself.
 #
-# Thread cancellation: pthread_cancel unwinds a host thread through ocerz's own
-# frames, so it is refused, and with no way to ask for a cancellation
-# pthread_testcancel never has one to act on: it is special and returns.  Qt's
-# threads call it, and the stub stopped ClipGrab in native mode.  dispatch_main is special instead: the real
+# Thread cancellation: the host's pthread_cancel would cancel a thread wherever
+# the host next makes a cancellation point, inside ocerz's translator as soon
+# as inside a call the guest made, and would then call the x86 cleanup handlers
+# on the thread's list.  So pthread_cancel, pthread_setcancelstate,
+# pthread_setcanceltype and pthread_testcancel are special: the guest's cancel
+# state is kept per thread, the host's stays disabled outside a bridged call
+# that waits in the kernel, and the guest's handlers run as guest code
+# (sysbridge.c, "Thread cancellation").  Qt's threads call pthread_testcancel,
+# and its stub stopped ClipGrab in native mode.  dispatch_main is special instead: the real
 # one ends the main thread and hands the main queue to the thread pool, and in
 # ocerz the main thread is the one the process belongs to, so the handler runs
 # the native main run loop there for good, which drains the main queue the way
@@ -742,7 +747,9 @@ special _pthread_key_delete pthread_key_delete
 special _pthread_key_init_np pthread_key_init_np
 special _pthread_setspecific pthread_setspecific
 special _pthread_getspecific pthread_getspecific
-stub _pthread_cancel override
+special _pthread_cancel pthread_cancel
+special _pthread_setcancelstate pthread_setcancelstate
+special _pthread_setcanceltype pthread_setcanceltype
 special _pthread_testcancel pthread_testcancel
 special _dispatch_main dispatch_main
 special _glob glob

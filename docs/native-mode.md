@@ -264,10 +264,24 @@ its functions cross; the push parser crosses when it is given no SAX handler
 and is refused by name when it is given one. Seven programs now bind
 completely and eleven with stubs, where five and thirteen did; among C and
 Objective-C names, imports stubbed for want of a declaration fell from 325 to
-237 and for a structure of callbacks from 222 to 92. What most programs still
-import and cannot call is `pthread_cancel` (twelve), GSS (ten),
-`JSClassCreate` (eight) and `sqlite3_vfs_find` (seven). The 21 refused
-programs are refused for Swift, all but two.
+237 and for a structure of callbacks from 222 to 92. The 21 refused programs
+are refused for Swift, all but two.
+
+`pthread_cancel`, which twelve of those programs import, was the name most of
+them could not call. A guest thread is a host thread, so the host's
+cancellation is what cancels it, but the host acts at its next cancellation
+point, and ocerz makes those itself, inside the translator with a lock held;
+and it then calls the thread's cleanup handlers, which the guest's
+`pthread_cleanup_push` links onto the host's list as x86 routines. So the
+host's cancel state stays disabled on every thread that runs guest code, the
+guest's own state and type are kept per thread by the handlers of
+`pthread_setcancelstate` and `pthread_setcanceltype`, and the host's state is
+enabled only for the length of a bridged call that waits in the kernel
+(`read`, `sleep`, `pthread_cond_wait` and the rest), behind a cleanup record
+of ocerz's that runs the guest's handlers and key destructors as guest code.
+That is where POSIX says a deferred cancel is acted on. What most programs
+still import and cannot call is GSS (ten), `JSClassCreate` (eight) and
+`sqlite3_vfs_find` (seven).
 
 ## Comparing with Rosetta
 
