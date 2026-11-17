@@ -5050,9 +5050,13 @@ static int emit_mem_ea(A64Buf *b, const X86Insn *insn, const X86Operand *op, int
     g_ea_is_const = 0;
     g_ea_w32 = 0;
     g_ea_lowhoisted = 0;
-    /* esp-relative operands of 32-bit code are stack accesses too, plain as their push and pop already are. */
-    g_ea_plain = ocerz_low_base != 0 && insn->seg == OCERZ_SEG_NONE && mem_plain_access_ok(op) &&
-                 (!insn->mode32 || !ENV_ON("OCERZ_NO_M32_STACK_PLAIN"));
+    /*
+     * esp-relative operands of 32-bit code are stack accesses too, plain as their push and pop already are.
+     * A load dep_plain_mark left plain is plain in every layout, and through gs.
+     */
+    g_ea_plain = (ocerz_low_base != 0 && insn->seg == OCERZ_SEG_NONE && mem_plain_access_ok(op) &&
+                  (!insn->mode32 || !ENV_ON("OCERZ_NO_M32_STACK_PLAIN"))) ||
+                 (g_dep_plain_op && op == g_dep_plain_op);
     uint64_t fold = ea_fold();
     int seg = insn->seg;
     if (seg != OCERZ_SEG_NONE) {
@@ -22617,30 +22621,125 @@ static unsigned long long g_promo_seq[JIT_MAX_BLOCK_INSNS];
 
 /*
  * In ordered memory, every scalar load is an acquire (ldapr), so that no later
- * access passes it, as x86 requires; and ldapr takes no index register, so an
- * indexed one costs an add as well.  But arm64 already orders a load before
- * any later load whose address it supplies.  So a load whose next memory
- * access is a load addressed through the register it loaded, with nothing but
- * register arithmetic between that leaves the register alone, can be a plain
- * ldr: that next load cannot pass it, and is itself an acquire, or plain by the
- * same rule, so nothing later passes either.  A release store may come between
- * (dep_store_release).  The last load of every chain
- * stays an acquire.  p = next[p], obj->a->b and a vtable's function pointer
- * are such chains.  OCERZ_NO_DEP_PLAIN=1 turns it off, and OCERZ_DEP_PLAIN_LOG=1
- * names each load made plain as it is translated.
+ * access passes it, as x86 requires.  The acquire itself is cheap; what it
+ * costs is what the processor does ahead of time for a plain load and not
+ * for it (a store and a load of one slot take 4 cycles plain and 7 to 8
+ * ordered, a load that returns the same value again 1 and 3, on an M5), and
+ * an interpreter's dispatch is such loads: Wine's JScript ran 16% faster with
+ * every load plain.  But arm64 already orders a load before any later load
+ * whose address is computed from what it loaded.  So a load whose next memory
+ * access is such a load can be a plain ldr: that next load cannot pass it,
+ * and is itself an acquire, or plain by the same rule, so nothing later
+ * passes either.  The last load of every chain stays an acquire.
+ * p = next[p], obj->a->b and a vtable's function pointer are such chains.
+ *
+ * The address may be computed from the loaded value through register
+ * arithmetic (dep_reg_step follows which registers carry it: an index scaled
+ * by lea, a sign extension, an add of a table's base), and the next access may
+ * be any scalar load of the integer forms: a mov, an and, or, xor, add, sub,
+ * cmp or test with a memory source, or the target of an indirect call or jump.
+ * Each of those is an acquire in translated code and in the interpreter, which
+ * a vector load, a load through rsp and a frame local are not.  A release
+ * store may come between (dep_store_release).  The load itself may be a mov
+ * or an arithmetic instruction with a memory source, whose result carries what
+ * it loaded.
+ *
+ * A load through gs is plain as well: gs addresses the thread's own block, the
+ * pthread TSD on macOS and the TEB in Windows code, as rsp addresses its own
+ * stack, and Windows code reads the TEB constantly (OCERZ_NO_TLS_PLAIN=1
+ * orders them).
+ *
+ * OCERZ_NO_DEP_PLAIN=1 turns all of it off, OCERZ_NO_DEP_WIDE=1 keeps the
+ * first form of the rule (a mov whose register the next mov addresses through,
+ * unchanged), and OCERZ_DEP_PLAIN_LOG=1 names each load made plain, and the
+ * load that orders it, as it is translated.  The rule stands on that second
+ * load being an acquire, which is the emitters' business and not this
+ * analysis's, so OCERZ_DEP_PLAIN_CHECK=1 looks for one in the code each block
+ * was given and reports a plain load that has none after it (dep_plain_check;
+ * tests/run_dynamic_tests.sh runs it).
  */
+enum { DEP_SCAN = 12 };
 static uint8_t g_dep_plain[JIT_MAX_BLOCK_INSNS];
+/* For dep_plain_check: the load that orders each plain one, where each instruction's translation starts, and
+   which went to the interpreter. */
+static int16_t g_dep_by[JIT_MAX_BLOCK_INSNS];
+static const uint32_t *g_dep_at[JIT_MAX_BLOCK_INSNS + 1];
+static uint8_t g_dep_slow[JIT_MAX_BLOCK_INSNS];
+static int dep_wide(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_DEP_WIDE") ? 0 : 1;
+    return on;
+}
+static int dep_tls_plain(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("OCERZ_NO_TLS_PLAIN") ? 0 : 1;
+    return on;
+}
+static inline int dep_gpr(const X86Operand *o) { return o->kind == OCERZ_OPK_REG && !(o->reg & ~15); }
 static int dep_load_dest(const X86Insn *in)
 {
-    if (in->op != OCERZ_OP_MOV && in->op != OCERZ_OP_MOVZX && in->op != OCERZ_OP_MOVSX && in->op != OCERZ_OP_MOVSXD)
+    switch (in->op) {
+    case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD:
+        break;
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+        if (!dep_wide()) return -1;
+        break;
+    default:
         return -1;
-    if (in->nops != 2 || in->mode32 || in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || in->lock) return -1;
+    }
+    if (in->nops != 2 || in->mode32 || in->addrsize != 8 || in->lock || in->rep) return -1;
+    if (in->seg != OCERZ_SEG_NONE && !(in->seg == OCERZ_SEG_GS && dep_wide() && dep_tls_plain())) return -1;
     const X86Operand *d = &in->ops[0], *m = &in->ops[1];
-    if (d->kind != OCERZ_OPK_REG || d->high8 || (d->size != 4 && d->size != 8)) return -1;
+    if (!dep_gpr(d) || d->high8 || (d->size != 4 && d->size != 8)) return -1;
     if (m->kind != OCERZ_OPK_MEM || (d->reg & 15) == OCERZ_RSP) return -1;
     return d->reg & 15;
 }
-static int dep_reg_only(const X86Insn *in, int reg)
+/* The operand an instruction loads, before any other access of its own, as an acquire. */
+static const X86Operand *dep_consumer_mem(const X86Insn *in)
+{
+    if (in->mode32 || in->seg != OCERZ_SEG_NONE || in->addrsize != 8 || in->lock || in->rep) return NULL;
+    switch (in->op) {
+    case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD:
+        if (in->nops != 2 || !dep_gpr(&in->ops[0]) || in->ops[1].kind != OCERZ_OPK_MEM) return NULL;
+        if ((in->ops[0].reg & 15) == OCERZ_RSP) return NULL;
+        if (!dep_wide() && (in->ops[0].high8 || (in->ops[0].size != 4 && in->ops[0].size != 8))) return NULL;
+        return &in->ops[1];
+    case OCERZ_OP_ADD: case OCERZ_OP_SUB: case OCERZ_OP_AND: case OCERZ_OP_OR: case OCERZ_OP_XOR:
+        if (!dep_wide() || in->nops != 2 || !dep_gpr(&in->ops[0]) || in->ops[1].kind != OCERZ_OPK_MEM) return NULL;
+        if ((in->ops[0].reg & 15) == OCERZ_RSP) return NULL;
+        return &in->ops[1];
+    case OCERZ_OP_CMP: case OCERZ_OP_TEST:
+        if (!dep_wide() || in->nops != 2) return NULL;
+        if (dep_gpr(&in->ops[0]) && in->ops[1].kind == OCERZ_OPK_MEM) return &in->ops[1];
+        if (in->ops[0].kind == OCERZ_OPK_MEM && (dep_gpr(&in->ops[1]) || in->ops[1].kind == OCERZ_OPK_IMM))
+            return &in->ops[0];
+        return NULL;
+    case OCERZ_OP_CALL: case OCERZ_OP_JMP:
+        if (!dep_wide() || in->nops < 1 || in->ops[0].kind != OCERZ_OPK_MEM) return NULL;
+        return &in->ops[0];
+    default:
+        return NULL;
+    }
+}
+/* Whether the address of a is computed from a register in the set t and its load is not one left plain. */
+static int dep_addr_from(const X86Operand *a, unsigned t)
+{
+    if (a->riprel || (a->base != OCERZ_REG_NONE && (a->base & 15) == OCERZ_RSP) || rbp_local(a)) return 0;
+    if (!dep_wide() && a->base == OCERZ_REG_NONE) return 0;
+    return (a->base != OCERZ_REG_NONE && (t >> (a->base & 15) & 1)) ||
+           (a->index != OCERZ_REG_NONE && (t >> (a->index & 15) & 1));
+}
+/*
+ * One instruction between the load and the load it addresses, which may only
+ * compute in registers: *t is the set of registers whose value is computed
+ * from what was loaded, and the run ends (0) at anything else or when the set
+ * empties.  A register stays in the set only through an operation that
+ * translated code really computes from it, so one that leaves a constant
+ * whatever its input takes it out: a mov of an immediate, xor r, r, and r, 0.
+ */
+static int dep_reg_step(const X86Insn *in, unsigned *t)
 {
     switch (in->op) {
     case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD: case OCERZ_OP_LEA:
@@ -22652,11 +22751,51 @@ static int dep_reg_only(const X86Insn *in, int reg)
         return 0;
     }
     if (in->op == OCERZ_OP_IMUL && in->nops < 2) return 0;
-    if (in->nops < 1 || in->ops[0].kind != OCERZ_OPK_REG || in->lock || in->rep) return 0;
-    for (int k = 0; k < in->nops; k++)
-        if (in->ops[k].kind == OCERZ_OPK_MEM && in->op != OCERZ_OP_LEA) return 0;
-    int writes = in->op != OCERZ_OP_CMP && in->op != OCERZ_OP_TEST;
-    return !(writes && (in->ops[0].reg & 15) == reg);
+    if (in->nops < 1 || !dep_gpr(&in->ops[0]) || in->lock || in->rep) return 0;
+    unsigned src = 0;
+    for (int k = 1; k < in->nops; k++) {
+        const X86Operand *o = &in->ops[k];
+        if (dep_gpr(o)) {
+            src |= 1u << (o->reg & 15);
+        } else if (o->kind == OCERZ_OPK_MEM && in->op == OCERZ_OP_LEA) {
+            if (o->base != OCERZ_REG_NONE) src |= 1u << (o->base & 15);
+            if (o->index != OCERZ_REG_NONE) src |= 1u << (o->index & 15);
+        } else if (o->kind != OCERZ_OPK_IMM) {
+            return 0;
+        }
+    }
+    unsigned d = 1u << (in->ops[0].reg & 15);
+    if (!dep_wide())
+        return in->op == OCERZ_OP_CMP || in->op == OCERZ_OP_TEST || !(*t & d);
+    int whole = in->ops[0].size >= 4, from = (*t & src) != 0, konst = 0;
+    const X86Operand *o1 = in->nops > 1 ? &in->ops[1] : NULL;
+    switch (in->op) {
+    case OCERZ_OP_CMP: case OCERZ_OP_TEST:
+        return 1;
+    case OCERZ_OP_MOV: case OCERZ_OP_MOVZX: case OCERZ_OP_MOVSX: case OCERZ_OP_MOVSXD: case OCERZ_OP_LEA:
+        if (whole && !from) *t &= ~d;
+        break;
+    case OCERZ_OP_IMUL:
+        konst = in->nops == 3 && in->ops[2].kind == OCERZ_OPK_IMM && in->ops[2].imm == 0;
+        if (whole && (konst || (in->nops == 3 && !from))) *t &= ~d;
+        break;
+    case OCERZ_OP_XOR: case OCERZ_OP_SUB:
+        konst = o1 && dep_gpr(o1) && o1->reg == in->ops[0].reg && o1->high8 == in->ops[0].high8;
+        if (whole && konst) *t &= ~d;
+        break;
+    case OCERZ_OP_AND:
+        konst = o1 && o1->kind == OCERZ_OPK_IMM && o1->imm == 0;
+        if (whole && konst) *t &= ~d;
+        break;
+    case OCERZ_OP_OR:
+        konst = o1 && o1->kind == OCERZ_OPK_IMM && (int64_t)o1->imm == -1;
+        if (whole && konst) *t &= ~d;
+        break;
+    default:
+        break;
+    }
+    if (from && !konst) *t |= d;
+    return *t != 0;
 }
 /*
  * A store between the load and the load it addresses keeps the rule sound when
@@ -22694,24 +22833,66 @@ static void dep_plain_mark(const X86Insn *insns, int n)
     static int off = -1, log = -1;
     if (off < 0) off = getenv("OCERZ_NO_DEP_PLAIN") ? 1 : 0;
     if (log < 0) log = getenv("OCERZ_DEP_PLAIN_LOG") ? 1 : 0;
-    for (int i = 0; i < n; i++) g_dep_plain[i] = 0;
+    for (int i = 0; i < n; i++) { g_dep_plain[i] = 0; g_dep_by[i] = -1; g_dep_slow[i] = 0; g_dep_at[i] = NULL; }
     if (off || g_plain_mem || hw_tso_ordered()) return;
-    for (int i = 0; i + 1 < n; i++) {
+    for (int i = 0; i < n; i++) {
         int r = dep_load_dest(&insns[i]);
         if (r < 0) continue;
-        for (int j = i + 1; j < n && j <= i + 8; j++) {
+        if (insns[i].seg != OCERZ_SEG_NONE) {
+            g_dep_plain[i] = 1;
+            if (log) fprintf(stderr, "ocerz: DEP_PLAIN %#llx tls\n", (unsigned long long)insns[i].rip);
+            continue;
+        }
+        unsigned t = 1u << r;
+        for (int j = i + 1; j < n && j <= i + (dep_wide() ? DEP_SCAN : 8); j++) {
             const X86Insn *m = &insns[j];
-            if (dep_load_dest(m) >= 0) {
-                const X86Operand *a = &m->ops[1];
-                g_dep_plain[i] = !a->riprel && a->base != OCERZ_REG_NONE && (a->base & 15) != OCERZ_RSP &&
-                                 ((a->base & 15) == r || (a->index != OCERZ_REG_NONE && (a->index & 15) == r));
+            const X86Operand *a = dep_consumer_mem(m);
+            if (a) {
+                g_dep_plain[i] = (uint8_t)dep_addr_from(a, t);
+                if (g_dep_plain[i]) g_dep_by[i] = (int16_t)j;
                 if (g_dep_plain[i] && log)
-                    fprintf(stderr, "ocerz: DEP_PLAIN %#llx\n", (unsigned long long)insns[i].rip);
+                    fprintf(stderr, "ocerz: DEP_PLAIN %#llx by %#llx\n", (unsigned long long)insns[i].rip,
+                            (unsigned long long)m->rip);
                 break;
             }
-            if (!dep_reg_only(m, r) && !dep_store_release(m))
-                break;
+            if (dep_store_release(m)) continue;
+            if (!dep_reg_step(m, &t)) break;
         }
+    }
+}
+static inline int a64_is_acquire_load(uint32_t w)
+{
+    return (w & 0x3ffffc00u) == 0x38bfc000u ||                              /* ldapr */
+           ((w & 0x3f200c00u) == 0x19000000u && ((w >> 22) & 3)) ||         /* ldapur, ldapursb/h/w */
+           (w & 0x3ffffc00u) == 0x08dffc00u;                                /* ldar */
+}
+/*
+ * OCERZ_DEP_PLAIN_CHECK=1, after a block's instructions are translated: every
+ * load dep_plain_mark left plain for a later one must have an acquire load in
+ * the code from its own translation to the end of that later instruction's,
+ * unless the later one went to the interpreter, whose loads are acquires, or
+ * is plain by the rule itself and so checked in its turn.  g_dep_at holds
+ * where each instruction's translation starts, NULL for one translated with
+ * the instruction before it.
+ */
+static void dep_plain_check(const X86Insn *insns, int n, const uint32_t *end)
+{
+    g_dep_at[n] = end;
+    for (int h = 0; h < n; h++) {
+        int j = g_dep_by[h];
+        if (!g_dep_plain[h] || j < 0 || g_dep_slow[j] || g_dep_plain[j]) continue;
+        int hs = h, je = j + 1;
+        while (hs > 0 && !g_dep_at[hs]) hs--;
+        while (je < n && !g_dep_at[je]) je++;
+        int found = 0;
+        for (const uint32_t *w = g_dep_at[hs]; w && w < g_dep_at[je] && !found; w++)
+            found = a64_is_acquire_load(*w);
+        if (found) continue;
+        char hb[96], cb[96];
+        ocerz_format_insn(&insns[h], hb, sizeof hb);
+        ocerz_format_insn(&insns[j], cb, sizeof cb);
+        fprintf(stderr, "ocerz: DEP_PLAIN_CHECK %#llx %s is plain and %#llx %s is no acquire\n",
+                (unsigned long long)insns[h].rip, hb, (unsigned long long)insns[j].rip, cb);
     }
 }
 
@@ -26388,6 +26569,7 @@ static JitBlock *translate_one(OcerzJit *jit, uint64_t rip, int mode32)
     dep_plain_mark(blk->insns, n);
     for (int i = 0; i < n; i++) {
         const X86Insn *insn = &blk->insns[i];
+        g_dep_at[i] = b.p;
         g_dep_plain_op = g_dep_plain[i] ? &insn->ops[1] : NULL;
         if (regen_after >= 0 && i > regen_after) {
             if (b.overflow || !a64_words_keep_nzcv(regen_from, b.p))
@@ -26895,12 +27077,15 @@ promo_push_fallthrough:
         if (!try_inline(&b, insn, fl_need[i], exit_sites, &n_exits)) {
             emit_slowcall(&b, insn, exit_sites, &n_exits);
             blk->n_slow++;
+            g_dep_slow[i] = 1;
         } else {
             blk->n_inlined++;
         }
         if (g_undo_saved && g_fpb_undo_ldst[i] >= 0) g_fpb_undo_done[g_fpb_undo_ldst[i]] = 1;
         g_undo_want_slot = -1; g_undo_saved = 0;
     }
+    if (!b.overflow && ENV_ON("OCERZ_DEP_PLAIN_CHECK"))
+        dep_plain_check(blk->insns, n, b.p);
 
     g_dep_plain_op = NULL;
     g_cur_live_after = OCERZ_FL_ALL;

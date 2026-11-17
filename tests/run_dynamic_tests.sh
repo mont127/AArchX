@@ -598,6 +598,34 @@ run_golden_case() {
     done
 }
 
+# In ordered memory a load is left plain when the next load is addressed through what it loaded (src/jit.c,
+# dep_plain_mark), which is sound only while that next load is an acquire.  OCERZ_DEP_PLAIN_CHECK=1 has the
+# translator look for the acquire in the code it emitted and name any plain load without one; the program runs
+# in both layouts with ordered memory from its first instruction, and must also print what it should.
+run_dep_plain_check_case() {
+    local name="$1" golden="$2" dir="$TMP/$1" layout code
+    for layout in pie low; do
+        run_bounded "$dir/$layout.out" "$dir/$layout.err" env OCERZ_DEP_PLAIN_CHECK=1 OCERZ_NO_PLAIN_MEM=1 "$OCERZ" "$dir/$layout"
+        code=$?
+        if [ "$code" = 0 ] && cmp -s "$dir/$layout.out" "$golden" && ! grep -q DEP_PLAIN_CHECK "$dir/$layout.err"; then
+            echo "PASS $name-$layout"; pass=$((pass+1))
+        else
+            echo "FAIL $name-$layout (exit=$code, $(grep -c DEP_PLAIN_CHECK "$dir/$layout.err") plain loads with no acquire after them: $(grep -m1 DEP_PLAIN_CHECK "$dir/$layout.err"))"
+            fail=$((fail+1))
+        fi
+    done
+}
+run_dep_plain_check_file() {
+    local name="$1" src="$2" golden="$3" dir="$TMP/$1"
+    mkdir -p "$dir"
+    if ! clang -arch x86_64 -O1 -pthread -Itests/guest -o "$dir/pie" "$src" 2>/dev/null ||
+       ! clang -arch x86_64 -O1 -pthread -Itests/guest -o "$dir/low" "$src" \
+            -Wl,-no_pie -Wl,-pagezero_size,0x1000 -Wl,-image_base,0x200000000 2>/dev/null; then
+        echo "FAIL $name (build)"; fail=$((fail+1)); return
+    fi
+    run_dep_plain_check_case "$name" "$golden"
+}
+
 run_low_golden_case() {
     local name="$1" src="$2" golden="$3"
     local dir="$TMP/$name"
@@ -1197,8 +1225,8 @@ run_file_case ddep_order tests/dynamic/dep_order.c 'OK'
 # addressed through, may be made plain, and the last of the chain must stay an acquire.
 if run_bounded "$TMP/ddep_order.log.out" "$TMP/ddep_order.log.err" env OCERZ_DEP_PLAIN_LOG=1 "$OCERZ" "$TMP/ddep_order" &&
    read -r _ dep_l1 dep_l2 dep_l3 < <(grep '^loads ' "$TMP/ddep_order.log.err") &&
-   grep -q "DEP_PLAIN $dep_l1\$" "$TMP/ddep_order.log.err" &&
-   ! grep -q -e "DEP_PLAIN $dep_l2\$" -e "DEP_PLAIN $dep_l3\$" "$TMP/ddep_order.log.err"; then
+   grep -q "DEP_PLAIN $dep_l1 " "$TMP/ddep_order.log.err" &&
+   ! grep -q -e "DEP_PLAIN $dep_l2 " -e "DEP_PLAIN $dep_l3 " "$TMP/ddep_order.log.err"; then
     echo "PASS ddep_order_plain (only the load the next one depends on is plain)"; pass=$((pass+1))
 else
     echo "FAIL ddep_order_plain (loads ${dep_l1:-?} ${dep_l2:-?} ${dep_l3:-?}; $(grep -c DEP_PLAIN "$TMP/ddep_order.log.err") plain)"
@@ -1207,8 +1235,8 @@ fi
 # Between the first two loads, a store to a global, a release in ordered memory, keeps the first one
 # plain; a store through rsp, which stays plain, does not.
 if read -r _ dep_r1 dep_s1 < <(grep '^stores ' "$TMP/ddep_order.log.err") &&
-   grep -q "DEP_PLAIN $dep_r1\$" "$TMP/ddep_order.log.err" &&
-   ! grep -q "DEP_PLAIN $dep_s1\$" "$TMP/ddep_order.log.err"; then
+   grep -q "DEP_PLAIN $dep_r1 " "$TMP/ddep_order.log.err" &&
+   ! grep -q "DEP_PLAIN $dep_s1 " "$TMP/ddep_order.log.err"; then
     echo "PASS ddep_order_store (a release store between keeps the load plain, a stack store does not)"; pass=$((pass+1))
 else
     echo "FAIL ddep_order_store (stores ${dep_r1:-?} ${dep_s1:-?})"
@@ -1491,6 +1519,7 @@ run_file_case dfp_rounding tests/dynamic/fp_rounding.c 'OK'
 export OCERZ_TSO_NARROW=1
 run_file_case dtso_narrow tests/dynamic/tso_narrow.c 'OK'
 unset OCERZ_TSO_NARROW
+run_file_case dtso_dep tests/dynamic/tso_dep.c 'OK' -O1
 run_file_case dnan_contexts tests/dynamic/nan_contexts.c 'OK'
 run_file_case dupward_init tests/dynamic/upward_init.c 'OK' -framework CoreFoundation
 run_file_case dcache_symlink_dep tests/dynamic/cache_symlink_dep.c 'OK'
@@ -1901,6 +1930,10 @@ run_low_golden_case dwine_hot_low tests/dynamic/wine_hot.c tests/dynamic/wine_ho
 export OCERZ_NO_PLAIN_MEM=1
 run_low_golden_case dwine_hot_low_ordered tests/dynamic/wine_hot.c tests/dynamic/wine_hot.out
 unset OCERZ_NO_PLAIN_MEM
+run_low_golden_case dtso_dep_low tests/dynamic/tso_dep.c tests/dynamic/tso_dep.out
+run_dep_plain_check_file ddep_check_tso tests/dynamic/tso_dep.c tests/dynamic/tso_dep.out
+run_dep_plain_check_file ddep_check_wine_hot tests/dynamic/wine_hot.c tests/dynamic/wine_hot.out
+run_dep_plain_check_file ddep_check_jcc_chain tests/guest/jcc_chain_rec.c tests/guest/expect/jcc_chain_rec.out
 export OCERZ_TSO_NARROW=1
 run_low_golden_case dtso_narrow_low tests/dynamic/tso_narrow.c tests/dynamic/tso_narrow.out
 unset OCERZ_TSO_NARROW

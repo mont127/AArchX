@@ -155,6 +155,11 @@ variant):
 | `OCERZ_TSO_STRICT=1` | order stack-relative accesses too |
 | `OCERZ_TSO_VECTOR=1` | order SSE loads and stores too, which costs a great deal |
 | `OCERZ_TSO_NARROW=1` | order `movd` and `movq` loads and stores; `=2` orders every SSE access of 8 bytes or fewer |
+| `OCERZ_NO_DEP_PLAIN=1` | make every scalar load an acquire, including one whose next load is addressed through what it loaded |
+| `OCERZ_NO_DEP_WIDE=1` | leave such a load plain only when it is a `mov` and the next load is a `mov` addressed through the same register, unchanged, as before 2026-11-15; `gs` loads are ordered again too |
+| `OCERZ_NO_TLS_PLAIN=1` | order loads through `gs`, the thread's own block |
+| `OCERZ_DEP_PLAIN_LOG=1` | name each load left plain and the load that orders it, as they are translated |
+| `OCERZ_DEP_PLAIN_CHECK=1` | after translating a block, report any load left plain that has no acquire load after it in the code the block was given (a debugging aid; the test suite runs it) |
 
 ### Turning off what makes it fast
 

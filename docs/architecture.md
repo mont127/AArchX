@@ -97,6 +97,20 @@ is worth; `OCERZ_TSO_VECTOR=1` orders them for anyone who wants it. That
 includes the 8-byte `movq` and 4-byte `movd`, which compilers sometimes use to
 move a pointer or a counter; `OCERZ_TSO_NARROW=1` orders just those two.
 
+Not every scalar load needs the acquire form. arm64 already orders a load
+before any later load whose address is computed from what it loaded, so a load
+whose next memory access is such a load is left plain, and the last load of
+each chain stays an acquire: following a pointer, indexing a table with a
+loaded value and calling through a loaded function pointer are all chains.
+Loads through `gs` are plain too, since `gs` addresses the thread's own block
+(the pthread TSD, or the TEB in Windows code) as `rsp` addresses its own
+stack. An acquire is no slower to execute than a plain load; what it loses is
+what the processor does ahead of time for a plain one, such as predicting a
+value that keeps coming back and forwarding a store that is still in flight,
+and that is most of what ordered memory costs an interpreter's dispatch loop.
+`OCERZ_DEP_PLAIN_CHECK=1` verifies, block by block, that every load left plain
+is followed by a real acquire in the translated code.
+
 ## Floating point
 
 x86 and arm64 disagree about NaNs: an invalid operation gives a negative default
