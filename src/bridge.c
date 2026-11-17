@@ -3621,6 +3621,7 @@ static const BrHandler g_br_handlers[] = {
     { "longjmp",         ocerz_sys_longjmp },
     { "_longjmp",        ocerz_sys__longjmp },
     { "siglongjmp",      ocerz_sys_siglongjmp },
+    { "syscall",         ocerz_sys_syscall },
     { "fork",            ocerz_sys_fork },
     { "execve",          ocerz_sys_execve },
     { "execv",           ocerz_sys_execv },

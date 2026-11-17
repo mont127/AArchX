@@ -12705,6 +12705,89 @@ EOC
 # 8-byte ones with a 32-bit addend (&table[300] in another library), and 16-byte ones with a 64-bit addend.  The
 # loader read every table as the first, so each ordinal bound another import's name or the empty one, in either mode
 # (dyld.c, apply_fixups; Photoshop's dvaui has the second layout).
+# One fixture run under -native with the JIT, under -native -no-jit and in cache mode, each of which must exit 0
+# and print exactly what the program prints on an Intel Mac.
+native_three_modes() {
+    local name="$1" exe="$2" want="$3" d="$TMP/$1" reason="" mode got rc
+    for mode in "-native" "-native -no-jit" "-cache"; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$exe"
+        rc=$?
+        got=$(cat "$d/out")
+        if [ -z "$reason" ] && { [ "$rc" != 0 ] || [ "$got" != "$want" ]; }; then
+            reason="$mode exit $rc and printed '$(echo "$got" | tr '\n' '|')', want '$(echo "$want" | tr '\n' '|')': $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    echo "$reason"
+}
+
+# syscall() and __syscall() were stubs in native mode, since the native functions would make the call on the
+# host's terms; their handler now makes the kernel's indirect system call through ocerz's own system call layer
+# (sysbridge.c, ocerz_sys_syscall).  Chromium asks for its thread id this way.  The fixture checks results against
+# the libc calls beside them, an errno, a 64-bit result, an x86 structure filled in, and a seventh argument.
+case_native_syscall() {
+    local name=native_syscall reason="" d="$TMP/native_syscall"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/sysc.c" <<'EOC'
+/* syscall() and __syscall() as a program calls them: results, errno, a seventh argument, an x86 structure */
+#include <errno.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <pthread.h>
+extern int syscall(int, ...);
+extern off_t __syscall(long long, ...);
+int main(void)
+{
+    unsigned bad = 0;
+    if (syscall(SYS_getpid) != getpid()) bad |= 1;
+    if (syscall(SYS_getuid) != (int)getuid()) bad |= 2;
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    if ((uint64_t)__syscall(SYS_thread_selfid) != tid) bad |= 4;
+    errno = 0;
+    if (syscall(SYS_close, -1) != -1 || errno != EBADF) bad |= 8;
+    int fd = open("/usr/share/dict/words", O_RDONLY);
+    char a[32] = { 0 }, b[32] = { 0 };
+    if (fd < 0 || syscall(SYS_read, fd, a, 16) != 16) bad |= 16;
+    if (__syscall(SYS_lseek, fd, (off_t)0x100000000ll, SEEK_SET) != (off_t)0x100000000ll) bad |= 32;
+    if (__syscall(SYS_lseek, fd, (off_t)0, SEEK_SET) != 0 || read(fd, b, 16) != 16 || memcmp(a, b, 16)) bad |= 64;
+    struct stat st1, st2;
+    memset(&st1, 0, sizeof st1); memset(&st2, 0, sizeof st2);
+    if (syscall(SYS_fstat64, fd, &st1) != 0 || fstat(fd, &st2) != 0 || st1.st_size != st2.st_size ||
+        st1.st_ino != st2.st_ino || st1.st_mode != st2.st_mode || st1.st_mtimespec.tv_sec != st2.st_mtimespec.tv_sec)
+        bad |= 128;
+    /* seven arguments to the C function: the offset is the one on the stack */
+    char *m = (char *)__syscall(SYS_mmap, (void *)0, (size_t)4096, PROT_READ, MAP_PRIVATE, fd, (off_t)4096);
+    char c[16];
+    if (m == MAP_FAILED || pread(fd, c, 16, 4096) != 16 || memcmp(m, c, 16)) bad |= 256;
+    if (m != MAP_FAILED && syscall(SYS_munmap, m, (size_t)4096) != 0) bad |= 512;
+    errno = 0;
+    if (syscall(SYS_open, "/nonexistent/ocerz", O_RDONLY) != -1 || errno != ENOENT) bad |= 1024;
+    const char msg[] = "sysc wrote this\n";
+    if (syscall(SYS_write, 1, msg, sizeof msg - 1) != (int)sizeof msg - 1) bad |= 2048;
+    close(fd);
+    if (bad) printf("sysc bad:%x\n", bad); else printf("sysc ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -Wno-deprecated-declarations -o "$d/sysc" "$d/sysc.c" >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    reason="$(native_three_modes "$name" "$d/sysc" "$(printf 'sysc wrote this\nsysc ok')")"
+    record "$name" "$reason" "syscall and __syscall through ocerz's system call layer"
+}
+
 case_native_import_addends() {
     local name=native_import_addends reason="" d="$TMP/native_import_addends" mode f want got
     rm -rf "$d"; mkdir -p "$d"
@@ -16051,6 +16134,7 @@ case_native_check
 case_native_objc_cycle
 case_native_lazy_flat
 case_native_import_addends
+case_native_syscall
 case_native_flat_nonlazy
 case_native_scanf_long_double
 case_native_fork_initialize

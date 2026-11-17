@@ -1059,6 +1059,24 @@ static int sb_translated_frame_below(struct OcerzVM *vm)
     return 0;
 }
 
+/*
+ * syscall and __syscall.  The native ones would make the system call on the host's terms: an x86 structure handed
+ * to the arm64 kernel, a mapping ocerz never hears of, a signal mask that is not the guest's.  ocerz's own system
+ * call layer answers instead, as it answers the syscall instruction in cache mode, and the carry flag it leaves
+ * becomes the -1 and errno the C function returns.
+ */
+int ocerz_sys_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int rc = ocerz_guest_syscall(vm, cpu);
+    if (rc != OCERZ_STEP_OK)
+        return rc;
+    if (cpu->rflags & OCERZ_CF) {
+        errno = (int)cpu->gpr[OCERZ_RAX];
+        return sb_ret(vm, cpu, -1);
+    }
+    return sb_ret(vm, cpu, (int64_t)cpu->gpr[OCERZ_RAX]);
+}
+
 int ocerz_sys_fork(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     const struct OcerzBridgeFrame *cb = ocerz_bridge_callback_frame();

@@ -277,8 +277,13 @@
 # space ocerz tracks for the guest, including the pages it translated code
 # from, without ocerz hearing of it.
 #
-# Raw syscalls: syscall and __syscall would reach the host kernel with x86
-# system call numbers.
+# Raw syscalls: the native syscall and __syscall would hand the host kernel
+# the guest's x86 structures and go round the guest's signal state and
+# address space, so they are special: the handler makes the kernel's indirect
+# system call through ocerz's own system call layer, which is what answers
+# the syscall instruction in cache mode, and turns its carry flag into the -1
+# and errno the C function returns.  Chromium asks for its thread id this
+# way, and the stub stopped any program that did.
 #
 # The rest of the signal interface: sigvec, sigblock, sigsetmask, the System
 # V sigset, sighold, sigrelse, sigignore, sigpause and siginterrupt,
@@ -828,8 +833,8 @@ special _vm_map mach_vm_map
 special _vm_remap mach_vm_remap
 stub _vm_remap_new override
 
-stub _syscall override
-stub ___syscall override
+special _syscall syscall
+special ___syscall syscall
 
 special _sigsuspend sigsuspend
 special _sigsuspend$NOCANCEL sigsuspend

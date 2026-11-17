@@ -9090,6 +9090,25 @@ int ocerz_signals_restart(OcerzCPU *cpu)
     return ready != 0;
 }
 
+/*
+ * syscall(number, ...) made as a call, which is how a native-mode guest makes it: libSystem's export is a special
+ * record, because the native function would hand the host kernel the guest's structures and bypass the guest's
+ * signal state and address space.  The x86 stub behind that export only moves the fourth argument from rcx to r10
+ * and makes system call 0, the kernel's indirect one, which dispatch_bsd_at unpacks; rsp is at the return address
+ * here as it is at the stub's syscall instruction, so the seventh argument is found where it was.  The result is
+ * left as the instruction leaves it: rax, and the carry flag beside an errno in rax.
+ */
+int ocerz_guest_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    cpu->gpr[OCERZ_R10] = cpu->gpr[OCERZ_RCX];
+    cpu->rflags &= ~(uint64_t)OCERZ_CF;
+    cpu->cur_sys_class = 2;
+    cpu->cur_sys_num = (int)(cpu->gpr[OCERZ_RDI] & 0xffffff);
+    int rc = dispatch_bsd(vm, cpu, 0);
+    cpu->cur_sys_class = -1;
+    return rc;
+}
+
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint64_t rax = cpu->gpr[OCERZ_RAX];

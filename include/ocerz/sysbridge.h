@@ -58,6 +58,7 @@ int ocerz_sys__longjmp(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_siglongjmp(struct OcerzVM *vm, OcerzCPU *cpu);
 
 int ocerz_sys_fork(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_syscall(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_execve(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_execv(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_execvp(struct OcerzVM *vm, OcerzCPU *cpu);
