@@ -105,6 +105,64 @@ cache on, as it does by default.
 | Start 32-bit `cmd` (WoW64) | 0.09 s | 0.13 s | 0.33 s |
 | The loop, start included | 0.56 s | 0.70 s | 1.57 s |
 
+## Wine's script engines, 15 November 2026
+
+`cmd` starting says little about how Windows code runs once it is running, so
+this measures Wine's own script engines: three scripts run by Wine's `cscript`,
+which is JScript's and VBScript's interpreters, their heap, `ucrtbase` and
+`ntdll`, all of it Windows code in the Wine layout with ordered memory. Each
+script times its own loop, so a process's start is not in the number. Wine
+Staging 11.18 as MacNdCheese ships it, an Apple M5 with macOS 27, the best of
+three with the engines taking turns, translation cache on:
+
+```sh
+WINE=/path/to/wine/bin/wine WINEPREFIX=~/prefix python3 tests/win/scriptbench.py old=./ocerz-1.0.2 new=./ocerz
+```
+
+| Script | Rosetta | AArchX 1.0.2 | AArchX now |
+| --- | ---: | ---: | ---: |
+| `objects.js`: objects, method calls, property access, a sort | 715 ms | 1284 ms (1.80x) | 935 ms (1.31x) |
+| `library.js`: strings, regular expressions, maths, dates | 617 ms | 1215 ms (1.97x) | 707 ms (1.15x) |
+| `loop.vbs`: a VBScript loop with `Select Case` and strings | 671 ms | 898 ms (1.34x) | 808 ms (1.20x) |
+
+Three times the work gives the same ratios (1.30x, 1.16x, 1.18x). Where the
+time went, in the order it was found:
+
+- **Instructions that ran in the interpreter.** 13.5% of `objects.js` was a
+  handful of instructions Windows code runs constantly and nothing else had
+  asked for: `sbb al, 0` at the end of `ucrtbase`'s `wcscmp`, `tzcnt` in
+  `ntdll`'s heap with a `rol` by `cl` after it that kept its flags alive, and
+  the single `movs` of `memcpy`'s tail. Translated, the script is over 98%
+  translated code.
+- **Flags that went through the flag record.** `or r10b, cl; je` cost thirty
+  instructions, and `memcpy` copies a tail by `shr r, 1; jae` for each power of
+  two, each of which called the routine that rebuilds x86's flags: 4% of
+  `library.js`. Both now set arm64's flags where the branch reads them.
+- **Acquire loads.** With those gone, memory ordering was the largest cost
+  left: with every load plain, which is not safe, `objects.js` runs at 1.05x.
+  An acquire load is not slow by itself. Measured on the M5, it has a plain
+  load's three cycles and costs next to nothing beside independent work; what
+  it loses is what the processor does ahead of time for a plain one. A store
+  and a load of the same slot take four cycles a round plain and seven to
+  eight when either is an ordered form, and a load that keeps returning the
+  same value takes one cycle plain and three as an acquire. An interpreter's
+  dispatch is exactly those loads. So the rule that leaves a load plain when
+  the next load is addressed through what it loaded was widened to follow the
+  value through register arithmetic and to accept a `cmp`, an `add` or an
+  indirect call as that next load, and loads through `gs` (the TEB) are plain
+  as stack loads are: 6% on `objects.js`, 2% on `library.js`, 1% on
+  `loop.vbs`. Outside Wine the load of a global's address from the GOT is
+  plain as well, which the rule already meant it to be and the translator did
+  not do; a Perl script forced into ordered memory runs about 7% faster than
+  under 1.0.2.
+
+What is left is ordering that cannot be dropped with what is known when a block
+is translated: a load followed by an unrelated load, or by a conditional
+branch. Two things that did not help, so nobody tries them again: guarding an
+address with one `orr` instead of a compare and a branch (fewer instructions,
+the same cycles), and a plain load followed by a discarded acquire of the same
+address, which orders as well as the acquire and is no faster.
+
 ## What makes it fast
 
 - **The guest's registers stay in registers.** All sixteen general registers and
