@@ -1,13 +1,13 @@
 library /usr/lib/libxml2.2.dylib
 sdk macos 27.0
 exports 1683
-fn 1214
+fn 1428
 data 47
 var 0
-special 0
+special 2
 stub callback-pointer 14
 stub callback-result 1
-stub callback-struct 322
+stub callback-struct 106
 stub no-declaration 47
 stub va-list 14
 stub variadic 24
@@ -16,7 +16,7 @@ objc-classes 0
 objc-eh-types 0
 objc-ivars 0
 ld-pseudo-skipped 0
-overrides 0
+overrides 2
 override-shapes 0
 override-structs 0
-override-opaque 0
+override-opaque 6

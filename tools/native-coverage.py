@@ -37,7 +37,7 @@ def bundle_executable(app):
     try:
         with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
             exe = plistlib.load(f).get("CFBundleExecutable")
-    except (OSError, plistlib.InvalidFileException, ValueError):
+    except Exception:       # unreadable, or not a property list: a malformed XML one raises expat's own error
         return None
     path = os.path.join(app, "Contents", "MacOS", exe) if exe else None
     return path if path and os.path.isfile(path) else None

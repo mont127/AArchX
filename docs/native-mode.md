@@ -246,6 +246,29 @@ native mode a lazy flat import that nothing defines at launch now waits for
 its first call. The last import it lacked, TWAIN's `DSM_Entry`, now has a
 database.
 
+On 17 November 2026 the survey ran again, over 39 programs, and the gaps it
+ranked highest that could be closed without a new mechanism were closed.
+`syscall` and `__syscall` are answered by ocerz's own system call layer, the
+one behind the `syscall` instruction in cache mode, instead of stopping the
+program: the native functions would have handed the host kernel the guest's
+structures. Functions the system exports and its headers do not declare, or
+declare only on request, have signatures in `tools/sdkgen/overrides`: `isnan`
+under its own name, `lgamma_r`, the `realpath` of old binaries,
+`objc_loadClassref`, CoreFoundation's hash functions, CoreVideo's Metal
+texture cache, and malloc's fork hooks, which do nothing because the fork a
+guest makes is ocerz's and takes malloc's locks itself. AddressBook's C
+interface is read from its own headers, 95 functions. And libxml2's parser
+context, XPath context and I/O buffers, which hold function pointers but are
+only ever built by libxml2, are opaque records as `FILE` is, so 214 more of
+its functions cross; the push parser crosses when it is given no SAX handler
+and is refused by name when it is given one. Seven programs now bind
+completely and eleven with stubs, where five and thirteen did; among C and
+Objective-C names, imports stubbed for want of a declaration fell from 325 to
+237 and for a structure of callbacks from 222 to 92. What most programs still
+import and cannot call is `pthread_cancel` (twelve), GSS (ten),
+`JSClassCreate` (eight) and `sqlite3_vfs_find` (seven). The 21 refused
+programs are refused for Swift, all but two.
+
 ## Comparing with Rosetta
 
 `tools/native-diff.py` runs the same x86_64 probes under Rosetta, cache mode

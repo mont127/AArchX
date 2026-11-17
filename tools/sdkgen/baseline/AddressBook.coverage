@@ -1,11 +1,11 @@
 library /System/Library/Frameworks/AddressBook.framework/Versions/A/AddressBook
 sdk macos 27.0
 exports 4841
-fn 1
+fn 96
 data 3265
 var 0
 special 0
-stub no-declaration 274
+stub no-declaration 179
 omit objc-ivar 1252
 omit swift 49
 host-missing 0
