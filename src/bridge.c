@@ -3071,6 +3071,57 @@ static int br_cfuuid_create(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_cfuuid_bytes(vm, cpu, &cached, "CFUUIDCreateWithBytes");
 }
 
+/*
+ * xmlCreatePushParserCtxt and htmlCreatePushParserCtxt take a SAX handler, a structure of callbacks the program
+ * builds, three of them variadic, which no shape describes.  Most callers pass none and let libxml2 build the
+ * document, and those cross here.  With a handler the call is refused by name, as the stub refused every call:
+ * handed on as it stands, native code would call the program's x86 functions.
+ */
+#define BR_LIBXML2 "/usr/lib/libxml2.2.dylib"
+static int br_xml_push_ctxt(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *sym, int html)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(BR_LIBXML2, sym);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", sym);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    uint64_t user = cpu->gpr[OCERZ_RSI], chunk = cpu->gpr[OCERZ_RDX], name = cpu->gpr[OCERZ_R8];
+    int size = (int)cpu->gpr[OCERZ_RCX];
+    if (cpu->gpr[OCERZ_RDI]) {
+        fprintf(stderr, "ocerz: bridge: " BR_LIBXML2 " _%s was given a SAX handler of the program's own, whose"
+                        " callbacks native code would call as x86; not implemented\n", sym);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    void *u = user ? ocerz_g2h(user) : NULL;
+    const char *c = chunk ? (const char *)ocerz_g2h(chunk) : NULL, *f = name ? (const char *)ocerz_g2h(name) : NULL;
+    struct OcerzBridgeFrame outer;
+    void *r;
+    if (html) {
+        ocerz_bridge_raise(&outer, BR_LIBXML2, sym, "p(pppipi)", (const void *)fn);
+        r = ((void *(*)(void *, void *, const char *, int, const char *, int))fn)(NULL, u, c, size, f,
+                                                                                (int)cpu->gpr[OCERZ_R9]);
+    } else {
+        ocerz_bridge_raise(&outer, BR_LIBXML2, sym, "p(pppip)", (const void *)fn);
+        r = ((void *(*)(void *, void *, const char *, int, const char *))fn)(NULL, u, c, size, f);
+    }
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, r ? ocerz_h2g(r) : 0);
+}
+static int br_xml_create_push_parser_ctxt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    return br_xml_push_ctxt(vm, cpu, &cached, "xmlCreatePushParserCtxt", 0);
+}
+static int br_html_create_push_parser_ctxt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    return br_xml_push_ctxt(vm, cpu, &cached, "htmlCreatePushParserCtxt", 1);
+}
+
 static int br_availability_version_check(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t want = (uint32_t)cpu->gpr[OCERZ_RDI];
@@ -3432,6 +3483,8 @@ static const BrHandler g_br_handlers[] = {
     { "thread_resume", br_thread_resume },
     { "cfuuid_constant", br_cfuuid_constant },
     { "cfuuid_create", br_cfuuid_create },
+    { "xml_create_push_parser_ctxt", br_xml_create_push_parser_ctxt },
+    { "html_create_push_parser_ctxt", br_html_create_push_parser_ctxt },
     { "ssl_get_supported_ciphers", br_ssl_get_supported_ciphers },
     { "cf_calendar_compose", br_cf_calendar_compose },
     { "cf_calendar_decompose", br_cf_calendar_decompose },

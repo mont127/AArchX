@@ -12880,6 +12880,114 @@ EOC
     record "$name" "$reason" "undeclared exports cross by the signatures the overrides give them"
 }
 
+# libxml2's parser context, XPath context and I/O buffers hold function pointers, so every function taking one was
+# a stub and a program stopped at its first XPath query.  libxml2 builds those structures itself, so they are
+# opaque records now and 214 more functions cross.  The push parser crosses when it is given no SAX handler and is
+# refused by name when it is given one, whose callbacks native code would otherwise call as x86.
+case_native_libxml2() {
+    local name=native_libxml2 reason="" d="$TMP/native_libxml2" rc
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/xml1.c" <<'EOC'
+/* what a program does with libxml2: parse, walk, XPath, serialize, push-parse, free */
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+#include <libxml/xpath.h>
+#include <libxml/xpathInternals.h>
+#include <libxml/xmlsave.h>
+#include <stdio.h>
+#include <string.h>
+static const char doc[] = "<?xml version=\"1.0\"?><r xmlns:n=\"urn:x\"><a id=\"1\">one</a><n:a id=\"2\">two &amp; a half</n:a><b><a id=\"3\">three</a></b></r>";
+static void on_start(void *ctx, const xmlChar *name, const xmlChar **atts) { (void)ctx; (void)name; (void)atts; }
+int main(int argc, char **argv)
+{
+    unsigned bad = 0;
+    if (argc > 1 && !strcmp(argv[1], "sax")) {
+        static xmlSAXHandler h;
+        h.startElement = on_start;
+        xmlParserCtxtPtr sc = xmlCreatePushParserCtxt(&h, NULL, NULL, 0, "sax.xml");
+        printf("xml1 sax %s\n", sc ? "context" : "none");
+        return 0;
+    }
+    xmlDocPtr d = xmlReadMemory(doc, (int)sizeof doc - 1, "mem.xml", NULL, 0);
+    if (!d) { printf("xml1 bad: no document\n"); return 1; }
+    xmlNodePtr root = xmlDocGetRootElement(d);
+    if (!root || strcmp((const char *)root->name, "r")) bad |= 1;
+    xmlChar *txt = xmlNodeGetContent(root->children);
+    if (!txt || strcmp((const char *)txt, "one")) bad |= 2;
+    xmlFree(txt);
+    xmlXPathContextPtr xc = xmlXPathNewContext(d);
+    if (!xc) bad |= 4;
+    else {
+        if (xmlXPathRegisterNs(xc, BAD_CAST "n", BAD_CAST "urn:x") != 0) bad |= 8;
+        xmlXPathObjectPtr o = xmlXPathEvalExpression(BAD_CAST "//a | //n:a", xc);
+        if (!o || !o->nodesetval || o->nodesetval->nodeNr != 3) bad |= 16;
+        else {
+            xmlChar *id = xmlGetProp(o->nodesetval->nodeTab[1], BAD_CAST "id");
+            if (!id || strcmp((const char *)id, "2")) bad |= 32;
+            xmlFree(id);
+        }
+        if (o) xmlXPathFreeObject(o);
+        xmlXPathFreeContext(xc);
+    }
+    xmlChar *mem = NULL; int n = 0;
+    xmlDocDumpMemory(d, &mem, &n);
+    if (!mem || n < 60 || !strstr((const char *)mem, "two &amp; a half")) bad |= 64;
+    xmlFree(mem);
+    xmlBufferPtr buf = xmlBufferCreate();
+    xmlOutputBufferPtr ob = xmlOutputBufferCreateBuffer(buf, NULL);
+    if (!ob) bad |= 128;
+    else {
+        xmlNodeDumpOutput(ob, d, root->children, 0, 0, NULL);
+        xmlOutputBufferClose(ob);
+        if (strcmp((const char *)xmlBufferContent(buf), "<a id=\"1\">one</a>")) bad |= 256;
+    }
+    xmlBufferFree(buf);
+    xmlFreeDoc(d);
+    /* the push parser, a chunk at a time, with no SAX handler of the program's own */
+    xmlParserCtxtPtr pc = xmlCreatePushParserCtxt(NULL, NULL, NULL, 0, "push.xml");
+    if (!pc) bad |= 512;
+    else {
+        for (size_t i = 0; i < sizeof doc - 1; i += 17) {
+            size_t len = sizeof doc - 1 - i < 17 ? sizeof doc - 1 - i : 17;
+            if (xmlParseChunk(pc, doc + i, (int)len, 0) != 0) bad |= 1024;
+        }
+        xmlParseChunk(pc, NULL, 0, 1);
+        if (!pc->wellFormed || !pc->myDoc) bad |= 2048;
+        if (pc->myDoc) xmlFreeDoc(pc->myDoc);
+        xmlFreeParserCtxt(pc);
+    }
+    xmlParserCtxtPtr c2 = xmlNewParserCtxt();
+    if (!c2) bad |= 4096;
+    else {
+        xmlDocPtr d2 = xmlCtxtReadMemory(c2, doc, (int)sizeof doc - 1, "ctx.xml", NULL, XML_PARSE_NOBLANKS);
+        if (!d2) bad |= 8192; else xmlFreeDoc(d2);
+        xmlFreeParserCtxt(c2);
+    }
+    xmlCleanupParser();
+    if (bad) printf("xml1 bad:%x\n", bad); else printf("xml1 ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -I"$(xcrun --show-sdk-path)/usr/include/libxml2" -o "$d/xml1" "$d/xml1.c" -lxml2 \
+            >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    reason="$(native_three_modes "$name" "$d/xml1" "xml1 ok")"
+    if [ -z "$reason" ]; then
+        run_bounded "$d/sax.out" "$d/sax.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/xml1" sax
+        rc=$?
+        if [ "$rc" != 72 ] || ! grep -q "_xmlCreatePushParserCtxt was given a SAX handler" "$d/sax.err"; then
+            reason="a push parser with a SAX handler exited $rc and printed '$(cat "$d/sax.out")', want 72 and the refusal by name: $(tail -1 "$d/sax.err" | cut -c1-160)"
+        fi
+    fi
+    record "$name" "$reason" "parse, XPath, output buffers and the push parser; a SAX handler is refused"
+}
+
 case_native_import_addends() {
     local name=native_import_addends reason="" d="$TMP/native_import_addends" mode f want got
     rm -rf "$d"; mkdir -p "$d"
@@ -16228,6 +16336,7 @@ case_native_lazy_flat
 case_native_import_addends
 case_native_syscall
 case_native_undeclared
+case_native_libxml2
 case_native_flat_nonlazy
 case_native_scanf_long_double
 case_native_fork_initialize

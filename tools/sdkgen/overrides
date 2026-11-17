@@ -1634,6 +1634,31 @@ special _CMBlockBufferCreateContiguous cm_block_buffer_create_contiguous
 # that reads those and calls the host through its variadic convention.  The
 # ops that install a table of functions are refused by name.
 
+# libxml2's parser context, XPath context, input and output buffers and
+# encoding handler hold function pointers, and libxml2 builds every one of
+# them itself: xmlNewParserCtxt, xmlXPathNewContext, xmlAllocOutputBuffer and
+# their relatives hand back a pointer, and what a program does with it is read
+# plain fields (ctxt->myDoc, ctxt->wellFormed, the XPath context's node) and
+# pass it on.  So they are opaque, and the 300 functions that take one cross.
+# A program that stores a callback of its own in one of them, a SAX handler in
+# ctxt->sax above all, would have native code call x86: before this it
+# stopped at the stub instead.  The SAX handler and the validation context are
+# not listed, since programs do build those.
+library /usr/lib/libxml2.2.dylib
+
+opaque _xmlParserCtxt
+opaque _xmlXPathContext
+opaque _xmlOutputBuffer
+opaque _xmlParserInputBuffer
+opaque _xmlParserInput
+opaque _xmlCharEncodingHandler
+
+# The push parsers take a SAX handler, which a program does build.  Their
+# handlers cross the call when it is given none, as it is by a program that
+# wants the document built, and refuse it by name otherwise.
+special _xmlCreatePushParserCtxt xml_create_push_parser_ctxt
+special _htmlCreatePushParserCtxt html_create_push_parser_ctxt
+
 library /usr/lib/libsqlite3.dylib
 
 special _sqlite3_config sqlite3_config
