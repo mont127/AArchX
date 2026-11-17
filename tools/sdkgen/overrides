@@ -697,6 +697,22 @@ fn ___signbitf __signbitf i(f)
 fn ___signbitd __signbitd i(d)
 fn ___fpclassifyf __fpclassifyf i(f)
 fn ___fpclassifyd __fpclassifyd i(d)
+# isnan is still exported under its own name for programs built before it
+# became a macro, lgamma_r and lgammaf_r are declared only under _REENTRANT,
+# and plain realpath is the entry of programs built before the $DARWIN_EXTSN
+# one; arm64 has one of each.  pthread_time_constraint_max_parallelism is in
+# no public header.
+fn _isnan isnan i(d)
+fn _lgamma_r lgamma_r d(dp)
+fn _lgammaf_r lgammaf_r f(fp)
+fn _realpath realpath p(pp)
+fn _pthread_time_constraint_max_parallelism pthread_time_constraint_max_parallelism i(L)
+# A program that forks by hand takes malloc's locks before and drops them
+# after, with these.  The fork it then makes is ocerz's, a native fork that
+# does both itself, and the locks are not recursive: the handlers do nothing.
+special __malloc_fork_prepare nothing
+special __malloc_fork_parent nothing
+special __malloc_fork_child nothing
 fn ___stpcpy_chk __stpcpy_chk p(ppL)
 fn ___stpncpy_chk __stpncpy_chk p(ppLL)
 fn ___strcat_chk __strcat_chk p(ppL)
@@ -1045,6 +1061,7 @@ special _CFCalendarDecomposeAbsoluteTime cf_calendar_decompose
 special _CFCalendarAddComponents cf_calendar_add
 special _CFCalendarGetComponentDifference cf_calendar_difference
 special _CFUUIDGetConstantUUIDWithBytes cfuuid_constant
+special _CFUUIDCreateWithBytes cfuuid_create
 
 shape CFArrayCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
 shape CFDictionaryKeyCallBacks 0 6 - p(pp) v(pp) p(p) B(pp) L(p)
@@ -1394,6 +1411,11 @@ library /usr/lib/libobjc.A.dylib
 
 special _objc_setExceptionPreprocessor objc_setExceptionPreprocessor
 
+# objc_loadClassref is what the compiler calls for a class it may not find at
+# run time: it takes the address of the reference and answers the class there
+# or nil.  objc-internal.h declares it and the SDK does not ship that header.
+fn _objc_loadClassref objc_loadClassref p(p)
+
 # __res_9_state answers the resolver state _res names.  It is a structure with
 # two hooks no shape describes, but Wine's dnsapi.so reads and sets only its
 # options, servers and search list in place, never the hooks, and its layout
@@ -1510,6 +1532,9 @@ inplace _BZ2_bzDecompressInit 0 64 v(pp)
 
 library /System/Library/Frameworks/Security.framework/Versions/A/Security
 
+# SecTrustedApplicationPriv.h's: a description, a requirement, and where the
+# application goes.
+fn _SecTrustedApplicationCreateFromRequirement SecTrustedApplicationCreateFromRequirement i(ppp)
 special _SSLGetSupportedCiphers ssl_get_supported_ciphers
 special _SSLGetEnabledCiphers ssl_get_enabled_ciphers
 special _SSLSetEnabledCiphers ssl_set_enabled_ciphers
@@ -1530,6 +1555,13 @@ fn _xcselect_invoke_xcrun xcselect_invoke_xcrun v(pipi)
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 
 var _OBJC_EHTYPE_$_NSException 24 objc_ehtype
+
+# Exports no header declares, with the signatures CoreFoundation's own source
+# gives them.
+fn _CFHashBytes CFHashBytes L(pl)
+fn _CFStringHashCString CFStringHashCString L(pl)
+fn _CFStringHashNSString CFStringHashNSString L(p)
+fn __CFBundleFlushBundleCaches _CFBundleFlushBundleCaches v(p)
 
 library /System/Library/Frameworks/CloudKit.framework/Versions/A/CloudKit
 
@@ -1567,6 +1599,19 @@ fn _AudioDeviceCreateIOProcIDWithBlock AudioDeviceCreateIOProcIDWithBlock i(pupk
 # VTDecompressionSessionCreate takes a VTDecompressionOutputCallbackRecord, a
 # callback and its refcon with no version word, so no shape describes it; its
 # handler converts a copy, which the session keeps (src/bridge.c).
+
+# CVMetalTextureCache.h declares these only to Objective-C, for the Metal
+# device and texture among their arguments, and CoreVideo's database is read
+# as C.  Objects cross as pointers.
+library /System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo
+
+fn _CVMetalTextureCacheCreate CVMetalTextureCacheCreate i(ppppp)
+fn _CVMetalTextureCacheCreateTextureFromImage CVMetalTextureCacheCreateTextureFromImage i(ppppLLLLp)
+fn _CVMetalTextureCacheFlush CVMetalTextureCacheFlush v(pL)
+fn _CVMetalTextureCacheGetTypeID CVMetalTextureCacheGetTypeID L()
+fn _CVMetalTextureGetTexture CVMetalTextureGetTexture p(p)
+fn _CVMetalTextureGetTypeID CVMetalTextureGetTypeID L()
+fn _CVMetalTextureIsFlipped CVMetalTextureIsFlipped B(p)
 
 library /System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox
 

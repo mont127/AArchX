@@ -3029,17 +3029,17 @@ typedef const void *(*BrCFUUIDFn)(const void *, uint8_t, uint8_t, uint8_t, uint8
                                   uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t,
                                   uint8_t, uint8_t, uint8_t, uint8_t, uint8_t);
 
-static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
+/* CFUUIDGetConstantUUIDWithBytes and CFUUIDCreateWithBytes: an allocator and sixteen bytes, each its own argument. */
+static int br_cfuuid_bytes(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *sym)
 {
-    static void *_Atomic cached = NULL;
-    void *fn = cached;
+    void *fn = *cache;
     if (!fn) {
-        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, "CFUUIDGetConstantUUIDWithBytes");
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, sym);
         if (!fn) {
-            fprintf(stderr, "ocerz: bridge: _CFUUIDGetConstantUUIDWithBytes has no host symbol\n");
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", sym);
             exit(OCERZ_BRIDGE_UNIMPL_EXIT);
         }
-        cached = fn;
+        *cache = fn;
     }
     OcerzAbiSig named;
     if (ocerz_abi_parse("p(p)", &named) != OCERZ_OK)   /* "p" alone has no argument list and never parsed */
@@ -3059,6 +3059,16 @@ static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
     const void *r = ((BrCFUUIDFn)fn)(alloc, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                                      b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     return br_answer(vm, cpu, r ? ocerz_h2g(r) : 0);
+}
+static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    return br_cfuuid_bytes(vm, cpu, &cached, "CFUUIDGetConstantUUIDWithBytes");
+}
+static int br_cfuuid_create(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    return br_cfuuid_bytes(vm, cpu, &cached, "CFUUIDCreateWithBytes");
 }
 
 static int br_availability_version_check(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -3421,6 +3431,7 @@ static const BrHandler g_br_handlers[] = {
     { "thread_suspend", br_thread_suspend },
     { "thread_resume", br_thread_resume },
     { "cfuuid_constant", br_cfuuid_constant },
+    { "cfuuid_create", br_cfuuid_create },
     { "ssl_get_supported_ciphers", br_ssl_get_supported_ciphers },
     { "cf_calendar_compose", br_cf_calendar_compose },
     { "cf_calendar_decompose", br_cf_calendar_decompose },

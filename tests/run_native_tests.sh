@@ -12788,6 +12788,98 @@ EOC
     record "$name" "$reason" "syscall and __syscall through ocerz's system call layer"
 }
 
+# Functions the system exports and its headers do not declare, or declare only on request, were stubs for want of
+# a signature: isnan under its own name, lgamma_r, the realpath of old binaries, malloc's fork hooks,
+# pthread_time_constraint_max_parallelism, CoreFoundation's hash functions, objc_loadClassref, CoreVideo's Metal
+# texture cache, and CFUUIDCreateWithBytes with its seventeen arguments.  tools/sdkgen/overrides gives each one.
+# The cache-mode run also holds bsdthread_ctl's parallelism query, which answered 0 there.
+case_native_undeclared() {
+    local name=native_undeclared reason="" d="$TMP/native_undeclared"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/und.m" <<'EOC'
+/* exports the system's headers do not declare, or declare only on request, called the way old binaries call them */
+#import <Foundation/Foundation.h>
+#import <CoreVideo/CoreVideo.h>
+#include <limits.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+extern int old_isnan(double) __asm("_isnan");
+extern double lgamma_r(double, int *);
+extern float lgammaf_r(float, int *);
+extern char *old_realpath(const char *, char *) __asm("_realpath");
+extern void _malloc_fork_prepare(void);
+extern void _malloc_fork_parent(void);
+extern void _malloc_fork_child(void);
+extern int syscall(int, ...);
+extern int pthread_time_constraint_max_parallelism(unsigned long);
+extern CFHashCode CFHashBytes(UInt8 *, CFIndex);
+extern CFHashCode CFStringHashCString(const uint8_t *, CFIndex);
+extern Class objc_loadClassref(Class *);
+extern CFTypeID CVMetalTextureCacheGetTypeID(void);
+int main(void)
+{
+    unsigned bad = 0;
+    @autoreleasepool {
+        volatile double zero = 0.0;
+        if (!old_isnan(zero / zero) || old_isnan(1.5)) bad |= 1;
+        int sg = 0, sf = 0;
+        double g = lgamma_r(-0.5, &sg);
+        float gf = lgammaf_r(4.0f, &sf);
+        if (fabs(g - 1.2655121234846454) > 1e-12 || sg != -1 || fabsf(gf - 1.7917595f) > 1e-5f || sf != 1) bad |= 2;
+        char buf[PATH_MAX];
+        if (!old_realpath("/usr/bin/../lib/./dyld", buf) || strcmp(buf, "/usr/lib/dyld")) bad |= 4;
+        /* a fork made by hand, as a program does that must not run atfork handlers: malloc's locks taken, the
+           system call, the locks dropped on both sides, and both sides able to allocate afterwards */
+        long me = syscall(SYS_getpid);
+        _malloc_fork_prepare();
+        long r = syscall(SYS_fork);
+        if (syscall(SYS_getpid) != me) {
+            _malloc_fork_child();
+            void *p = malloc(100);
+            _exit(p ? 7 : 8);
+        }
+        _malloc_fork_parent();
+        int st = 0;
+        void *q = malloc(4000);
+        if (r <= 0 || waitpid((pid_t)r, &st, 0) != (pid_t)r || !WIFEXITED(st) || WEXITSTATUS(st) != 7 || !q) bad |= 8;
+        free(q);
+        if (pthread_time_constraint_max_parallelism(0) < 1) bad |= 16;
+        UInt8 bytes[] = "the same bytes hash the same";
+        if (CFHashBytes(bytes, 28) != CFHashBytes(bytes, 28) || CFHashBytes(bytes, 28) == CFHashBytes(bytes, 27)) bad |= 32;
+        if (CFStringHashCString(bytes, 28) != CFHash(CFSTR("the same bytes hash the same"))) bad |= 64;
+        CFUUIDRef u = CFUUIDCreateWithBytes(NULL, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+        CFStringRef us = u ? CFUUIDCreateString(NULL, u) : NULL;
+        if (!us || ![(__bridge NSString *)us isEqualToString:@"01020304-0506-0708-090A-0B0C0D0E0F10"]) bad |= 128;
+        if (us) CFRelease(us);
+        if (u) CFRelease(u);
+        static Class ref;
+        ref = [NSMutableString class];
+        static Class none;
+        if (objc_loadClassref(&ref) != [NSMutableString class] || objc_loadClassref(&none) != Nil) bad |= 256;
+        if (CVMetalTextureCacheGetTypeID() == 0 || CVMetalTextureCacheGetTypeID() == CVPixelBufferGetTypeID()) bad |= 512;
+    }
+    if (bad) printf("und bad:%x\n", bad); else printf("und ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -fobjc-arc -Wno-deprecated-declarations -o "$d/und" "$d/und.m" \
+            -framework Foundation -framework CoreVideo >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    reason="$(native_three_modes "$name" "$d/und" "und ok")"
+    record "$name" "$reason" "undeclared exports cross by the signatures the overrides give them"
+}
+
 case_native_import_addends() {
     local name=native_import_addends reason="" d="$TMP/native_import_addends" mode f want got
     rm -rf "$d"; mkdir -p "$d"
@@ -16135,6 +16227,7 @@ case_native_objc_cycle
 case_native_lazy_flat
 case_native_import_addends
 case_native_syscall
+case_native_undeclared
 case_native_flat_nonlazy
 case_native_scanf_long_double
 case_native_fork_initialize
