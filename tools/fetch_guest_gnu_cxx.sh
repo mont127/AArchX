@@ -2,8 +2,8 @@
 # fetch_guest_gnu_cxx.sh -- the x86_64 GNU libstdc++ native mode (-native) loads for programs built with GCC, or with
 # Apple's compilers before libc++, which import it from /usr/lib/libstdc++.6.dylib: macOS on Apple silicon has no such
 # library, where Rosetta's x86_64 shared cache still does (VLC 2.2's matroska, DASH, live555, UPnP and taglib plugins
-# import it).  Source: the x86_64 slice of the MacPorts package tools/fetch_guest32_cxx.sh takes the i386 one from,
-# GCC 15.2's runtime for darwin_10 (GPLv3 with the GCC Runtime Library Exception), and GNU libiconv 1.19 for
+# import it).  Source: the x86_64 build of the MacPorts package tools/fetch_guest32_cxx.sh takes the i386 one of,
+# GCC 15.3's runtime for darwin_10 (GPLv3 with the GCC Runtime Library Exception), and GNU libiconv 1.19 for
 # darwin_10 (LGPL), whose libiconv* functions that libstdc++ imports and Apple's libiconv does not export; both pinned
 # by SHA-256.  They go to runtime/guest-gnu, which native mode searches after runtime/guest (src/dyld.c,
 # native_guest_path); the directory is not tracked and no release carries it.
@@ -18,13 +18,13 @@ fetch() {   # fetch <port> <file> <sha256>
   mkdir -p "$T/$1"
   tar -xjf "$T/$2" -C "$T/$1"
 }
-fetch libgcc15 libgcc15-15.2.0_0+stdlib_flag+universal.darwin_10.i386-x86_64.tbz2 \
-  d23b0099c24e4452c848ed2d39d0b3c50d6b23badfdc4d2bd60fa0c84ee2b6d5
+fetch libgcc15 libgcc15-15.3.0_0+stdlib_flag.darwin_10.x86_64.tbz2 \
+  c66bcb9ec4774408f67487f989c881e2d17f33f9d2401aba06b8384ac031d43a
 fetch libiconv libiconv-1.19_0.darwin_10.x86_64.tbz2 \
   fc0607368701ef2e9aab2aac152179bd4db5aba8e17b8a093493b2cf2c3321ca
 mkdir -p $G
 for l in libstdc++.6.dylib libgcc_s.1.1.dylib; do
-  lipo "$(find "$T/libgcc15/opt/local/lib" -name "$l" -type f | head -1)" -thin x86_64 -output "$G/$l"
+  cp "$(find "$T/libgcc15/opt/local/lib" -name "$l" -type f | head -1)" "$G/$l"
 done
 # GNU libiconv keeps a name of its own, so a program's imports of Apple's iconv from /usr/lib/libiconv.2.dylib
 # still reach the native one

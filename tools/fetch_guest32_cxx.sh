@@ -1,7 +1,7 @@
 #!/bin/bash
 # fetch_guest32_cxx.sh [root] -- the guest i386 GNU libstdc++ and libgcc_s that m32 programs built with GCC import from
 # /usr/lib, which macOS no longer ships (Batman: Arkham Asylum takes the old-ABI std::string, iostreams and
-# _Rb_tree_* from libstdc++.6.dylib).  Source: MacPorts' universal build of GCC 15.2's runtime for darwin_10, pinned
+# _Rb_tree_* from libstdc++.6.dylib).  Source: MacPorts' i386 build of GCC 15.3's runtime for darwin_10, pinned
 # by SHA-256 (GPLv3 with the GCC Runtime Library Exception), with GNU libiconv 1.19, which that libstdc++ imports
 # (LGPL).  Games built with Apple's clang import LLVM's libc++ instead (Call of Duty: Modern Warfare 3's std::__1
 # strings): MacPorts' universal libc++ 5.0.1 and libc++abi for darwin_10, also pinned (MIT and UIUC licenses).
@@ -22,8 +22,8 @@ fetch() {   # port file sha256: unpacked into $T/x
     echo "$3  $T/$2" | shasum -a 256 -c - >/dev/null
     tar -xjf "$T/$2" -C "$T/x" 2>/dev/null
 }
-fetch libgcc15 libgcc15-15.2.0_0+stdlib_flag+universal.darwin_10.i386-x86_64.tbz2 \
-    d23b0099c24e4452c848ed2d39d0b3c50d6b23badfdc4d2bd60fa0c84ee2b6d5
+fetch libgcc15 libgcc15-15.3.0_0+stdlib_flag.darwin_10.i386.tbz2 \
+    dfd0a2124f7e774221559fabb7d853c6632b163e43109ce759a0b628daa82835
 fetch libiconv libiconv-1.19_0+universal.darwin_17.i386-x86_64.tbz2 \
     fb6a003e6fa35434eee23459cc231bab409cb35ab676023fef01b531598e3b09
 fetch libcxx libcxx-5.0.1_5+emulated_tls+universal.darwin_10.i386-x86_64.tbz2 \
