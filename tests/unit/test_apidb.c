@@ -354,6 +354,8 @@ static void test_committed(void)
           "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation" },
         { "runtime/apis/macos/27.0/ExceptionHandling.api",
           "/System/Library/Frameworks/ExceptionHandling.framework/Versions/A/ExceptionHandling" },
+        { "runtime/apis/macos/27.0/LatentSemanticMapping.api",
+          "/System/Library/Frameworks/LatentSemanticMapping.framework/Versions/A/LatentSemanticMapping" },
     };
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
         size_t len = 0;

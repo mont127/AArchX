@@ -1,0 +1,1 @@
+#include <LatentSemanticMapping/LatentSemanticMapping.h>

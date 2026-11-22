@@ -676,6 +676,9 @@ pass AutomaticAssessmentConfiguration.h
 library DVDPlayback /System/Library/Frameworks/DVDPlayback.framework/Versions/A/DVDPlayback System/Library/Frameworks/DVDPlayback.framework/DVDPlayback.tbd
 pass DVDPlayback.h
 
+library LatentSemanticMapping /System/Library/Frameworks/LatentSemanticMapping.framework/Versions/A/LatentSemanticMapping System/Library/Frameworks/LatentSemanticMapping.framework/LatentSemanticMapping.tbd
+pass LatentSemanticMapping.h
+
 library libsbuf /usr/lib/libsbuf.dylib usr/lib/libsbuf.tbd
 pass libsbuf.h
 
