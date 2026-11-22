@@ -782,7 +782,10 @@
  * MMX is translated in 32-bit blocks as in 64-bit ones (emit_mmx): Bink's
  * video decoder and Feral's IndirectX use it in i386 code.
  * shld and shrd there also take a count in cl or a memory destination
- * (emit_shiftd32), with the flags dead as in emit_shiftd.
+ * (emit_shiftd32) when the flags are dead. With a dword register pair and a
+ * constant count, EXTR produces the result and a live flag record keeps the
+ * old destination, result and count. The fixed-point multiply in WoW64
+ * Chocolate Doom returns through this path with its flags live.
  * In an m32 program an import stub's jump calls its export from inside the
  * block (emit_bridge_fastcall32), as a 64-bit one does through the bridge.
  *
@@ -13767,9 +13770,9 @@ static int emit_leave(A64Buf *b, const X86Insn *insn, uint32_t **exit_sites, int
  * were the commonest instruction Batman's render thread still interpreted.
  * The pair is one 64-bit value shifted by the masked count; a count of 0
  * leaves the destination alone, as the interpreter does in 32-bit code.
- * Flags dead only, as emit_shiftd.
+ * Only the immediate register-pair path also builds a live flag record.
  */
-static int emit_shiftd32(A64Buf *b, const X86Insn *insn)
+static int emit_shiftd32(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1], *c = &insn->ops[2];
     int dmem = d->kind == OCERZ_OPK_MEM;
@@ -13782,6 +13785,16 @@ static int emit_shiftd32(A64Buf *b, const X86Insn *insn)
     if (cl && (c->reg != OCERZ_RCX || c->high8 || c->size != 1)) return 0;
     if (!cl && c->kind != OCERZ_OPK_IMM) return 0;
     unsigned icnt = cl ? 0 : (unsigned)c->imm & 31u;
+    if (!dmem && !cl && pin_slot(d->reg) >= 0 && pin_slot(s->reg) >= 0) {
+        if (icnt == 0) return 1;
+        int rd = pin_hreg(pin_slot(d->reg)), rs = pin_hreg(pin_slot(s->reg));
+        int right = insn->op == OCERZ_OP_SHRD;
+        if (need) a64_mov_reg(b, 0, JT0, rd);
+        a64_extr(b, 0, rd, right ? rs : rd, right ? rd : rs, right ? icnt : 32 - icnt);
+        if (need) emit_defer_flags(b, ocerz_cc_pack(right ? OCERZ_CC_SHRD : OCERZ_CC_SHLD, 4, icnt), JT0, rd);
+        return 1;
+    }
+    if (need) return 0;
     if (!cl && icnt == 0) return 1;
     uint32_t *zero = NULL;
     if (cl) {
@@ -13827,10 +13840,11 @@ static int emit_shiftd32(A64Buf *b, const X86Insn *insn)
  */
 static int emit_shiftd(A64Buf *b, const X86Insn *insn, uint64_t need)
 {
-    if (need != 0 || !g_defer || insn->nops != 3) return 0;
+    if (!g_defer || insn->nops != 3) return 0;
     const X86Operand *d = &insn->ops[0], *s = &insn->ops[1], *c = &insn->ops[2];
     if (insn->mode32 && d->size == 4)
-        return emit_shiftd32(b, insn);
+        return emit_shiftd32(b, insn, need);
+    if (need) return 0;
     static int no16 = -1;
     if (no16 < 0) no16 = getenv("OCERZ_NO_SHIFTD16") ? 1 : 0;
     if (!no16 && d->kind == OCERZ_OPK_REG && !d->high8 && d->size == 2 &&
