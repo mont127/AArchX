@@ -31,6 +31,8 @@
  *      GPR starts with a nonzero high half, so a missed zero-extension shows
  *      up in the very first comparison.
  *
+ * The memory-source ADC/SBB chain also checks that no instruction calls the
+ * interpreter: doing that for each high word dominated a WoW64 pixel loop.
  * The last group is the other half of the claim: the opcodes the JIT refuses
  * to compile (PUSHA/POPA, the BCD adjusts, SALC, XCHG, BTS) must still run
  * through the interpreter callout and leave the same state - including when
@@ -216,7 +218,7 @@ static int run_jit(uint64_t at, uint64_t esp)
     return 0;
 }
 
-static void run_case(const char *name, uint64_t at, uint64_t esp,
+static uint64_t run_case(const char *name, uint64_t at, uint64_t esp,
                      const uint8_t *code, size_t n)
 {
     Snapshot si, sj;
@@ -226,24 +228,26 @@ static void run_case(const char *name, uint64_t at, uint64_t esp,
         fprintf(stderr, "FAIL %s: interpreter did not reach DONE (eip=%#llx)\n",
                 name, (unsigned long long)cpu()->rip);
         g_failures++;
-        return;
+        return 0;
     }
     snap(&si);
     uint64_t before = ocerz_jit_blocks(g_vm.jit);
+    uint64_t interpreted = g_vm.insn_count;
     if (!run_jit(at, esp)) {
         fprintf(stderr, "FAIL %s: jit did not reach DONE (eip=%#llx)\n",
                 name, (unsigned long long)cpu()->rip);
         g_failures++;
-        return;
+        return 0;
     }
     snap(&sj);
     if (ocerz_jit_blocks(g_vm.jit) == before) {
         fprintf(stderr, "FAIL %s: no block was compiled\n", name);
         g_failures++;
-        return;
+        return 0;
     }
     if (cmp_snap(name, &si, &sj))
         printf("  ok  %s\n", name);
+    return g_vm.insn_count - interpreted;
 }
 
 #define CASE(name, at, esp, ...) do { \
@@ -271,6 +275,18 @@ int main(void)
     }
     ocerz_ldt_install(CS32, 0, 0xfffff, 0xfb, 1, 0, 1);
     *(uint8_t *)ocerz_g2h(DONE) = 0xf4;
+
+    static const uint8_t carry_chain[] = {
+        0xb8, 0xff, 0xff, 0xff, 0xff,
+        0x03, 0x44, 0x24, 0x18,
+        0x13, 0x4c, 0x24, 0x1c,
+        0x1b, 0x53, 0x01
+    };
+    if (run_case("add eax,[esp+24]; adc ecx,[esp+28]; sbb edx,[ebx+1]",
+                 M32_CODE, M32_STACK, carry_chain, sizeof carry_chain)) {
+        fprintf(stderr, "FAIL: memory-source carry chain called the interpreter\n");
+        g_failures++;
+    }
 
     CASE("mov [ebx], eax", M32_CODE, M32_STACK,
          0x89, 0x03);
