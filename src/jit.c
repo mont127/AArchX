@@ -213,6 +213,9 @@
  * address, whose side of 12 GB is known when the block is translated, takes an
  * orr below it and nothing above it.  On xbench in the Wine layout these took
  * leafcall from 1.27 s to 0.65 s (Rosetta 0.62 s) and str from 0.84 s to 0.75 s.
+ * In i386 code a dword ADC or SBB into a register loads its memory source
+ * through the same guarded load as IMUL before reading CF. This keeps a WoW64
+ * pixel loop from calling the interpreter once per pixel.
  * A 32-bit address is below 4 GB, so in 32-bit code every translation is the
  * orr alone, and esp-relative operands there are stack accesses as well: a
  * WoW64 loop of virtual calls into small frames spent most of its time in the
@@ -8775,7 +8778,9 @@ static int emit_adc_sbb(A64Buf *b, const X86Insn *insn, uint64_t need)
        jit_scratch across the CF computation, which may call out. */
     int s_mem = s->kind == OCERZ_OPK_MEM;
     if (s_mem) {
-        if (!emit_mem_load_plain(b, insn, s, d->size, JT1)) return 0;
+        if (insn->mode32) {
+            if (!emit_mem_load_any(b, insn, s, d->size, JT1)) return 0;
+        } else if (!emit_mem_load_plain(b, insn, s, d->size, JT1)) return 0;
         a64_str(b, 8, JT1, 20, (uint32_t)offsetof(OcerzCPU, jit_scratch));
     }
     if (!need && pin_slot(d->reg) >= 0 &&
