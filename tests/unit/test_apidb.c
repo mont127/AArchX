@@ -352,6 +352,8 @@ static void test_committed(void)
         { "runtime/apis/macos/27.0/libSystem.B.dylib.api", "/usr/lib/libSystem.B.dylib" },
         { "runtime/apis/macos/27.0/CoreFoundation.api",
           "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation" },
+        { "runtime/apis/macos/27.0/ExceptionHandling.api",
+          "/System/Library/Frameworks/ExceptionHandling.framework/Versions/A/ExceptionHandling" },
     };
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
         size_t len = 0;

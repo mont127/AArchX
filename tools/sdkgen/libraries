@@ -54,6 +54,10 @@ library Foundation /System/Library/Frameworks/Foundation.framework/Versions/C/Fo
 language objective-c
 pass Foundation.h
 
+library ExceptionHandling /System/Library/Frameworks/ExceptionHandling.framework/Versions/A/ExceptionHandling System/Library/Frameworks/ExceptionHandling.framework/ExceptionHandling.tbd
+language objective-c
+pass ExceptionHandling.h
+
 library CoreGraphics /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics System/Library/Frameworks/CoreGraphics.framework/CoreGraphics.tbd
 pass CoreGraphics.h
 
