@@ -1,5 +1,6 @@
 /*
- * RFLAGS helpers, and the semantic reference for x86 flags.
+ * RFLAGS helpers, and the semantic reference for x86 flags. A deferred
+ * record packs the kind, operand size and either carry-in or shift count.
  */
 #ifndef OCERZ_FLAGS_H
 #define OCERZ_FLAGS_H
@@ -43,6 +44,7 @@ void ocerz_flags_inc(OcerzCPU *cpu, int size, uint64_t res);
 void ocerz_flags_dec(OcerzCPU *cpu, int size, uint64_t res);
 void ocerz_flags_shl(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64_t res);
 void ocerz_flags_shr(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64_t res);
+void ocerz_flags_shrd(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64_t res);
 void ocerz_flags_sar(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64_t res);
 void ocerz_flags_mul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi);
 void ocerz_flags_imul(OcerzCPU *cpu, int size, uint64_t lo, uint64_t hi);
@@ -60,11 +62,13 @@ enum {
     OCERZ_CC_SAR,
     OCERZ_CC_MUL,
     OCERZ_CC_IMUL,
+    OCERZ_CC_SHLD,
+    OCERZ_CC_SHRD,
 };
 
-static inline uint32_t ocerz_cc_pack(unsigned kind, int size, int cin)
+static inline uint32_t ocerz_cc_pack(unsigned kind, int size, unsigned aux)
 {
-    return (uint32_t)kind | ((uint32_t)size << 8) | ((uint32_t)(cin & 1) << 16);
+    return (uint32_t)kind | ((uint32_t)size << 8) | (aux << 16);
 }
 
 void ocerz_flags_materialize(OcerzCPU *cpu);

@@ -33,6 +33,10 @@
  *
  * The memory-source ADC/SBB chain also checks that no instruction calls the
  * interpreter: doing that for each high word dominated a WoW64 pixel loop.
+ * Register double shifts with an immediate count make the same check with
+ * flags live, as at the return from Chocolate Doom's fixed-point multiply.
+ * The one-bit right shifts pin OF to a Rosetta run as well: it reports a
+ * change in the destination sign even when the source and destination alias.
  * The last group is the other half of the claim: the opcodes the JIT refuses
  * to compile (PUSHA/POPA, the BCD adjusts, SALC, XCHG, BTS) must still run
  * through the interpreter callout and leave the same state - including when
@@ -287,6 +291,30 @@ int main(void)
         fprintf(stderr, "FAIL: memory-source carry chain called the interpreter\n");
         g_failures++;
     }
+
+    static const struct {
+        const char *name;
+        uint8_t code[4];
+        int of;
+    } shifts[] = {
+        { "shrd ecx,edx,16", {0x0f,0xac,0xd1,16}, -1 },
+        { "shld ecx,edx,31", {0x0f,0xa4,0xd1,31}, -1 },
+        { "shrd eax,eax,33", {0x0f,0xac,0xc0,33},  1 },
+        { "shrd eax,ecx,1",  {0x0f,0xac,0xc8, 1},  0 },
+        { "shld eax,edx,32", {0x0f,0xa4,0xd0,32}, -1 },
+    };
+    for (size_t i = 0; i < sizeof shifts / sizeof shifts[0]; i++) {
+        if (run_case(shifts[i].name, M32_CODE, M32_STACK, shifts[i].code, sizeof shifts[i].code)) {
+            fprintf(stderr, "FAIL: %s called the interpreter\n", shifts[i].name);
+            g_failures++;
+        }
+        if (shifts[i].of >= 0 && !!(cpu()->rflags & OCERZ_OF) != shifts[i].of) {
+            fprintf(stderr, "FAIL: %s overflow differs from Rosetta\n", shifts[i].name);
+            g_failures++;
+        }
+    }
+    CASE("sub ecx,edx; shrd eax,eax,0; adc eax,eax", M32_CODE, M32_STACK,
+         0x29,0xd1, 0x0f,0xac,0xc0,0, 0x11,0xc0);
 
     CASE("mov [ebx], eax", M32_CODE, M32_STACK,
          0x89, 0x03);

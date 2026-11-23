@@ -1,6 +1,9 @@
 /*
  * Eager RFLAGS computation: the bit-for-bit x86 flag reference the JIT's
  * deferred-record paths must agree with, and the interpreter's flag source.
+ * A double shift records the original destination and the joined result,
+ * with the nonzero count in the high half of cc_op rather than cc_dst. For
+ * SHRD by one, OF reports a change of sign, not the original sign as for SHR.
  *
  * Where the architecture says "undefined" this file follows Rosetta, since
  * Rosetta is the golden oracle the guest tests are generated against.  MUL and
@@ -125,6 +128,13 @@ void ocerz_flags_shr(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64
     put_arith(cpu, f);
 }
 
+void ocerz_flags_shrd(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64_t res)
+{
+    ocerz_flags_shr(cpu, size, val, cnt, res);
+    if (cnt == 1)
+        ocerz_flag_assign(cpu, OCERZ_OF, ocerz_msb(val ^ res, size));
+}
+
 void ocerz_flags_sar(OcerzCPU *cpu, int size, uint64_t val, unsigned cnt, uint64_t res)
 {
     res &= ocerz_mask(size);
@@ -194,6 +204,12 @@ void ocerz_flags_materialize(OcerzCPU *cpu)
         break;
     case OCERZ_CC_SAR:
         ocerz_flags_sar(cpu, size, s, cnt, (uint64_t)(ocerz_sext(s, size) >> cnt));
+        break;
+    case OCERZ_CC_SHLD:
+        ocerz_flags_shl(cpu, size, s, op >> 16, d);
+        break;
+    case OCERZ_CC_SHRD:
+        ocerz_flags_shrd(cpu, size, s, op >> 16, d);
         break;
     case OCERZ_CC_MUL:
         ocerz_flags_mul(cpu, size, s, d);

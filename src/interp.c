@@ -1,6 +1,7 @@
 /*
  * The core single-step interpreter: reference semantics for x86_64, and the
- * oracle the JIT is checked against by the differential gates.
+ * oracle the JIT is checked against by the differential gates. A double
+ * right shift takes its overflow from the change in sign for a count of one.
  *
  * x86 makes a LOCK-prefixed access atomic at any alignment - the bus or
  * cache-line lock covers a split access - while ARM64's LSE atomics fault on a
@@ -692,7 +693,7 @@ static int op_shiftd(OcerzVM *vm, OcerzCPU *cpu, const X86Insn *insn)
         __uint128_t big = ((__uint128_t)src << bits) | dst;
         big >>= cnt;
         res = ocerz_trunc((uint64_t)big, size);
-        ocerz_flags_shr(cpu, size, dst, cnt, res);
+        ocerz_flags_shrd(cpu, size, dst, cnt, res);
     }
     ocerz_write_op(cpu, insn, &insn->ops[0], res);
     return OCERZ_STEP_OK;
