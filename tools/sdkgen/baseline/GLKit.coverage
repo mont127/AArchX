@@ -1,0 +1,19 @@
+library /System/Library/Frameworks/GLKit.framework/Versions/A/GLKit
+sdk macos 27.0
+exports 144
+fn 13
+data 57
+var 0
+special 0
+stub no-declaration 2
+stub union-value 35
+omit objc-ivar 37
+host-missing 0
+objc-classes 22
+objc-eh-types 0
+objc-ivars 37
+ld-pseudo-skipped 0
+overrides 0
+override-shapes 0
+override-structs 0
+override-opaque 0
