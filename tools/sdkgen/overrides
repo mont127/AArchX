@@ -16,6 +16,11 @@
 # record that matches nothing in its library stops the generator, so a name
 # that leaves the SDK is noticed rather than kept.
 #
+# AudioComponentRegister is special in AudioToolbox and AudioUnit: its factory
+# returns a table of guest functions the generic converter cannot carry, so the
+# handler builds the host table and converts each selector's method when Lookup
+# asks for it (src/bridge.c).
+#
 # inplace <export> <argpos> <offset> <signature> is for a structure the guest
 # owns and the native function works in, a compression stream above all: zlib
 # reads its input and writes its progress in the z_stream the caller holds, so
@@ -1642,10 +1647,6 @@ special _AudioUnitSetProperty audio_unit_set_property
 library /System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit
 
 special _AudioUnitSetProperty audio_unit_set_property
-
-# AudioComponentRegister's factory returns a table of guest functions, which
-# the generic callback converter cannot carry; its handler builds the host
-# table and converts each method when Lookup asks for it (src/bridge.c).
 
 library /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
 

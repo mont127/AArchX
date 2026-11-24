@@ -1,11 +1,28 @@
+/*
+ * A guest x86_64 Audio Component registers itself with AudioComponentRegister,
+ * and the host AudioToolbox then discovers, counts, opens, initializes,
+ * property-sets, renders and disposes it as if it were a native component.
+ * The fixture is a generator with a stream-format property and a render
+ * method, and it also receives an AURenderCallbackStruct through
+ * AudioUnitSetProperty, which is the path a guest effect uses to pull input.
+ */
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
 #include <string.h>
 
-static int opens, closes, inits, uninits, getprops, getinfos, sets, renders;
+static int opens, closes, inits, uninits, getprops, getinfos, sets, renders, input_calls;
+static AURenderCallbackStruct input_cb;
 static AudioStreamBasicDescription format;
 static int have_format;
+
+static OSStatus guest_input(void *refcon, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
+                            UInt32 frames, AudioBufferList *ioData)
+{
+    (void)refcon; (void)flags; (void)ts; (void)bus; (void)frames; (void)ioData;
+    input_calls++;
+    return noErr;
+}
 
 static OSStatus au_open(void *self, AudioComponentInstance instance)
 {
@@ -76,6 +93,10 @@ static OSStatus au_setprop(void *self, AudioUnitPropertyID id, AudioUnitScope sc
 {
     (void)self;
     sets++;
+    if (id == kAudioUnitProperty_SetRenderCallback && data && size == sizeof input_cb) {
+        memcpy(&input_cb, data, sizeof input_cb);
+        return noErr;
+    }
     if (id == kAudioUnitProperty_StreamFormat && scope == kAudioUnitScope_Output && element == 0 && data &&
         size == sizeof format) {
         memcpy(&format, data, sizeof format);
@@ -87,8 +108,12 @@ static OSStatus au_setprop(void *self, AudioUnitPropertyID id, AudioUnitScope sc
 static OSStatus au_render(void *self, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
                           UInt32 frames, AudioBufferList *ioData)
 {
-    (void)self; (void)flags; (void)ts; (void)bus; (void)frames;
+    (void)self; (void)flags;
     renders++;
+    if (input_cb.inputProc) {
+        AudioUnitRenderActionFlags in_flags = 0;
+        input_cb.inputProc(input_cb.inputProcRefCon, &in_flags, ts, bus, frames, ioData);
+    }
     if (ioData)
         for (UInt32 b = 0; b < ioData->mNumberBuffers; b++)
             if (ioData->mBuffers[b].mData)
@@ -150,6 +175,10 @@ int main(void)
     OSStatus get = unit ? AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
                                                kAudioUnitScope_Output, 0, &got, &got_size) : -1;
     OSStatus initialize = unit ? AudioUnitInitialize(unit) : -1;
+    AURenderCallbackStruct render_cb = { guest_input, NULL };
+    OSStatus set_callback = unit ? AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
+                                                       kAudioUnitScope_Input, 0, &render_cb,
+                                                       sizeof render_cb) : -1;
 
     AudioBufferList buffers;
     buffers.mNumberBuffers = 1;
@@ -184,10 +213,12 @@ int main(void)
            (int)initialize, (int)uninitialize);
     printf("render status=%d renders=%d frames=%u bytes=%u filled=%d dispose=%d\n",
            (int)render, renders, frames, buffers.mBuffers[0].mDataByteSize, filled, (int)dispose);
+    printf("input set=%d calls=%d\n", (int)set_callback, input_calls);
     printf("again instance=%d init=%d uninit=%d dispose=%d\n", (int)instance2, (int)initialize2,
            (int)uninitialize2, (int)dispose2);
     printf("methods init=%d uninit=%d get=%d getinfo=%d set=%d\n", inits, uninits, getprops, getinfos, sets);
     return instance == noErr && instance2 == noErr && set_format == noErr && info == noErr && get == noErr &&
-           initialize == noErr && initialize2 == noErr && render == noErr && uninitialize == noErr &&
+           initialize == noErr && initialize2 == noErr && set_callback == noErr && input_calls == 1 &&
+           render == noErr && uninitialize == noErr &&
            uninitialize2 == noErr && dispose == noErr && dispose2 == noErr ? 0 : 1;
 }

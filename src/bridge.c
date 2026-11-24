@@ -66,6 +66,14 @@
  * guest's, handled the ordinary way, and a strcmp the comparator makes raises
  * and lowers a frame of its own inside it.
  *
+ * ---- Audio Units the guest registers ----
+ * AudioComponentRegister is special for the same reason in a larger shape: the
+ * factory answers a table of guest Open, Close and Lookup functions, and Lookup
+ * answers each AudioUnit selector's method.  The handler keeps the component
+ * descriptions, wraps each interface the factory returns, and converts a method
+ * only when Lookup asks for it, so AudioComponentFindNext, AudioComponentCount,
+ * AudioComponentInstanceNew and the AudioUnit property calls reach guest code.
+ *
  * ---- callbacks on threads the guest never created ----
  * libdispatch's function-pointer entry points are bridged: dispatch_async_f,
  * dispatch_sync_f and dispatch_apply_f, with the global queues, the semaphores
@@ -2507,6 +2515,44 @@ static int br_cm_block_buffer_create_contiguous(struct OcerzVM *vm, OcerzCPU *cp
 #define BR_AU_INPUT_SAMPLES_IN_OUTPUT 49
 #define BR_AU_SET_INPUT_CALLBACK 2005
 
+#define BR_AU_INSTANCE_SLOTS 128
+static void *br_au_instances[BR_AU_INSTANCE_SLOTS];
+static pthread_mutex_t br_au_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void br_au_instance_add(void *host)
+{
+    if (!host)
+        return;
+    pthread_mutex_lock(&br_au_lock);
+    int found = 0, free_slot = -1;
+    for (int i = 0; i < BR_AU_INSTANCE_SLOTS; i++) {
+        if (br_au_instances[i] == host) {
+            found = 1;
+            break;
+        }
+        if (!br_au_instances[i] && free_slot < 0)
+            free_slot = i;
+    }
+    if (!found && free_slot >= 0)
+        br_au_instances[free_slot] = host;
+    pthread_mutex_unlock(&br_au_lock);
+}
+
+static int br_au_instance_is_guest(void *host)
+{
+    int found = 0;
+    if (host) {
+        pthread_mutex_lock(&br_au_lock);
+        for (int i = 0; i < BR_AU_INSTANCE_SLOTS; i++)
+            if (br_au_instances[i] == host) {
+                found = 1;
+                break;
+            }
+        pthread_mutex_unlock(&br_au_lock);
+    }
+    return found;
+}
+
 /* AudioUnitSetProperty takes its value as bytes, and for two properties the
    bytes are an AURenderCallbackStruct, the function an output unit's I/O
    thread calls for every buffer and its refCon.  Passed as they came,
@@ -2529,9 +2575,11 @@ static int br_audio_unit_set_property(struct OcerzVM *vm, OcerzCPU *cpu)
     uint64_t unit = cpu->gpr[OCERZ_RDI], data = cpu->gpr[OCERZ_R8];
     uint32_t id = (uint32_t)cpu->gpr[OCERZ_RSI], scope = (uint32_t)cpu->gpr[OCERZ_RDX];
     uint32_t element = (uint32_t)cpu->gpr[OCERZ_RCX], size = (uint32_t)cpu->gpr[OCERZ_R9];
+    void *host_unit = unit ? ocerz_g2h(unit) : NULL;
     const void *bytes = data ? ocerz_g2h(data) : NULL;
     struct { uint64_t proc, refcon; } cb;
-    if ((id == BR_AU_SET_RENDER_CALLBACK || id == BR_AU_SET_INPUT_CALLBACK) && data && size >= sizeof cb) {
+    if ((id == BR_AU_SET_RENDER_CALLBACK || id == BR_AU_SET_INPUT_CALLBACK) && data && size >= sizeof cb &&
+        !br_au_instance_is_guest(host_unit)) {
         uint64_t proc;
         if (ocerz_abi_callback_convert(ocerz_ld(data, 8), "i(pppuup)", &proc) != OCERZ_OK) {
             fprintf(stderr, "ocerz: bridge: _AudioUnitSetProperty: no callback slot is left for property %u\n", id);
@@ -2554,18 +2602,26 @@ static int br_audio_unit_set_property(struct OcerzVM *vm, OcerzCPU *cpu)
 }
 
 #define BR_AU_COMPONENT_SLOTS 32
+#define BR_AU_INTERFACE_SLOTS 64
 
 typedef struct {
     int used;
     uint32_t desc[5];
     void *factory;
+} BrAuComponent;
+
+typedef struct {
+    int used;
+    int converted;
+    int component;
+    void *self;
     void *open;
     void *close;
     void *lookup;
-    int converted;
-} BrAuComponent;
+} BrAuInterface;
 
 static BrAuComponent br_au_components[BR_AU_COMPONENT_SLOTS];
+static BrAuInterface br_au_interfaces[BR_AU_INTERFACE_SLOTS];
 
 static void *br_au_callback(uint64_t guest_fn, const char *notation)
 {
@@ -2596,12 +2652,16 @@ static const char *br_au_method_sig(int selector)
     }
 }
 
-static void *br_au_lookup_call(int index, int16_t selector)
+static void *br_au_iface_lookup_call(int index, int16_t selector)
 {
-    BrAuComponent *component = &br_au_components[index];
-    if (!component->used || !component->lookup)
+    void *lookup = NULL;
+    pthread_mutex_lock(&br_au_lock);
+    if (index >= 0 && index < BR_AU_INTERFACE_SLOTS && br_au_interfaces[index].used)
+        lookup = br_au_interfaces[index].lookup;
+    pthread_mutex_unlock(&br_au_lock);
+    if (!lookup)
         return NULL;
-    void *returned = ((void *(*)(int16_t))component->lookup)(selector);
+    void *returned = ((void *(*)(int16_t))lookup)(selector);
     uint64_t guest_fn = returned ? ocerz_h2g(returned) : 0;
     if (!guest_fn)
         return NULL;
@@ -2609,56 +2669,130 @@ static void *br_au_lookup_call(int index, int16_t selector)
     return sig ? br_au_callback(guest_fn, sig) : NULL;
 }
 
-#define BR_AU_LOOKUP_FN(n) \
-    static void *br_au_lookup_##n(int16_t selector) { return br_au_lookup_call(n, selector); }
-BR_AU_LOOKUP_FN(0) BR_AU_LOOKUP_FN(1) BR_AU_LOOKUP_FN(2) BR_AU_LOOKUP_FN(3)
-BR_AU_LOOKUP_FN(4) BR_AU_LOOKUP_FN(5) BR_AU_LOOKUP_FN(6) BR_AU_LOOKUP_FN(7)
-BR_AU_LOOKUP_FN(8) BR_AU_LOOKUP_FN(9) BR_AU_LOOKUP_FN(10) BR_AU_LOOKUP_FN(11)
-BR_AU_LOOKUP_FN(12) BR_AU_LOOKUP_FN(13) BR_AU_LOOKUP_FN(14) BR_AU_LOOKUP_FN(15)
-BR_AU_LOOKUP_FN(16) BR_AU_LOOKUP_FN(17) BR_AU_LOOKUP_FN(18) BR_AU_LOOKUP_FN(19)
-BR_AU_LOOKUP_FN(20) BR_AU_LOOKUP_FN(21) BR_AU_LOOKUP_FN(22) BR_AU_LOOKUP_FN(23)
-BR_AU_LOOKUP_FN(24) BR_AU_LOOKUP_FN(25) BR_AU_LOOKUP_FN(26) BR_AU_LOOKUP_FN(27)
-BR_AU_LOOKUP_FN(28) BR_AU_LOOKUP_FN(29) BR_AU_LOOKUP_FN(30) BR_AU_LOOKUP_FN(31)
+#define BR_AU_IFACE_LOOKUP_FN(n) \
+    static void *br_au_iface_lookup_##n(int16_t selector) { return br_au_iface_lookup_call(n, selector); }
+BR_AU_IFACE_LOOKUP_FN(0) BR_AU_IFACE_LOOKUP_FN(1) BR_AU_IFACE_LOOKUP_FN(2) BR_AU_IFACE_LOOKUP_FN(3)
+BR_AU_IFACE_LOOKUP_FN(4) BR_AU_IFACE_LOOKUP_FN(5) BR_AU_IFACE_LOOKUP_FN(6) BR_AU_IFACE_LOOKUP_FN(7)
+BR_AU_IFACE_LOOKUP_FN(8) BR_AU_IFACE_LOOKUP_FN(9) BR_AU_IFACE_LOOKUP_FN(10) BR_AU_IFACE_LOOKUP_FN(11)
+BR_AU_IFACE_LOOKUP_FN(12) BR_AU_IFACE_LOOKUP_FN(13) BR_AU_IFACE_LOOKUP_FN(14) BR_AU_IFACE_LOOKUP_FN(15)
+BR_AU_IFACE_LOOKUP_FN(16) BR_AU_IFACE_LOOKUP_FN(17) BR_AU_IFACE_LOOKUP_FN(18) BR_AU_IFACE_LOOKUP_FN(19)
+BR_AU_IFACE_LOOKUP_FN(20) BR_AU_IFACE_LOOKUP_FN(21) BR_AU_IFACE_LOOKUP_FN(22) BR_AU_IFACE_LOOKUP_FN(23)
+BR_AU_IFACE_LOOKUP_FN(24) BR_AU_IFACE_LOOKUP_FN(25) BR_AU_IFACE_LOOKUP_FN(26) BR_AU_IFACE_LOOKUP_FN(27)
+BR_AU_IFACE_LOOKUP_FN(28) BR_AU_IFACE_LOOKUP_FN(29) BR_AU_IFACE_LOOKUP_FN(30) BR_AU_IFACE_LOOKUP_FN(31)
+BR_AU_IFACE_LOOKUP_FN(32) BR_AU_IFACE_LOOKUP_FN(33) BR_AU_IFACE_LOOKUP_FN(34) BR_AU_IFACE_LOOKUP_FN(35)
+BR_AU_IFACE_LOOKUP_FN(36) BR_AU_IFACE_LOOKUP_FN(37) BR_AU_IFACE_LOOKUP_FN(38) BR_AU_IFACE_LOOKUP_FN(39)
+BR_AU_IFACE_LOOKUP_FN(40) BR_AU_IFACE_LOOKUP_FN(41) BR_AU_IFACE_LOOKUP_FN(42) BR_AU_IFACE_LOOKUP_FN(43)
+BR_AU_IFACE_LOOKUP_FN(44) BR_AU_IFACE_LOOKUP_FN(45) BR_AU_IFACE_LOOKUP_FN(46) BR_AU_IFACE_LOOKUP_FN(47)
+BR_AU_IFACE_LOOKUP_FN(48) BR_AU_IFACE_LOOKUP_FN(49) BR_AU_IFACE_LOOKUP_FN(50) BR_AU_IFACE_LOOKUP_FN(51)
+BR_AU_IFACE_LOOKUP_FN(52) BR_AU_IFACE_LOOKUP_FN(53) BR_AU_IFACE_LOOKUP_FN(54) BR_AU_IFACE_LOOKUP_FN(55)
+BR_AU_IFACE_LOOKUP_FN(56) BR_AU_IFACE_LOOKUP_FN(57) BR_AU_IFACE_LOOKUP_FN(58) BR_AU_IFACE_LOOKUP_FN(59)
+BR_AU_IFACE_LOOKUP_FN(60) BR_AU_IFACE_LOOKUP_FN(61) BR_AU_IFACE_LOOKUP_FN(62) BR_AU_IFACE_LOOKUP_FN(63)
 
-static void *(*const br_au_lookups[BR_AU_COMPONENT_SLOTS])(int16_t) = {
-    br_au_lookup_0, br_au_lookup_1, br_au_lookup_2, br_au_lookup_3,
-    br_au_lookup_4, br_au_lookup_5, br_au_lookup_6, br_au_lookup_7,
-    br_au_lookup_8, br_au_lookup_9, br_au_lookup_10, br_au_lookup_11,
-    br_au_lookup_12, br_au_lookup_13, br_au_lookup_14, br_au_lookup_15,
-    br_au_lookup_16, br_au_lookup_17, br_au_lookup_18, br_au_lookup_19,
-    br_au_lookup_20, br_au_lookup_21, br_au_lookup_22, br_au_lookup_23,
-    br_au_lookup_24, br_au_lookup_25, br_au_lookup_26, br_au_lookup_27,
-    br_au_lookup_28, br_au_lookup_29, br_au_lookup_30, br_au_lookup_31,
+static void *(*const br_au_iface_lookups[BR_AU_INTERFACE_SLOTS])(int16_t) = {
+    br_au_iface_lookup_0, br_au_iface_lookup_1, br_au_iface_lookup_2, br_au_iface_lookup_3,
+    br_au_iface_lookup_4, br_au_iface_lookup_5, br_au_iface_lookup_6, br_au_iface_lookup_7,
+    br_au_iface_lookup_8, br_au_iface_lookup_9, br_au_iface_lookup_10, br_au_iface_lookup_11,
+    br_au_iface_lookup_12, br_au_iface_lookup_13, br_au_iface_lookup_14, br_au_iface_lookup_15,
+    br_au_iface_lookup_16, br_au_iface_lookup_17, br_au_iface_lookup_18, br_au_iface_lookup_19,
+    br_au_iface_lookup_20, br_au_iface_lookup_21, br_au_iface_lookup_22, br_au_iface_lookup_23,
+    br_au_iface_lookup_24, br_au_iface_lookup_25, br_au_iface_lookup_26, br_au_iface_lookup_27,
+    br_au_iface_lookup_28, br_au_iface_lookup_29, br_au_iface_lookup_30, br_au_iface_lookup_31,
+    br_au_iface_lookup_32, br_au_iface_lookup_33, br_au_iface_lookup_34, br_au_iface_lookup_35,
+    br_au_iface_lookup_36, br_au_iface_lookup_37, br_au_iface_lookup_38, br_au_iface_lookup_39,
+    br_au_iface_lookup_40, br_au_iface_lookup_41, br_au_iface_lookup_42, br_au_iface_lookup_43,
+    br_au_iface_lookup_44, br_au_iface_lookup_45, br_au_iface_lookup_46, br_au_iface_lookup_47,
+    br_au_iface_lookup_48, br_au_iface_lookup_49, br_au_iface_lookup_50, br_au_iface_lookup_51,
+    br_au_iface_lookup_52, br_au_iface_lookup_53, br_au_iface_lookup_54, br_au_iface_lookup_55,
+    br_au_iface_lookup_56, br_au_iface_lookup_57, br_au_iface_lookup_58, br_au_iface_lookup_59,
+    br_au_iface_lookup_60, br_au_iface_lookup_61, br_au_iface_lookup_62, br_au_iface_lookup_63,
 };
+
+static int32_t br_au_open(void *self, void *instance)
+{
+    void *open = NULL;
+    pthread_mutex_lock(&br_au_lock);
+    for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
+        if (br_au_interfaces[i].used && br_au_interfaces[i].self == self) {
+            open = br_au_interfaces[i].open;
+            break;
+        }
+    pthread_mutex_unlock(&br_au_lock);
+    br_au_instance_add(instance);
+    if (!open)
+        return -1;
+    return ((int32_t (*)(void *, void *))open)(self, instance);
+}
+
+static int32_t br_au_close(void *self)
+{
+    void *close = NULL;
+    pthread_mutex_lock(&br_au_lock);
+    for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
+        if (br_au_interfaces[i].used && br_au_interfaces[i].self == self) {
+            close = br_au_interfaces[i].close;
+            break;
+        }
+    pthread_mutex_unlock(&br_au_lock);
+    if (!close)
+        return -1;
+    return ((int32_t (*)(void *))close)(self);
+}
 
 static void *br_au_factory(const void *desc)
 {
     const uint32_t *wanted = desc;
     int index = -1;
+    void *factory = NULL;
+    pthread_mutex_lock(&br_au_lock);
     for (int i = 0; i < BR_AU_COMPONENT_SLOTS; i++) {
         BrAuComponent *component = &br_au_components[i];
         if (component->used && memcmp(component->desc, wanted, sizeof component->desc) == 0) {
             index = i;
+            factory = component->factory;
             break;
         }
     }
-    if (index < 0)
+    pthread_mutex_unlock(&br_au_lock);
+    if (index < 0 || !factory)
         return NULL;
-    BrAuComponent *component = &br_au_components[index];
-    void *interface = ((void *(*)(const void *))component->factory)(desc);
+    void *interface = ((void *(*)(const void *))factory)(desc);
     if (!interface)
         return NULL;
-    uint64_t *words = interface;
-    if (!component->converted) {
-        uint64_t guest_lookup = words[2];
-        component->open = br_au_callback(words[0], "i(pp)");
-        component->close = br_au_callback(words[1], "i(p)");
-        component->lookup = br_au_callback(guest_lookup, "p(h)");
-        component->converted = 1;
+    pthread_mutex_lock(&br_au_lock);
+    int slot = -1;
+    for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
+        if (br_au_interfaces[i].used && br_au_interfaces[i].self == interface) {
+            slot = i;
+            break;
+        }
+    int fresh = slot < 0;
+    if (fresh)
+        for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
+            if (!br_au_interfaces[i].used) {
+                slot = i;
+                br_au_interfaces[i].used = 1;
+                break;
+            }
+    if (slot < 0) {
+        pthread_mutex_unlock(&br_au_lock);
+        fprintf(stderr, "ocerz: bridge: AudioComponentRegister: no plugin interface slot is left\n");
+        return NULL;
     }
-    words[0] = (uint64_t)(uintptr_t)component->open;
-    words[1] = (uint64_t)(uintptr_t)component->close;
-    words[2] = (uint64_t)(uintptr_t)br_au_lookups[index];
+    BrAuInterface *iface = &br_au_interfaces[slot];
+    iface->component = index;
+    iface->self = interface;
+    if (!iface->converted) {
+        uint64_t *words = interface;
+        iface->open = br_au_callback(words[0], "i(pp)");
+        iface->close = br_au_callback(words[1], "i(p)");
+        iface->lookup = br_au_callback(words[2], "p(h)");
+        iface->converted = 1;
+    }
+    uint64_t *words = interface;
+    words[0] = (uint64_t)(uintptr_t)br_au_open;
+    words[1] = (uint64_t)(uintptr_t)br_au_close;
+    words[2] = (uint64_t)(uintptr_t)br_au_iface_lookups[slot];
+    pthread_mutex_unlock(&br_au_lock);
     return interface;
 }
 
@@ -2677,29 +2811,31 @@ static int br_audio_component_register(struct OcerzVM *vm, OcerzCPU *cpu)
     uint64_t guest_desc = cpu->gpr[OCERZ_RDI], guest_name = cpu->gpr[OCERZ_RSI];
     uint32_t version = (uint32_t)cpu->gpr[OCERZ_RDX];
     uint64_t guest_factory = cpu->gpr[OCERZ_RCX];
+    uint32_t desc[5];
+    if (!guest_desc)
+        return br_answer(vm, cpu, 0);
+    memcpy(desc, ocerz_g2h(guest_desc), sizeof desc);
     BrAuComponent *component = NULL;
+    uint64_t slot = 0;
+    pthread_mutex_lock(&br_au_lock);
     for (int i = 0; i < BR_AU_COMPONENT_SLOTS; i++)
         if (!br_au_components[i].used) {
             component = &br_au_components[i];
             break;
         }
-    if (!component || !guest_factory || !ocerz_abi_is_guest_code(guest_factory)) {
+    if (component && guest_factory && ocerz_abi_is_guest_code(guest_factory) &&
+        ocerz_abi_callback_convert(guest_factory, "p(p)", &slot) == OCERZ_OK && slot) {
+        memcpy(component->desc, desc, sizeof component->desc);
+        component->used = 1;
+        component->factory = ocerz_g2h(slot);
+    } else {
+        component = NULL;
+    }
+    pthread_mutex_unlock(&br_au_lock);
+    if (!component) {
         fprintf(stderr, "ocerz: bridge: _AudioComponentRegister: no guest component slot or factory is left\n");
         return br_answer(vm, cpu, 0);
     }
-    const uint32_t *desc = ocerz_g2h(guest_desc);
-    memcpy(component->desc, desc, sizeof component->desc);
-    uint64_t slot = 0;
-    if (ocerz_abi_callback_convert(guest_factory, "p(p)", &slot) != OCERZ_OK || !slot) {
-        fprintf(stderr, "ocerz: bridge: _AudioComponentRegister: no callback slot is left for the factory\n");
-        return br_answer(vm, cpu, 0);
-    }
-    component->used = 1;
-    component->factory = ocerz_g2h(slot);
-    component->open = NULL;
-    component->close = NULL;
-    component->lookup = NULL;
-    component->converted = 0;
     void *name = guest_name ? ocerz_g2h(guest_name) : NULL;
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, BR_AUDIO_TOOLBOX, "_AudioComponentRegister", "p(pPup)", f);
@@ -2707,12 +2843,10 @@ static int br_audio_component_register(struct OcerzVM *vm, OcerzCPU *cpu)
         component->desc, name, version, br_au_factory);
     ocerz_bridge_lower(&outer);
     if (!registered) {
+        pthread_mutex_lock(&br_au_lock);
         component->used = 0;
         component->factory = NULL;
-        component->open = NULL;
-        component->close = NULL;
-        component->lookup = NULL;
-        component->converted = 0;
+        pthread_mutex_unlock(&br_au_lock);
     }
     return br_answer(vm, cpu, registered ? ocerz_h2g(registered) : 0);
 }
