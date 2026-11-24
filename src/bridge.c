@@ -2516,26 +2516,62 @@ static int br_cm_block_buffer_create_contiguous(struct OcerzVM *vm, OcerzCPU *cp
 #define BR_AU_SET_INPUT_CALLBACK 2005
 
 #define BR_AU_INSTANCE_SLOTS 128
-static void *br_au_instances[BR_AU_INSTANCE_SLOTS];
+typedef struct {
+    int used;
+    void *instance;
+    void *self;
+    uint64_t sequence;
+} BrAuInstance;
+static BrAuInstance br_au_instances[BR_AU_INSTANCE_SLOTS];
+static uint64_t br_au_instance_sequence;
 static pthread_mutex_t br_au_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void br_au_instance_add(void *host)
+static void br_au_instance_add_locked(void *host, void *self)
 {
     if (!host)
         return;
-    pthread_mutex_lock(&br_au_lock);
-    int found = 0, free_slot = -1;
+    int free_slot = -1;
     for (int i = 0; i < BR_AU_INSTANCE_SLOTS; i++) {
-        if (br_au_instances[i] == host) {
-            found = 1;
-            break;
+        if (br_au_instances[i].used && br_au_instances[i].instance == host) {
+            br_au_instances[i].self = self;
+            br_au_instances[i].sequence = ++br_au_instance_sequence;
+            return;
         }
-        if (!br_au_instances[i] && free_slot < 0)
+        if (!br_au_instances[i].used && free_slot < 0)
             free_slot = i;
     }
-    if (!found && free_slot >= 0)
-        br_au_instances[free_slot] = host;
-    pthread_mutex_unlock(&br_au_lock);
+    if (free_slot >= 0) {
+        br_au_instances[free_slot].used = 1;
+        br_au_instances[free_slot].instance = host;
+        br_au_instances[free_slot].self = self;
+        br_au_instances[free_slot].sequence = ++br_au_instance_sequence;
+    }
+}
+
+static void br_au_instance_remove_locked(void *host)
+{
+    for (int i = 0; i < BR_AU_INSTANCE_SLOTS; i++)
+        if (br_au_instances[i].used && br_au_instances[i].instance == host) {
+            br_au_instances[i].used = 0;
+            br_au_instances[i].instance = NULL;
+            br_au_instances[i].self = NULL;
+            br_au_instances[i].sequence = 0;
+        }
+}
+
+static void br_au_instance_remove_latest_locked(void *self)
+{
+    int latest = -1;
+    for (int i = 0; i < BR_AU_INSTANCE_SLOTS; i++)
+        if (br_au_instances[i].used && br_au_instances[i].self == self &&
+            (latest < 0 || br_au_instances[i].sequence > br_au_instances[latest].sequence))
+            latest = i;
+    if (latest >= 0) {
+        br_au_instances[latest].used = 0;
+        br_au_instances[latest].instance = NULL;
+        br_au_instances[latest].self = NULL;
+        br_au_instances[latest].sequence = 0;
+    }
 }
 
 static int br_au_instance_is_guest(void *host)
@@ -2544,7 +2580,7 @@ static int br_au_instance_is_guest(void *host)
     if (host) {
         pthread_mutex_lock(&br_au_lock);
         for (int i = 0; i < BR_AU_INSTANCE_SLOTS; i++)
-            if (br_au_instances[i] == host) {
+            if (br_au_instances[i].used && br_au_instances[i].instance == host) {
                 found = 1;
                 break;
             }
@@ -2614,10 +2650,14 @@ typedef struct {
     int used;
     int converted;
     int component;
+    int instances;
     void *self;
     void *open;
     void *close;
     void *lookup;
+    uint64_t guest_open;
+    uint64_t guest_close;
+    uint64_t guest_lookup;
 } BrAuInterface;
 
 static BrAuComponent br_au_components[BR_AU_COMPONENT_SLOTS];
@@ -2710,32 +2750,75 @@ static void *(*const br_au_iface_lookups[BR_AU_INTERFACE_SLOTS])(int16_t) = {
 static int32_t br_au_open(void *self, void *instance)
 {
     void *open = NULL;
+    int slot = -1;
     pthread_mutex_lock(&br_au_lock);
     for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
         if (br_au_interfaces[i].used && br_au_interfaces[i].self == self) {
+            slot = i;
             open = br_au_interfaces[i].open;
             break;
         }
+    if (open) {
+        br_au_interfaces[slot].instances++;
+        br_au_instance_add_locked(instance, self);
+    }
     pthread_mutex_unlock(&br_au_lock);
-    br_au_instance_add(instance);
     if (!open)
         return -1;
-    return ((int32_t (*)(void *, void *))open)(self, instance);
+    int32_t st = ((int32_t (*)(void *, void *))open)(self, instance);
+    if (st) {
+        pthread_mutex_lock(&br_au_lock);
+        br_au_instance_remove_locked(instance);
+        if (slot >= 0 && br_au_interfaces[slot].used && br_au_interfaces[slot].self == self &&
+            br_au_interfaces[slot].instances > 0)
+            br_au_interfaces[slot].instances--;
+        pthread_mutex_unlock(&br_au_lock);
+    }
+    return st;
+}
+
+static void br_au_interface_release_locked(int slot)
+{
+    BrAuInterface *iface = &br_au_interfaces[slot];
+    if (iface->self) {
+        uint64_t *words = (uint64_t *)iface->self;
+        words[0] = iface->guest_open;
+        words[1] = iface->guest_close;
+        words[2] = iface->guest_lookup;
+    }
+    memset(iface, 0, sizeof *iface);
 }
 
 static int32_t br_au_close(void *self)
 {
     void *close = NULL;
+    int slot = -1, release = 0;
     pthread_mutex_lock(&br_au_lock);
     for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
         if (br_au_interfaces[i].used && br_au_interfaces[i].self == self) {
-            close = br_au_interfaces[i].close;
+            slot = i;
             break;
         }
+    if (slot >= 0) {
+        BrAuInterface *iface = &br_au_interfaces[slot];
+        close = iface->close;
+        br_au_instance_remove_latest_locked(self);
+        if (iface->instances > 0)
+            iface->instances--;
+        release = iface->instances == 0;
+    }
     pthread_mutex_unlock(&br_au_lock);
-    if (!close)
-        return -1;
-    return ((int32_t (*)(void *))close)(self);
+    int32_t st = -1;
+    if (close)
+        st = ((int32_t (*)(void *))close)(self);
+    if (release) {
+        pthread_mutex_lock(&br_au_lock);
+        if (slot >= 0 && slot < BR_AU_INTERFACE_SLOTS && br_au_interfaces[slot].used &&
+            br_au_interfaces[slot].self == self && br_au_interfaces[slot].instances == 0)
+            br_au_interface_release_locked(slot);
+        pthread_mutex_unlock(&br_au_lock);
+    }
+    return st;
 }
 
 static void *br_au_factory(const void *desc)
@@ -2759,30 +2842,36 @@ static void *br_au_factory(const void *desc)
     if (!interface)
         return NULL;
     pthread_mutex_lock(&br_au_lock);
-    int slot = -1;
+    int slot = -1, fresh = 0;
     for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
         if (br_au_interfaces[i].used && br_au_interfaces[i].self == interface) {
             slot = i;
             break;
         }
-    int fresh = slot < 0;
-    if (fresh)
+    if (slot < 0) {
+        fresh = 1;
         for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
             if (!br_au_interfaces[i].used) {
                 slot = i;
-                br_au_interfaces[i].used = 1;
                 break;
             }
+    }
     if (slot < 0) {
         pthread_mutex_unlock(&br_au_lock);
         fprintf(stderr, "ocerz: bridge: AudioComponentRegister: no plugin interface slot is left\n");
         return NULL;
     }
     BrAuInterface *iface = &br_au_interfaces[slot];
+    if (fresh)
+        memset(iface, 0, sizeof *iface);
+    iface->used = 1;
     iface->component = index;
     iface->self = interface;
     if (!iface->converted) {
         uint64_t *words = interface;
+        iface->guest_open = words[0];
+        iface->guest_close = words[1];
+        iface->guest_lookup = words[2];
         iface->open = br_au_callback(words[0], "i(pp)");
         iface->close = br_au_callback(words[1], "i(p)");
         iface->lookup = br_au_callback(words[2], "p(h)");

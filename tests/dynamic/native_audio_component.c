@@ -135,16 +135,23 @@ static AudioComponentMethod au_lookup(SInt16 selector)
 }
 
 static AudioComponentPlugInInterface interface = { au_open, au_close, au_lookup, NULL };
+static AudioComponentPlugInInterface cleanup_interfaces[130];
+static int factory_calls;
 
 static AudioComponentPlugInInterface *factory(const AudioComponentDescription *desc)
 {
     (void)desc;
-    return &interface;
+    int call = factory_calls++;
+    if (call < 2)
+        return &interface;
+    return &cleanup_interfaces[2 + (call - 2) % 128];
 }
 
 int main(void)
 {
     AudioComponentDescription desc = { 'augn', 'ocez', 'ocez', kAudioComponentFlag_SandboxSafe, 0 };
+    for (unsigned i = 0; i < sizeof cleanup_interfaces / sizeof cleanup_interfaces[0]; i++)
+        cleanup_interfaces[i] = (AudioComponentPlugInInterface){ au_open, au_close, au_lookup, NULL };
     AudioComponent registered = AudioComponentRegister(&desc, CFSTR("Ocerz Probe"), 0x00010000, factory);
     AudioComponent found = registered ? AudioComponentFindNext(NULL, &desc) : NULL;
     UInt32 count = registered ? AudioComponentCount(&desc) : 0;
@@ -205,6 +212,14 @@ int main(void)
     OSStatus dispose2 = second ? AudioComponentInstanceDispose(second) : -1;
     OSStatus uninitialize = unit ? AudioUnitUninitialize(unit) : -1;
     OSStatus dispose = unit ? AudioComponentInstanceDispose(unit) : -1;
+    int cycles = 0;
+    for (int i = 0; i < 70; i++) {
+        AudioComponentInstance tmp = NULL;
+        OSStatus inst = component ? AudioComponentInstanceNew(component, &tmp) : -1;
+        OSStatus disp = tmp ? AudioComponentInstanceDispose(tmp) : -1;
+        if (inst == noErr && disp == noErr)
+            cycles++;
+    }
     printf("component register=%d find=%d count=%u instance=%d open=%d close=%d\n",
            registered != NULL, found != NULL, count, (int)instance, opens, closes);
     printf("property set=%d info=%d size=%u writable=%d get=%d same=%d init=%d uninit=%d\n",
@@ -214,11 +229,12 @@ int main(void)
     printf("render status=%d renders=%d frames=%u bytes=%u filled=%d dispose=%d\n",
            (int)render, renders, frames, buffers.mBuffers[0].mDataByteSize, filled, (int)dispose);
     printf("input set=%d calls=%d\n", (int)set_callback, input_calls);
+    printf("cleanup cycles=%d\n", cycles);
     printf("again instance=%d init=%d uninit=%d dispose=%d\n", (int)instance2, (int)initialize2,
            (int)uninitialize2, (int)dispose2);
     printf("methods init=%d uninit=%d get=%d getinfo=%d set=%d\n", inits, uninits, getprops, getinfos, sets);
     return instance == noErr && instance2 == noErr && set_format == noErr && info == noErr && get == noErr &&
-           initialize == noErr && initialize2 == noErr && set_callback == noErr && input_calls == 1 &&
+           initialize == noErr && initialize2 == noErr && set_callback == noErr && input_calls == 1 && cycles == 70 &&
            render == noErr && uninitialize == noErr &&
            uninitialize2 == noErr && dispose == noErr && dispose2 == noErr ? 0 : 1;
 }
