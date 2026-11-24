@@ -9,7 +9,7 @@
  * own that is otherwise valid, and each refusal is asserted to be NULL and to
  * say exactly path:line: and the rule, so a parser that refuses for the wrong
  * reason, or names the wrong line, fails as surely as one that accepts.  The
- * committed interim database is parsed the same way, so a hand edit that
+ * committed databases are parsed the same way, so a hand edit that
  * breaks a rule is caught here rather than as a guest that binds nothing.
  *
  * The second half is the part that happens once per process: the choice of
@@ -352,6 +352,10 @@ static void test_committed(void)
         { "runtime/apis/macos/27.0/libSystem.B.dylib.api", "/usr/lib/libSystem.B.dylib" },
         { "runtime/apis/macos/27.0/CoreFoundation.api",
           "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation" },
+        { "runtime/apis/macos/27.0/ExceptionHandling.api",
+          "/System/Library/Frameworks/ExceptionHandling.framework/Versions/A/ExceptionHandling" },
+        { "runtime/apis/macos/27.0/LatentSemanticMapping.api",
+          "/System/Library/Frameworks/LatentSemanticMapping.framework/Versions/A/LatentSemanticMapping" },
     };
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
         size_t len = 0;

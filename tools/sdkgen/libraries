@@ -54,6 +54,10 @@ library Foundation /System/Library/Frameworks/Foundation.framework/Versions/C/Fo
 language objective-c
 pass Foundation.h
 
+library ExceptionHandling /System/Library/Frameworks/ExceptionHandling.framework/Versions/A/ExceptionHandling System/Library/Frameworks/ExceptionHandling.framework/ExceptionHandling.tbd
+language objective-c
+pass ExceptionHandling.h
+
 library CoreGraphics /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics System/Library/Frameworks/CoreGraphics.framework/CoreGraphics.tbd
 pass CoreGraphics.h
 
@@ -671,6 +675,9 @@ pass AutomaticAssessmentConfiguration.h
 
 library DVDPlayback /System/Library/Frameworks/DVDPlayback.framework/Versions/A/DVDPlayback System/Library/Frameworks/DVDPlayback.framework/DVDPlayback.tbd
 pass DVDPlayback.h
+
+library LatentSemanticMapping /System/Library/Frameworks/LatentSemanticMapping.framework/Versions/A/LatentSemanticMapping System/Library/Frameworks/LatentSemanticMapping.framework/LatentSemanticMapping.tbd
+pass LatentSemanticMapping.h
 
 library libsbuf /usr/lib/libsbuf.dylib usr/lib/libsbuf.tbd
 pass libsbuf.h
