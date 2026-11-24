@@ -364,6 +364,16 @@ static void test_committed(void)
           "/System/Library/Frameworks/MLCompute.framework/Versions/A/MLCompute" },
         { "runtime/apis/macos/27.0/ParavirtualizedGraphics.api",
           "/System/Library/Frameworks/ParavirtualizedGraphics.framework/Versions/A/ParavirtualizedGraphics" },
+        { "runtime/apis/macos/27.0/ReplayKit.api",
+          "/System/Library/Frameworks/ReplayKit.framework/Versions/A/ReplayKit" },
+        { "runtime/apis/macos/27.0/GameplayKit.api",
+          "/System/Library/Frameworks/GameplayKit.framework/Versions/A/GameplayKit" },
+        { "runtime/apis/macos/27.0/InputMethodKit.api",
+          "/System/Library/Frameworks/InputMethodKit.framework/Versions/A/InputMethodKit" },
+        { "runtime/apis/macos/27.0/SyncServices.api",
+          "/System/Library/Frameworks/SyncServices.framework/Versions/A/SyncServices" },
+        { "runtime/apis/macos/27.0/libpcap.A.dylib.api", "/usr/lib/libpcap.A.dylib" },
+        { "runtime/apis/macos/27.0/libffi.dylib.api", "/usr/lib/libffi.dylib" },
     };
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
         size_t len = 0;
