@@ -1643,6 +1643,18 @@ library /System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit
 
 special _AudioUnitSetProperty audio_unit_set_property
 
+# AudioComponentRegister's factory returns a table of guest functions, which
+# the generic callback converter cannot carry; its handler builds the host
+# table and converts each method when Lookup asks for it (src/bridge.c).
+
+library /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
+
+special _AudioComponentRegister audio_component_register
+
+library /System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit
+
+special _AudioComponentRegister audio_component_register
+
 # compiler-rt's complex arithmetic and powi builtins, which no SDK header
 # declares (Unity 2019's libmonobdwgc imports __divdc3).  A _Complex double
 # comes back in xmm0/xmm1 on x86_64 and d0/d1 on arm64, as a {dd} structure

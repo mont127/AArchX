@@ -2553,6 +2553,170 @@ static int br_audio_unit_set_property(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_answer(vm, cpu, (uint64_t)(int64_t)st);
 }
 
+#define BR_AU_COMPONENT_SLOTS 32
+
+typedef struct {
+    int used;
+    uint32_t desc[5];
+    void *factory;
+    void *open;
+    void *close;
+    void *lookup;
+    int converted;
+} BrAuComponent;
+
+static BrAuComponent br_au_components[BR_AU_COMPONENT_SLOTS];
+
+static void *br_au_callback(uint64_t guest_fn, const char *notation)
+{
+    if (!guest_fn)
+        return NULL;
+    uint64_t slot = 0;
+    if (ocerz_abi_callback_convert(guest_fn, notation, &slot) != OCERZ_OK || !slot) {
+        fprintf(stderr, "ocerz: bridge: AudioComponentRegister: no callback slot is left for %s\n", notation);
+        return NULL;
+    }
+    return ocerz_g2h(slot);
+}
+
+static const char *br_au_method_sig(int selector)
+{
+    switch (selector) {
+    case 1: return "i(p)";
+    case 2: return "i(p)";
+    case 3: return "i(puuupp)";
+    case 4: return "i(puuupp)";
+    case 5: return "i(puuupu)";
+    case 6: return "i(puuup)";
+    case 7: return "i(puuufu)";
+    case 9: return "i(puu)";
+    case 14: return "i(pppuup)";
+    case 20: return "i(pppup)";
+    default: return NULL;
+    }
+}
+
+static void *br_au_lookup_call(int index, int16_t selector)
+{
+    BrAuComponent *component = &br_au_components[index];
+    if (!component->used || !component->lookup)
+        return NULL;
+    void *returned = ((void *(*)(int16_t))component->lookup)(selector);
+    uint64_t guest_fn = returned ? ocerz_h2g(returned) : 0;
+    if (!guest_fn)
+        return NULL;
+    const char *sig = br_au_method_sig(selector);
+    return sig ? br_au_callback(guest_fn, sig) : NULL;
+}
+
+#define BR_AU_LOOKUP_FN(n) \
+    static void *br_au_lookup_##n(int16_t selector) { return br_au_lookup_call(n, selector); }
+BR_AU_LOOKUP_FN(0) BR_AU_LOOKUP_FN(1) BR_AU_LOOKUP_FN(2) BR_AU_LOOKUP_FN(3)
+BR_AU_LOOKUP_FN(4) BR_AU_LOOKUP_FN(5) BR_AU_LOOKUP_FN(6) BR_AU_LOOKUP_FN(7)
+BR_AU_LOOKUP_FN(8) BR_AU_LOOKUP_FN(9) BR_AU_LOOKUP_FN(10) BR_AU_LOOKUP_FN(11)
+BR_AU_LOOKUP_FN(12) BR_AU_LOOKUP_FN(13) BR_AU_LOOKUP_FN(14) BR_AU_LOOKUP_FN(15)
+BR_AU_LOOKUP_FN(16) BR_AU_LOOKUP_FN(17) BR_AU_LOOKUP_FN(18) BR_AU_LOOKUP_FN(19)
+BR_AU_LOOKUP_FN(20) BR_AU_LOOKUP_FN(21) BR_AU_LOOKUP_FN(22) BR_AU_LOOKUP_FN(23)
+BR_AU_LOOKUP_FN(24) BR_AU_LOOKUP_FN(25) BR_AU_LOOKUP_FN(26) BR_AU_LOOKUP_FN(27)
+BR_AU_LOOKUP_FN(28) BR_AU_LOOKUP_FN(29) BR_AU_LOOKUP_FN(30) BR_AU_LOOKUP_FN(31)
+
+static void *(*const br_au_lookups[BR_AU_COMPONENT_SLOTS])(int16_t) = {
+    br_au_lookup_0, br_au_lookup_1, br_au_lookup_2, br_au_lookup_3,
+    br_au_lookup_4, br_au_lookup_5, br_au_lookup_6, br_au_lookup_7,
+    br_au_lookup_8, br_au_lookup_9, br_au_lookup_10, br_au_lookup_11,
+    br_au_lookup_12, br_au_lookup_13, br_au_lookup_14, br_au_lookup_15,
+    br_au_lookup_16, br_au_lookup_17, br_au_lookup_18, br_au_lookup_19,
+    br_au_lookup_20, br_au_lookup_21, br_au_lookup_22, br_au_lookup_23,
+    br_au_lookup_24, br_au_lookup_25, br_au_lookup_26, br_au_lookup_27,
+    br_au_lookup_28, br_au_lookup_29, br_au_lookup_30, br_au_lookup_31,
+};
+
+static void *br_au_factory(const void *desc)
+{
+    const uint32_t *wanted = desc;
+    int index = -1;
+    for (int i = 0; i < BR_AU_COMPONENT_SLOTS; i++) {
+        BrAuComponent *component = &br_au_components[i];
+        if (component->used && memcmp(component->desc, wanted, sizeof component->desc) == 0) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0)
+        return NULL;
+    BrAuComponent *component = &br_au_components[index];
+    void *interface = ((void *(*)(const void *))component->factory)(desc);
+    if (!interface)
+        return NULL;
+    uint64_t *words = interface;
+    if (!component->converted) {
+        uint64_t guest_lookup = words[2];
+        component->open = br_au_callback(words[0], "i(pp)");
+        component->close = br_au_callback(words[1], "i(p)");
+        component->lookup = br_au_callback(guest_lookup, "p(h)");
+        component->converted = 1;
+    }
+    words[0] = (uint64_t)(uintptr_t)component->open;
+    words[1] = (uint64_t)(uintptr_t)component->close;
+    words[2] = (uint64_t)(uintptr_t)br_au_lookups[index];
+    return interface;
+}
+
+static int br_audio_component_register(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic fn;
+    void *f = atomic_load(&fn);
+    if (!f) {
+        f = ocerz_bridge_host_symbol(BR_AUDIO_TOOLBOX, "AudioComponentRegister");
+        if (!f) {
+            fprintf(stderr, "ocerz: bridge: _AudioComponentRegister has no host symbol\n");
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        atomic_store(&fn, f);
+    }
+    uint64_t guest_desc = cpu->gpr[OCERZ_RDI], guest_name = cpu->gpr[OCERZ_RSI];
+    uint32_t version = (uint32_t)cpu->gpr[OCERZ_RDX];
+    uint64_t guest_factory = cpu->gpr[OCERZ_RCX];
+    BrAuComponent *component = NULL;
+    for (int i = 0; i < BR_AU_COMPONENT_SLOTS; i++)
+        if (!br_au_components[i].used) {
+            component = &br_au_components[i];
+            break;
+        }
+    if (!component || !guest_factory || !ocerz_abi_is_guest_code(guest_factory)) {
+        fprintf(stderr, "ocerz: bridge: _AudioComponentRegister: no guest component slot or factory is left\n");
+        return br_answer(vm, cpu, 0);
+    }
+    const uint32_t *desc = ocerz_g2h(guest_desc);
+    memcpy(component->desc, desc, sizeof component->desc);
+    uint64_t slot = 0;
+    if (ocerz_abi_callback_convert(guest_factory, "p(p)", &slot) != OCERZ_OK || !slot) {
+        fprintf(stderr, "ocerz: bridge: _AudioComponentRegister: no callback slot is left for the factory\n");
+        return br_answer(vm, cpu, 0);
+    }
+    component->used = 1;
+    component->factory = ocerz_g2h(slot);
+    component->open = NULL;
+    component->close = NULL;
+    component->lookup = NULL;
+    component->converted = 0;
+    void *name = guest_name ? ocerz_g2h(guest_name) : NULL;
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_AUDIO_TOOLBOX, "_AudioComponentRegister", "p(pPup)", f);
+    void *registered = ((void *(*)(const void *, void *, uint32_t, void *))f)(
+        component->desc, name, version, br_au_factory);
+    ocerz_bridge_lower(&outer);
+    if (!registered) {
+        component->used = 0;
+        component->factory = NULL;
+        component->open = NULL;
+        component->close = NULL;
+        component->lookup = NULL;
+        component->converted = 0;
+    }
+    return br_answer(vm, cpu, registered ? ocerz_h2g(registered) : 0);
+}
+
 static int br_vt_decompression_session_create(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     static void *_Atomic fn;
@@ -2970,6 +3134,7 @@ static const BrHandler g_br_handlers[] = {
     { "ulock_wait2",     br_ulock_wait2 },
     { "malloc_zone_statistics", br_malloc_zone_statistics },
     { "audio_unit_set_property", br_audio_unit_set_property },
+    { "audio_component_register", br_audio_component_register },
     { "readv",           br_readv },
     { "writev",          br_writev },
     { "preadv",          br_preadv },
