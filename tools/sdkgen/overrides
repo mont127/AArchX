@@ -16,6 +16,11 @@
 # record that matches nothing in its library stops the generator, so a name
 # that leaves the SDK is noticed rather than kept.
 #
+# AudioComponentRegister is special in AudioToolbox and AudioUnit: its factory
+# returns a table of guest functions the generic converter cannot carry, so the
+# handler builds the host table and converts each selector's method when Lookup
+# asks for it (src/bridge.c).
+#
 # inplace <export> <argpos> <offset> <signature> is for a structure the guest
 # owns and the native function works in, a compression stream above all: zlib
 # reads its input and writes its progress in the z_stream the caller holds, so
@@ -1642,6 +1647,14 @@ special _AudioUnitSetProperty audio_unit_set_property
 library /System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit
 
 special _AudioUnitSetProperty audio_unit_set_property
+
+library /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
+
+special _AudioComponentRegister audio_component_register
+
+library /System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit
+
+special _AudioComponentRegister audio_component_register
 
 # compiler-rt's complex arithmetic and powi builtins, which no SDK header
 # declares (Unity 2019's libmonobdwgc imports __divdc3).  A _Complex double

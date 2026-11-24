@@ -44,6 +44,8 @@ for arch in x86_64 arm64; do
         -framework Accelerate -framework Security -o "$work/lapack_asn1.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_audio.c -framework CoreAudio \
         -framework AudioUnit -framework AudioToolbox -o "$work/audio.$arch"
+    clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_audio_component.c -framework AudioToolbox \
+        -framework AudioUnit -framework CoreFoundation -o "$work/audio_component.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_videotoolbox.c -framework CoreMedia \
         -framework CoreVideo -framework VideoToolbox -framework CoreFoundation -o "$work/videotoolbox.$arch"
     clang -arch "$arch" -O1 -Wall -Wextra -Werror tests/dynamic/native_sqlite.c -lsqlite3 -o "$work/sqlite.$arch"
@@ -95,6 +97,7 @@ sed 's/compat\.arm64/compat/' "$work/compat.arm.err" > "$work/compat.expected.er
 "$work/callback_structs.arm64" > "$work/callback_structs.expected"
 "$work/lapack_asn1.arm64" > "$work/lapack_asn1.expected"
 "$work/audio.arm64" > "$work/audio.expected"
+"$work/audio_component.arm64" > "$work/audio_component.expected"
 "$work/videotoolbox.arm64" > "$work/videotoolbox.expected"
 "$work/sqlite.arm64" > "$work/sqlite.expected"
 "$work/curl.arm64" > "$work/curl.expected"
@@ -164,6 +167,11 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/audio.x86_64" > "$work/audio.$engine.out" 2> "$work/audio.$engine.err"
     cmp "$work/audio.expected" "$work/audio.$engine.out"
     echo "PASS native audio device IOProcs, IO blocks and output unit render callbacks $engine"
+    env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
+        "${args[@]}" "$work/audio_component.x86_64" > "$work/audio_component.$engine.out" \
+        2> "$work/audio_component.$engine.err"
+    cmp "$work/audio_component.expected" "$work/audio_component.$engine.out"
+    echo "PASS native AudioComponent registration, discovery, properties and render $engine"
     env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 60; exec @ARGV' "$repo/ocerz" \
         "${args[@]}" "$work/videotoolbox.x86_64" > "$work/videotoolbox.$engine.out" 2> "$work/videotoolbox.$engine.err"
     cmp "$work/videotoolbox.expected" "$work/videotoolbox.$engine.out"
