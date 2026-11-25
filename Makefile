@@ -191,7 +191,7 @@ native-formats: ocerz
 native-swift: ocerz
 	bash tests/run_native_swift_tests.sh
 
-native-swift-overlays: ocerz
+native-swift-overlays: ocerz apis
 	bash tests/run_native_swift_overlay_tests.sh
 
 diff32:

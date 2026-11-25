@@ -4,15 +4,15 @@
 # Xcode carries them under the Swift 5 compatibility directory as standalone
 # Mach-O files; their @rpath install names are rewritten to /usr/lib/swift so
 # native_guest_path can supply them in place of the shared-cache images.
+# libswiftDispatch is the first overlay with a working guest closure here: its
+# Swift dependencies are libswiftCore (from tools/install_guest_swift.sh) and
+# the Darwin/ObjectiveC overlays copied below.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 repo=$PWD
 developer_dir=${DEVELOPER_DIR:-$(xcode-select -p)}
 overlays="$developer_dir/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/macosx"
 dest=${1:-"$repo/runtime/guest"}
-# libswiftDispatch is the first overlay with a working guest closure here: its
-# Swift dependencies are libswiftCore (from tools/install_guest_swift.sh) and
-# the Darwin/ObjectiveC overlays below.
 libs="libswiftDispatch libswiftDarwin libswiftObjectiveC"
 mkdir -p "$dest/usr/lib/swift"
 dest=$(cd "$dest" && pwd -P)
