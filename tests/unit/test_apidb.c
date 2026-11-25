@@ -356,6 +356,14 @@ static void test_committed(void)
           "/System/Library/Frameworks/ExceptionHandling.framework/Versions/A/ExceptionHandling" },
         { "runtime/apis/macos/27.0/LatentSemanticMapping.api",
           "/System/Library/Frameworks/LatentSemanticMapping.framework/Versions/A/LatentSemanticMapping" },
+        { "runtime/apis/macos/27.0/GLKit.api",
+          "/System/Library/Frameworks/GLKit.framework/Versions/A/GLKit" },
+        { "runtime/apis/macos/27.0/ICADevices.api",
+          "/System/Library/Frameworks/ICADevices.framework/Versions/A/ICADevices" },
+        { "runtime/apis/macos/27.0/MLCompute.api",
+          "/System/Library/Frameworks/MLCompute.framework/Versions/A/MLCompute" },
+        { "runtime/apis/macos/27.0/ParavirtualizedGraphics.api",
+          "/System/Library/Frameworks/ParavirtualizedGraphics.framework/Versions/A/ParavirtualizedGraphics" },
     };
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
         size_t len = 0;

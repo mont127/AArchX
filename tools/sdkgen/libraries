@@ -181,6 +181,10 @@ pass OpenAL.h
 library GLUT /System/Library/Frameworks/GLUT.framework/Versions/A/GLUT System/Library/Frameworks/GLUT.framework/GLUT.tbd
 pass GLUT.h
 
+library GLKit /System/Library/Frameworks/GLKit.framework/Versions/A/GLKit System/Library/Frameworks/GLKit.framework/GLKit.tbd
+language objective-c
+pass GLKit.h
+
 library IOBluetooth /System/Library/Frameworks/IOBluetooth.framework/Versions/A/IOBluetooth System/Library/Frameworks/IOBluetooth.framework/IOBluetooth.tbd
 language objective-c
 pass IOBluetooth.h
@@ -217,6 +221,10 @@ library CoreML /System/Library/Frameworks/CoreML.framework/Versions/A/CoreML Sys
 language objective-c
 pass CoreML.h
 
+library MLCompute /System/Library/Frameworks/MLCompute.framework/Versions/A/MLCompute System/Library/Frameworks/MLCompute.framework/MLCompute.tbd
+language objective-c
+pass MLCompute.h
+
 library CoreWLAN /System/Library/Frameworks/CoreWLAN.framework/Versions/A/CoreWLAN System/Library/Frameworks/CoreWLAN.framework/CoreWLAN.tbd
 language objective-c
 pass CoreWLAN.h
@@ -228,6 +236,9 @@ pass CryptoTokenKit.h
 library ImageCaptureCore /System/Library/Frameworks/ImageCaptureCore.framework/Versions/A/ImageCaptureCore System/Library/Frameworks/ImageCaptureCore.framework/ImageCaptureCore.tbd
 language objective-c
 pass ImageCaptureCore.h
+
+library ICADevices /System/Library/Frameworks/ICADevices.framework/Versions/A/ICADevices System/Library/Frameworks/ICADevices.framework/ICADevices.tbd
+pass ICADevices.h
 
 library LocalAuthentication /System/Library/Frameworks/LocalAuthentication.framework/Versions/A/LocalAuthentication System/Library/Frameworks/LocalAuthentication.framework/LocalAuthentication.tbd
 language objective-c
@@ -624,6 +635,10 @@ pass OSLog.h
 
 library vmnet /System/Library/Frameworks/vmnet.framework/Versions/A/vmnet System/Library/Frameworks/vmnet.framework/vmnet.tbd
 pass vmnet.h
+
+library ParavirtualizedGraphics /System/Library/Frameworks/ParavirtualizedGraphics.framework/Versions/A/ParavirtualizedGraphics System/Library/Frameworks/ParavirtualizedGraphics.framework/ParavirtualizedGraphics.tbd
+language objective-c
+pass ParavirtualizedGraphics.h
 
 library DeviceCheck /System/Library/Frameworks/DeviceCheck.framework/Versions/A/DeviceCheck System/Library/Frameworks/DeviceCheck.framework/DeviceCheck.tbd
 language objective-c
