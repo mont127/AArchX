@@ -226,9 +226,11 @@ each gate proves and lists the component suites.
 - Application compatibility is incomplete, and some system calls and framework
   behaviour are still missing.
 - Native mode runs Swift programs on a guest copy of the Swift runtime
-  (`make guest-swift`), but not yet the system frameworks' Swift APIs; it has
-  no bridge for WebKit or GameKit, and stops with a named message on any call it
-  cannot make.
+  (`make guest-swift`), and Dispatch's Swift overlay as guest code
+  (`make guest-swift-overlays`), but not yet the Swift APIs that system
+  frameworks export from the framework binaries themselves; it has no bridge
+  for WebKit or GameKit, and stops with a named message on any call it cannot
+  make.
 - x87 arithmetic computes in 64-bit doubles rather than 80-bit precision
   (loads and stores stay exact), MMX always
   runs in the interpreter, and a few AVX2 forms do as well.

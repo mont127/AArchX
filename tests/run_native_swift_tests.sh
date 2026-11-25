@@ -38,7 +38,8 @@
 # runtime's in its place rather than the first file it finds.
 #
 # The guest runtime comes from tools/install_guest_swift.sh (make guest-swift),
-# and the suite skips without it or without a swiftc that targets both slices.
+# its C++ runtime from tools/build_guest_cxx.sh (make guest-cxx), and the suite
+# skips without them or without a swiftc that targets both slices.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 repo=$PWD
@@ -47,6 +48,12 @@ if [ ! -f "$root/usr/lib/swift/libswiftCore.dylib" ]; then
     echo 'SKIP native Swift tests: run make guest-swift first'
     exit 0
 fi
+for f in usr/lib/libc++.1.dylib usr/lib/libc++abi.dylib usr/lib/libunwind.1.dylib; do
+    if [ ! -f "$root/$f" ]; then
+        echo "SKIP native Swift tests: missing $root/$f (run make guest-cxx first)"
+        exit 0
+    fi
+done
 if ! command -v swiftc > /dev/null; then
     echo 'SKIP native Swift tests: no swiftc'
     exit 0

@@ -168,12 +168,16 @@ check: ocerz unit guest apis
 	bash tests/run_native_framework_tests.sh
 	bash tests/run_native_format_tests.sh
 	bash tests/run_native_swift_tests.sh
+	bash tests/run_native_swift_overlay_tests.sh
 
 guest-cxx:
 	bash tools/build_guest_cxx.sh
 
 guest-swift:
 	bash tools/install_guest_swift.sh
+
+guest-swift-overlays:
+	bash tools/install_guest_swift_overlays.sh
 
 native-cxx: ocerz
 	bash tests/run_native_cxx_tests.sh
@@ -186,6 +190,9 @@ native-formats: ocerz
 
 native-swift: ocerz
 	bash tests/run_native_swift_tests.sh
+
+native-swift-overlays: ocerz apis
+	bash tests/run_native_swift_overlay_tests.sh
 
 diff32:
 	bash tests/run_diff32.sh .
@@ -201,4 +208,4 @@ clean:
 
 -include $(DEPS)
 
-.PHONY: unit guest check apis apis32 steam32 app check-m32 clean i386diff diff32 guest-cxx guest-swift native-cxx native-frameworks native-formats native-swift
+.PHONY: unit guest check apis apis32 steam32 app check-m32 clean i386diff diff32 guest-cxx guest-swift guest-swift-overlays native-cxx native-frameworks native-formats native-swift native-swift-overlays
