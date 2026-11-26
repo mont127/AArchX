@@ -53,12 +53,23 @@
 #
 # Keeping 71 and 72 alive still matters, and both now need their own fixture.
 # 71 means nothing bound, so the loader never handed control to the guest at
-# all; native_unbound pins it with a two-line program calling
-# mdns_mach_ticks_per_second from libmdns, a library native mode synthesizes no
-# image for. It used to call getpwnam, until the generated libSystem database
-# exported every function the real libSystem does and getpwnam bound, then
-# sqlite3_libversion, until libsqlite3 got a database of its own, and then
-# pcap_lib_version, until libpcap got one. 72 means
+# all; native_unbound pins it with a two-line program calling ffi_prep_cif
+# from libffi, a library native mode synthesizes no image for. It shares the
+# missing library with native_check so the exit-71 path does not depend on a
+# private library remaining linkable. The fixture used to call getpwnam, until
+# the generated libSystem database exported every function the real libSystem
+# does and getpwnam bound, then sqlite3_libversion, until libsqlite3 got a
+# database of its own, and then pcap_lib_version, until libpcap got one.
+#
+# libpcap keeps its old question as a comparison against the same programs
+# built for arm64: one asks pcap_lib_version, and one passes stdout's FILE
+# object to pcap_dump_fopen and writes a fixed packet. The answer and the
+# stream bytes must agree exactly in native mode under the JIT and the
+# interpreter. The stream half is there because libpcap's database treats
+# __sFILE as opaque; only a crossing can show whether the host library accepts
+# the stream object stdout names.
+#
+# 72 means
 # everything bound and the guest ran, and what is missing is the bridge behind
 # one export rather than the export itself; xbench_dyn no longer reaches it, so
 # bridge_unimpl pins it with a program whose only import is asl_log, which the
@@ -15791,11 +15802,8 @@ EOC
     record "$name" "$reason" "exit=$rc out='$(cat "$out" 2>/dev/null)'"
 }
 
-# libpcap is one of the libraries native_unbound used before it had a database.
-# Keep its one question as a comparison against the same program built for the
-# host: pcap_lib_version's answer must cross and agree byte for byte.
 case_native_libpcap() {
-    local name=native_libpcap reason="" d="$TMP/native_libpcap" rc rc_arm
+    local name=native_libpcap reason="" d="$TMP/native_libpcap" rc rc_arm fixture mode
     rm -rf "$d"; mkdir -p "$d"
     if [ "$X86_CLANG" -ne 1 ]; then
         echo "SKIP $name (no x86_64 clang toolchain)"
@@ -15806,55 +15814,86 @@ case_native_libpcap() {
 #include <pcap.h>
 int main(void) { printf("%s\n", pcap_lib_version()); return 0; }
 EOC
-    if ! clang -arch x86_64 -fno-stack-protector -o "$d/pcapver" "$d/pcapver.c" -lpcap >"$d/cc.log" 2>&1; then
-        record "$name" "the x86_64 fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
-        return
-    fi
-    if ! clang -arch arm64 -fno-stack-protector -o "$d/pcapver.arm64" "$d/pcapver.c" -lpcap >"$d/cc.arm64.log" 2>&1; then
-        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $(grep -m1 error "$d/cc.arm64.log" | cut -c1-160)"
-        return
-    fi
-    run_bounded "$d/arm64.out" "$d/arm64.err" "$d/pcapver.arm64"
-    rc_arm=$?
-    if [ "$rc_arm" != 0 ] || [ ! -s "$d/arm64.out" ]; then
-        record "$name" "the arm64 oracle exited $rc_arm with '$(cat "$d/arm64.out")'"
-        return
-    fi
-    for mode in jit nojit; do
-        if [ "$mode" = jit ]; then
-            run_bounded "$d/$mode.out" "$d/$mode.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -v -native "$d/pcapver"
-        else
-            run_bounded "$d/$mode.out" "$d/$mode.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -v -native -no-jit "$d/pcapver"
+    cat > "$d/pcapstream.c" <<'EOC'
+#include <stdio.h>
+#include <string.h>
+#include <pcap.h>
+int main(void) {
+    unsigned char packet[4] = { 0, 1, 2, 3 };
+    struct pcap_pkthdr h;
+    memset(&h, 0, sizeof h);
+    h.ts.tv_sec = 1;
+    h.ts.tv_usec = 2;
+    h.caplen = sizeof packet;
+    h.len = sizeof packet;
+    pcap_t *p = pcap_open_dead(DLT_EN10MB, 65535);
+    if (!p) return 1;
+    pcap_dumper_t *dumper = pcap_dump_fopen(p, stdout);
+    if (!dumper) return 2;
+    pcap_dump((u_char *)dumper, &h, packet);
+    pcap_dump_close(dumper);
+    pcap_close(p);
+    return 0;
+}
+EOC
+    for fixture in pcapver pcapstream; do
+        if ! clang -arch x86_64 -fno-stack-protector -o "$d/$fixture" "$d/$fixture.c" -lpcap >"$d/$fixture.cc.log" 2>&1; then
+            record "$name" "the x86_64 $fixture fixture did not compile: $(grep -m1 error "$d/$fixture.cc.log" | cut -c1-160)"
+            return
         fi
-        rc=$?
-        if [ -z "$reason" ]; then
-            reason="$(native_run_reason "$rc" "$d/$mode.out" "$d/$mode.err")"
-            if [ -n "$reason" ]; then
-                reason="$mode: $reason"
-            elif ! cmp -s "$d/$mode.out" "$d/arm64.out"; then
-                reason="$mode printed '$(cat "$d/$mode.out")', want the host's '$(cat "$d/arm64.out")'"
-            fi
+        if ! clang -arch arm64 -fno-stack-protector -o "$d/$fixture.arm64" "$d/$fixture.c" -lpcap >"$d/$fixture.cc.arm64.log" 2>&1; then
+            record "$name" "the x86_64 $fixture fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $(grep -m1 error "$d/$fixture.cc.arm64.log" | cut -c1-160)"
+            return
+        fi
+        run_bounded "$d/$fixture.arm64.out" "$d/$fixture.arm64.err" "$d/$fixture.arm64"
+        rc_arm=$?
+        if [ "$rc_arm" != 0 ] || [ ! -s "$d/$fixture.arm64.out" ]; then
+            record "$name" "the arm64 $fixture oracle exited $rc_arm with '$(cat "$d/$fixture.arm64.out")'"
+            return
         fi
     done
-    record "$name" "$reason" "pcap_lib_version agrees with the arm64 build"
+    for mode in jit nojit; do
+        for fixture in pcapver pcapstream; do
+            if [ "$mode" = jit ]; then
+                run_bounded "$d/$fixture.$mode.out" "$d/$fixture.$mode.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -v -native "$d/$fixture"
+            else
+                run_bounded "$d/$fixture.$mode.out" "$d/$fixture.$mode.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -v -native -no-jit "$d/$fixture"
+            fi
+            rc=$?
+            if [ -z "$reason" ]; then
+                reason="$(native_run_reason "$rc" "$d/$fixture.$mode.out" "$d/$fixture.$mode.err")"
+                if [ -n "$reason" ]; then
+                    reason="$mode $fixture: $reason"
+                elif ! cmp -s "$d/$fixture.$mode.out" "$d/$fixture.arm64.out"; then
+                    reason="$mode $fixture does not agree byte for byte with the arm64 build"
+                fi
+            fi
+        done
+    done
+    record "$name" "$reason" "pcap_lib_version and pcap_dump_fopen agree with the arm64 builds"
 }
 
 case_native_unbound() {
     local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
     local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
     cat > "$src" <<'EOC'
-extern unsigned long long mdns_mach_ticks_per_second(void);
-int main(void) { return mdns_mach_ticks_per_second() == 0; }
+extern int ffi_prep_cif(void *, int, unsigned, void *, void **);
+int main(void) { return ffi_prep_cif(0, 0, 0, 0, 0) == 0; }
 EOC
-    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" -lmdns >/dev/null 2>&1; then
-        echo "SKIP $name (no x86_64 clang toolchain)"; return
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    if ! clang -arch x86_64 -fno-stack-protector -o "$bin" "$src" -lffi >/dev/null 2>&1; then
+        record "$name" "the x86_64 fixture did not compile"
+        return
     fi
     run_bounded "$out" "$err" "$OCERZ" -v -native "$bin"
     rc=$?
     if [ "$rc" -ne 71 ]; then
         reason="exit $rc, want 71"
-    elif ! grep -Fq "${NOBIND}_mdns_mach_ticks_per_second" "$out" "$err"; then
-        reason="no 'no bridge for _mdns_mach_ticks_per_second' line"
+    elif ! grep -Fq "${NOBIND}_ffi_prep_cif" "$out" "$err"; then
+        reason="no 'no bridge for _ffi_prep_cif' line"
     elif ! grep -Fq "$M0_SUMMARY" "$out" "$err"; then
         reason="no unresolved-import summary line"
     fi
