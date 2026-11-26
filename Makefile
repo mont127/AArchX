@@ -156,7 +156,7 @@ check-m32: ocerz apis32 tests/unit/bin/test_m32
 	bash tests/run_m32_tests.sh
 	OCERZ_NO_HIGH8_ARITH=1 OCERZ_NO_SHIFT_MEM_IMM=1 bash tests/run_m32_tests.sh high8 shiftmem
 
-check: ocerz unit guest apis
+check: ocerz apis unit guest
 	bash tests/run_guest_tests.sh --no-jit
 	bash tests/run_guest_tests.sh
 	bash tests/run_diff_test.sh
