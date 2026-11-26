@@ -102,7 +102,7 @@ The component suites inside the unit phase, as last counted in September 2026
 | extension and SSE suites | 237 / 0, 246 / 0, SSE4.2 differential against Rosetta |
 | loader, syscall | 54 / 0, 365 / 0 |
 | memory, shared mappings | 2692 / 0, 105 / 0 |
-| native mode: API database, image, bridge, ABI, callbacks, thread attach, Objective-C, blocks | 334 / 0, 142426 / 0, 1247 / 0, 28071 / 0, 131974 / 0, 270 / 0, 125400 / 0, 107 / 0 |
+| native mode: API database, image, bridge, ABI, callbacks, thread attach, Objective-C, blocks | 374 / 0, 142426 / 0, 1247 / 0, 28071 / 0, 131974 / 0, 270 / 0, 125400 / 0, 107 / 0 |
 | in-place string and memory routines against the host's | 6,736,902 / 0 |
 | xbench output against native | 15 / 15 kernels bit-identical |
 
