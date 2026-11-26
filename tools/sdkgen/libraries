@@ -723,10 +723,6 @@ library ReplayKit /System/Library/Frameworks/ReplayKit.framework/Versions/A/Repl
 language objective-c
 pass ReplayKit.h
 
-library GameplayKit /System/Library/Frameworks/GameplayKit.framework/Versions/A/GameplayKit System/Library/Frameworks/GameplayKit.framework/GameplayKit.tbd
-language objective-c
-pass GameplayKit.h
-
 library InputMethodKit /System/Library/Frameworks/InputMethodKit.framework/Versions/A/InputMethodKit System/Library/Frameworks/InputMethodKit.framework/InputMethodKit.tbd
 language objective-c
 pass InputMethodKit.h
@@ -737,6 +733,3 @@ pass SyncServices.h
 
 library libpcap /usr/lib/libpcap.A.dylib usr/lib/libpcap.A.tbd
 pass libpcap.h
-
-library libffi /usr/lib/libffi.dylib usr/lib/libffi.tbd
-pass libffi.h

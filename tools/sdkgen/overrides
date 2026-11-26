@@ -1769,3 +1769,7 @@ fn ___powisf2 __powisf2 f(fi)
 library /usr/lib/libiconv.2.dylib
 
 fn _locale_charset locale_charset p()
+
+library /usr/lib/libpcap.A.dylib
+
+opaque __sFILE
