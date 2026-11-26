@@ -2655,6 +2655,7 @@ typedef struct {
     int converted;
     int component;
     int instances;
+    int pending;                  /* handed out by the factory and not yet opened */
     void *self;
     void *open;
     void *close;
@@ -2751,6 +2752,23 @@ static void *(*const br_au_iface_lookups[BR_AU_INTERFACE_SLOTS])(int16_t) = {
     br_au_iface_lookup_60, br_au_iface_lookup_61, br_au_iface_lookup_62, br_au_iface_lookup_63,
 };
 
+/*
+ * The life of an interface slot.  The factory hands the plugin's interface to the host with its three functions
+ * replaced by native ones, and the slot keeps the plugin's own beside the callbacks made from them.  Two kinds of
+ * plugin exist: one keeps a single interface for every instance, another allocates one per instance and frees it
+ * in Close, which is what Apple's own AUPlugInDispatch does.  So:
+ * - a slot is released, and the plugin's functions put back, when its last instance closes, BEFORE the plugin's
+ *   Close runs: afterwards the memory may no longer be the interface.  Writing them back after it corrupted the
+ *   heap of a plugin of the second kind.
+ * - an interface the factory has returned and the host has not opened yet counts as pending, and a slot with one
+ *   pending is not released: the host is about to call the native functions in it.
+ * - a slot is found again by address, and an address can come back as another interface, after an Open that
+ *   failed (nothing closes that one) or a free and a malloc.  The slot is the same interface only while the three
+ *   words still hold the native functions this slot put there; otherwise it is taken as new, where it used to
+ *   keep the first interface's callbacks for the second.
+ * - when every slot is taken, one with no instance and nothing pending is given up without a write to memory
+ *   that may be gone.
+ */
 static int32_t br_au_open(void *self, void *instance)
 {
     void *open = NULL;
@@ -2762,6 +2780,8 @@ static int32_t br_au_open(void *self, void *instance)
             open = br_au_interfaces[i].open;
             break;
         }
+    if (slot >= 0 && br_au_interfaces[slot].pending > 0)
+        br_au_interfaces[slot].pending--;
     if (open) {
         br_au_interfaces[slot].instances++;
         br_au_instance_add_locked(instance, self);
@@ -2781,10 +2801,20 @@ static int32_t br_au_open(void *self, void *instance)
     return st;
 }
 
+static int32_t br_au_close(void *self);
+/* The words of an interface still hold what this slot wrote there. */
+static int br_au_interface_ours_locked(int slot, const void *interface)
+{
+    const uint64_t *words = interface;
+    return words[0] == (uint64_t)(uintptr_t)br_au_open && words[1] == (uint64_t)(uintptr_t)br_au_close &&
+           words[2] == (uint64_t)(uintptr_t)br_au_iface_lookups[slot];
+}
+
+/* Only while the interface is known to be alive: the plugin's own functions go back into it. */
 static void br_au_interface_release_locked(int slot)
 {
     BrAuInterface *iface = &br_au_interfaces[slot];
-    if (iface->self) {
+    if (iface->self && br_au_interface_ours_locked(slot, iface->self)) {
         uint64_t *words = (uint64_t *)iface->self;
         words[0] = iface->guest_open;
         words[1] = iface->guest_close;
@@ -2796,33 +2826,20 @@ static void br_au_interface_release_locked(int slot)
 static int32_t br_au_close(void *self)
 {
     void *close = NULL;
-    int slot = -1, release = 0;
     pthread_mutex_lock(&br_au_lock);
     for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
         if (br_au_interfaces[i].used && br_au_interfaces[i].self == self) {
-            slot = i;
+            BrAuInterface *iface = &br_au_interfaces[i];
+            close = iface->close;
+            br_au_instance_remove_latest_locked(self);
+            if (iface->instances > 0)
+                iface->instances--;
+            if (iface->instances == 0 && iface->pending == 0)
+                br_au_interface_release_locked(i);
             break;
         }
-    if (slot >= 0) {
-        BrAuInterface *iface = &br_au_interfaces[slot];
-        close = iface->close;
-        br_au_instance_remove_latest_locked(self);
-        if (iface->instances > 0)
-            iface->instances--;
-        release = iface->instances == 0;
-    }
     pthread_mutex_unlock(&br_au_lock);
-    int32_t st = -1;
-    if (close)
-        st = ((int32_t (*)(void *))close)(self);
-    if (release) {
-        pthread_mutex_lock(&br_au_lock);
-        if (slot >= 0 && slot < BR_AU_INTERFACE_SLOTS && br_au_interfaces[slot].used &&
-            br_au_interfaces[slot].self == self && br_au_interfaces[slot].instances == 0)
-            br_au_interface_release_locked(slot);
-        pthread_mutex_unlock(&br_au_lock);
-    }
-    return st;
+    return close ? ((int32_t (*)(void *))close)(self) : -1;
 }
 
 static void *br_au_factory(const void *desc)
@@ -2831,12 +2848,22 @@ static void *br_au_factory(const void *desc)
     int index = -1;
     void *factory = NULL;
     pthread_mutex_lock(&br_au_lock);
+    /* The description is the host's own, which is not always the one registered: AudioToolbox drops the
+       IsV3AudioUnit and CanLoadInProcess flags from it.  The record holds the host's once the registration has
+       returned; until then, and for whatever else the host may change, type, subtype and manufacturer decide. */
     for (int i = 0; i < BR_AU_COMPONENT_SLOTS; i++) {
         BrAuComponent *component = &br_au_components[i];
         if (component->used && memcmp(component->desc, wanted, sizeof component->desc) == 0) {
             index = i;
             factory = component->factory;
             break;
+        }
+    }
+    for (int i = 0; index < 0 && i < BR_AU_COMPONENT_SLOTS; i++) {
+        BrAuComponent *component = &br_au_components[i];
+        if (component->used && memcmp(component->desc, wanted, 3 * sizeof component->desc[0]) == 0) {
+            index = i;
+            factory = component->factory;
         }
     }
     pthread_mutex_unlock(&br_au_lock);
@@ -2846,33 +2873,36 @@ static void *br_au_factory(const void *desc)
     if (!interface)
         return NULL;
     pthread_mutex_lock(&br_au_lock);
-    int slot = -1, fresh = 0;
+    int slot = -1;
     for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
         if (br_au_interfaces[i].used && br_au_interfaces[i].self == interface) {
             slot = i;
             break;
         }
-    if (slot < 0) {
-        fresh = 1;
-        for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
-            if (!br_au_interfaces[i].used) {
-                slot = i;
-                break;
-            }
-    }
+    if (slot >= 0 && !br_au_interface_ours_locked(slot, interface))
+        memset(&br_au_interfaces[slot], 0, sizeof br_au_interfaces[slot]);   /* another interface at that address */
+    for (int i = 0; slot < 0 && i < BR_AU_INTERFACE_SLOTS; i++)
+        if (!br_au_interfaces[i].used)
+            slot = i;
+    for (int i = 0; slot < 0 && i < BR_AU_INTERFACE_SLOTS; i++)
+        if (br_au_interfaces[i].instances == 0 && br_au_interfaces[i].pending == 0) {
+            memset(&br_au_interfaces[i], 0, sizeof br_au_interfaces[i]);
+            slot = i;
+        }
     if (slot < 0) {
         pthread_mutex_unlock(&br_au_lock);
         fprintf(stderr, "ocerz: bridge: AudioComponentRegister: no plugin interface slot is left\n");
         return NULL;
     }
     BrAuInterface *iface = &br_au_interfaces[slot];
-    if (fresh)
-        memset(iface, 0, sizeof *iface);
-    iface->used = 1;
-    iface->component = index;
-    iface->self = interface;
+    uint64_t *words = interface;
     if (!iface->converted) {
-        uint64_t *words = interface;
+        if (words[0] == (uint64_t)(uintptr_t)br_au_open) {
+            /* native functions and no slot that knows whose: its slot was given up while it was still alive */
+            pthread_mutex_unlock(&br_au_lock);
+            fprintf(stderr, "ocerz: bridge: AudioComponentRegister: a plugin interface outlived its slot\n");
+            return NULL;
+        }
         iface->guest_open = words[0];
         iface->guest_close = words[1];
         iface->guest_lookup = words[2];
@@ -2881,7 +2911,10 @@ static void *br_au_factory(const void *desc)
         iface->lookup = br_au_callback(words[2], "p(h)");
         iface->converted = 1;
     }
-    uint64_t *words = interface;
+    iface->used = 1;
+    iface->component = index;
+    iface->self = interface;
+    iface->pending++;
     words[0] = (uint64_t)(uintptr_t)br_au_open;
     words[1] = (uint64_t)(uintptr_t)br_au_close;
     words[2] = (uint64_t)(uintptr_t)br_au_iface_lookups[slot];
@@ -2933,14 +2966,20 @@ static int br_audio_component_register(struct OcerzVM *vm, OcerzCPU *cpu)
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, BR_AUDIO_TOOLBOX, "_AudioComponentRegister", "p(pPup)", f);
     void *registered = ((void *(*)(const void *, void *, uint32_t, void *))f)(
-        component->desc, name, version, br_au_factory);
+        desc, name, version, br_au_factory);
+    uint32_t hosts[5];
+    int32_t (*describe)(void *, void *) =
+        registered ? ocerz_bridge_host_symbol(BR_AUDIO_TOOLBOX, "AudioComponentGetDescription") : NULL;
+    int described = describe && describe(registered, hosts) == 0;
     ocerz_bridge_lower(&outer);
+    pthread_mutex_lock(&br_au_lock);
     if (!registered) {
-        pthread_mutex_lock(&br_au_lock);
         component->used = 0;
         component->factory = NULL;
-        pthread_mutex_unlock(&br_au_lock);
+    } else if (described) {
+        memcpy(component->desc, hosts, sizeof component->desc);   /* what the factory will be asked for */
     }
+    pthread_mutex_unlock(&br_au_lock);
     return br_answer(vm, cpu, registered ? ocerz_h2g(registered) : 0);
 }
 
