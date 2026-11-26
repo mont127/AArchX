@@ -55,10 +55,10 @@
 # 71 means nothing bound, so the loader never handed control to the guest at
 # all; native_unbound pins it with a two-line program calling
 # mdns_mach_ticks_per_second from libmdns, a library native mode synthesizes no
-# image for. It used to call
-# getpwnam, until the generated libSystem database exported every function the
-# real libSystem does and getpwnam bound, and then sqlite3_libversion, until
-# libsqlite3 got a database of its own. 72 means
+# image for. It used to call getpwnam, until the generated libSystem database
+# exported every function the real libSystem does and getpwnam bound, then
+# sqlite3_libversion, until libsqlite3 got a database of its own, and then
+# pcap_lib_version, until libpcap got one. 72 means
 # everything bound and the guest ran, and what is missing is the bridge behind
 # one export rather than the export itself; xbench_dyn no longer reaches it, so
 # bridge_unimpl pins it with a program whose only import is asl_log, which the
@@ -15791,6 +15791,54 @@ EOC
     record "$name" "$reason" "exit=$rc out='$(cat "$out" 2>/dev/null)'"
 }
 
+# libpcap is one of the libraries native_unbound used before it had a database.
+# Keep its one question as a comparison against the same program built for the
+# host: pcap_lib_version's answer must cross and agree byte for byte.
+case_native_libpcap() {
+    local name=native_libpcap reason="" d="$TMP/native_libpcap" rc rc_arm
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/pcapver.c" <<'EOC'
+#include <stdio.h>
+#include <pcap.h>
+int main(void) { printf("%s\n", pcap_lib_version()); return 0; }
+EOC
+    if ! clang -arch x86_64 -fno-stack-protector -o "$d/pcapver" "$d/pcapver.c" -lpcap >"$d/cc.log" 2>&1; then
+        record "$name" "the x86_64 fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    if ! clang -arch arm64 -fno-stack-protector -o "$d/pcapver.arm64" "$d/pcapver.c" -lpcap >"$d/cc.arm64.log" 2>&1; then
+        record "$name" "the x86_64 fixture compiled and its arm64 build did not, which leaves the case without its host oracle: $(grep -m1 error "$d/cc.arm64.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/arm64.out" "$d/arm64.err" "$d/pcapver.arm64"
+    rc_arm=$?
+    if [ "$rc_arm" != 0 ] || [ ! -s "$d/arm64.out" ]; then
+        record "$name" "the arm64 oracle exited $rc_arm with '$(cat "$d/arm64.out")'"
+        return
+    fi
+    for mode in jit nojit; do
+        if [ "$mode" = jit ]; then
+            run_bounded "$d/$mode.out" "$d/$mode.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -v -native "$d/pcapver"
+        else
+            run_bounded "$d/$mode.out" "$d/$mode.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -v -native -no-jit "$d/pcapver"
+        fi
+        rc=$?
+        if [ -z "$reason" ]; then
+            reason="$(native_run_reason "$rc" "$d/$mode.out" "$d/$mode.err")"
+            if [ -n "$reason" ]; then
+                reason="$mode: $reason"
+            elif ! cmp -s "$d/$mode.out" "$d/arm64.out"; then
+                reason="$mode printed '$(cat "$d/$mode.out")', want the host's '$(cat "$d/arm64.out")'"
+            fi
+        fi
+    done
+    record "$name" "$reason" "pcap_lib_version agrees with the arm64 build"
+}
+
 case_native_unbound() {
     local name=native_unbound rc reason="" src="$TMP/unbound.c" bin="$TMP/unbound"
     local out="$TMP/native_unbound.out" err="$TMP/native_unbound.err"
@@ -16491,6 +16539,7 @@ case_last_flag_cache
 case_bad_mode
 case_empty_mode
 case_native_static
+case_native_libpcap
 case_native_unbound
 case_native_float
 case_native_classic_bind
