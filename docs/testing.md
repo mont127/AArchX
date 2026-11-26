@@ -88,7 +88,7 @@ On an Apple M5 running macOS 27, in September 2026:
 | x86-64 differential | 97 / 97 |
 | i386 differential | 20,033 / 20,033 |
 | Dynamic suite | 113 / 113 |
-| Native suite | 88 / 88 |
+| Native suite | 87 / 87 |
 
 The component suites inside the unit phase, as last counted in November 2026
 (passes / failures):
