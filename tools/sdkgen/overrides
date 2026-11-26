@@ -1329,7 +1329,15 @@ struct _SCPreferencesSetCallback 2 SCPreferencesContext
 
 library /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
 
+# LaunchServices' open calls start programs, and a guest must not start an
+# Intel one outside ocerz, so they are stubs.  The two that take URLs are what
+# a program opens a web page, a document or a folder with, which starts none
+# of its own code: their handlers cross the call, and refuse it by name only
+# when what it names is a program, or an application whose program is, with
+# x86 code and no arm64 code.
 stub _LSOpen* process-launch
+special _LSOpenCFURLRef ls_open_cfurl
+special _LSOpenFromURLSpec ls_open_from_url_spec
 
 library /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
 

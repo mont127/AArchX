@@ -13124,6 +13124,79 @@ EOC
     record "$name" "$reason" "threads cancelled in read, sleep and a condition wait; handlers, destructors, deferral"
 }
 
+# Every LSOpen export was a stub, because a guest must not start an Intel program outside ocerz.  The two that
+# take URLs are what a program opens a web page, a document or a folder with, so they cross now, and are refused by
+# name only when what they would start is a program with x86 code and no arm64 code (bridge.c, br_ls_check).  The
+# fixture opens nothing: a scheme no application handles and a file that is not there must give the errors the
+# arm64 build gets from the host, and a file URL to an Intel-only program must be refused, by both calls.  That
+# program is not executable and has no known type, so nothing would open it if the refusal were ever lost.
+case_native_lsopen() {
+    local name=native_lsopen reason="" d="$TMP/native_lsopen" mode got want rc form
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/lsopen.c" <<'EOC'
+/* LSOpenCFURLRef and LSOpenFromURLSpec on things that start nothing: a scheme no application handles and a file
+   that is not there.  With "intel <path>", a file URL to an Intel-only program, which native mode must refuse. */
+#include <CoreServices/CoreServices.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv)
+{
+    unsigned bad = 0;
+    if (argc > 2 && !strcmp(argv[1], "intel")) {
+        CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)argv[2], (CFIndex)strlen(argv[2]), false);
+        OSStatus st = argc > 3 ? LSOpenFromURLSpec(&(LSLaunchURLSpec){ .appURL = u }, NULL) : LSOpenCFURLRef(u, NULL);
+        printf("lsopen intel %d\n", (int)st);
+        return 0;
+    }
+    CFURLRef nobody = CFURLCreateWithString(NULL, CFSTR("ocerz-no-such-scheme-5381://nothing/at/all"), NULL);
+    CFURLRef missing = CFURLCreateWithFileSystemPath(NULL, CFSTR("/nonexistent/ocerz/lsopen.txt"), kCFURLPOSIXPathStyle, false);
+    CFURLRef launched = (CFURLRef)0x1;
+    OSStatus a = LSOpenCFURLRef(nobody, &launched);
+    OSStatus b = LSOpenCFURLRef(missing, NULL);
+    const void *items[1] = { nobody };
+    CFArrayRef arr = CFArrayCreate(NULL, items, 1, &kCFTypeArrayCallBacks);
+    LSLaunchURLSpec spec = { .appURL = NULL, .itemURLs = arr, .passThruParams = NULL, .launchFlags = kLSLaunchDefaults, .asyncRefCon = NULL };
+    OSStatus c = LSOpenFromURLSpec(&spec, NULL);
+    if (a == noErr || b == noErr || c == noErr) bad |= 1;
+    printf("lsopen %d %d %d%s\n", (int)a, (int)b, (int)c, bad ? " bad" : "");
+    return bad != 0;
+}
+EOC
+    printf 'int main(void) { return 0; }\n' > "$d/intelonly.c"
+    if ! { clang -arch x86_64 -O1 -Wno-deprecated-declarations -o "$d/lsopen" "$d/lsopen.c" -framework CoreServices &&
+           clang -arch arm64 -O1 -Wno-deprecated-declarations -o "$d/lsopen.arm64" "$d/lsopen.c" -framework CoreServices &&
+           clang -arch x86_64 -o "$d/intelonly.ocerz-test" "$d/intelonly.c" &&
+           chmod 644 "$d/intelonly.ocerz-test"; } >"$d/cc.log" 2>&1; then
+        record "$name" "the fixtures did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/arm64.out" "$d/arm64.err" "$d/lsopen.arm64"
+    want=$(cat "$d/arm64.out")
+    case "$want" in
+        "lsopen "*" bad"|"") record "$name" "the arm64 build, run on the host, printed '$want': this Mac opens the test's URLs, so the case cannot tell"; return ;;
+    esac
+    for mode in "-native" "-native -no-jit" "-cache"; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$d/lsopen"
+        rc=$?
+        got=$(cat "$d/out")
+        if [ -z "$reason" ] && { [ "$rc" != 0 ] || [ "$got" != "$want" ]; }; then
+            reason="$mode exit $rc and printed '$got', want the host's '$want': $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    for form in "" spec; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/lsopen" intel "$d/intelonly.ocerz-test" $form
+        rc=$?
+        if [ -z "$reason" ] && { [ "$rc" != 72 ] || ! grep -q "would start .*intelonly.ocerz-test, an Intel program, outside ocerz" "$d/err"; }; then
+            reason="opening an Intel-only program${form:+ through a launch spec} exited $rc and printed '$(cat "$d/out")', want 72 and the refusal: $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    record "$name" "$reason" "LSOpenCFURLRef and LSOpenFromURLSpec cross ($want); an Intel-only program is refused"
+}
+
 case_native_import_addends() {
     local name=native_import_addends reason="" d="$TMP/native_import_addends" mode f want got
     rm -rf "$d"; mkdir -p "$d"
@@ -16474,6 +16547,7 @@ case_native_syscall
 case_native_undeclared
 case_native_libxml2
 case_native_cancel
+case_native_lsopen
 case_native_flat_nonlazy
 case_native_scanf_long_double
 case_native_fork_initialize

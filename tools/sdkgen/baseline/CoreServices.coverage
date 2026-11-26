@@ -4,12 +4,12 @@ exports 5372
 fn 1240
 data 1900
 var 0
-special 0
+special 2
 stub callback-pointer 6
 stub callback-struct 98
 stub layout 6
 stub no-declaration 2108
-stub process-launch 7
+stub process-launch 5
 stub va-list 3
 stub variadic 4
 host-missing 2

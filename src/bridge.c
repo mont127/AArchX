@@ -374,6 +374,7 @@
  * matched again on its low half.
  */
 #include "ocerz/bridge.h"
+#include "ocerz/bundle.h"
 #include "ocerz/apidb.h"
 #include "ocerz/abi.h"
 #include "ocerz/blocks.h"
@@ -390,6 +391,8 @@
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <mach-o/loader.h>
 #include <mach/kern_return.h>
 #include <mach/mach.h>
@@ -3123,6 +3126,119 @@ static int br_html_create_push_parser_ctxt(struct OcerzVM *vm, OcerzCPU *cpu)
     return br_xml_push_ctxt(vm, cpu, &cached, "htmlCreatePushParserCtxt", 1);
 }
 
+/*
+ * LSOpenCFURLRef and LSOpenFromURLSpec ask LaunchServices to open something: a web page in the browser, a document
+ * in its application, an application.  Every LSOpen export was a stub, because a guest must not start an Intel
+ * program outside ocerz, where nothing translates it.  But what a program opens this way is seldom a program: it
+ * is the page it signs in on, its help, a folder in the Finder, and those start none of the guest's code.  So
+ * these two cross, and are refused by name only when what they would start is a program, or an application whose
+ * program is, with x86 code and no arm64 code in it; that one LaunchServices would hand to Rosetta or to nothing.
+ */
+#define BR_CORESERVICES "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices"
+static uint32_t br_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static int br_intel_only(const char *path)
+{
+    char exe[PATH_MAX];
+    if (ocerz_bundle_executable(path, exe, sizeof exe))
+        path = exe;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    uint8_t h[4096];
+    ssize_t n = read(fd, h, sizeof h);
+    close(fd);
+    if (n < 8)
+        return 0;
+    uint32_t magic = br_be32(h);
+    int x86 = 0, arm = 0;
+    if (magic == 0xcafebabeu || magic == 0xcafebabfu) {
+        size_t step = magic == 0xcafebabeu ? 20 : 32;
+        uint32_t count = br_be32(h + 4);
+        for (uint32_t k = 0; k < count && 8 + (k + 1) * step <= (size_t)n; k++) {
+            uint32_t cpu = br_be32(h + 8 + k * step);
+            x86 |= cpu == 7 || cpu == 0x01000007u;
+            arm |= cpu == 0x0100000cu;
+        }
+    } else if (magic == 0xcffaedfeu || magic == 0xcefaedfeu) {
+        uint32_t cpu = (uint32_t)h[4] | ((uint32_t)h[5] << 8) | ((uint32_t)h[6] << 16) | ((uint32_t)h[7] << 24);
+        x86 = cpu == 7 || cpu == 0x01000007u;
+        arm = cpu == 0x0100000cu;
+    }
+    return x86 && !arm;
+}
+static void *br_cf_symbol(void *_Atomic *cache, const char *sym)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, sym);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", sym);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    return fn;
+}
+/* Stops the program when the URL names an Intel-only program in the file system; any other URL comes back. */
+static void br_ls_check(const char *sym, uint64_t url)
+{
+    static void *_Atomic rep;
+    uint8_t path[PATH_MAX];
+    if (!url)
+        return;
+    unsigned char (*get)(const void *, unsigned char, uint8_t *, long) =
+        (unsigned char (*)(const void *, unsigned char, uint8_t *, long))br_cf_symbol(&rep, "CFURLGetFileSystemRepresentation");
+    if (!get(ocerz_g2h(url), 1, path, (long)sizeof path) || !br_intel_only((const char *)path))
+        return;
+    fprintf(stderr, "ocerz: bridge: " BR_CORESERVICES " _%s would start %s, an Intel program, outside ocerz;"
+                    " not implemented\n", sym, (const char *)path);
+    exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+}
+static int br_ls_open(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *sym)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(BR_CORESERVICES, sym);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", sym);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    uint64_t what = cpu->gpr[OCERZ_RDI], out = cpu->gpr[OCERZ_RSI];
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_CORESERVICES, sym, "i(pp)", (const void *)fn);
+    int32_t st = ((int32_t (*)(const void *, void *))fn)(what ? ocerz_g2h(what) : NULL, out ? ocerz_g2h(out) : NULL);
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, (uint64_t)(int64_t)st);
+}
+static int br_ls_open_cfurl(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    br_ls_check("LSOpenCFURLRef", cpu->gpr[OCERZ_RDI]);
+    return br_ls_open(vm, cpu, &cached, "LSOpenCFURLRef");
+}
+/* LSLaunchURLSpec: the application to open with, or none, then the array of items; the same on both sides. */
+static int br_ls_open_from_url_spec(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL, *_Atomic count_fn = NULL, *_Atomic at_fn = NULL;
+    uint64_t spec = cpu->gpr[OCERZ_RDI];
+    uint64_t app = spec ? ocerz_ld(spec, 8) : 0, items = spec ? ocerz_ld(spec + 8, 8) : 0;
+    if (app) {
+        br_ls_check("LSOpenFromURLSpec", app);
+    } else if (items) {
+        long (*count)(const void *) = (long (*)(const void *))br_cf_symbol(&count_fn, "CFArrayGetCount");
+        const void *(*at)(const void *, long) = (const void *(*)(const void *, long))br_cf_symbol(&at_fn, "CFArrayGetValueAtIndex");
+        const void *array = ocerz_g2h(items);
+        for (long k = 0, n = count(array); k < n; k++)
+            br_ls_check("LSOpenFromURLSpec", ocerz_h2g(at(array, k)));
+    }
+    return br_ls_open(vm, cpu, &cached, "LSOpenFromURLSpec");
+}
+
 static int br_availability_version_check(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     uint32_t want = (uint32_t)cpu->gpr[OCERZ_RDI];
@@ -3484,6 +3600,8 @@ static const BrHandler g_br_handlers[] = {
     { "thread_resume", br_thread_resume },
     { "cfuuid_constant", br_cfuuid_constant },
     { "cfuuid_create", br_cfuuid_create },
+    { "ls_open_cfurl", br_ls_open_cfurl },
+    { "ls_open_from_url_spec", br_ls_open_from_url_spec },
     { "xml_create_push_parser_ctxt", br_xml_create_push_parser_ctxt },
     { "html_create_push_parser_ctxt", br_html_create_push_parser_ctxt },
     { "ssl_get_supported_ciphers", br_ssl_get_supported_ciphers },

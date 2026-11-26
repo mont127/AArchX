@@ -279,9 +279,16 @@ guest's own state and type are kept per thread by the handlers of
 enabled only for the length of a bridged call that waits in the kernel
 (`read`, `sleep`, `pthread_cond_wait` and the rest), behind a cleanup record
 of ocerz's that runs the guest's handlers and key destructors as guest code.
-That is where POSIX says a deferred cancel is acted on. What most programs
-still import and cannot call is GSS (ten), `JSClassCreate` (eight) and
-`sqlite3_vfs_find` (seven).
+That is where POSIX says a deferred cancel is acted on.
+
+LaunchServices' open calls were all stubs, because a guest must not start an
+Intel program outside ocerz, where nothing translates it. The two that take
+URLs, `LSOpenCFURLRef` and `LSOpenFromURLSpec`, are what a program opens a web
+page, a document or a folder with, and that starts none of its own code: they
+cross now, and are refused by name only when what they would start is a
+program, or an application whose program is, with x86 code and no arm64 code.
+What most programs still import and cannot call is GSS (ten), `JSClassCreate`
+(eight) and `sqlite3_vfs_find` (seven).
 
 ## Comparing with Rosetta
 
