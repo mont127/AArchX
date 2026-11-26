@@ -1061,6 +1061,27 @@ static int sys_workq_stub(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
     return OCERZ_STEP_OK;
 }
 
+/*
+ * bsdthread_ctl.  Its commands set a thread's QoS and voucher, which the guest's threads leave to ocerz, so they
+ * succeed without doing anything, as they always did here.  One is a question: QOS_MAX_PARALLELISM (0x800) asks
+ * how many threads of a QoS class, or of the time-constraint band, can run at once, which is the processor count
+ * a program sizes its thread pools by.  It answered 0 with the rest; pthread_qos_max_parallelism and
+ * pthread_time_constraint_max_parallelism then said 0 where Rosetta says the count.  Its arguments are numbers,
+ * so the host's kernel answers it.
+ */
+extern int __bsdthread_ctl(uintptr_t cmd, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3);
+static int sys_bsdthread_ctl(OcerzVM *vm, OcerzCPU *cpu, uint64_t a[8])
+{
+    if (a[0] != 0x800)
+        return sys_workq_stub(vm, cpu, a);
+    int r = __bsdthread_ctl((uintptr_t)a[0], (uintptr_t)a[1], (uintptr_t)a[2], (uintptr_t)a[3]);
+    if (r < 0)
+        ret_err(cpu, (uint64_t)errno);
+    else
+        ret_ok(cpu, (uint64_t)r);
+    return OCERZ_STEP_OK;
+}
+
 struct ocerz_sysctl_ovr {
     const char *name;
     int is_str;
@@ -5826,7 +5847,7 @@ static const ocerz_bsd_entry bsd_table[OCERZ_BSD_MAX] = {
     [375] = { "kevent_id",   6, 0x00, 0, sys_kevent_id },
     [406] = { "fcntl_nocancel", 3, 0x00, 0, sys_fcntl },
     [409] = { "connect_nocancel", 3, 0x02, 0, NULL },
-    [478] = { "bsdthread_ctl", 4, 0x00, 0, sys_workq_stub },
+    [478] = { "bsdthread_ctl", 4, 0x00, 0, sys_bsdthread_ctl },
     [515] = { "ulock_wait",  4, 0x02, 0, NULL },
     [516] = { "ulock_wake",  3, 0x02, 0, NULL },
     [544] = { "ulock_wait2", 5, 0x02, 0, NULL },
@@ -9067,6 +9088,25 @@ int ocerz_signals_restart(OcerzCPU *cpu)
             return 0;
     }
     return ready != 0;
+}
+
+/*
+ * syscall(number, ...) made as a call, which is how a native-mode guest makes it: libSystem's export is a special
+ * record, because the native function would hand the host kernel the guest's structures and bypass the guest's
+ * signal state and address space.  The x86 stub behind that export only moves the fourth argument from rcx to r10
+ * and makes system call 0, the kernel's indirect one, which dispatch_bsd_at unpacks; rsp is at the return address
+ * here as it is at the stub's syscall instruction, so the seventh argument is found where it was.  The result is
+ * left as the instruction leaves it: rax, and the carry flag beside an errno in rax.
+ */
+int ocerz_guest_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    cpu->gpr[OCERZ_R10] = cpu->gpr[OCERZ_RCX];
+    cpu->rflags &= ~(uint64_t)OCERZ_CF;
+    cpu->cur_sys_class = 2;
+    cpu->cur_sys_num = (int)(cpu->gpr[OCERZ_RDI] & 0xffffff);
+    int rc = dispatch_bsd(vm, cpu, 0);
+    cpu->cur_sys_class = -1;
+    return rc;
 }
 
 int ocerz_handle_syscall(struct OcerzVM *vm, OcerzCPU *cpu)

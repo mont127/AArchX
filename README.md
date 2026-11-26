@@ -74,17 +74,17 @@ The app is only a wrapper around the terminal version, which works the same with
 or without it. In Terminal, open a new window, then:
 
 ```sh
-ocerz version                         # AArchX 0.9
+ocerz version                         # AArchX 1.0.3
 ocerz /Applications/Some.app          # a bundle runs the executable its Info.plist names
 ```
 
 With Homebrew, `brew install --cask mont127/aarchx/aarchx` installs the same
-prebuilt. Without Terminal at all, download `AArchX.zip` from the
-[latest release](https://github.com/mont127/AArchX/releases/latest), unzip it
-and move AArchX.app to Applications. It is not notarized, so the first time
-macOS refuses to open it; click **Open Anyway** in System Settings → Privacy &
-Security. Running the same curl command with `sh -s -- --uninstall` instead of
-`sh` removes it.
+prebuilt. Without Terminal at all, download `AArchX.dmg` from the
+[latest release](https://github.com/mont127/AArchX/releases/latest), open it
+and drag AArchX to Applications (`AArchX.zip` is the same app as a zip). It is
+not notarized, so the first time macOS refuses to open it; click **Open
+Anyway** in System Settings → Privacy & Security. Running the same curl
+command with `sh -s -- --uninstall` instead of `sh` removes it.
 Cache mode also needs Rosetta installed (see below). 32-bit Steam games need a
 build from source; see [32-bit Mac games from Steam](docs/32-bit-steam-games.md).
 
@@ -214,11 +214,11 @@ contributors.
 | x86-64 guest suite, interpreted and translated | 150 / 150 |
 | x86-64 differential, interpreter against JIT | 111 / 111 |
 | i386 differential, in each of two memory layouts | 40,044 / 40,044 |
-| dynamic-linking suite | 472 / 472 |
-| native-mode suite | 99 / 99 |
+| dynamic-linking suite | 488 / 488 |
+| native-mode suite | 104 / 104 |
 | 32-bit (m32) programs | 81 / 81, one more skipped without a Steam database |
 
-Counted on macOS 27 in October 2026. [Testing](docs/testing.md) says what
+Counted on macOS 27 in November 2026. [Testing](docs/testing.md) says what
 each gate proves and lists the component suites.
 
 ## Limitations

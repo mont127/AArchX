@@ -111,6 +111,8 @@ int ocerz_guest_vm_protect(struct OcerzVM *vm, OcerzCPU *cpu, uint64_t task, uin
 
 void ocerz_fork_register(void);
 int ocerz_guest_fork(struct OcerzVM *vm, OcerzCPU *cpu, int *pid_out);
+/* syscall(number, ...) as libSystem's export: the indirect system call, answered as the instruction is. */
+int ocerz_guest_syscall(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_guest_execve(struct OcerzVM *vm, OcerzCPU *cpu, const char *path, char *const *argv,
                        char *const *envp);
 int ocerz_guest_posix_spawn(struct OcerzVM *vm, OcerzCPU *cpu, int *pid, const char *path,

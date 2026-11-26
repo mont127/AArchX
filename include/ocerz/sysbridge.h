@@ -23,6 +23,7 @@
 
 #include "ocerz/types.h"
 #include "ocerz/cpu.h"
+#include <pthread.h>
 
 struct OcerzVM;
 
@@ -58,6 +59,7 @@ int ocerz_sys__longjmp(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_siglongjmp(struct OcerzVM *vm, OcerzCPU *cpu);
 
 int ocerz_sys_fork(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_syscall(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_execve(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_execv(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_execvp(struct OcerzVM *vm, OcerzCPU *cpu);
@@ -104,6 +106,22 @@ int ocerz_sys_pthread_getspecific(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_create(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_testcancel(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_cancel(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_setcancelstate(struct OcerzVM *vm, OcerzCPU *cpu);
+int ocerz_sys_pthread_setcanceltype(struct OcerzVM *vm, OcerzCPU *cpu);
+/*
+ * The length of one bridged call that waits in the kernel, during which the host may cancel the thread: open puts
+ * a cleanup record of ocerz's on the thread's list and enables the host's cancel state, close undoes both
+ * (sysbridge.c, "Thread cancellation").  ocerz_sys_cancel_enabled is the guest's own cancel state.
+ */
+struct OcerzCancelScope {
+    struct __darwin_pthread_handler_rec rec;
+    struct OcerzVM *vm;
+    OcerzCPU *cpu;
+};
+int ocerz_sys_cancel_enabled(void);
+void ocerz_sys_cancel_open(struct OcerzVM *vm, OcerzCPU *cpu, struct OcerzCancelScope *s);
+void ocerz_sys_cancel_close(struct OcerzCancelScope *s);
 int ocerz_sys_mach_vm_map(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_mach_vm_remap(struct OcerzVM *vm, OcerzCPU *cpu);
 int ocerz_sys_pthread_get_stackaddr_np(struct OcerzVM *vm, OcerzCPU *cpu);

@@ -374,6 +374,7 @@
  * matched again on its low half.
  */
 #include "ocerz/bridge.h"
+#include "ocerz/bundle.h"
 #include "ocerz/apidb.h"
 #include "ocerz/abi.h"
 #include "ocerz/blocks.h"
@@ -390,6 +391,8 @@
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <mach-o/loader.h>
 #include <mach/kern_return.h>
 #include <mach/mach.h>
@@ -436,6 +439,7 @@ struct OcerzBridgeFn {
     BrInplaceBinding inplace[OCERZ_APIDB_INPLACE];
     uint64_t calls;
     int waits;                    /* BR_WAITS_*: the call can wait in the kernel for a signal to interrupt */
+    int cancels;                  /* and is a cancellation point: every one of those but the $NOCANCEL forms */
     struct OcerzBridgeFn *next;
 };
 
@@ -2651,6 +2655,7 @@ typedef struct {
     int converted;
     int component;
     int instances;
+    int pending;                  /* handed out by the factory and not yet opened */
     void *self;
     void *open;
     void *close;
@@ -2747,6 +2752,23 @@ static void *(*const br_au_iface_lookups[BR_AU_INTERFACE_SLOTS])(int16_t) = {
     br_au_iface_lookup_60, br_au_iface_lookup_61, br_au_iface_lookup_62, br_au_iface_lookup_63,
 };
 
+/*
+ * The life of an interface slot.  The factory hands the plugin's interface to the host with its three functions
+ * replaced by native ones, and the slot keeps the plugin's own beside the callbacks made from them.  Two kinds of
+ * plugin exist: one keeps a single interface for every instance, another allocates one per instance and frees it
+ * in Close, which is what Apple's own AUPlugInDispatch does.  So:
+ * - a slot is released, and the plugin's functions put back, when its last instance closes, BEFORE the plugin's
+ *   Close runs: afterwards the memory may no longer be the interface.  Writing them back after it corrupted the
+ *   heap of a plugin of the second kind.
+ * - an interface the factory has returned and the host has not opened yet counts as pending, and a slot with one
+ *   pending is not released: the host is about to call the native functions in it.
+ * - a slot is found again by address, and an address can come back as another interface, after an Open that
+ *   failed (nothing closes that one) or a free and a malloc.  The slot is the same interface only while the three
+ *   words still hold the native functions this slot put there; otherwise it is taken as new, where it used to
+ *   keep the first interface's callbacks for the second.
+ * - when every slot is taken, one with no instance and nothing pending is given up without a write to memory
+ *   that may be gone.
+ */
 static int32_t br_au_open(void *self, void *instance)
 {
     void *open = NULL;
@@ -2758,6 +2780,8 @@ static int32_t br_au_open(void *self, void *instance)
             open = br_au_interfaces[i].open;
             break;
         }
+    if (slot >= 0 && br_au_interfaces[slot].pending > 0)
+        br_au_interfaces[slot].pending--;
     if (open) {
         br_au_interfaces[slot].instances++;
         br_au_instance_add_locked(instance, self);
@@ -2777,10 +2801,20 @@ static int32_t br_au_open(void *self, void *instance)
     return st;
 }
 
+static int32_t br_au_close(void *self);
+/* The words of an interface still hold what this slot wrote there. */
+static int br_au_interface_ours_locked(int slot, const void *interface)
+{
+    const uint64_t *words = interface;
+    return words[0] == (uint64_t)(uintptr_t)br_au_open && words[1] == (uint64_t)(uintptr_t)br_au_close &&
+           words[2] == (uint64_t)(uintptr_t)br_au_iface_lookups[slot];
+}
+
+/* Only while the interface is known to be alive: the plugin's own functions go back into it. */
 static void br_au_interface_release_locked(int slot)
 {
     BrAuInterface *iface = &br_au_interfaces[slot];
-    if (iface->self) {
+    if (iface->self && br_au_interface_ours_locked(slot, iface->self)) {
         uint64_t *words = (uint64_t *)iface->self;
         words[0] = iface->guest_open;
         words[1] = iface->guest_close;
@@ -2792,33 +2826,20 @@ static void br_au_interface_release_locked(int slot)
 static int32_t br_au_close(void *self)
 {
     void *close = NULL;
-    int slot = -1, release = 0;
     pthread_mutex_lock(&br_au_lock);
     for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
         if (br_au_interfaces[i].used && br_au_interfaces[i].self == self) {
-            slot = i;
+            BrAuInterface *iface = &br_au_interfaces[i];
+            close = iface->close;
+            br_au_instance_remove_latest_locked(self);
+            if (iface->instances > 0)
+                iface->instances--;
+            if (iface->instances == 0 && iface->pending == 0)
+                br_au_interface_release_locked(i);
             break;
         }
-    if (slot >= 0) {
-        BrAuInterface *iface = &br_au_interfaces[slot];
-        close = iface->close;
-        br_au_instance_remove_latest_locked(self);
-        if (iface->instances > 0)
-            iface->instances--;
-        release = iface->instances == 0;
-    }
     pthread_mutex_unlock(&br_au_lock);
-    int32_t st = -1;
-    if (close)
-        st = ((int32_t (*)(void *))close)(self);
-    if (release) {
-        pthread_mutex_lock(&br_au_lock);
-        if (slot >= 0 && slot < BR_AU_INTERFACE_SLOTS && br_au_interfaces[slot].used &&
-            br_au_interfaces[slot].self == self && br_au_interfaces[slot].instances == 0)
-            br_au_interface_release_locked(slot);
-        pthread_mutex_unlock(&br_au_lock);
-    }
-    return st;
+    return close ? ((int32_t (*)(void *))close)(self) : -1;
 }
 
 static void *br_au_factory(const void *desc)
@@ -2827,12 +2848,22 @@ static void *br_au_factory(const void *desc)
     int index = -1;
     void *factory = NULL;
     pthread_mutex_lock(&br_au_lock);
+    /* The description is the host's own, which is not always the one registered: AudioToolbox drops the
+       IsV3AudioUnit and CanLoadInProcess flags from it.  The record holds the host's once the registration has
+       returned; until then, and for whatever else the host may change, type, subtype and manufacturer decide. */
     for (int i = 0; i < BR_AU_COMPONENT_SLOTS; i++) {
         BrAuComponent *component = &br_au_components[i];
         if (component->used && memcmp(component->desc, wanted, sizeof component->desc) == 0) {
             index = i;
             factory = component->factory;
             break;
+        }
+    }
+    for (int i = 0; index < 0 && i < BR_AU_COMPONENT_SLOTS; i++) {
+        BrAuComponent *component = &br_au_components[i];
+        if (component->used && memcmp(component->desc, wanted, 3 * sizeof component->desc[0]) == 0) {
+            index = i;
+            factory = component->factory;
         }
     }
     pthread_mutex_unlock(&br_au_lock);
@@ -2842,33 +2873,36 @@ static void *br_au_factory(const void *desc)
     if (!interface)
         return NULL;
     pthread_mutex_lock(&br_au_lock);
-    int slot = -1, fresh = 0;
+    int slot = -1;
     for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
         if (br_au_interfaces[i].used && br_au_interfaces[i].self == interface) {
             slot = i;
             break;
         }
-    if (slot < 0) {
-        fresh = 1;
-        for (int i = 0; i < BR_AU_INTERFACE_SLOTS; i++)
-            if (!br_au_interfaces[i].used) {
-                slot = i;
-                break;
-            }
-    }
+    if (slot >= 0 && !br_au_interface_ours_locked(slot, interface))
+        memset(&br_au_interfaces[slot], 0, sizeof br_au_interfaces[slot]);   /* another interface at that address */
+    for (int i = 0; slot < 0 && i < BR_AU_INTERFACE_SLOTS; i++)
+        if (!br_au_interfaces[i].used)
+            slot = i;
+    for (int i = 0; slot < 0 && i < BR_AU_INTERFACE_SLOTS; i++)
+        if (br_au_interfaces[i].instances == 0 && br_au_interfaces[i].pending == 0) {
+            memset(&br_au_interfaces[i], 0, sizeof br_au_interfaces[i]);
+            slot = i;
+        }
     if (slot < 0) {
         pthread_mutex_unlock(&br_au_lock);
         fprintf(stderr, "ocerz: bridge: AudioComponentRegister: no plugin interface slot is left\n");
         return NULL;
     }
     BrAuInterface *iface = &br_au_interfaces[slot];
-    if (fresh)
-        memset(iface, 0, sizeof *iface);
-    iface->used = 1;
-    iface->component = index;
-    iface->self = interface;
+    uint64_t *words = interface;
     if (!iface->converted) {
-        uint64_t *words = interface;
+        if (words[0] == (uint64_t)(uintptr_t)br_au_open) {
+            /* native functions and no slot that knows whose: its slot was given up while it was still alive */
+            pthread_mutex_unlock(&br_au_lock);
+            fprintf(stderr, "ocerz: bridge: AudioComponentRegister: a plugin interface outlived its slot\n");
+            return NULL;
+        }
         iface->guest_open = words[0];
         iface->guest_close = words[1];
         iface->guest_lookup = words[2];
@@ -2877,7 +2911,10 @@ static void *br_au_factory(const void *desc)
         iface->lookup = br_au_callback(words[2], "p(h)");
         iface->converted = 1;
     }
-    uint64_t *words = interface;
+    iface->used = 1;
+    iface->component = index;
+    iface->self = interface;
+    iface->pending++;
     words[0] = (uint64_t)(uintptr_t)br_au_open;
     words[1] = (uint64_t)(uintptr_t)br_au_close;
     words[2] = (uint64_t)(uintptr_t)br_au_iface_lookups[slot];
@@ -2929,14 +2966,20 @@ static int br_audio_component_register(struct OcerzVM *vm, OcerzCPU *cpu)
     struct OcerzBridgeFrame outer;
     ocerz_bridge_raise(&outer, BR_AUDIO_TOOLBOX, "_AudioComponentRegister", "p(pPup)", f);
     void *registered = ((void *(*)(const void *, void *, uint32_t, void *))f)(
-        component->desc, name, version, br_au_factory);
+        desc, name, version, br_au_factory);
+    uint32_t hosts[5];
+    int32_t (*describe)(void *, void *) =
+        registered ? ocerz_bridge_host_symbol(BR_AUDIO_TOOLBOX, "AudioComponentGetDescription") : NULL;
+    int described = describe && describe(registered, hosts) == 0;
     ocerz_bridge_lower(&outer);
+    pthread_mutex_lock(&br_au_lock);
     if (!registered) {
-        pthread_mutex_lock(&br_au_lock);
         component->used = 0;
         component->factory = NULL;
-        pthread_mutex_unlock(&br_au_lock);
+    } else if (described) {
+        memcpy(component->desc, hosts, sizeof component->desc);   /* what the factory will be asked for */
     }
+    pthread_mutex_unlock(&br_au_lock);
     return br_answer(vm, cpu, registered ? ocerz_h2g(registered) : 0);
 }
 
@@ -3029,17 +3072,17 @@ typedef const void *(*BrCFUUIDFn)(const void *, uint8_t, uint8_t, uint8_t, uint8
                                   uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t,
                                   uint8_t, uint8_t, uint8_t, uint8_t, uint8_t);
 
-static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
+/* CFUUIDGetConstantUUIDWithBytes and CFUUIDCreateWithBytes: an allocator and sixteen bytes, each its own argument. */
+static int br_cfuuid_bytes(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *sym)
 {
-    static void *_Atomic cached = NULL;
-    void *fn = cached;
+    void *fn = *cache;
     if (!fn) {
-        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, "CFUUIDGetConstantUUIDWithBytes");
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, sym);
         if (!fn) {
-            fprintf(stderr, "ocerz: bridge: _CFUUIDGetConstantUUIDWithBytes has no host symbol\n");
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", sym);
             exit(OCERZ_BRIDGE_UNIMPL_EXIT);
         }
-        cached = fn;
+        *cache = fn;
     }
     OcerzAbiSig named;
     if (ocerz_abi_parse("p(p)", &named) != OCERZ_OK)   /* "p" alone has no argument list and never parsed */
@@ -3059,6 +3102,180 @@ static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
     const void *r = ((BrCFUUIDFn)fn)(alloc, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                                      b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     return br_answer(vm, cpu, r ? ocerz_h2g(r) : 0);
+}
+static int br_cfuuid_constant(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    return br_cfuuid_bytes(vm, cpu, &cached, "CFUUIDGetConstantUUIDWithBytes");
+}
+static int br_cfuuid_create(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    return br_cfuuid_bytes(vm, cpu, &cached, "CFUUIDCreateWithBytes");
+}
+
+/*
+ * xmlCreatePushParserCtxt and htmlCreatePushParserCtxt take a SAX handler, a structure of callbacks the program
+ * builds, three of them variadic, which no shape describes.  Most callers pass none and let libxml2 build the
+ * document, and those cross here.  With a handler the call is refused by name, as the stub refused every call:
+ * handed on as it stands, native code would call the program's x86 functions.
+ */
+#define BR_LIBXML2 "/usr/lib/libxml2.2.dylib"
+static int br_xml_push_ctxt(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *sym, int html)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(BR_LIBXML2, sym);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", sym);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    uint64_t user = cpu->gpr[OCERZ_RSI], chunk = cpu->gpr[OCERZ_RDX], name = cpu->gpr[OCERZ_R8];
+    int size = (int)cpu->gpr[OCERZ_RCX];
+    if (cpu->gpr[OCERZ_RDI]) {
+        fprintf(stderr, "ocerz: bridge: " BR_LIBXML2 " _%s was given a SAX handler of the program's own, whose"
+                        " callbacks native code would call as x86; not implemented\n", sym);
+        exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+    }
+    void *u = user ? ocerz_g2h(user) : NULL;
+    const char *c = chunk ? (const char *)ocerz_g2h(chunk) : NULL, *f = name ? (const char *)ocerz_g2h(name) : NULL;
+    struct OcerzBridgeFrame outer;
+    void *r;
+    if (html) {
+        ocerz_bridge_raise(&outer, BR_LIBXML2, sym, "p(pppipi)", (const void *)fn);
+        r = ((void *(*)(void *, void *, const char *, int, const char *, int))fn)(NULL, u, c, size, f,
+                                                                                (int)cpu->gpr[OCERZ_R9]);
+    } else {
+        ocerz_bridge_raise(&outer, BR_LIBXML2, sym, "p(pppip)", (const void *)fn);
+        r = ((void *(*)(void *, void *, const char *, int, const char *))fn)(NULL, u, c, size, f);
+    }
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, r ? ocerz_h2g(r) : 0);
+}
+static int br_xml_create_push_parser_ctxt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    return br_xml_push_ctxt(vm, cpu, &cached, "xmlCreatePushParserCtxt", 0);
+}
+static int br_html_create_push_parser_ctxt(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    return br_xml_push_ctxt(vm, cpu, &cached, "htmlCreatePushParserCtxt", 1);
+}
+
+/*
+ * LSOpenCFURLRef and LSOpenFromURLSpec ask LaunchServices to open something: a web page in the browser, a document
+ * in its application, an application.  Every LSOpen export was a stub, because a guest must not start an Intel
+ * program outside ocerz, where nothing translates it.  But what a program opens this way is seldom a program: it
+ * is the page it signs in on, its help, a folder in the Finder, and those start none of the guest's code.  So
+ * these two cross, and are refused by name only when what they would start is a program, or an application whose
+ * program is, with x86 code and no arm64 code in it; that one LaunchServices would hand to Rosetta or to nothing.
+ */
+#define BR_CORESERVICES "/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices"
+static uint32_t br_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static int br_intel_only(const char *path)
+{
+    char exe[PATH_MAX];
+    if (ocerz_bundle_executable(path, exe, sizeof exe))
+        path = exe;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    uint8_t h[4096];
+    ssize_t n = read(fd, h, sizeof h);
+    close(fd);
+    if (n < 8)
+        return 0;
+    uint32_t magic = br_be32(h);
+    int x86 = 0, arm = 0;
+    if (magic == 0xcafebabeu || magic == 0xcafebabfu) {
+        size_t step = magic == 0xcafebabeu ? 20 : 32;
+        uint32_t count = br_be32(h + 4);
+        for (uint32_t k = 0; k < count && 8 + (k + 1) * step <= (size_t)n; k++) {
+            uint32_t cpu = br_be32(h + 8 + k * step);
+            x86 |= cpu == 7 || cpu == 0x01000007u;
+            arm |= cpu == 0x0100000cu;
+        }
+    } else if (magic == 0xcffaedfeu || magic == 0xcefaedfeu) {
+        uint32_t cpu = (uint32_t)h[4] | ((uint32_t)h[5] << 8) | ((uint32_t)h[6] << 16) | ((uint32_t)h[7] << 24);
+        x86 = cpu == 7 || cpu == 0x01000007u;
+        arm = cpu == 0x0100000cu;
+    }
+    return x86 && !arm;
+}
+static void *br_cf_symbol(void *_Atomic *cache, const char *sym)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(OCERZ_BRIDGE_COREFOUNDATION, sym);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", sym);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    return fn;
+}
+/* Stops the program when the URL names an Intel-only program in the file system; any other URL comes back. */
+static void br_ls_check(const char *sym, uint64_t url)
+{
+    static void *_Atomic rep;
+    uint8_t path[PATH_MAX];
+    if (!url)
+        return;
+    unsigned char (*get)(const void *, unsigned char, uint8_t *, long) =
+        (unsigned char (*)(const void *, unsigned char, uint8_t *, long))br_cf_symbol(&rep, "CFURLGetFileSystemRepresentation");
+    if (!get(ocerz_g2h(url), 1, path, (long)sizeof path) || !br_intel_only((const char *)path))
+        return;
+    fprintf(stderr, "ocerz: bridge: " BR_CORESERVICES " _%s would start %s, an Intel program, outside ocerz;"
+                    " not implemented\n", sym, (const char *)path);
+    exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+}
+static int br_ls_open(struct OcerzVM *vm, OcerzCPU *cpu, void *_Atomic *cache, const char *sym)
+{
+    void *fn = *cache;
+    if (!fn) {
+        fn = ocerz_bridge_host_symbol(BR_CORESERVICES, sym);
+        if (!fn) {
+            fprintf(stderr, "ocerz: bridge: _%s has no host symbol\n", sym);
+            exit(OCERZ_BRIDGE_UNIMPL_EXIT);
+        }
+        *cache = fn;
+    }
+    uint64_t what = cpu->gpr[OCERZ_RDI], out = cpu->gpr[OCERZ_RSI];
+    struct OcerzBridgeFrame outer;
+    ocerz_bridge_raise(&outer, BR_CORESERVICES, sym, "i(pp)", (const void *)fn);
+    int32_t st = ((int32_t (*)(const void *, void *))fn)(what ? ocerz_g2h(what) : NULL, out ? ocerz_g2h(out) : NULL);
+    ocerz_bridge_lower(&outer);
+    return br_answer(vm, cpu, (uint64_t)(int64_t)st);
+}
+static int br_ls_open_cfurl(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL;
+    br_ls_check("LSOpenCFURLRef", cpu->gpr[OCERZ_RDI]);
+    return br_ls_open(vm, cpu, &cached, "LSOpenCFURLRef");
+}
+/* LSLaunchURLSpec: the application to open with, or none, then the array of items; the same on both sides. */
+static int br_ls_open_from_url_spec(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    static void *_Atomic cached = NULL, *_Atomic count_fn = NULL, *_Atomic at_fn = NULL;
+    uint64_t spec = cpu->gpr[OCERZ_RDI];
+    uint64_t app = spec ? ocerz_ld(spec, 8) : 0, items = spec ? ocerz_ld(spec + 8, 8) : 0;
+    if (app) {
+        br_ls_check("LSOpenFromURLSpec", app);
+    } else if (items) {
+        long (*count)(const void *) = (long (*)(const void *))br_cf_symbol(&count_fn, "CFArrayGetCount");
+        const void *(*at)(const void *, long) = (const void *(*)(const void *, long))br_cf_symbol(&at_fn, "CFArrayGetValueAtIndex");
+        const void *array = ocerz_g2h(items);
+        for (long k = 0, n = count(array); k < n; k++)
+            br_ls_check("LSOpenFromURLSpec", ocerz_h2g(at(array, k)));
+    }
+    return br_ls_open(vm, cpu, &cached, "LSOpenFromURLSpec");
 }
 
 static int br_availability_version_check(struct OcerzVM *vm, OcerzCPU *cpu)
@@ -3421,6 +3638,11 @@ static const BrHandler g_br_handlers[] = {
     { "thread_suspend", br_thread_suspend },
     { "thread_resume", br_thread_resume },
     { "cfuuid_constant", br_cfuuid_constant },
+    { "cfuuid_create", br_cfuuid_create },
+    { "ls_open_cfurl", br_ls_open_cfurl },
+    { "ls_open_from_url_spec", br_ls_open_from_url_spec },
+    { "xml_create_push_parser_ctxt", br_xml_create_push_parser_ctxt },
+    { "html_create_push_parser_ctxt", br_html_create_push_parser_ctxt },
     { "ssl_get_supported_ciphers", br_ssl_get_supported_ciphers },
     { "cf_calendar_compose", br_cf_calendar_compose },
     { "cf_calendar_decompose", br_cf_calendar_decompose },
@@ -3621,6 +3843,7 @@ static const BrHandler g_br_handlers[] = {
     { "longjmp",         ocerz_sys_longjmp },
     { "_longjmp",        ocerz_sys__longjmp },
     { "siglongjmp",      ocerz_sys_siglongjmp },
+    { "syscall",         ocerz_sys_syscall },
     { "fork",            ocerz_sys_fork },
     { "execve",          ocerz_sys_execve },
     { "execv",           ocerz_sys_execv },
@@ -3645,6 +3868,9 @@ static const BrHandler g_br_handlers[] = {
     { "pthread_create",      ocerz_sys_pthread_create },
     { "pthread_exit",        ocerz_sys_pthread_exit },
     { "pthread_testcancel",  ocerz_sys_pthread_testcancel },
+    { "pthread_cancel",      ocerz_sys_pthread_cancel },
+    { "pthread_setcancelstate", ocerz_sys_pthread_setcancelstate },
+    { "pthread_setcanceltype", ocerz_sys_pthread_setcanceltype },
     { "Block_copy",                ocerz_block_special_copy },
     { "Block_object_assign",       ocerz_block_special_object_assign },
 };
@@ -3913,6 +4139,7 @@ static struct OcerzBridgeFn *br_make(const OcerzApiLibrary *api, const OcerzApiE
         }
         fn->register_only = ocerz_abi_register_only(&fn->parsed);
         fn->waits = br_waits(fn->host);
+        fn->cancels = fn->waits && !strstr(fn->sym, "$NOCANCEL") && !(fn->host && strstr(fn->host, "$NOCANCEL"));
     }
     fn->next = g_br_made;
     g_br_made = fn;
@@ -4206,7 +4433,17 @@ static int br_cross_waiting(const struct OcerzBridgeFn *fn, OcerzCPU *cpu)
         rc = OCERZ_STEP_OK;   /* the handler first, then the call */
         restart = 1;
     } else {
+        /* The one place a guest thread can be cancelled: the host's state is enabled for this call alone. */
+        struct OcerzCancelScope scope;
+        int cancel = fn->cancels && ocerz_sys_cancel_enabled();
+        if (cancel)
+            ocerz_sys_cancel_open(cpu->vm, cpu, &scope);
         rc = br_cross(fn, cpu);
+        if (cancel) {
+            int e = errno;
+            ocerz_sys_cancel_close(&scope);
+            errno = e;
+        }
         restart = rc == OCERZ_STEP_OK && fn->waits == BR_WAITS_RESTART && (int32_t)cpu->gpr[OCERZ_RAX] == -1 &&
                   errno == EINTR && ocerz_signals_restart(cpu);
     }

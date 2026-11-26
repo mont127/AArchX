@@ -1059,6 +1059,24 @@ static int sb_translated_frame_below(struct OcerzVM *vm)
     return 0;
 }
 
+/*
+ * syscall and __syscall.  The native ones would make the system call on the host's terms: an x86 structure handed
+ * to the arm64 kernel, a mapping ocerz never hears of, a signal mask that is not the guest's.  ocerz's own system
+ * call layer answers instead, as it answers the syscall instruction in cache mode, and the carry flag it leaves
+ * becomes the -1 and errno the C function returns.
+ */
+int ocerz_sys_syscall(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int rc = ocerz_guest_syscall(vm, cpu);
+    if (rc != OCERZ_STEP_OK)
+        return rc;
+    if (cpu->rflags & OCERZ_CF) {
+        errno = (int)cpu->gpr[OCERZ_RAX];
+        return sb_ret(vm, cpu, -1);
+    }
+    return sb_ret(vm, cpu, (int64_t)cpu->gpr[OCERZ_RAX]);
+}
+
 int ocerz_sys_fork(struct OcerzVM *vm, OcerzCPU *cpu)
 {
     const struct OcerzBridgeFrame *cb = ocerz_bridge_callback_frame();
@@ -1661,6 +1679,7 @@ static void *sb_thread_main(void *p)
 {
     SbThreadStart start = *(SbThreadStart *)p;
     free(p);
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);   /* until a call that waits; see ocerz_sys_cancel_open */
     void *result = start.entry(start.arg);
     OcerzCPU *cpu = ocerz_vm_current_cpu();
     if (!cpu)
@@ -1738,10 +1757,116 @@ int ocerz_sys_pthread_exit(struct OcerzVM *vm, OcerzCPU *cpu)
     pthread_exit(value);
 }
 
-/* pthread_cancel is refused (it would unwind a host thread through ocerz's
-   frames), so no cancellation can ever be pending and there is nothing to test. */
+/*
+ * Thread cancellation.  A guest thread is a host thread, and the host's cancellation is what cancels it: the
+ * kernel that wakes a thread out of read or a condition wait for a cancel is the host's.  What kept
+ * pthread_cancel a stub is where the host acts on one.  It acts at a cancellation point, and ocerz makes those
+ * for itself, reading a file or taking a lock inside the translator, where a thread that died would take the
+ * lock with it; and it then runs the thread's cleanup handlers, which the guest's pthread_cleanup_push links
+ * onto the host's own list as x86 routines.
+ *
+ * So the host's cancel state stays disabled on every thread that runs guest code (ocerz_thread_attach, the
+ * thread's first instruction and main), and the guest's own state and type are kept here, per thread, by the
+ * handlers of pthread_setcancelstate and pthread_setcanceltype.  A bridged call that waits in the kernel
+ * (bridge.c, br_cross_waiting) is where a guest thread is at a cancellation point and nowhere inside ocerz: if
+ * the guest's state allows it, ocerz_sys_cancel_open enables the host's for the length of that call, with a
+ * cleanup record of ocerz's own on top of the thread's list.  The host does the rest.  A cancel made while the
+ * thread ran guest code is only pending in the host's library, which pthread_testcancel acts on as the scope
+ * opens; one made while the thread waits reaches the kernel, which ends the wait.  Either way the host runs
+ * ocerz's record first, and sb_cancel_unwind runs the guest's handlers beneath it as the guest code they are,
+ * innermost first, then the guest's key destructors, and takes them off the list before the host reads on.
+ * The thread's guest personality goes with the host thread, as it does when it returns.
+ *
+ * An asynchronous cancel type is kept and answered and acted on as a deferred one, which POSIX allows: the
+ * request may be acted on at any time.  The calls that wait through a handler of their own (sigsuspend, sigwait,
+ * pause) are not cancellation points here.
+ */
+static _Thread_local uint8_t t_cancel_off, t_cancel_async;
+
+int ocerz_sys_cancel_enabled(void)
+{
+    return !t_cancel_off;
+}
+
+static void sb_cancel_unwind(void *arg)
+{
+    struct OcerzCancelScope *s = arg;
+    struct OcerzVM *vm = s->vm;
+    OcerzCPU *cpu = s->cpu;
+    struct OcerzBridgeFrame saved;
+    ocerz_bridge_guest_enter(&saved);
+    uint64_t fpcr = ocerz_abi_round_swap(ocerz_abi_round_of_mxcsr(cpu->mxcsr));
+    while (s->rec.__next && !vm->exited) {
+        uint64_t rec = (uint64_t)(uintptr_t)s->rec.__next;
+        uint64_t routine = ocerz_ld(rec, 8), value = ocerz_ld(rec + 8, 8);
+        if (!ocerz_abi_is_guest_code(routine))
+            break;
+        s->rec.__next = (struct __darwin_pthread_handler_rec *)(uintptr_t)ocerz_ld(rec + 16, 8);
+        uint64_t args[1] = { value };
+        ocerz_vm_call(vm, routine, args, 1, (cpu->gpr[OCERZ_RSP] - 256) & ~0xfull);
+    }
+    sb_key_destructors(vm, cpu);
+    ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
+    ocerz_bridge_guest_leave(&saved);
+}
+
+void ocerz_sys_cancel_open(struct OcerzVM *vm, OcerzCPU *cpu, struct OcerzCancelScope *s)
+{
+    pthread_t self = pthread_self();
+    s->vm = vm;
+    s->cpu = cpu;
+    s->rec.__routine = sb_cancel_unwind;
+    s->rec.__arg = s;
+    s->rec.__next = self->__cleanup_stack;
+    self->__cleanup_stack = &s->rec;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_testcancel();
+}
+
+void ocerz_sys_cancel_close(struct OcerzCancelScope *s)
+{
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_self()->__cleanup_stack = s->rec.__next;
+}
+
+int ocerz_sys_pthread_cancel(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    pthread_t thread = (pthread_t)(uintptr_t)sb_arg(cpu, 0);
+    return sb_ret(vm, cpu, thread ? pthread_cancel(thread) : ESRCH);
+}
+
+int ocerz_sys_pthread_setcancelstate(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int state = (int)sb_arg(cpu, 0);
+    uint64_t old = sb_arg(cpu, 1);
+    if (state != PTHREAD_CANCEL_ENABLE && state != PTHREAD_CANCEL_DISABLE)
+        return sb_ret(vm, cpu, EINVAL);
+    if (old)
+        ocerz_st(old, 4, t_cancel_off ? PTHREAD_CANCEL_DISABLE : PTHREAD_CANCEL_ENABLE);
+    t_cancel_off = state == PTHREAD_CANCEL_DISABLE;
+    return sb_ret(vm, cpu, 0);
+}
+
+int ocerz_sys_pthread_setcanceltype(struct OcerzVM *vm, OcerzCPU *cpu)
+{
+    int type = (int)sb_arg(cpu, 0);
+    uint64_t old = sb_arg(cpu, 1);
+    if (type != PTHREAD_CANCEL_DEFERRED && type != PTHREAD_CANCEL_ASYNCHRONOUS)
+        return sb_ret(vm, cpu, EINVAL);
+    if (old)
+        ocerz_st(old, 4, t_cancel_async ? PTHREAD_CANCEL_ASYNCHRONOUS : PTHREAD_CANCEL_DEFERRED);
+    t_cancel_async = type == PTHREAD_CANCEL_ASYNCHRONOUS;
+    return sb_ret(vm, cpu, 0);
+}
+
+/* A cancellation point with nothing to wait for: the scope opens, which acts on a pending cancel, and closes. */
 int ocerz_sys_pthread_testcancel(struct OcerzVM *vm, OcerzCPU *cpu)
 {
+    if (ocerz_sys_cancel_enabled()) {
+        struct OcerzCancelScope scope;
+        ocerz_sys_cancel_open(vm, cpu, &scope);
+        ocerz_sys_cancel_close(&scope);
+    }
     return sb_ret(vm, cpu, 0);
 }
 

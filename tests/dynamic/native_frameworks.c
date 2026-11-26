@@ -242,7 +242,11 @@ int main(int argc, char **argv)
         return 1;
     }
     if (strcmp(argv[1], "reject-launch") == 0) {
-        CFURLRef url = CFURLCreateWithString(NULL, CFSTR("file:///ocerz-nonexistent-test"), NULL);
+        /* A file with x86 code and no arm64 code in it, which LaunchServices must not be asked to start.  The
+           test names one that nothing could open if the call did cross: not executable, of no known type. */
+        const char *intel = getenv("OCERZ_TEST_INTEL_PROGRAM");
+        assert(intel);
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)intel, (CFIndex)strlen(intel), false);
         assert(url);
         LSOpenCFURLRef(url, NULL);
         return 1;

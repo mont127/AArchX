@@ -105,10 +105,15 @@
 # daemon and wordexp, which runs a shell, would start an x86 image with no
 # translator under it.  ocerz has to launch those through itself.
 #
-# Thread cancellation: pthread_cancel unwinds a host thread through ocerz's own
-# frames, so it is refused, and with no way to ask for a cancellation
-# pthread_testcancel never has one to act on: it is special and returns.  Qt's
-# threads call it, and the stub stopped ClipGrab in native mode.  dispatch_main is special instead: the real
+# Thread cancellation: the host's pthread_cancel would cancel a thread wherever
+# the host next makes a cancellation point, inside ocerz's translator as soon
+# as inside a call the guest made, and would then call the x86 cleanup handlers
+# on the thread's list.  So pthread_cancel, pthread_setcancelstate,
+# pthread_setcanceltype and pthread_testcancel are special: the guest's cancel
+# state is kept per thread, the host's stays disabled outside a bridged call
+# that waits in the kernel, and the guest's handlers run as guest code
+# (sysbridge.c, "Thread cancellation").  Qt's threads call pthread_testcancel,
+# and its stub stopped ClipGrab in native mode.  dispatch_main is special instead: the real
 # one ends the main thread and hands the main queue to the thread pool, and in
 # ocerz the main thread is the one the process belongs to, so the handler runs
 # the native main run loop there for good, which drains the main queue the way
@@ -277,8 +282,13 @@
 # space ocerz tracks for the guest, including the pages it translated code
 # from, without ocerz hearing of it.
 #
-# Raw syscalls: syscall and __syscall would reach the host kernel with x86
-# system call numbers.
+# Raw syscalls: the native syscall and __syscall would hand the host kernel
+# the guest's x86 structures and go round the guest's signal state and
+# address space, so they are special: the handler makes the kernel's indirect
+# system call through ocerz's own system call layer, which is what answers
+# the syscall instruction in cache mode, and turns its carry flag into the -1
+# and errno the C function returns.  Chromium asks for its thread id this
+# way, and the stub stopped any program that did.
 #
 # The rest of the signal interface: sigvec, sigblock, sigsetmask, the System
 # V sigset, sighold, sigrelse, sigignore, sigpause and siginterrupt,
@@ -692,6 +702,22 @@ fn ___signbitf __signbitf i(f)
 fn ___signbitd __signbitd i(d)
 fn ___fpclassifyf __fpclassifyf i(f)
 fn ___fpclassifyd __fpclassifyd i(d)
+# isnan is still exported under its own name for programs built before it
+# became a macro, lgamma_r and lgammaf_r are declared only under _REENTRANT,
+# and plain realpath is the entry of programs built before the $DARWIN_EXTSN
+# one; arm64 has one of each.  pthread_time_constraint_max_parallelism is in
+# no public header.
+fn _isnan isnan i(d)
+fn _lgamma_r lgamma_r d(dp)
+fn _lgammaf_r lgammaf_r f(fp)
+fn _realpath realpath p(pp)
+fn _pthread_time_constraint_max_parallelism pthread_time_constraint_max_parallelism i(L)
+# A program that forks by hand takes malloc's locks before and drops them
+# after, with these.  The fork it then makes is ocerz's, a native fork that
+# does both itself, and the locks are not recursive: the handlers do nothing.
+special __malloc_fork_prepare nothing
+special __malloc_fork_parent nothing
+special __malloc_fork_child nothing
 fn ___stpcpy_chk __stpcpy_chk p(ppL)
 fn ___stpncpy_chk __stpncpy_chk p(ppLL)
 fn ___strcat_chk __strcat_chk p(ppL)
@@ -721,7 +747,9 @@ special _pthread_key_delete pthread_key_delete
 special _pthread_key_init_np pthread_key_init_np
 special _pthread_setspecific pthread_setspecific
 special _pthread_getspecific pthread_getspecific
-stub _pthread_cancel override
+special _pthread_cancel pthread_cancel
+special _pthread_setcancelstate pthread_setcancelstate
+special _pthread_setcanceltype pthread_setcanceltype
 special _pthread_testcancel pthread_testcancel
 special _dispatch_main dispatch_main
 special _glob glob
@@ -828,8 +856,8 @@ special _vm_map mach_vm_map
 special _vm_remap mach_vm_remap
 stub _vm_remap_new override
 
-stub _syscall override
-stub ___syscall override
+special _syscall syscall
+special ___syscall syscall
 
 special _sigsuspend sigsuspend
 special _sigsuspend$NOCANCEL sigsuspend
@@ -1040,6 +1068,7 @@ special _CFCalendarDecomposeAbsoluteTime cf_calendar_decompose
 special _CFCalendarAddComponents cf_calendar_add
 special _CFCalendarGetComponentDifference cf_calendar_difference
 special _CFUUIDGetConstantUUIDWithBytes cfuuid_constant
+special _CFUUIDCreateWithBytes cfuuid_create
 
 shape CFArrayCallBacks 0 5 - p(pp) v(pp) p(p) B(pp)
 shape CFDictionaryKeyCallBacks 0 6 - p(pp) v(pp) p(p) B(pp) L(p)
@@ -1300,7 +1329,15 @@ struct _SCPreferencesSetCallback 2 SCPreferencesContext
 
 library /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
 
+# LaunchServices' open calls start programs, and a guest must not start an
+# Intel one outside ocerz, so they are stubs.  The two that take URLs are what
+# a program opens a web page, a document or a folder with, which starts none
+# of its own code: their handlers cross the call, and refuse it by name only
+# when what it names is a program, or an application whose program is, with
+# x86 code and no arm64 code.
 stub _LSOpen* process-launch
+special _LSOpenCFURLRef ls_open_cfurl
+special _LSOpenFromURLSpec ls_open_from_url_spec
 
 library /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
 
@@ -1388,6 +1425,11 @@ fn _sandbox_free_profile sandbox_free_profile v(p)
 library /usr/lib/libobjc.A.dylib
 
 special _objc_setExceptionPreprocessor objc_setExceptionPreprocessor
+
+# objc_loadClassref is what the compiler calls for a class it may not find at
+# run time: it takes the address of the reference and answers the class there
+# or nil.  objc-internal.h declares it and the SDK does not ship that header.
+fn _objc_loadClassref objc_loadClassref p(p)
 
 # __res_9_state answers the resolver state _res names.  It is a structure with
 # two hooks no shape describes, but Wine's dnsapi.so reads and sets only its
@@ -1505,6 +1547,9 @@ inplace _BZ2_bzDecompressInit 0 64 v(pp)
 
 library /System/Library/Frameworks/Security.framework/Versions/A/Security
 
+# SecTrustedApplicationPriv.h's: a description, a requirement, and where the
+# application goes.
+fn _SecTrustedApplicationCreateFromRequirement SecTrustedApplicationCreateFromRequirement i(ppp)
 special _SSLGetSupportedCiphers ssl_get_supported_ciphers
 special _SSLGetEnabledCiphers ssl_get_enabled_ciphers
 special _SSLSetEnabledCiphers ssl_set_enabled_ciphers
@@ -1525,6 +1570,13 @@ fn _xcselect_invoke_xcrun xcselect_invoke_xcrun v(pipi)
 library /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
 
 var _OBJC_EHTYPE_$_NSException 24 objc_ehtype
+
+# Exports no header declares, with the signatures CoreFoundation's own source
+# gives them.
+fn _CFHashBytes CFHashBytes L(pl)
+fn _CFStringHashCString CFStringHashCString L(pl)
+fn _CFStringHashNSString CFStringHashNSString L(p)
+fn __CFBundleFlushBundleCaches _CFBundleFlushBundleCaches v(p)
 
 library /System/Library/Frameworks/CloudKit.framework/Versions/A/CloudKit
 
@@ -1563,6 +1615,19 @@ fn _AudioDeviceCreateIOProcIDWithBlock AudioDeviceCreateIOProcIDWithBlock i(pupk
 # callback and its refcon with no version word, so no shape describes it; its
 # handler converts a copy, which the session keeps (src/bridge.c).
 
+# CVMetalTextureCache.h declares these only to Objective-C, for the Metal
+# device and texture among their arguments, and CoreVideo's database is read
+# as C.  Objects cross as pointers.
+library /System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo
+
+fn _CVMetalTextureCacheCreate CVMetalTextureCacheCreate i(ppppp)
+fn _CVMetalTextureCacheCreateTextureFromImage CVMetalTextureCacheCreateTextureFromImage i(ppppLLLLp)
+fn _CVMetalTextureCacheFlush CVMetalTextureCacheFlush v(pL)
+fn _CVMetalTextureCacheGetTypeID CVMetalTextureCacheGetTypeID L()
+fn _CVMetalTextureGetTexture CVMetalTextureGetTexture p(p)
+fn _CVMetalTextureGetTypeID CVMetalTextureGetTypeID L()
+fn _CVMetalTextureIsFlipped CVMetalTextureIsFlipped B(p)
+
 library /System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox
 
 special _VTDecompressionSessionCreate vt_decompression_session_create
@@ -1583,6 +1648,31 @@ special _CMBlockBufferCreateContiguous cm_block_buffer_create_contiguous
 # arguments that follow it, as sqlite3.h lists them, so each has a handler
 # that reads those and calls the host through its variadic convention.  The
 # ops that install a table of functions are refused by name.
+
+# libxml2's parser context, XPath context, input and output buffers and
+# encoding handler hold function pointers, and libxml2 builds every one of
+# them itself: xmlNewParserCtxt, xmlXPathNewContext, xmlAllocOutputBuffer and
+# their relatives hand back a pointer, and what a program does with it is read
+# plain fields (ctxt->myDoc, ctxt->wellFormed, the XPath context's node) and
+# pass it on.  So they are opaque, and the 300 functions that take one cross.
+# A program that stores a callback of its own in one of them, a SAX handler in
+# ctxt->sax above all, would have native code call x86: before this it
+# stopped at the stub instead.  The SAX handler and the validation context are
+# not listed, since programs do build those.
+library /usr/lib/libxml2.2.dylib
+
+opaque _xmlParserCtxt
+opaque _xmlXPathContext
+opaque _xmlOutputBuffer
+opaque _xmlParserInputBuffer
+opaque _xmlParserInput
+opaque _xmlCharEncodingHandler
+
+# The push parsers take a SAX handler, which a program does build.  Their
+# handlers cross the call when it is given none, as it is by a program that
+# wants the document built, and refuse it by name otherwise.
+special _xmlCreatePushParserCtxt xml_create_push_parser_ctxt
+special _htmlCreatePushParserCtxt html_create_push_parser_ctxt
 
 library /usr/lib/libsqlite3.dylib
 

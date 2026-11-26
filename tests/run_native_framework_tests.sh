@@ -232,16 +232,21 @@ for engine in jit interpreter slow-bridge; do
         "${args[@]}" "$work/low_wine.x86_64" > "$work/low_wine.$engine.out" 2> "$work/low_wine.$engine.err"
     cmp tests/dynamic/native_low_wine.out "$work/low_wine.$engine.out"
     echo "PASS native Wine layout: pool token, low __block, coherent and claimed mach_vm_map $engine"
+    # What LSOpenCFURLRef is refused for: a program with x86 code and no arm64 code.  The copy is not executable
+    # and has no known type, so nothing would open it if the call ever crossed.
+    cp "$work/frameworks.x86_64" "$work/intel-only.ocerz-test"
+    chmod 644 "$work/intel-only.ocerz-test"
     for refusal in context launch; do
         rc=0
-        env OCERZ_GUEST_ROOT= ${extra[@]+"${extra[@]}"} /usr/bin/perl -e 'alarm 30; exec @ARGV' \
+        env OCERZ_GUEST_ROOT= OCERZ_TEST_INTEL_PROGRAM="$work/intel-only.ocerz-test" ${extra[@]+"${extra[@]}"} \
+            /usr/bin/perl -e 'alarm 30; exec @ARGV' \
             "$repo/ocerz" "${args[@]}" "$work/frameworks.x86_64" "reject-$refusal" \
             > "$work/$refusal.$engine.out" 2> "$work/$refusal.$engine.err" || rc=$?
         [ "$rc" = 72 ]
         if [ "$refusal" = context ]; then
             grep -q 'SCNetworkReachabilityContext of version 42' "$work/$refusal.$engine.err"
         else
-            grep -q '_LSOpenCFURLRef not implemented' "$work/$refusal.$engine.err"
+            grep -q '_LSOpenCFURLRef would start .*intel-only.ocerz-test, an Intel program, outside ocerz' "$work/$refusal.$engine.err"
         fi
         echo "PASS native framework $refusal refusal $engine"
     done

@@ -164,10 +164,11 @@ To point it at another `ocerz`, run
 How to get it:
 - **The one-line installer** puts it in `~/Applications`.
 - **The Homebrew cask** puts it in `/Applications`.
-- **`AArchX.zip`** on each release is the app with `ocerz` and its runtime
-  inside, for anyone who would rather not use Terminal at all. It is not
-  notarized, so macOS refuses to open it the first time:
-  1. Move it to Applications.
+- **`AArchX.dmg`** on each release is the app with `ocerz` and its runtime
+  inside, for anyone who would rather not use Terminal at all; `AArchX.zip`
+  is the same app as a zip. It is not notarized, so macOS refuses to open it
+  the first time:
+  1. Open the disk image and drag AArchX to Applications.
   2. Try to open it.
   3. Click **Open Anyway** in System Settings → Privacy & Security.
 
@@ -179,7 +180,7 @@ How to get it:
 
 ```sh
 make -j
-./ocerz version        # AArchX 1.0.2
+./ocerz version        # AArchX 1.0.3
 ```
 
 The build is C11 with `-arch arm64 -O2`, takes well under a minute, and has no

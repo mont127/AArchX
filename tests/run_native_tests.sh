@@ -12706,6 +12706,498 @@ EOC
 # 8-byte ones with a 32-bit addend (&table[300] in another library), and 16-byte ones with a 64-bit addend.  The
 # loader read every table as the first, so each ordinal bound another import's name or the empty one, in either mode
 # (dyld.c, apply_fixups; Photoshop's dvaui has the second layout).
+# One fixture run under -native with the JIT, under -native -no-jit and in cache mode, each of which must exit 0
+# and print exactly what the program prints on an Intel Mac.
+native_three_modes() {
+    local name="$1" exe="$2" want="$3" d="$TMP/$1" reason="" mode got rc
+    for mode in "-native" "-native -no-jit" "-cache"; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$exe"
+        rc=$?
+        got=$(cat "$d/out")
+        if [ -z "$reason" ] && { [ "$rc" != 0 ] || [ "$got" != "$want" ]; }; then
+            reason="$mode exit $rc and printed '$(echo "$got" | tr '\n' '|')', want '$(echo "$want" | tr '\n' '|')': $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    echo "$reason"
+}
+
+# syscall() and __syscall() were stubs in native mode, since the native functions would make the call on the
+# host's terms; their handler now makes the kernel's indirect system call through ocerz's own system call layer
+# (sysbridge.c, ocerz_sys_syscall).  Chromium asks for its thread id this way.  The fixture checks results against
+# the libc calls beside them, an errno, a 64-bit result, an x86 structure filled in, and a seventh argument.
+case_native_syscall() {
+    local name=native_syscall reason="" d="$TMP/native_syscall"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/sysc.c" <<'EOC'
+/* syscall() and __syscall() as a program calls them: results, errno, a seventh argument, an x86 structure */
+#include <errno.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <pthread.h>
+extern int syscall(int, ...);
+extern off_t __syscall(long long, ...);
+int main(void)
+{
+    unsigned bad = 0;
+    if (syscall(SYS_getpid) != getpid()) bad |= 1;
+    if (syscall(SYS_getuid) != (int)getuid()) bad |= 2;
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    if ((uint64_t)__syscall(SYS_thread_selfid) != tid) bad |= 4;
+    errno = 0;
+    if (syscall(SYS_close, -1) != -1 || errno != EBADF) bad |= 8;
+    int fd = open("/usr/share/dict/words", O_RDONLY);
+    char a[32] = { 0 }, b[32] = { 0 };
+    if (fd < 0 || syscall(SYS_read, fd, a, 16) != 16) bad |= 16;
+    if (__syscall(SYS_lseek, fd, (off_t)0x100000000ll, SEEK_SET) != (off_t)0x100000000ll) bad |= 32;
+    if (__syscall(SYS_lseek, fd, (off_t)0, SEEK_SET) != 0 || read(fd, b, 16) != 16 || memcmp(a, b, 16)) bad |= 64;
+    struct stat st1, st2;
+    memset(&st1, 0, sizeof st1); memset(&st2, 0, sizeof st2);
+    if (syscall(SYS_fstat64, fd, &st1) != 0 || fstat(fd, &st2) != 0 || st1.st_size != st2.st_size ||
+        st1.st_ino != st2.st_ino || st1.st_mode != st2.st_mode || st1.st_mtimespec.tv_sec != st2.st_mtimespec.tv_sec)
+        bad |= 128;
+    /* seven arguments to the C function: the offset is the one on the stack */
+    char *m = (char *)__syscall(SYS_mmap, (void *)0, (size_t)4096, PROT_READ, MAP_PRIVATE, fd, (off_t)4096);
+    char c[16];
+    if (m == MAP_FAILED || pread(fd, c, 16, 4096) != 16 || memcmp(m, c, 16)) bad |= 256;
+    if (m != MAP_FAILED && syscall(SYS_munmap, m, (size_t)4096) != 0) bad |= 512;
+    errno = 0;
+    if (syscall(SYS_open, "/nonexistent/ocerz", O_RDONLY) != -1 || errno != ENOENT) bad |= 1024;
+    const char msg[] = "sysc wrote this\n";
+    if (syscall(SYS_write, 1, msg, sizeof msg - 1) != (int)sizeof msg - 1) bad |= 2048;
+    close(fd);
+    if (bad) printf("sysc bad:%x\n", bad); else printf("sysc ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -Wno-deprecated-declarations -o "$d/sysc" "$d/sysc.c" >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    reason="$(native_three_modes "$name" "$d/sysc" "$(printf 'sysc wrote this\nsysc ok')")"
+    record "$name" "$reason" "syscall and __syscall through ocerz's system call layer"
+}
+
+# Functions the system exports and its headers do not declare, or declare only on request, were stubs for want of
+# a signature: isnan under its own name, lgamma_r, the realpath of old binaries, malloc's fork hooks,
+# pthread_time_constraint_max_parallelism, CoreFoundation's hash functions, objc_loadClassref, CoreVideo's Metal
+# texture cache, and CFUUIDCreateWithBytes with its seventeen arguments.  tools/sdkgen/overrides gives each one.
+# The cache-mode run also holds bsdthread_ctl's parallelism query, which answered 0 there.
+case_native_undeclared() {
+    local name=native_undeclared reason="" d="$TMP/native_undeclared"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/und.m" <<'EOC'
+/* exports the system's headers do not declare, or declare only on request, called the way old binaries call them */
+#import <Foundation/Foundation.h>
+#import <CoreVideo/CoreVideo.h>
+#include <limits.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+extern int old_isnan(double) __asm("_isnan");
+extern double lgamma_r(double, int *);
+extern float lgammaf_r(float, int *);
+extern char *old_realpath(const char *, char *) __asm("_realpath");
+extern void _malloc_fork_prepare(void);
+extern void _malloc_fork_parent(void);
+extern void _malloc_fork_child(void);
+extern int syscall(int, ...);
+extern int pthread_time_constraint_max_parallelism(unsigned long);
+extern CFHashCode CFHashBytes(UInt8 *, CFIndex);
+extern CFHashCode CFStringHashCString(const uint8_t *, CFIndex);
+extern Class objc_loadClassref(Class *);
+extern CFTypeID CVMetalTextureCacheGetTypeID(void);
+int main(void)
+{
+    unsigned bad = 0;
+    @autoreleasepool {
+        volatile double zero = 0.0;
+        if (!old_isnan(zero / zero) || old_isnan(1.5)) bad |= 1;
+        int sg = 0, sf = 0;
+        double g = lgamma_r(-0.5, &sg);
+        float gf = lgammaf_r(4.0f, &sf);
+        if (fabs(g - 1.2655121234846454) > 1e-12 || sg != -1 || fabsf(gf - 1.7917595f) > 1e-5f || sf != 1) bad |= 2;
+        char buf[PATH_MAX];
+        if (!old_realpath("/usr/bin/../lib/./dyld", buf) || strcmp(buf, "/usr/lib/dyld")) bad |= 4;
+        /* a fork made by hand, as a program does that must not run atfork handlers: malloc's locks taken, the
+           system call, the locks dropped on both sides, and both sides able to allocate afterwards */
+        long me = syscall(SYS_getpid);
+        _malloc_fork_prepare();
+        long r = syscall(SYS_fork);
+        if (syscall(SYS_getpid) != me) {
+            _malloc_fork_child();
+            void *p = malloc(100);
+            _exit(p ? 7 : 8);
+        }
+        _malloc_fork_parent();
+        int st = 0;
+        void *q = malloc(4000);
+        if (r <= 0 || waitpid((pid_t)r, &st, 0) != (pid_t)r || !WIFEXITED(st) || WEXITSTATUS(st) != 7 || !q) bad |= 8;
+        free(q);
+        if (pthread_time_constraint_max_parallelism(0) < 1) bad |= 16;
+        UInt8 bytes[] = "the same bytes hash the same";
+        if (CFHashBytes(bytes, 28) != CFHashBytes(bytes, 28) || CFHashBytes(bytes, 28) == CFHashBytes(bytes, 27)) bad |= 32;
+        if (CFStringHashCString(bytes, 28) != CFHash(CFSTR("the same bytes hash the same"))) bad |= 64;
+        CFUUIDRef u = CFUUIDCreateWithBytes(NULL, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+        CFStringRef us = u ? CFUUIDCreateString(NULL, u) : NULL;
+        if (!us || ![(__bridge NSString *)us isEqualToString:@"01020304-0506-0708-090A-0B0C0D0E0F10"]) bad |= 128;
+        if (us) CFRelease(us);
+        if (u) CFRelease(u);
+        static Class ref;
+        ref = [NSMutableString class];
+        static Class none;
+        if (objc_loadClassref(&ref) != [NSMutableString class] || objc_loadClassref(&none) != Nil) bad |= 256;
+        if (CVMetalTextureCacheGetTypeID() == 0 || CVMetalTextureCacheGetTypeID() == CVPixelBufferGetTypeID()) bad |= 512;
+    }
+    if (bad) printf("und bad:%x\n", bad); else printf("und ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -fobjc-arc -Wno-deprecated-declarations -o "$d/und" "$d/und.m" \
+            -framework Foundation -framework CoreVideo >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    reason="$(native_three_modes "$name" "$d/und" "und ok")"
+    record "$name" "$reason" "undeclared exports cross by the signatures the overrides give them"
+}
+
+# libxml2's parser context, XPath context and I/O buffers hold function pointers, so every function taking one was
+# a stub and a program stopped at its first XPath query.  libxml2 builds those structures itself, so they are
+# opaque records now and 214 more functions cross.  The push parser crosses when it is given no SAX handler and is
+# refused by name when it is given one, whose callbacks native code would otherwise call as x86.
+case_native_libxml2() {
+    local name=native_libxml2 reason="" d="$TMP/native_libxml2" rc
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/xml1.c" <<'EOC'
+/* what a program does with libxml2: parse, walk, XPath, serialize, push-parse, free */
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+#include <libxml/xpath.h>
+#include <libxml/xpathInternals.h>
+#include <libxml/xmlsave.h>
+#include <stdio.h>
+#include <string.h>
+static const char doc[] = "<?xml version=\"1.0\"?><r xmlns:n=\"urn:x\"><a id=\"1\">one</a><n:a id=\"2\">two &amp; a half</n:a><b><a id=\"3\">three</a></b></r>";
+static void on_start(void *ctx, const xmlChar *name, const xmlChar **atts) { (void)ctx; (void)name; (void)atts; }
+int main(int argc, char **argv)
+{
+    unsigned bad = 0;
+    if (argc > 1 && !strcmp(argv[1], "sax")) {
+        static xmlSAXHandler h;
+        h.startElement = on_start;
+        xmlParserCtxtPtr sc = xmlCreatePushParserCtxt(&h, NULL, NULL, 0, "sax.xml");
+        printf("xml1 sax %s\n", sc ? "context" : "none");
+        return 0;
+    }
+    xmlDocPtr d = xmlReadMemory(doc, (int)sizeof doc - 1, "mem.xml", NULL, 0);
+    if (!d) { printf("xml1 bad: no document\n"); return 1; }
+    xmlNodePtr root = xmlDocGetRootElement(d);
+    if (!root || strcmp((const char *)root->name, "r")) bad |= 1;
+    xmlChar *txt = xmlNodeGetContent(root->children);
+    if (!txt || strcmp((const char *)txt, "one")) bad |= 2;
+    xmlFree(txt);
+    xmlXPathContextPtr xc = xmlXPathNewContext(d);
+    if (!xc) bad |= 4;
+    else {
+        if (xmlXPathRegisterNs(xc, BAD_CAST "n", BAD_CAST "urn:x") != 0) bad |= 8;
+        xmlXPathObjectPtr o = xmlXPathEvalExpression(BAD_CAST "//a | //n:a", xc);
+        if (!o || !o->nodesetval || o->nodesetval->nodeNr != 3) bad |= 16;
+        else {
+            xmlChar *id = xmlGetProp(o->nodesetval->nodeTab[1], BAD_CAST "id");
+            if (!id || strcmp((const char *)id, "2")) bad |= 32;
+            xmlFree(id);
+        }
+        if (o) xmlXPathFreeObject(o);
+        xmlXPathFreeContext(xc);
+    }
+    xmlChar *mem = NULL; int n = 0;
+    xmlDocDumpMemory(d, &mem, &n);
+    if (!mem || n < 60 || !strstr((const char *)mem, "two &amp; a half")) bad |= 64;
+    xmlFree(mem);
+    xmlBufferPtr buf = xmlBufferCreate();
+    xmlOutputBufferPtr ob = xmlOutputBufferCreateBuffer(buf, NULL);
+    if (!ob) bad |= 128;
+    else {
+        xmlNodeDumpOutput(ob, d, root->children, 0, 0, NULL);
+        xmlOutputBufferClose(ob);
+        if (strcmp((const char *)xmlBufferContent(buf), "<a id=\"1\">one</a>")) bad |= 256;
+    }
+    xmlBufferFree(buf);
+    xmlFreeDoc(d);
+    /* the push parser, a chunk at a time, with no SAX handler of the program's own */
+    xmlParserCtxtPtr pc = xmlCreatePushParserCtxt(NULL, NULL, NULL, 0, "push.xml");
+    if (!pc) bad |= 512;
+    else {
+        for (size_t i = 0; i < sizeof doc - 1; i += 17) {
+            size_t len = sizeof doc - 1 - i < 17 ? sizeof doc - 1 - i : 17;
+            if (xmlParseChunk(pc, doc + i, (int)len, 0) != 0) bad |= 1024;
+        }
+        xmlParseChunk(pc, NULL, 0, 1);
+        if (!pc->wellFormed || !pc->myDoc) bad |= 2048;
+        if (pc->myDoc) xmlFreeDoc(pc->myDoc);
+        xmlFreeParserCtxt(pc);
+    }
+    xmlParserCtxtPtr c2 = xmlNewParserCtxt();
+    if (!c2) bad |= 4096;
+    else {
+        xmlDocPtr d2 = xmlCtxtReadMemory(c2, doc, (int)sizeof doc - 1, "ctx.xml", NULL, XML_PARSE_NOBLANKS);
+        if (!d2) bad |= 8192; else xmlFreeDoc(d2);
+        xmlFreeParserCtxt(c2);
+    }
+    xmlCleanupParser();
+    if (bad) printf("xml1 bad:%x\n", bad); else printf("xml1 ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -I"$(xcrun --show-sdk-path)/usr/include/libxml2" -o "$d/xml1" "$d/xml1.c" -lxml2 \
+            >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    reason="$(native_three_modes "$name" "$d/xml1" "xml1 ok")"
+    if [ -z "$reason" ]; then
+        run_bounded "$d/sax.out" "$d/sax.err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/xml1" sax
+        rc=$?
+        if [ "$rc" != 72 ] || ! grep -q "_xmlCreatePushParserCtxt was given a SAX handler" "$d/sax.err"; then
+            reason="a push parser with a SAX handler exited $rc and printed '$(cat "$d/sax.out")', want 72 and the refusal by name: $(tail -1 "$d/sax.err" | cut -c1-160)"
+        fi
+    fi
+    record "$name" "$reason" "parse, XPath, output buffers and the push parser; a SAX handler is refused"
+}
+
+# pthread_cancel was a stub: the host's cancellation would have ended a thread inside ocerz as readily as inside a
+# call the guest made, and called its x86 cleanup handlers as arm64.  Now the host's cancel state is enabled only
+# for the length of a bridged call that waits in the kernel, behind a cleanup record that runs the guest's handlers
+# as guest code (sysbridge.c, "Thread cancellation").  The fixture cancels threads waiting in read, in sleep and
+# on a condition, expects their handlers and key destructors to have run and the joiner to get PTHREAD_CANCELED,
+# holds a cancel back with pthread_setcancelstate until pthread_testcancel, and lets a thread that reaches no
+# cancellation point return its own value.  Cache mode is not asked: there the guest's own libpthread makes the
+# request with a system call ocerz does not act on yet.
+case_native_cancel() {
+    local name=native_cancel reason="" d="$TMP/native_cancel" mode got rc n
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/cancel.c" <<'EOC'
+/* pthread_cancel as programs use it: a thread waiting in read, in sleep and on a condition is cancelled, its
+   cleanup handlers and key destructors run, the joiner gets PTHREAD_CANCELED; a thread with cancellation off
+   is cancelled only once it turns it on again; one that reaches no cancellation point returns normally. */
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static int pipes[4][2];
+static volatile int cleaned[4], destroyed, got_byte, started[5];
+static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+static pthread_key_t key;
+static void on_cancel(void *a) { cleaned[(long)a]++; }
+static void unlock_mu(void *a) { cleaned[(long)a]++; pthread_mutex_unlock(&mu); }
+static void on_key(void *v) { destroyed += (int)(long)v; }
+static void *in_read(void *a)
+{
+    char c;
+    pthread_setspecific(key, (void *)5);
+    pthread_cleanup_push(on_cancel, (void *)0);
+    pthread_cleanup_push(on_cancel, (void *)0);
+    started[0] = 1;
+    read(pipes[0][0], &c, 1);
+    pthread_cleanup_pop(0);
+    pthread_cleanup_pop(0);
+    return (void *)11;
+}
+static void *in_sleep(void *a)
+{
+    pthread_cleanup_push(on_cancel, (void *)1);
+    started[1] = 1;
+    for (;;) sleep(100);
+    pthread_cleanup_pop(0);
+    return (void *)12;
+}
+static void *in_cond(void *a)
+{
+    pthread_mutex_lock(&mu);
+    pthread_cleanup_push(unlock_mu, (void *)2);
+    started[2] = 1;
+    for (;;) pthread_cond_wait(&cv, &mu);
+    pthread_cleanup_pop(1);
+    return (void *)13;
+}
+static void *deferred(void *a)
+{
+    char c = 0;
+    int old = -1, type = -1;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &type);
+    pthread_cleanup_push(on_cancel, (void *)3);
+    started[3] = 1 + (old == PTHREAD_CANCEL_ENABLE) + 2 * (type == PTHREAD_CANCEL_DEFERRED);
+    if (read(pipes[3][0], &c, 1) == 1 && c == 'x') got_byte = 1;      /* cancelled by now, and not acted on */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old);
+    if (old != PTHREAD_CANCEL_DISABLE) got_byte = 100;
+    pthread_testcancel();
+    got_byte = 200;                                                    /* not reached */
+    pthread_cleanup_pop(0);
+    return (void *)14;
+}
+static void *no_point(void *a)
+{
+    volatile unsigned long x = 1;
+    started[4] = 1;
+    while (!started[0] || x < 50000000) x = x * 3 + 1 < x ? 1 : x + 1;  /* no cancellation point in here */
+    return (void *)15;
+}
+int main(void)
+{
+    unsigned bad = 0;
+    pthread_t t[5];
+    void *r[5] = { 0 };
+    void *(*fn[5])(void *) = { in_read, in_sleep, in_cond, deferred, no_point };
+    for (int i = 0; i < 4; i++) pipe(pipes[i]);
+    pthread_key_create(&key, on_key);
+    for (int i = 0; i < 5; i++) pthread_create(&t[i], NULL, fn[i], NULL);
+    for (int i = 0; i < 5; i++) while (!started[i]) usleep(1000);
+    usleep(20000);                                   /* the first three are waiting now */
+    pthread_mutex_lock(&mu); pthread_mutex_unlock(&mu);
+    for (int i = 0; i < 5; i++) if (pthread_cancel(t[i]) != 0) bad |= 1;
+    usleep(20000);
+    if (got_byte) bad |= 2;                          /* the fourth is still in its read */
+    write(pipes[3][1], "x", 1);
+    for (int i = 0; i < 5; i++) if (pthread_join(t[i], &r[i]) != 0) bad |= 4;
+    if (r[0] != PTHREAD_CANCELED || r[1] != PTHREAD_CANCELED || r[2] != PTHREAD_CANCELED || r[3] != PTHREAD_CANCELED) bad |= 8;
+    if (r[4] != (void *)15) bad |= 16;
+    if (cleaned[0] != 2 || cleaned[1] != 1 || cleaned[2] != 1 || cleaned[3] != 1) bad |= 32;
+    if (destroyed != 5) bad |= 64;
+    if (got_byte != 1 || started[3] != 4) bad |= 128;
+    if (pthread_mutex_trylock(&mu) != 0) bad |= 256; else pthread_mutex_unlock(&mu);
+    /* the process goes on: another thread starts, waits and ends by itself */
+    pthread_t more;
+    void *mr = 0;
+    started[0] = 0;
+    pthread_create(&more, NULL, in_read, NULL);
+    while (!started[0]) usleep(1000);
+    write(pipes[0][1], "y", 1);
+    if (pthread_join(more, &mr) != 0 || mr != (void *)11) bad |= 512;
+    if (pthread_cancel(more) != ESRCH && 0) bad |= 1024;
+    if (bad) printf("cancel bad:%x cleaned=%d,%d,%d,%d destroyed=%d got=%d r4=%ld\n", bad, cleaned[0], cleaned[1], cleaned[2], cleaned[3], destroyed, got_byte, (long)r[4]);
+    else printf("cancel ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -o "$d/cancel" "$d/cancel.c" >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    for mode in "-native" "-native" "-native" "-native -no-jit"; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$d/cancel"
+        rc=$?
+        got=$(cat "$d/out")
+        if [ -z "$reason" ] && { [ "$rc" != 0 ] || [ "$got" != "cancel ok" ]; }; then
+            reason="$mode exit $rc and printed '$got', want 'cancel ok': $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    record "$name" "$reason" "threads cancelled in read, sleep and a condition wait; handlers, destructors, deferral"
+}
+
+# Every LSOpen export was a stub, because a guest must not start an Intel program outside ocerz.  The two that
+# take URLs are what a program opens a web page, a document or a folder with, so they cross now, and are refused by
+# name only when what they would start is a program with x86 code and no arm64 code (bridge.c, br_ls_check).  The
+# fixture opens nothing: a scheme no application handles and a file that is not there must give the errors the
+# arm64 build gets from the host, and a file URL to an Intel-only program must be refused, by both calls.  That
+# program is not executable and has no known type, so nothing would open it if the refusal were ever lost.
+case_native_lsopen() {
+    local name=native_lsopen reason="" d="$TMP/native_lsopen" mode got want rc form
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/lsopen.c" <<'EOC'
+/* LSOpenCFURLRef and LSOpenFromURLSpec on things that start nothing: a scheme no application handles and a file
+   that is not there.  With "intel <path>", a file URL to an Intel-only program, which native mode must refuse. */
+#include <CoreServices/CoreServices.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv)
+{
+    unsigned bad = 0;
+    if (argc > 2 && !strcmp(argv[1], "intel")) {
+        CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)argv[2], (CFIndex)strlen(argv[2]), false);
+        OSStatus st = argc > 3 ? LSOpenFromURLSpec(&(LSLaunchURLSpec){ .appURL = u }, NULL) : LSOpenCFURLRef(u, NULL);
+        printf("lsopen intel %d\n", (int)st);
+        return 0;
+    }
+    CFURLRef nobody = CFURLCreateWithString(NULL, CFSTR("ocerz-no-such-scheme-5381://nothing/at/all"), NULL);
+    CFURLRef missing = CFURLCreateWithFileSystemPath(NULL, CFSTR("/nonexistent/ocerz/lsopen.txt"), kCFURLPOSIXPathStyle, false);
+    CFURLRef launched = (CFURLRef)0x1;
+    OSStatus a = LSOpenCFURLRef(nobody, &launched);
+    OSStatus b = LSOpenCFURLRef(missing, NULL);
+    const void *items[1] = { nobody };
+    CFArrayRef arr = CFArrayCreate(NULL, items, 1, &kCFTypeArrayCallBacks);
+    LSLaunchURLSpec spec = { .appURL = NULL, .itemURLs = arr, .passThruParams = NULL, .launchFlags = kLSLaunchDefaults, .asyncRefCon = NULL };
+    OSStatus c = LSOpenFromURLSpec(&spec, NULL);
+    if (a == noErr || b == noErr || c == noErr) bad |= 1;
+    printf("lsopen %d %d %d%s\n", (int)a, (int)b, (int)c, bad ? " bad" : "");
+    return bad != 0;
+}
+EOC
+    printf 'int main(void) { return 0; }\n' > "$d/intelonly.c"
+    if ! { clang -arch x86_64 -O1 -Wno-deprecated-declarations -o "$d/lsopen" "$d/lsopen.c" -framework CoreServices &&
+           clang -arch arm64 -O1 -Wno-deprecated-declarations -o "$d/lsopen.arm64" "$d/lsopen.c" -framework CoreServices &&
+           clang -arch x86_64 -o "$d/intelonly.ocerz-test" "$d/intelonly.c" &&
+           chmod 644 "$d/intelonly.ocerz-test"; } >"$d/cc.log" 2>&1; then
+        record "$name" "the fixtures did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    run_bounded "$d/arm64.out" "$d/arm64.err" "$d/lsopen.arm64"
+    want=$(cat "$d/arm64.out")
+    case "$want" in
+        "lsopen "*" bad"|"") record "$name" "the arm64 build, run on the host, printed '$want': this Mac opens the test's URLs, so the case cannot tell"; return ;;
+    esac
+    for mode in "-native" "-native -no-jit" "-cache"; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$d/lsopen"
+        rc=$?
+        got=$(cat "$d/out")
+        if [ -z "$reason" ] && { [ "$rc" != 0 ] || [ "$got" != "$want" ]; }; then
+            reason="$mode exit $rc and printed '$got', want the host's '$want': $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    for form in "" spec; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" -native "$d/lsopen" intel "$d/intelonly.ocerz-test" $form
+        rc=$?
+        if [ -z "$reason" ] && { [ "$rc" != 72 ] || ! grep -q "would start .*intelonly.ocerz-test, an Intel program, outside ocerz" "$d/err"; }; then
+            reason="opening an Intel-only program${form:+ through a launch spec} exited $rc and printed '$(cat "$d/out")', want 72 and the refusal: $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    record "$name" "$reason" "LSOpenCFURLRef and LSOpenFromURLSpec cross ($want); an Intel-only program is refused"
+}
+
 case_native_import_addends() {
     local name=native_import_addends reason="" d="$TMP/native_import_addends" mode f want got
     rm -rf "$d"; mkdir -p "$d"
@@ -16052,6 +16544,11 @@ case_native_check
 case_native_objc_cycle
 case_native_lazy_flat
 case_native_import_addends
+case_native_syscall
+case_native_undeclared
+case_native_libxml2
+case_native_cancel
+case_native_lsopen
 case_native_flat_nonlazy
 case_native_scanf_long_double
 case_native_fork_initialize

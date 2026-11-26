@@ -246,6 +246,50 @@ native mode a lazy flat import that nothing defines at launch now waits for
 its first call. The last import it lacked, TWAIN's `DSM_Entry`, now has a
 database.
 
+On 17 November 2026 the survey ran again, over 39 programs, and the gaps it
+ranked highest that could be closed without a new mechanism were closed.
+`syscall` and `__syscall` are answered by ocerz's own system call layer, the
+one behind the `syscall` instruction in cache mode, instead of stopping the
+program: the native functions would have handed the host kernel the guest's
+structures. Functions the system exports and its headers do not declare, or
+declare only on request, have signatures in `tools/sdkgen/overrides`: `isnan`
+under its own name, `lgamma_r`, the `realpath` of old binaries,
+`objc_loadClassref`, CoreFoundation's hash functions, CoreVideo's Metal
+texture cache, and malloc's fork hooks, which do nothing because the fork a
+guest makes is ocerz's and takes malloc's locks itself. AddressBook's C
+interface is read from its own headers, 95 functions. And libxml2's parser
+context, XPath context and I/O buffers, which hold function pointers but are
+only ever built by libxml2, are opaque records as `FILE` is, so 214 more of
+its functions cross; the push parser crosses when it is given no SAX handler
+and is refused by name when it is given one. Seven programs now bind
+completely and eleven with stubs, where five and thirteen did; among C and
+Objective-C names, imports stubbed for want of a declaration fell from 325 to
+237 and for a structure of callbacks from 222 to 92. The 21 refused programs
+are refused for Swift, all but two.
+
+`pthread_cancel`, which twelve of those programs import, was the name most of
+them could not call. A guest thread is a host thread, so the host's
+cancellation is what cancels it, but the host acts at its next cancellation
+point, and ocerz makes those itself, inside the translator with a lock held;
+and it then calls the thread's cleanup handlers, which the guest's
+`pthread_cleanup_push` links onto the host's list as x86 routines. So the
+host's cancel state stays disabled on every thread that runs guest code, the
+guest's own state and type are kept per thread by the handlers of
+`pthread_setcancelstate` and `pthread_setcanceltype`, and the host's state is
+enabled only for the length of a bridged call that waits in the kernel
+(`read`, `sleep`, `pthread_cond_wait` and the rest), behind a cleanup record
+of ocerz's that runs the guest's handlers and key destructors as guest code.
+That is where POSIX says a deferred cancel is acted on.
+
+LaunchServices' open calls were all stubs, because a guest must not start an
+Intel program outside ocerz, where nothing translates it. The two that take
+URLs, `LSOpenCFURLRef` and `LSOpenFromURLSpec`, are what a program opens a web
+page, a document or a folder with, and that starts none of its own code: they
+cross now, and are refused by name only when what they would start is a
+program, or an application whose program is, with x86 code and no arm64 code.
+What most programs still import and cannot call is GSS (ten), `JSClassCreate`
+(eight) and `sqlite3_vfs_find` (seven).
+
 ## Comparing with Rosetta
 
 `tools/native-diff.py` runs the same x86_64 probes under Rosetta, cache mode
