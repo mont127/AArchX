@@ -74,7 +74,7 @@ The app is only a wrapper around the terminal version, which works the same with
 or without it. In Terminal, open a new window, then:
 
 ```sh
-ocerz version                         # AArchX 1.0.3
+ocerz version                         # AArchX 1.0.4
 ocerz /Applications/Some.app          # a bundle runs the executable its Info.plist names
 ```
 
