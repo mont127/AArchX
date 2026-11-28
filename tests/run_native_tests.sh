@@ -12880,6 +12880,74 @@ EOC
     record "$name" "$reason" "undeclared exports cross by the signatures the overrides give them"
 }
 
+# dyld runs initializers from the bottom of the dependency graph up, and the libraries one image links in the
+# order it links them.  Native mode ran a program's libraries at launch in the reverse of the order it had found
+# them in, which also has every dependency before its dependent but turns the libraries of one image round:
+# the second one a program links ran before the first.  Chrome links a small library first whose initializer
+# prepares the allocator for the big one after it, found the big one's allocator already there, and aborted
+# ("The PartitionAlloc default zone has unexpectedly already been registered").  The program here links two
+# libraries, each with one of its own beneath it, and every initializer writes a letter: the x86_64 build must
+# write them in the order the arm64 build does under dyld itself.
+case_native_init_order() {
+    local name=native_init_order reason="" d="$TMP/native_init_order" arch want mode rc got
+    rm -rf "$d"; mkdir -p "$d/x86_64" "$d/arm64"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    cat > "$d/note.c" <<'EOC'
+#include <unistd.h>
+void order_note(char c) { write(1, &c, 1); }
+__attribute__((constructor)) static void note_init(void) { order_note('n'); }
+EOC
+    cat > "$d/under.c" <<'EOC'
+extern void order_note(char);
+__attribute__((constructor)) static void under_init(void) { order_note('u'); }
+int under_value(void) { return 3; }
+EOC
+    cat > "$d/first.c" <<'EOC'
+extern void order_note(char);
+__attribute__((constructor)) static void first_init(void) { order_note('1'); }
+int first_value(void) { return 1; }
+EOC
+    cat > "$d/second.c" <<'EOC'
+extern void order_note(char);
+extern int under_value(void);
+__attribute__((constructor)) static void second_init(void) { order_note('2'); }
+int second_value(void) { return 2 + under_value(); }
+EOC
+    cat > "$d/main.c" <<'EOC'
+extern void order_note(char);
+extern int first_value(void), second_value(void);
+__attribute__((constructor)) static void main_init(void) { order_note('m'); }
+int main(void) { order_note(first_value() + second_value() == 6 ? '.' : '!'); order_note('\n'); return 0; }
+EOC
+    for arch in x86_64 arm64; do
+        if ! { clang -arch $arch -dynamiclib -install_name @executable_path/libnote.dylib -o "$d/$arch/libnote.dylib" "$d/note.c" &&
+               clang -arch $arch -dynamiclib -install_name @executable_path/libunder.dylib -o "$d/$arch/libunder.dylib" "$d/under.c" -L"$d/$arch" -lnote &&
+               clang -arch $arch -dynamiclib -install_name @executable_path/libfirst.dylib -o "$d/$arch/libfirst.dylib" "$d/first.c" -L"$d/$arch" -lnote &&
+               clang -arch $arch -dynamiclib -install_name @executable_path/libsecond.dylib -o "$d/$arch/libsecond.dylib" "$d/second.c" -L"$d/$arch" -lunder -lnote &&
+               clang -arch $arch -o "$d/$arch/prog" "$d/main.c" -L"$d/$arch" -lfirst -lsecond -lnote; } >"$d/cc.log" 2>&1; then
+            record "$name" "the $arch fixture did not build: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+            return
+        fi
+    done
+    want=$("$d/arm64/prog")
+    if [ "$want" != "n1u2m." ]; then
+        record "$name" "the arm64 build under dyld wrote '$want', and the fixture expects n1u2m."
+        return
+    fi
+    for mode in "-native" "-native -no-jit" "-cache"; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$d/x86_64/prog"
+        rc=$?
+        got=$(cat "$d/out")
+        if [ -z "$reason" ] && { [ "$rc" != 0 ] || [ "$got" != "$want" ]; }; then
+            reason="$mode exit $rc and wrote '$got', dyld's order is '$want': $(tail -1 "$d/err" | cut -c1-140)"
+        fi
+    done
+    record "$name" "$reason" "a program's libraries initialized in the order it links them, each after what it links"
+}
+
 # libxml2's parser context, XPath context and I/O buffers hold function pointers, so every function taking one was
 # a stub and a program stopped at its first XPath query.  libxml2 builds those structures itself, so they are
 # opaque records now and 214 more functions cross.  The push parser crosses when it is given no SAX handler and is
@@ -16545,6 +16613,7 @@ case_native_lazy_flat
 case_native_import_addends
 case_native_syscall
 case_native_undeclared
+case_native_init_order
 case_native_libxml2
 case_native_cancel
 case_native_lsopen

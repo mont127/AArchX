@@ -265,6 +265,7 @@ bug is in what that switch controls.
 | `OCERZ_NO_FILEMAP=1` | read every private file mapping into anonymous memory instead of mapping it from the file |
 | `OCERZ_PRELOAD_OBJC=<paths>` | put matching shared-cache Objective-C images into the startup batch; `@cat` does it for every image that defines categories |
 | `OCERZ_NO_UPWARD_INIT=1` | do not initialize a library reached only through an upward dependency, as before 2026-09-22 |
+| `OCERZ_NO_INIT_SEQ=1` | in native mode, initialize a program's libraries at launch in the reverse of the order they were found in, as up to 1.0.4, instead of dyld's order |
 | `OCERZ_NO_DELAY_INIT=1` | load and initialize at launch the libraries reached only through delayed-init dependencies, which dyld leaves until the program asks for them, as before 2026-10-09 |
 | `OCERZ_NO_WEAK_MAIN_FIRST=1` | look a weak definition up in the shared cache before the main executable, as before 2026-10-09 |
 | `OCERZ_NO_LOADMAP=1` | do not map a shared-cache image's Objective-C classes before its `+load` runs |

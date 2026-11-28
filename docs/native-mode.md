@@ -290,6 +290,17 @@ program, or an application whose program is, with x86 code and no arm64 code.
 What most programs still import and cannot call is GSS (ten), `JSClassCreate`
 (eight) and `sqlite3_vfs_find` (seven).
 
+A program's own libraries are initialized at launch in dyld's order: from the
+bottom of the dependency graph up, and the libraries one image links in the
+order it links them. Up to 1.0.4 native mode ran them in the reverse of the
+order it had found them in, which turned the libraries of one image round and
+could run a library before one it links. Chrome is built on the right order:
+its program links a small library first whose initializer prepares the memory
+allocator for the framework after it, and in native mode the framework came
+first and Chrome aborted before it had drawn anything ("The PartitionAlloc
+default zone has unexpectedly already been registered"). Libraries opened
+later with `dlopen` were already initialized in the right order.
+
 ## Comparing with Rosetta
 
 `tools/native-diff.py` runs the same x86_64 probes under Rosetta, cache mode

@@ -331,9 +331,17 @@
  * cache mode gates on it never runs either, and for a while nothing ran a guest
  * image's own initializers at all: a C constructor or a C++ static object's
  * constructor was silently skipped.  Each guest image's __mod_init_func and
- * __init_offsets entries now run just before main, after every +load, the
- * dylibs in the reverse of the order they were loaded, so a library's
- * dependencies are initialized before it, and the main image last.  dyld
+ * __init_offsets entries now run just before main, after every +load, and the
+ * main image last.  The dylibs run in dyld's order, from the bottom of the
+ * dependency graph up and the libraries of one image in the order it links
+ * them, which is the order load_disk_dylib finished them in (seq, numbered once
+ * an image's own dependencies are loaded; dlopen has always used it).  They
+ * used to run in the reverse of the order they were found in, which is not the
+ * same thing: it turns the libraries of one image round, and it runs a library
+ * ahead of a dependency that an earlier sibling had brought in first.  Chrome's
+ * program links a small library whose initializer prepares the allocator for
+ * the framework it links second, and aborted when the framework's ran first.
+ * OCERZ_NO_INIT_SEQ=1 goes back to the reverse order.  dyld
  * interleaves the two per image, +load then constructors, image by image; ocerz
  * runs all +load methods first, a difference only a constructor that sends a
  * message to a class in a later image could see.  Virtual images carry no
@@ -7762,8 +7770,13 @@ int ocerz_dyld_run(struct OcerzVM *vm, const char *path, int argc, char **argv, 
         ocerz_objcbridge_run_loads(vm, fr.stack_top);
         if (vm->exited)
             return vm->exit_code;
-        for (int i = loaded - 1; i >= 0 && !vm->exited; i--)
-            run_image_inits(vm, g_dimgs[i].load_base, nia, fr.stack_top);
+        DynImage *order[DYN_DIMG_MAX];
+        for (int i = 0; i < loaded; i++)
+            order[i] = getenv("OCERZ_NO_INIT_SEQ") ? &g_dimgs[loaded - 1 - i] : &g_dimgs[i];
+        if (loaded > 1 && !getenv("OCERZ_NO_INIT_SEQ"))
+            qsort(order, (size_t)loaded, sizeof order[0], ndl_seq_cmp);
+        for (int i = 0; i < loaded && !vm->exited; i++)
+            run_image_inits(vm, order[i]->load_base, nia, fr.stack_top);
         if (!vm->exited)
             run_image_inits(vm, img.load_base, nia, fr.stack_top);
         if (vm->exited)
