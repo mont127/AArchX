@@ -39,6 +39,7 @@ cx="$work/cx/CrossOver.app"
 cxbin="$cx/Contents/SharedSupport/CrossOver/bin"
 bottle="$home/Library/Application Support/CrossOver/Bottles/Game"
 shims="$home/Library/Application Support/AArchX/CrossOver/bin"
+shims_native="$shims-native"
 launcher="$home/Applications/CrossOver/Game/Prog.app"
 command="$bottle/desktopdata/cxmenu/StartMenu.C^5E3A_users/Programs/Some Game/Prog.lnk"
 mkdir -p "$home" "$cxbin" "$bottle" "$launcher/Contents/MacOS" "$(dirname "$command")"
@@ -68,6 +69,11 @@ expect "wineloader runs under the ocerz that wrote it, arguments whole" \
     "$(printf 'OCERZ-A\n--\n%s/wineloader\none\ntwo words' "$cxbin")" "$got"
 got=$(env HOME="$home" CX_ROOT="${cxbin%/bin}" "$shims/wineserver" -k 2>&1)
 expect "wineserver runs under it too" "$(printf 'OCERZ-A\n--\n%s/wineserver\n-k' "$cxbin")" "$got"
+got=$(env HOME="$home" CX_ROOT="${cxbin%/bin}" "$shims_native/wineloader" one "two words" 2>&1)
+expect "the second pair of scripts runs it under ocerz -native" \
+    "$(printf 'OCERZ-A\n-native\n--\n%s/wineloader\none\ntwo words' "$cxbin")" "$got"
+got=$(env HOME="$home" CX_ROOT="${cxbin%/bin}" "$shims_native/wineserver" -k 2>&1)
+expect "its wineserver too" "$(printf 'OCERZ-A\n-native\n--\n%s/wineserver\n-k' "$cxbin")" "$got"
 
 mv "$work/ocerz-a" "$work/ocerz-a.gone"
 mkdir -p "$home/.aarchx"
@@ -98,6 +104,17 @@ if app uses "$bottle/cxbottle.conf" &&
 else
     flunk "switching a bottle on sets its BinPath" "$(grep BinPath "$bottle/cxbottle.conf")"
 fi
+if app native "$bottle/cxbottle.conf"; then flunk "a bottle switched on" "reads as native without being asked"; else pass "a bottle switched on is in cache mode"; fi
+app bottle "$bottle/cxbottle.conf" on native || flunk "bottle switched to native" "refused"
+if app uses "$bottle/cxbottle.conf" && app native "$bottle/cxbottle.conf" && [ "$(grep -c BinPath "$bottle/cxbottle.conf")" = 1 ] &&
+   grep -q '^"BinPath" = "/.*/home/Library/Application Support/AArchX/CrossOver/bin-native:${CX_ROOT}/bin"$' "$bottle/cxbottle.conf"; then
+    pass "Native points the bottle's one BinPath at the scripts that pass -native"
+else
+    flunk "Native" "$(grep BinPath "$bottle/cxbottle.conf")"
+fi
+app bottle "$bottle/cxbottle.conf" on
+if app uses "$bottle/cxbottle.conf" && ! app native "$bottle/cxbottle.conf"; then pass "unticking Native leaves the bottle under AArchX in cache mode"; else flunk "unticking Native" "$(grep BinPath "$bottle/cxbottle.conf")"; fi
+app bottle "$bottle/cxbottle.conf" on native
 app bottle "$bottle/cxbottle.conf" off
 if cmp -s "$bottle/cxbottle.conf" "$work/conf.before"; then pass "switching it off leaves cxbottle.conf as it was"; else flunk "switching off" "cxbottle.conf differs"; fi
 printf '[Wine]\n"BinPath" = "/somewhere/else"\n' > "$work/other.conf"
@@ -168,6 +185,18 @@ fresh="$work/fresh-home"
 mkdir -p "$fresh"
 env CFFIXED_USER_HOME="$fresh" HOME="$fresh" "$work/apptest" refresh -OcerzPath "$work/ocerz-b" -CrossOverPath "$cx"
 if [ -e "$fresh/Library" ]; then flunk "a start of the app with no switched bottle" "wrote into the home"; else pass "a start of the app writes nothing for someone who never switched a bottle"; fi
+
+# ---- how a run in native mode ended: the exit code alone does not say, ocerz's own last lines do
+printf 'a program that\nexits 71 by itself\n' > "$work/own71.log"
+printf 'ocerz: native: no bridge for _swift_once in /usr/lib/swift/libswiftCore.dylib\nocerz: native: 50 unresolved imports, which no virtual library exports\nocerz: native: to run it translated instead, supply an x86_64 build\n' > "$work/refused.log"
+printf 'the program printed this\nocerz: bridge: /usr/lib/libSystem.B.dylib _stat64 not implemented\nocerz:   called from 0x7c6e08be5d\n' > "$work/stopped.log"
+if app log "$work/refused.log" "unresolved imports, which no virtual library exports" && app log "$work/stopped.log" " not implemented" &&
+   ! app log "$work/own71.log" "unresolved imports, which no virtual library exports" && ! app log "$work/own71.log" " not implemented" &&
+   ! app log "$work/no-such.log" " not implemented"; then
+    pass "a refusal and a missing call are told from a program's own exit by ocerz's last lines"
+else
+    flunk "reading the end of a run's log" "took one kind of ending for another"
+fi
 
 # ---- a copy of the app that will not stay where it is
 if app passing "/private/var/folders/xx/T/AppTranslocation/ABCD/d/AArchX.app/Contents/Resources/aarchx/ocerz"; then

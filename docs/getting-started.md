@@ -102,6 +102,13 @@ How the app picks the mode:
   Mac programs only; 32-bit and Windows programs are left as they are.
 - The app switches to native mode by itself for a 32-bit program, which only
   [m32](m32.md) runs, and when Rosetta's x86-64 cache is missing.
+- Native mode refuses a program it cannot bind, one that uses Swift's system
+  frameworks for instance, before any of it has run. The app then starts the
+  program again in cache mode by itself and says so in Activity: "Native mode
+  cannot run it yet; started it in cache mode". A program that started and
+  then reached a call native mode cannot make is not started again; Activity
+  says "Stopped at a call native mode cannot make yet", and its log names the
+  call.
 - It refuses an Apple silicon app, which runs without AArchX.
 
 A Windows program runs through Wine, as `ocerz <wine> <program>`:
@@ -123,10 +130,15 @@ A Windows program runs through Wine, as `ocerz <wine> <program>`:
 With CrossOver installed, **CrossOver Bottles…** in the bottom bar lists its
 bottles, each with a box. A ticked bottle runs its Windows programs under
 AArchX instead of Rosetta, started from CrossOver or from their launchers as
-usual. Ticking does two things, and unticking undoes both:
+usual. **Native**, beside a ticked bottle, runs that bottle's Wine in
+[native mode](modes.md): against the Mac's own libraries instead of the Intel
+ones that come with Rosetta. It is a second pair of the scripts below, which
+pass `-native`. Fewer programs run that way, and unticking it puts the bottle
+back in cache mode. Ticking a bottle does two things, and unticking undoes both:
 - **The bottle.** It sets the bottle's `[Wine] "BinPath"`, CrossOver's
   documented way to use another Wine, to two small scripts in
-  `~/Library/Application Support/AArchX/CrossOver/bin`. They run CrossOver's
+  `~/Library/Application Support/AArchX/CrossOver/bin` (`bin-native` for a
+  bottle with Native ticked). They run CrossOver's
   `wineloader` and `wineserver` under `ocerz`: the one of the AArchX you
   opened last, or if that has gone, one in the places AArchX installs to, and
   directly only if there is none at all.

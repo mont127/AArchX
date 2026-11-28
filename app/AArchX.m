@@ -240,9 +240,16 @@ static NSString *crossover_shims(void)
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/AArchX/CrossOver/bin"];
 }
 
-static NSString *crossover_binpath(void)
+/* The same two scripts with -native, for a bottle whose Wine is to run against the Mac's own libraries.  The
+ * name begins with the other directory's, so that either one in a BinPath marks the bottle as AArchX's. */
+static NSString *crossover_shims_native(void)
 {
-    return [crossover_shims() stringByAppendingString:@":${CX_ROOT}/bin"];
+    return [crossover_shims() stringByAppendingString:@"-native"];
+}
+
+static NSString *crossover_binpath(BOOL native)
+{
+    return [(native ? crossover_shims_native() : crossover_shims()) stringByAppendingString:@":${CX_ROOT}/bin"];
 }
 
 static NSString *shell_quote(NSString *s)
@@ -263,26 +270,28 @@ static NSString *shell_quote(NSString *s)
  * scripts again (refresh_crossover), so the AArchX opened last is the one bottles use. */
 static BOOL write_crossover_shims(NSString *ocerz)
 {
-    NSString *dir = crossover_shims();
-    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil])
-        return NO;
-    for (NSString *name in @[ @"wineloader", @"wineserver" ]) {
-        NSString *script = [NSString stringWithFormat:
-            @"#!/bin/sh\n"
-            @"# Written by AArchX.app: CrossOver's own %@, run by ocerz instead of Rosetta.\n"
-            @"# The first ocerz is the one of the AArchX opened last; the others are where AArchX installs one.\n"
-            @"export WINELOADER=\"$CX_ROOT/bin/wineloader\"\n"
-            @"export WINESERVER=\"$CX_ROOT/bin/wineserver\"\n"
-            @"for ocerz in %@ \"$HOME/.aarchx/ocerz\" /Applications/AArchX.app/Contents/Resources/aarchx/ocerz \\\n"
-            @"    \"$HOME/Applications/AArchX.app/Contents/Resources/aarchx/ocerz\" /opt/homebrew/bin/ocerz /usr/local/bin/ocerz; do\n"
-            @"    [ -x \"$ocerz\" ] && exec \"$ocerz\" -- \"$CX_ROOT/bin/%@\" \"$@\"\n"
-            @"done\n"
-            @"exec \"$CX_ROOT/bin/%@\" \"$@\"\n",
-            name, shell_quote(ocerz), name, name];
-        NSString *path = [dir stringByAppendingPathComponent:name];
-        if (![script writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil])
+    for (NSString *dir in @[ crossover_shims(), crossover_shims_native() ]) {
+        BOOL native = [dir isEqualToString:crossover_shims_native()];
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil])
             return NO;
-        [[NSFileManager defaultManager] setAttributes:@{ NSFilePosixPermissions : @0755 } ofItemAtPath:path error:nil];
+        for (NSString *name in @[ @"wineloader", @"wineserver" ]) {
+            NSString *script = [NSString stringWithFormat:
+                @"#!/bin/sh\n"
+                @"# Written by AArchX.app: CrossOver's own %@, run by ocerz%@ instead of Rosetta.\n"
+                @"# The first ocerz is the one of the AArchX opened last; the others are where AArchX installs one.\n"
+                @"export WINELOADER=\"$CX_ROOT/bin/wineloader\"\n"
+                @"export WINESERVER=\"$CX_ROOT/bin/wineserver\"\n"
+                @"for ocerz in %@ \"$HOME/.aarchx/ocerz\" /Applications/AArchX.app/Contents/Resources/aarchx/ocerz \\\n"
+                @"    \"$HOME/Applications/AArchX.app/Contents/Resources/aarchx/ocerz\" /opt/homebrew/bin/ocerz /usr/local/bin/ocerz; do\n"
+                @"    [ -x \"$ocerz\" ] && exec \"$ocerz\"%@ -- \"$CX_ROOT/bin/%@\" \"$@\"\n"
+                @"done\n"
+                @"exec \"$CX_ROOT/bin/%@\" \"$@\"\n",
+                name, native ? @" in native mode" : @"", shell_quote(ocerz), native ? @" -native" : @"", name, name];
+            NSString *path = [dir stringByAppendingPathComponent:name];
+            if (![script writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil])
+                return NO;
+            [[NSFileManager defaultManager] setAttributes:@{ NSFilePosixPermissions : @0755 } ofItemAtPath:path error:nil];
+        }
     }
     return YES;
 }
@@ -317,9 +326,20 @@ static BOOL bottle_uses_aarchx(NSString *conf)
     return i >= 0 && [lines[i] rangeOfString:crossover_shims()].location != NSNotFound;
 }
 
-/* Sets or removes the bottle's BinPath.  A BinPath someone else set is left
- * alone and reported as a failure. */
-static BOOL set_bottle_aarchx(NSString *conf, BOOL on)
+/* Whether a switched bottle's BinPath names the scripts that pass -native. */
+static BOOL bottle_is_native(NSString *conf)
+{
+    NSString *text = [NSString stringWithContentsOfFile:conf encoding:NSUTF8StringEncoding error:nil];
+    NSArray *lines = [text componentsSeparatedByString:@"\n"];
+    NSInteger wine_at;
+    NSInteger i = text ? binpath_line(lines, &wine_at) : -1;
+    return i >= 0 && [lines[i] rangeOfString:[crossover_shims_native() stringByAppendingString:@":"]].location != NSNotFound;
+}
+
+/* Sets or removes the bottle's BinPath; native picks the scripts that pass
+ * -native.  A BinPath someone else set is left alone and reported as a
+ * failure. */
+static BOOL set_bottle_aarchx(NSString *conf, BOOL on, BOOL native)
 {
     NSString *text = [NSString stringWithContentsOfFile:conf encoding:NSUTF8StringEncoding error:nil];
     if (!text)
@@ -330,7 +350,7 @@ static BOOL set_bottle_aarchx(NSString *conf, BOOL on)
     BOOL ours = i >= 0 && [lines[i] rangeOfString:crossover_shims()].location != NSNotFound;
     if (i >= 0 && !ours)
         return NO;
-    NSString *line = [NSString stringWithFormat:@"\"BinPath\" = \"%@\"", crossover_binpath()];
+    NSString *line = [NSString stringWithFormat:@"\"BinPath\" = \"%@\"", crossover_binpath(native)];
     if (on && ours)
         lines[i] = line;
     else if (on && wine_at >= 0)
@@ -543,9 +563,25 @@ enum { KIND_INTEL, KIND_I386, KIND_WINDOWS };
 @property(copy) NSString *winePrefix;
 @property(strong) NSDate *started;
 @property(strong) NSTask *task;
+/* For a run in native mode that has cache mode to fall back on: the arguments of that second run. */
+@property(copy) NSArray *fallbackArgs;
 @end
 @implementation Run
 @end
+
+/* Whether the end of a run's log holds a line of ocerz's own.  An exit code alone does not say that native
+ * mode gave up: 71 and 72 are also what a program may exit with by itself. */
+static BOOL log_ends_with(NSString *log, NSString *line)
+{
+    NSFileHandle *h = [NSFileHandle fileHandleForReadingAtPath:log];
+    if (!h)
+        return NO;
+    unsigned long long size = [h seekToEndOfFile];
+    [h seekToFileOffset:size > 8192 ? size - 8192 : 0];
+    NSString *tail = [[NSString alloc] initWithData:[h readDataToEndOfFile] encoding:NSUTF8StringEncoding];
+    [h closeFile];
+    return tail && [tail rangeOfString:line].location != NSNotFound;
+}
 
 /* A program in the library, and its latest run. */
 @interface Item : NSObject
@@ -1321,8 +1357,10 @@ static int program_kind(NSString *path, NSString **why)
     title.font = [NSFont boldSystemFontOfSize:13];
     NSTextField *intro = [NSTextField wrappingLabelWithString:
         @"Ticked bottles run their Windows programs under AArchX instead of Rosetta, started from CrossOver or "
-        @"from their launchers in ~/Applications/CrossOver as usual. A change takes effect the next time the "
-        @"bottle starts, so quit its programs first. Unticking puts every file back as CrossOver wrote it."];
+        @"from their launchers in ~/Applications/CrossOver as usual. Native runs the bottle's Wine against the "
+        @"Mac's own libraries instead of the Intel ones that come with Rosetta; fewer programs run that way. "
+        @"A change takes effect the next time the bottle starts, so quit its programs first. Unticking puts "
+        @"every file back as CrossOver wrote it."];
     NSStackView *boxes = [NSStackView new];
     boxes.orientation = NSUserInterfaceLayoutOrientationVertical;
     boxes.alignment = NSLayoutAttributeLeading;
@@ -1332,7 +1370,17 @@ static int program_kind(NSString *path, NSString **why)
         box.state = bottle_uses_aarchx(box.identifier) ? NSControlStateValueOn : NSControlStateValueOff;
         if (box.state == NSControlStateValueOn)
             set_launchers_aarchx(b, YES);
-        [boxes addArrangedSubview:box];
+        NSButton *native = [NSButton checkboxWithTitle:@"Native" target:self action:@selector(bottleNativeToggled:)];
+        native.identifier = box.identifier;
+        native.controlSize = NSControlSizeSmall;
+        native.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
+        native.toolTip = @"Run this bottle's Wine in native mode: against the Mac's own libraries, with no need of Rosetta's.";
+        native.enabled = box.state == NSControlStateValueOn;
+        native.state = bottle_is_native(box.identifier) ? NSControlStateValueOn : NSControlStateValueOff;
+        NSStackView *row = [NSStackView stackViewWithViews:@[ box, native ]];
+        row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+        row.spacing = 14;
+        [boxes addArrangedSubview:row];
     }
     NSScrollView *scroll = [NSScrollView new];
     FlippedView *list = [FlippedView new];
@@ -1364,11 +1412,32 @@ static int program_kind(NSString *path, NSString **why)
     [self.window beginSheet:sheet completionHandler:nil];
 }
 
+/* The Native box beside a bottle's own: the other button of its row. */
+- (NSButton *)nativeBoxFor:(NSButton *)box
+{
+    for (NSView *v in box.superview.subviews)
+        if (v != box && [v isKindOfClass:[NSButton class]])
+            return (NSButton *)v;
+    return nil;
+}
+
+- (void)bottleNativeToggled:(NSButton *)native
+{
+    if (!set_bottle_aarchx(native.identifier, YES, native.state == NSControlStateValueOn)) {
+        native.state = native.state == NSControlStateValueOn ? NSControlStateValueOff : NSControlStateValueOn;
+        NSAlert *a = [NSAlert new];
+        a.messageText = @"The bottle was not changed";
+        a.informativeText = @"Its cxbottle.conf could not be written.";
+        [a beginSheetModalForWindow:native.window completionHandler:nil];
+    }
+}
+
 - (void)bottleToggled:(NSButton *)box
 {
     BOOL on = box.state == NSControlStateValueOn;
+    NSButton *native = [self nativeBoxFor:box];
     NSString *why = nil;
-    if (!set_bottle_aarchx(box.identifier, on)) {
+    if (!set_bottle_aarchx(box.identifier, on, on && native.state == NSControlStateValueOn)) {
         box.state = on ? NSControlStateValueOff : NSControlStateValueOn;
         why = @"Its cxbottle.conf already sets [Wine] BinPath to something else, or could not be written.";
     } else if (!set_launchers_aarchx(box.title, on)) {
@@ -1376,6 +1445,7 @@ static int program_kind(NSString *path, NSString **why)
                    @"changed, so they still start it under Rosetta."
                  : @"Some of its launchers in ~/Applications/CrossOver could not be put back.";
     }
+    native.enabled = box.state == NSControlStateValueOn;
     if (why) {
         NSAlert *a = [NSAlert new];
         a.messageText = [NSString stringWithFormat:@"%@ was not fully changed", box.title];
@@ -1486,7 +1556,11 @@ static int program_kind(NSString *path, NSString **why)
     NSString *mode = reason ? [NSString stringWithFormat:@"native, %@", reason] : native ? @"native" : nil;
     if (fex)
         mode = mode ? [mode stringByAppendingString:@", FEX"] : @"FEX";
-    return [self launch:path name:name ocerz:ocerz args:args env:nil cwd:NSHomeDirectory() mode:mode wine:nil];
+    Run *run = [self launch:path name:name ocerz:ocerz args:args env:nil cwd:NSHomeDirectory() mode:mode wine:nil];
+    /* Native mode refuses a program it cannot bind before any of it has run, and cache mode can run it then. */
+    if (run && native && kind == KIND_INTEL && rosetta_cache_present())
+        run.fallbackArgs = fex ? @[ @"-fex", @"--", path ] : @[ @"--", path ];
+    return run;
 }
 
 /* Wine runs in cache mode, in the program's own folder, with the chosen build. */
@@ -1572,14 +1646,35 @@ static int program_kind(NSString *path, NSString **why)
     t.terminationHandler = ^(NSTask *done) {
         dispatch_async(dispatch_get_main_queue(), ^{
             NSString *how;
-            if (done.terminationReason == NSTaskTerminationReasonUncaughtSignal)
+            BOOL exited = done.terminationReason != NSTaskTerminationReasonUncaughtSignal;
+            BOOL was_native = [args containsObject:@"-native"];
+            BOOL refused = exited && was_native && done.terminationStatus == 71 &&
+                           log_ends_with(run.log, @"unresolved imports, which no virtual library exports");
+            BOOL stopped = exited && was_native && done.terminationStatus == 72 && log_ends_with(run.log, @" not implemented");
+            if (!exited)
                 how = [NSString stringWithFormat:@"Stopped by signal %d", done.terminationStatus];
             else if (done.terminationStatus == 0)
                 how = @"Exited";
+            else if (refused)
+                how = @"Native mode cannot run it yet";
+            else if (stopped)
+                how = @"Stopped at a call native mode cannot make yet";
             else
                 how = [NSString stringWithFormat:@"Exited with code %d", done.terminationStatus];
-            run.status = run.mode ? [NSString stringWithFormat:@"%@ (%@)", how, run.mode] : how;
+            run.status = refused || stopped ? how : run.mode ? [NSString stringWithFormat:@"%@ (%@)", how, run.mode] : how;
             run.task = nil;
+            AppDelegate *me = weakSelf;
+            if (refused && run.fallbackArgs && me) {
+                /* Nothing of the program ran: it starts again in cache mode, and its tile follows the new run. */
+                run.status = [how stringByAppendingString:@"; started it in cache mode"];
+                Run *again = [me launch:path name:name ocerz:ocerz args:run.fallbackArgs env:env cwd:cwd
+                                   mode:@"cache mode, after native mode could not" wine:wine];
+                for (Item *i in me.items)
+                    if (i.run == run && again)
+                        i.run = again;
+            } else if (stopped && run.fallbackArgs) {
+                run.status = [how stringByAppendingString:@"; untick Native to run it in cache mode"];
+            }
             [weakSelf.table reloadData];
             [weakSelf.grid reloadData];
         });
@@ -1747,12 +1842,17 @@ int main(int argc, const char **argv)
         NSString *verb = argc > 1 ? @(argv[1]) : @"";
         NSString *what = argc > 2 ? @(argv[2]) : @"";
         BOOL on = argc > 3 && strcmp(argv[3], "on") == 0;
+        BOOL native = argc > 4 && strcmp(argv[4], "native") == 0;
         if ([verb isEqualToString:@"shims"])
             return write_crossover_shims(what) ? 0 : 1;
         if ([verb isEqualToString:@"bottle"])
-            return set_bottle_aarchx(what, on) ? 0 : 1;
+            return set_bottle_aarchx(what, on, native) ? 0 : 1;
         if ([verb isEqualToString:@"uses"])
             return bottle_uses_aarchx(what) ? 0 : 1;
+        if ([verb isEqualToString:@"native"])
+            return bottle_is_native(what) ? 0 : 1;
+        if ([verb isEqualToString:@"log"])
+            return log_ends_with(what, argc > 3 ? @(argv[3]) : @"") ? 0 : 1;
         if ([verb isEqualToString:@"launchers"])
             return set_launchers_aarchx(what, on) ? 0 : 1;
         if ([verb isEqualToString:@"passing"])
