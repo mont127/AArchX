@@ -17,6 +17,7 @@ bash tests/run_diff32.sh .
 bash tests/run_dynamic_tests.sh
 bash tests/run_native_tests.sh
 bash tests/run_native_swift_tests.sh
+bash tests/run_app_tests.sh
 ```
 
 ## What each phase proves
@@ -75,6 +76,16 @@ program whose `libswiftDispatch.dylib` runs as guest code. They need the
 guest Swift and C++ runtimes (`make guest-swift`, `make guest-cxx`), and the
 overlay suite also needs `make guest-swift-overlays`; each skips without its
 guest libraries.
+
+**The app's CrossOver scripts.** AArchX.app writes shell scripts for a switched
+CrossOver bottle: two in front of CrossOver's `wineloader` and `wineserver`, and
+one in place of each launcher. The suite builds `app/AArchX.m` without its
+window and runs what it writes against a CrossOver and a home made in a
+temporary directory, whose programs print their own names and arguments: the
+`ocerz` a bottle runs under after AArchX was updated or moved, a launcher whose
+command names a CrossOver that has moved, a launcher CrossOver wrote again, and
+switching off putting every file back byte for byte. Nothing of the real home
+or of a real CrossOver is touched.
 
 ## Current state
 

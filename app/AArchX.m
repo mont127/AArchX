@@ -11,7 +11,12 @@
  * one by one: the bottle's [Wine] BinPath, CrossOver's documented way to use
  * another Wine, puts two small scripts ahead of CrossOver's own bin, and they
  * run CrossOver's wineloader and wineserver under ocerz instead of Rosetta.
- * CrossOver's own files are not modified.  -fex, FEX-Emu's translator in place
+ * CrossOver's own files are not modified.  Those scripts, and the one put in
+ * place of each launcher of a switched bottle, find ocerz and CrossOver when
+ * they run, and every start of the app writes them again, so that a bottle
+ * follows the AArchX and the CrossOver that are installed now rather than the
+ * ones that were there when it was switched.  tests/run_app_tests.sh builds
+ * this file with AARCHX_APP_TEST and runs what it writes.  -fex, FEX-Emu's translator in place
  * of AArchX's, applies to 64-bit Intel Mac programs only: 32-bit ones and Wine
  * need memory FEXCore cannot be given.
  */
@@ -186,15 +191,38 @@ static NSString *wine_prefix(void)
     return p.stringByExpandingTildeInPath;
 }
 
-/* CrossOver.app, wherever Launch Services or the usual folders have it. */
-static NSString *find_crossover(void)
+/* Every place CrossOver.app may be: the CrossOverPath setting when there is one, and nothing else then, or
+ * wherever Launch Services and the usual folders have it. */
+static NSArray<NSString *> *crossover_candidates(void)
 {
+    NSString *custom = [[NSUserDefaults standardUserDefaults] stringForKey:@"CrossOverPath"];
+    if (custom.length)
+        return @[ custom.stringByExpandingTildeInPath ];
     NSMutableArray *candidates = [NSMutableArray array];
     for (NSURL *u in [[NSWorkspace sharedWorkspace] URLsForApplicationsWithBundleIdentifier:@"com.codeweavers.CrossOver"])
         [candidates addObject:u.path];
     [candidates addObjectsFromArray:@[
-        @"/Applications/CrossOver.app", [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/CrossOver.app"]
+        @"/Applications/CrossOver.app", [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/CrossOver.app"],
+        [NSHomeDirectory() stringByAppendingPathComponent:@"Downloads/CrossOver.app"]
     ]];
+    return candidates;
+}
+
+/* A path that stops existing by itself: inside the randomised read-only copy macOS runs a downloaded app
+ * from, or on a volume that cannot be written, which is what an opened disk image is. */
+static BOOL path_is_passing(NSString *path)
+{
+    if ([path rangeOfString:@"/AppTranslocation/"].location != NSNotFound)
+        return YES;
+    NSNumber *readonly = nil;
+    [[NSURL fileURLWithPath:path] getResourceValue:&readonly forKey:NSURLVolumeIsReadOnlyKey error:nil];
+    return readonly.boolValue;
+}
+
+/* CrossOver.app, wherever it is. */
+static NSString *find_crossover(void)
+{
+    NSArray<NSString *> *candidates = crossover_candidates();
     for (NSString *c in candidates)
         if ([[NSFileManager defaultManager]
                 isExecutableFileAtPath:[c stringByAppendingPathComponent:@"Contents/SharedSupport/CrossOver/bin/wineloader"]])
@@ -225,7 +253,14 @@ static NSString *shell_quote(NSString *s)
 /* wineloader and wineserver in the shim directory, each running CrossOver's
  * own binary of that name under ocerz, or as it is when ocerz has gone.  WINELOADER and WINESERVER go back to
  * CrossOver's real binaries, so the processes Wine starts itself are x86 ones,
- * which ocerz keeps under itself. */
+ * which ocerz keeps under itself.
+ *
+ * The script looks for ocerz when it runs.  It used to name one path, the ocerz of the AArchX that wrote it,
+ * and a bottle went on running under that one whatever was installed since: a bottle switched by a build of
+ * 0.9 still ran under 0.9 beside an installed 1.0.3, at twice the time to start a Windows program, and a
+ * bottle switched by a copy that was then moved went back to Rosetta without a word.  The path written here
+ * is still tried first, the places AArchX installs an ocerz after it, and every start of the app writes the
+ * scripts again (refresh_crossover), so the AArchX opened last is the one bottles use. */
 static BOOL write_crossover_shims(NSString *ocerz)
 {
     NSString *dir = crossover_shims();
@@ -235,11 +270,15 @@ static BOOL write_crossover_shims(NSString *ocerz)
         NSString *script = [NSString stringWithFormat:
             @"#!/bin/sh\n"
             @"# Written by AArchX.app: CrossOver's own %@, run by ocerz instead of Rosetta.\n"
+            @"# The first ocerz is the one of the AArchX opened last; the others are where AArchX installs one.\n"
             @"export WINELOADER=\"$CX_ROOT/bin/wineloader\"\n"
             @"export WINESERVER=\"$CX_ROOT/bin/wineserver\"\n"
-            @"[ -x %@ ] || exec \"$CX_ROOT/bin/%@\" \"$@\"\n"
-            @"exec %@ -- \"$CX_ROOT/bin/%@\" \"$@\"\n",
-            name, shell_quote(ocerz), name, shell_quote(ocerz), name];
+            @"for ocerz in %@ \"$HOME/.aarchx/ocerz\" /Applications/AArchX.app/Contents/Resources/aarchx/ocerz \\\n"
+            @"    \"$HOME/Applications/AArchX.app/Contents/Resources/aarchx/ocerz\" /opt/homebrew/bin/ocerz /usr/local/bin/ocerz; do\n"
+            @"    [ -x \"$ocerz\" ] && exec \"$ocerz\" -- \"$CX_ROOT/bin/%@\" \"$@\"\n"
+            @"done\n"
+            @"exec \"$CX_ROOT/bin/%@\" \"$@\"\n",
+            name, shell_quote(ocerz), name, name];
         NSString *path = [dir stringByAppendingPathComponent:name];
         if (![script writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil])
             return NO;
@@ -309,14 +348,7 @@ static BOOL set_bottle_aarchx(NSString *conf, BOOL on)
  * whose path is gone once that copy quits. */
 static NSString *crossover_home(void)
 {
-    NSMutableArray *candidates = [NSMutableArray array];
-    for (NSURL *u in [[NSWorkspace sharedWorkspace] URLsForApplicationsWithBundleIdentifier:@"com.codeweavers.CrossOver"])
-        [candidates addObject:u.path];
-    [candidates addObjectsFromArray:@[
-        @"/Applications/CrossOver.app", [NSHomeDirectory() stringByAppendingPathComponent:@"Applications/CrossOver.app"],
-        [NSHomeDirectory() stringByAppendingPathComponent:@"Downloads/CrossOver.app"]
-    ]];
-    for (NSString *c in candidates)
+    for (NSString *c in crossover_candidates())
         if ([c rangeOfString:@"/AppTranslocation/"].location == NSNotFound &&
             [[NSFileManager defaultManager]
                 isExecutableFileAtPath:[c stringByAppendingPathComponent:@"Contents/SharedSupport/CrossOver/bin/wine"]])
@@ -353,7 +385,17 @@ static NSString *const kLauncherMark = @"# Written by AArchX.app";
  * --enable-alt-loader, whose processes do not run under ocerz yet.  With
  * arguments it is CrossOver asking for the launcher itself, and the original
  * gets them.  The script becomes that command, so the launcher stays running
- * while the program does, as CrossOver's own launcher would. */
+ * while the program does, as CrossOver's own launcher would.
+ *
+ * CrossOver's command names its wine by a full path, the path of the CrossOver that wrote it, and that path
+ * is dead once CrossOver has moved: one first opened from Downloads ran from a randomised copy
+ * (/private/var/folders/.../AppTranslocation/...) and wrote that into every command, and dragging it to
+ * Applications afterwards rewrote none of them.  The script used to run the command whenever the file was
+ * there, so each launcher of such a bottle ended at once with status 126 and nothing on screen.  It now looks
+ * at the path first, and when no wine is there, gives the same command to the CrossOver that is here: the
+ * one the app found, or one in the usual places.  Its last resort used to hand the command file itself to
+ * wine --start, which is a shell script and not a program of the bottle; the last resort is CrossOver's own
+ * launcher now, under Rosetta. */
 static NSString *launcher_script(NSString *exe, NSString *crossover)
 {
     return [NSString stringWithFormat:
@@ -365,22 +407,31 @@ static NSString *launcher_script(NSString *exe, NSString *crossover)
         @"orig=\"$here/%@.cx-original\"\n"
         @"case \"$1\" in ''|-psn_*) ;; *) exec \"$orig\" \"$@\" ;; esac\n"
         @"info=\"$here/../Info.plist\"\n"
-        @"bottle=$(/usr/bin/plutil -extract CXHelperAppBottleName raw \"$info\" 2>/dev/null)\n"
         @"target=$(/usr/bin/plutil -extract CrossOverHelperCommand raw \"$info\" 2>/dev/null | /usr/bin/sed 's/^\"//; s/\"$//')\n"
-        @"[ -f \"$target\" ] && [ -x \"$target\" ] && exec \"$target\"\n"
-        @"for app in %@ /Applications/CrossOver.app \"$HOME/Applications/CrossOver.app\"; do\n"
-        @"    wine=\"$app/Contents/SharedSupport/CrossOver/bin/wine\"\n"
-        @"    if [ -x \"$wine\" ] && [ -n \"$bottle\" ] && [ -n \"$target\" ]; then\n"
-        @"        exec \"$wine\" --bottle \"$bottle\" --wait-children --start \"$target\"\n"
+        @"if [ -f \"$target\" ]; then\n"
+        @"    # CrossOver's command names its wine by a full path, which is dead once CrossOver has moved.\n"
+        @"    theirs=$(/usr/bin/sed -n 's/^exec \"\\([^\"]*\\)\".*/\\1/p' \"$target\" | /usr/bin/head -1)\n"
+        @"    if [ -x \"$target\" ] && { [ -z \"$theirs\" ] || [ -x \"$theirs\" ]; }; then\n"
+        @"        exec \"$target\"\n"
         @"    fi\n"
-        @"done\n"
+        @"    # The same command, with the wine of the CrossOver that is here in place of the dead one.\n"
+        @"    for app in %@ /Applications/CrossOver.app \"$HOME/Applications/CrossOver.app\"; do\n"
+        @"        wine=\"$app/Contents/SharedSupport/CrossOver/bin/wine\"\n"
+        @"        if [ -n \"$theirs\" ] && [ -x \"$wine\" ]; then\n"
+        @"            exec /bin/sh -c \"$(/usr/bin/sed 's/^exec \"[^\"]*\"/exec \"$0\"/' \"$target\")\" \"$wine\"\n"
+        @"        fi\n"
+        @"    done\n"
+        @"fi\n"
         @"exec \"$orig\" \"$@\"\n",
         kLauncherMark, exe, shell_quote(crossover ? crossover : @"/Applications/CrossOver.app")];
 }
 
 /* Points one launcher at that script, keeping its own executable beside it as
- * <name>.cx-original, or puts the original back.  A launcher CrossOver has
- * written again since is left as CrossOver wrote it. */
+ * <name>.cx-original, or puts the original back.  Unticking leaves a launcher
+ * CrossOver has written again since as CrossOver wrote it.  Ticking takes such
+ * a launcher as the original from then on: it used to find the older
+ * <name>.cx-original still beside it and refuse, so a launcher CrossOver had
+ * written again could never be switched again. */
 static BOOL set_launcher_aarchx(NSString *app, BOOL on, NSString *crossover)
 {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -404,7 +455,9 @@ static BOOL set_launcher_aarchx(NSString *app, BOOL on, NSString *crossover)
             return NO;
         moved = YES;
     } else if (!ours && [fm fileExistsAtPath:path]) {
-        return NO;
+        if (![fm removeItemAtPath:orig error:nil] || ![fm moveItemAtPath:path toPath:orig error:nil])
+            return NO;
+        moved = YES;
     }
     if (![launcher_script(exe, crossover) writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil] ||
         ![fm setAttributes:@{ NSFilePosixPermissions : @0755 } ofItemAtPath:path error:nil]) {
@@ -425,6 +478,23 @@ static BOOL set_launchers_aarchx(NSString *bottle, BOOL on)
     for (NSString *app in crossover_launchers(bottle))
         ok = set_launcher_aarchx(app, on, crossover) && ok;
     return ok;
+}
+
+/* Bottles switched by an earlier AArchX go on using what that one wrote: the path of its ocerz in the two
+ * scripts, and launcher scripts as it wrote them.  So each start of the app writes both again, when this copy
+ * is one that stays where it is.  Nothing is written for someone who never switched a bottle. */
+static void refresh_crossover(void)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *ocerz = find_ocerz();
+    BOOL is_dir = NO;
+    if (!ocerz || path_is_passing(ocerz) || ![fm fileExistsAtPath:crossover_shims() isDirectory:&is_dir] || !is_dir)
+        return;
+    write_crossover_shims(ocerz);
+    NSString *dir = crossover_bottles();
+    for (NSString *b in [fm contentsOfDirectoryAtPath:dir error:nil])
+        if (bottle_uses_aarchx([[dir stringByAppendingPathComponent:b] stringByAppendingPathComponent:@"cxbottle.conf"]))
+            set_launchers_aarchx(b, YES);
 }
 
 /* A copy downloaded with a browser carries the quarantine flag on every file;
@@ -722,6 +792,7 @@ static int program_kind(NSString *path, NSString **why)
     self.runs = [NSMutableArray array];
     self.items = [NSMutableArray array];
     clear_own_quarantine();
+    refresh_crossover();
     [self buildMenu];
     [self buildWindow];
     [self loadLibrary];
@@ -1223,6 +1294,12 @@ static int program_kind(NSString *path, NSString **why)
         [self tell:@"ocerz was not found" detail:@"Install AArchX first, then switch bottles to it."];
         return;
     }
+    if (path_is_passing(ocerz)) {
+        [self tell:@"Move AArchX to Applications first"
+            detail:@"This copy is running from a disk image or a temporary place. A bottle switched to it would go "
+                   @"back to Rosetta as soon as the copy is gone."];
+        return;
+    }
     NSString *dir = crossover_bottles();
     NSMutableArray *bottles = [NSMutableArray array];
     for (NSString *b in [[[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil]
@@ -1660,6 +1737,34 @@ static int program_kind(NSString *path, NSString **why)
 
 @end
 
+#ifdef AARCHX_APP_TEST
+/* tests/run_app_tests.sh builds the file with this defined and drives the CrossOver functions without the
+ * window: what they write is shell scripts, and the test runs those against a CrossOver and a home of its
+ * own (the CrossOverPath and OcerzPath settings as arguments, CFFIXED_USER_HOME). */
+int main(int argc, const char **argv)
+{
+    @autoreleasepool {
+        NSString *verb = argc > 1 ? @(argv[1]) : @"";
+        NSString *what = argc > 2 ? @(argv[2]) : @"";
+        BOOL on = argc > 3 && strcmp(argv[3], "on") == 0;
+        if ([verb isEqualToString:@"shims"])
+            return write_crossover_shims(what) ? 0 : 1;
+        if ([verb isEqualToString:@"bottle"])
+            return set_bottle_aarchx(what, on) ? 0 : 1;
+        if ([verb isEqualToString:@"uses"])
+            return bottle_uses_aarchx(what) ? 0 : 1;
+        if ([verb isEqualToString:@"launchers"])
+            return set_launchers_aarchx(what, on) ? 0 : 1;
+        if ([verb isEqualToString:@"passing"])
+            return path_is_passing(what) ? 0 : 1;
+        if ([verb isEqualToString:@"refresh"]) {
+            refresh_crossover();
+            return 0;
+        }
+        return 2;
+    }
+}
+#else
 int main(int argc, const char **argv)
 {
     @autoreleasepool {
@@ -1671,3 +1776,4 @@ int main(int argc, const char **argv)
     }
     return 0;
 }
+#endif

@@ -169,6 +169,7 @@ check: ocerz unit guest apis
 	bash tests/run_native_format_tests.sh
 	bash tests/run_native_swift_tests.sh
 	bash tests/run_native_swift_overlay_tests.sh
+	bash tests/run_app_tests.sh
 
 guest-cxx:
 	bash tools/build_guest_cxx.sh
@@ -193,6 +194,10 @@ native-swift: ocerz
 
 native-swift-overlays: ocerz apis
 	bash tests/run_native_swift_overlay_tests.sh
+
+# AArchX.app's CrossOver scripts, run against a CrossOver and a home made for the test.
+app-tests:
+	bash tests/run_app_tests.sh
 
 diff32:
 	bash tests/run_diff32.sh .

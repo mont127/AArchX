@@ -127,7 +127,9 @@ usual. Ticking does two things, and unticking undoes both:
 - **The bottle.** It sets the bottle's `[Wine] "BinPath"`, CrossOver's
   documented way to use another Wine, to two small scripts in
   `~/Library/Application Support/AArchX/CrossOver/bin`. They run CrossOver's
-  `wineloader` and `wineserver` under `ocerz`, or directly if `ocerz` is gone.
+  `wineloader` and `wineserver` under `ocerz`: the one of the AArchX you
+  opened last, or if that has gone, one in the places AArchX installs to, and
+  directly only if there is none at all.
 - **The launchers.** CrossOver writes a launcher app for each program into
   `~/Applications/CrossOver`. Normally that launcher is also Wine's alternate
   loader, which means the program's window processes run inside it, under
@@ -135,7 +137,18 @@ usual. Ticking does two things, and unticking undoes both:
   bottle's launchers keeps its own executable beside it as
   `<name>.cx-original`, and a short script in its place starts the program
   through CrossOver's `wine` without the alternate loader. Every process then
-  runs under AArchX.
+  runs under AArchX. CrossOver's own command for the program names the place
+  CrossOver ran from when it wrote it; if CrossOver has moved since, from
+  Downloads to Applications for instance, the script gives the same command to
+  the CrossOver that is there now.
+
+Every start of AArchX writes those scripts again. So after updating AArchX,
+open it once and the switched bottles run under the new version; up to 1.0.3
+they went on using the `ocerz` of whichever copy had switched them. A copy of
+AArchX opened from its disk image, or from Downloads before it has been moved,
+does not switch bottles and asks to be moved to Applications first: its path
+would be gone the next day. To use a CrossOver that Launch Services does not
+find, run `defaults write io.github.mont127.aarchx CrossOverPath /path/to/CrossOver.app`.
 
 Unticking deletes the scripts and renames the originals back, so the launchers
 are byte for byte as CrossOver wrote them. Nothing inside CrossOver.app changes.
@@ -145,8 +158,8 @@ While a bottle is ticked:
   launcher.
 
 If CrossOver writes a launcher again, it is back on Rosetta until you next open
-**CrossOver Bottles…**, which switches it again. Quit a bottle's programs before
-switching it; the change applies when the bottle next starts.
+AArchX, which switches it again. Quit a bottle's programs before switching it;
+the change applies when the bottle next starts.
 
 For games, [MacNdCheese](https://github.com/mont127/MacNdCheese) sets up a whole
 Wine environment, with DXMT, DXVK and Steam, and can run its bottles under
