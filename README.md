@@ -74,7 +74,7 @@ The app is only a wrapper around the terminal version, which works the same with
 or without it. In Terminal, open a new window, then:
 
 ```sh
-ocerz version                         # AArchX 1.0.4
+ocerz version                         # AArchX 1.0.5
 ocerz /Applications/Some.app          # a bundle runs the executable its Info.plist names
 ```
 
@@ -215,7 +215,7 @@ contributors.
 | x86-64 differential, interpreter against JIT | 111 / 111 |
 | i386 differential, in each of two memory layouts | 40,044 / 40,044 |
 | dynamic-linking suite | 488 / 488 |
-| native-mode suite | 104 / 104 |
+| native-mode suite | 106 / 106 |
 | 32-bit (m32) programs | 81 / 81, one more skipped without a Steam database |
 
 Counted on macOS 27 in November 2026. [Testing](docs/testing.md) says what
