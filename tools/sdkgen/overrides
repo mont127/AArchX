@@ -712,6 +712,22 @@ fn _lgamma_r lgamma_r d(dp)
 fn _lgammaf_r lgammaf_r f(fp)
 fn _realpath realpath p(pp)
 fn _pthread_time_constraint_max_parallelism pthread_time_constraint_max_parallelism i(L)
+# The names with 64 on the end are what 10.5 called the calls that take the
+# structures with 64-bit inode numbers, before 10.6 made those the plain
+# structures and spelled the calls stat$INODE64.  x86_64 libSystem still exports
+# both spellings for one function, and Go's runtime, for one, imports the old
+# one: Ollama stopped at _stat64.  arm64 never had the second spelling, and its
+# plain calls take the same structures.  __getdirentries64 is the system call
+# under readdir, which older Go programs make themselves.
+fn _stat64 stat i(pp)
+fn _lstat64 lstat i(pp)
+fn _fstat64 fstat i(ip)
+fn _fstatat64 fstatat i(ippi)
+fn _statfs64 statfs i(pp)
+fn _fstatfs64 fstatfs i(ip)
+fn _getfsstat64 getfsstat i(pii)
+fn _getmntinfo64 getmntinfo i(pi)
+fn ___getdirentries64 __getdirentries64 l(ipLp)
 # A program that forks by hand takes malloc's locks before and drops them
 # after, with these.  The fork it then makes is ocerz's, a native fork that
 # does both itself, and the locks are not recursive: the handlers do nothing.

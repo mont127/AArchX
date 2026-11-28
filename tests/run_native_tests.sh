@@ -12948,6 +12948,103 @@ EOC
     record "$name" "$reason" "a program's libraries initialized in the order it links them, each after what it links"
 }
 
+# The calls 10.5 named stat64, lstat64, fstat64, fstatat64, statfs64, fstatfs64, getfsstat64 and getmntinfo64
+# take the structures with 64-bit inode numbers, which 10.6 made the plain ones.  x86_64 libSystem exports both
+# spellings, Go's runtime imports the old one, and arm64 has only the plain calls, so native mode had a stub for
+# each: Ollama, a Go program, stopped at _stat64.  __getdirentries64, the system call under readdir that older
+# Go programs make themselves, is in no header.  Each must answer what the plain call beside it answers.
+case_native_stat64() {
+    local name=native_stat64 reason="" d="$TMP/native_stat64"
+    rm -rf "$d"; mkdir -p "$d/dir"
+    if [ "$X86_CLANG" -ne 1 ]; then
+        echo "SKIP $name (no x86_64 clang toolchain)"
+        return
+    fi
+    printf 'twelve bytes' > "$d/dir/a-file"
+    ln -s a-file "$d/dir/a-link"
+    cat > "$d/st.c" <<'EOC'
+/* the file calls under the names 10.5 gave them, each beside the plain call of today */
+#include <dirent.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <unistd.h>
+extern int stat64_(const char *, struct stat *) __asm("_stat64");
+extern int lstat64_(const char *, struct stat *) __asm("_lstat64");
+extern int fstat64_(int, struct stat *) __asm("_fstat64");
+extern int fstatat64_(int, const char *, struct stat *, int) __asm("_fstatat64");
+extern int statfs64_(const char *, struct statfs *) __asm("_statfs64");
+extern int fstatfs64_(int, struct statfs *) __asm("_fstatfs64");
+extern int getfsstat64_(struct statfs *, int, int) __asm("_getfsstat64");
+extern int getmntinfo64_(struct statfs **, int) __asm("_getmntinfo64");
+extern long getdirentries64_(int, void *, unsigned long, long long *) __asm("___getdirentries64");
+static int same_fs(const struct statfs *a, const struct statfs *b)
+{
+    return a->f_bsize == b->f_bsize && a->f_blocks == b->f_blocks && a->f_fsid.val[0] == b->f_fsid.val[0] &&
+           !strcmp(a->f_fstypename, b->f_fstypename) && !strcmp(a->f_mntonname, b->f_mntonname) &&
+           !strcmp(a->f_mntfromname, b->f_mntfromname);
+}
+int main(int argc, char **argv)
+{
+    unsigned bad = 0;
+    char file[1024], link[1024];
+    snprintf(file, sizeof file, "%s/a-file", argv[1]);
+    snprintf(link, sizeof link, "%s/a-link", argv[1]);
+    struct stat a, b;
+    memset(&a, 0x5a, sizeof a); memset(&b, 0x5a, sizeof b);
+    if (stat(file, &a) || stat64_(file, &b) || memcmp(&a, &b, sizeof a) || b.st_size != 12 || !S_ISREG(b.st_mode)) bad |= 1;
+    if (stat64_("/nonexistent/ocerz", &b) != -1) bad |= 1;
+    memset(&a, 0x5a, sizeof a); memset(&b, 0x5a, sizeof b);
+    if (lstat(link, &a) || lstat64_(link, &b) || memcmp(&a, &b, sizeof a) || !S_ISLNK(b.st_mode)) bad |= 2;
+    int fd = open(file, O_RDONLY), dfd = open(argv[1], O_RDONLY | O_DIRECTORY);
+    memset(&a, 0x5a, sizeof a); memset(&b, 0x5a, sizeof b);
+    if (fd < 0 || fstat(fd, &a) || fstat64_(fd, &b) || memcmp(&a, &b, sizeof a) || b.st_size != 12) bad |= 4;
+    memset(&a, 0x5a, sizeof a); memset(&b, 0x5a, sizeof b);
+    if (dfd < 0 || fstatat(dfd, "a-link", &a, AT_SYMLINK_NOFOLLOW) || fstatat64_(dfd, "a-link", &b, AT_SYMLINK_NOFOLLOW) ||
+        memcmp(&a, &b, sizeof a) || !S_ISLNK(b.st_mode)) bad |= 8;
+    struct statfs fa, fb;
+    if (statfs(file, &fa) || statfs64_(file, &fb) || !same_fs(&fa, &fb)) bad |= 16;
+    if (fstatfs(fd, &fa) || fstatfs64_(fd, &fb) || !same_fs(&fa, &fb)) bad |= 32;
+    static struct statfs list_a[64], list_b[64];
+    int na = getfsstat(list_a, sizeof list_a, MNT_NOWAIT), nb = getfsstat64_(list_b, sizeof list_b, MNT_NOWAIT);
+    if (na < 1 || na != nb || !same_fs(&list_a[0], &list_b[0]) || !same_fs(&list_a[na - 1], &list_b[nb - 1])) bad |= 64;
+    struct statfs *ma = NULL, *mb = NULL;
+    int ca = getmntinfo(&ma, MNT_NOWAIT), cb = getmntinfo64_(&mb, MNT_NOWAIT);
+    if (ca < 1 || ca != cb || !mb || strcmp(ma[0].f_mntonname, "/") || strcmp(mb[0].f_mntonname, "/")) bad |= 128;
+    char buf[4096];
+    long long base = 0;
+    long got = getdirentries64_(dfd, buf, sizeof buf, &base);
+    int seen_file = 0, seen_link = 0;
+    for (long at = 0; got > 0 && at < got;) {
+        struct dirent *e = (struct dirent *)(buf + at);
+        if (!e->d_reclen) break;
+        if (!strcmp(e->d_name, "a-file") && e->d_type == DT_REG) seen_file = 1;
+        if (!strcmp(e->d_name, "a-link") && e->d_type == DT_LNK) seen_link = 1;
+        at += e->d_reclen;
+    }
+    if (got <= 0 || !seen_file || !seen_link) bad |= 256;
+    if (bad) printf("stat64 bad:%x\n", bad); else printf("stat64 ok\n");
+    return bad != 0;
+}
+EOC
+    if ! clang -arch x86_64 -O1 -Wall -Wextra -Werror -Wno-unused-parameter -o "$d/st" "$d/st.c" >"$d/cc.log" 2>&1; then
+        record "$name" "the fixture did not compile: $(grep -m1 error "$d/cc.log" | cut -c1-160)"
+        return
+    fi
+    local mode rc got
+    for mode in "-native" "-native -no-jit" "-cache"; do
+        run_bounded "$d/out" "$d/err" env OCERZ_NO_CACHE_HOLDER=1 "$OCERZ" $mode "$d/st" "$d/dir"
+        rc=$?
+        got=$(cat "$d/out")
+        if [ -z "$reason" ] && { [ "$rc" != 0 ] || [ "$got" != "stat64 ok" ]; }; then
+            reason="$mode exit $rc and printed '$got': $(tail -1 "$d/err" | cut -c1-160)"
+        fi
+    done
+    record "$name" "$reason" "stat64, lstat64, fstat64, fstatat64, statfs64, fstatfs64, getfsstat64, getmntinfo64 and __getdirentries64"
+}
+
 # libxml2's parser context, XPath context and I/O buffers hold function pointers, so every function taking one was
 # a stub and a program stopped at its first XPath query.  libxml2 builds those structures itself, so they are
 # opaque records now and 214 more functions cross.  The push parser crosses when it is given no SAX handler and is
@@ -16614,6 +16711,7 @@ case_native_import_addends
 case_native_syscall
 case_native_undeclared
 case_native_init_order
+case_native_stat64
 case_native_libxml2
 case_native_cancel
 case_native_lsopen

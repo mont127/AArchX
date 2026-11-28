@@ -301,6 +301,17 @@ first and Chrome aborted before it had drawn anything ("The PartitionAlloc
 default zone has unexpectedly already been registered"). Libraries opened
 later with `dlopen` were already initialized in the right order.
 
+The file calls have two spellings on x86_64. 10.5 named the ones that take
+structures with 64-bit inode numbers `stat64`, `lstat64`, `fstat64`,
+`fstatat64`, `statfs64`, `fstatfs64`, `getfsstat64` and `getmntinfo64`; 10.6
+made those structures the plain ones and spelled the calls `stat$INODE64`, and
+x86_64 libSystem has exported both names for one function ever since. arm64
+never had the first spelling, so native mode had a stub for each, and a Go
+program, whose runtime imports the old names, stopped at its first `stat64`:
+Ollama did. They cross to the plain calls now, which take the same structures,
+and so does `__getdirentries64`, the system call under `readdir` that older Go
+programs make themselves.
+
 ## Comparing with Rosetta
 
 `tools/native-diff.py` runs the same x86_64 probes under Rosetta, cache mode
